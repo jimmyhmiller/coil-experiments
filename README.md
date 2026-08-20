@@ -11,7 +11,7 @@ API surface.
 ## What's here
 
 ### `src/apps/scheme/` — an R5RS Scheme dialect
-About 17,000 lines. One import (`(import "coil.scheme" :use *)`) and you write
+About 17,000 lines. One import (`(import "experiments.scheme.lang" :use *)`) and you write
 real Scheme in a `.scm` or `.coil` file: proper tail calls, `call/cc`,
 `define-syntax` with `syntax-rules`, bignums, ports, a precise GC. The dialect
 is a `:phase before-expand` whole-program transform — the compiler has no
@@ -22,8 +22,8 @@ A reader provider that compiles raw `.bf` bytes to a complete Coil module at
 compile time — direct tape operations and native loops, no interpreter.
 
 ```sh
-coil run tests/brainfuck/hello.bf --use brainfuck   # Hello World!
-coil run brainfuck tests/brainfuck/hello.bf         # print the emitted Coil
+coil run tests/brainfuck/hello.bf --use experiments.brainfuck.lang
+coil run experiments.brainfuck.lang tests/brainfuck/hello.bf   # print the emitted Coil
 ```
 
 ### `src/apps/` — applications
@@ -57,10 +57,32 @@ python3 tests/scheme/run.py --list
 Everything here consumes an installed Coil toolchain — there is no compiler in
 this repo. Pass `--compiler` to the scripts, or put `coil` on your `PATH`.
 
-## Known debt
+## Layout
 
-`src/apps/scheme` still declares the `coil.scheme.*` namespaces, which belong to
-Coil's standard library, not to this repo. It cannot be renamed yet: Coil's
-loader triggers the dialect's ASCII identifier case-folding by scanning for a
-literal `(import "coil.scheme" …)` form (`src/compiler/loader.coil`). Renaming
-these namespaces needs that hook generalized upstream first.
+This is a Coil **workspace** named `experiments`. Every directory under
+`src/apps`, `src/dialects` and `src/experiments` is a member package with its own
+`Coil.toml`, and its modules are `experiments.<package>.<name>` — the Scheme
+evaluator is `experiments.scheme.eval`, the CHIP-8 CPU is `experiments.chip8.lang`.
+Members compile together and refer to each other directly; nothing declares a
+dependency on anything.
+
+```sh
+coil test                       # the deftest suites (191 Scheme tests)
+coil test --suite mal           # opt-in: slow, several currently red
+coil check                      # typecheck every member that is a program
+python3 scripts/experiments.py --compiler "$(command -v coil)"
+```
+
+That last one is the corpus runner: the demos here are programs, not `deftest`s,
+so their contract is "runs, prints this, exits N". `tests/experiments.txt` lists
+them and `tests/reference/` holds blessed stdout and exit status, so a silent
+change in what a demo prints fails rather than passing quietly. Re-freeze with
+`--bless` after an intentional change.
+
+## Known broken
+
+- `src/apps/mini-scheme/scheme.coil` does not compile: the GC transform leaves
+  `Val` unresolved and the build dies with 20 errors. It predates the workspace
+  conversion. It is commented out of `tests/experiments.txt` rather than blessed
+  at exit 1, which would have reported health it does not have.
+- Several `--suite mal` stages fail, some by SIGABRT in the compiler.

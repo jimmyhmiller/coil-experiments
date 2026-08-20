@@ -1,5 +1,5 @@
 (module plain-existing-main)
-(import "coil.scheme" :use *)
+(import "experiments.scheme.lang" :use *)
 
 (defn main [] (-> i64)
   (display (+ 40 2))
