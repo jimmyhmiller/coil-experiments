@@ -40,7 +40,9 @@ coil run brainfuck tests/brainfuck/hello.bf         # print the emitted Coil
 - `httptap/` — HTTP interception as a whole-program transform, three sinks
 
 ### `tests/` and `scripts/`
-`tests/scheme/` is the conformance corpus: a differential harness against Chez,
+`tests/staged-meta/` holds the staged-metacompilation bridge that computes
+through the Scheme phase runtime at expansion time. `tests/scheme/` is the
+conformance corpus: a differential harness against Chez,
 Guile, and Chibi (`tests/scheme/run.py`), the dialect suite, MAL, a Lox
 interpreter written in Scheme, and benchmarks. The `scripts/scheme-*.py` drive
 them.
