@@ -18,29 +18,34 @@ neither. Includes and macros work because clang performs preprocessing first.
 
 ## Implemented surface
 
-The first end-to-end slice lowers integer/floating scalar types with clang's
-resolved widths, typedefs, enums, named structs and fields, pointers,
-fixed arrays, function pointers, direct/indirect calls, C/variadic externs,
-mutable parameters and locals, arithmetic/comparisons/casts, lvalues, address and
-deref, indexing/member access, conditionals, loops, break/continue, and return.
-Static/global storage has native process lifetime and zero initialization.
+The reader lowers integer/floating scalar types with clang's resolved widths,
+typedefs, enums, structs/unions, anonymous records, pointers, fixed arrays,
+function pointers, direct/indirect calls, C/variadic externs, mutable parameters
+and locals, arithmetic/comparisons/casts, lvalues, address and dereference,
+indexing/member access, conditionals, switch/fallthrough, loops, break/continue,
+goto/labels, and return. Static/global storage has native process lifetime and
+zero initialization. Function-local cells are allocated once at function entry,
+matching C's reusable automatic storage and allowing LLVM's normal mem2reg pass.
+
+Whole-program compilation specializes a C-defined variadic forwarding function
+for each statically observed argument signature. This makes clox's
+`runtimeError(...)/vfprintf` path fixed-signature ordinary Coil while preserving
+external C variadics such as `printf` through Coil's C ABI support.
 
 ## Explicit limitations
 
-This is not yet a conforming C implementation. Designated/nested/global aggregate
-initializers, unions, bitfields, anonymous records,
-switch/goto/labels, VLAs, atomics, complex numbers, TLS, GNU statement expressions,
-and exact signed/unsigned usual-arithmetic-conversion insertion remain unsupported.
-Struct layout currently relies on Coil matching the target C ABI; packed/aligned
-attributes are not represented. Local fixed-array and named-record positional
-initializers are applied; designated, nested, and global aggregate initializers
-remain unsupported. `static` local identity and C's
-tentative-definition/coalescing rules are incomplete. Diagnostics deliberately
-name the first unsupported typed-AST node instead of silently invoking C codegen.
+This is not yet a conforming TCC-scale C implementation. Bitfields, VLAs,
+atomics, complex numbers, TLS, GNU statement expressions, arbitrary irreducible
+goto graphs, and every packed/over-aligned layout are not complete. Unions use
+overlaid member access on storage whose ordinary Coil struct supplies sufficient
+size/alignment for the validated corpus. `static` local identity and C's
+tentative-definition/coalescing rules also remain incomplete. Diagnostics name
+the first unsupported typed-AST node instead of silently invoking C codegen.
 
-Consequently clox and other substantial C applications are milestone targets,
-not claimed passing targets. All three fixtures under `tests/c` build with the
-dialect and are compared byte-for-byte (output, diagnostics, and exit status) with clang.
+The checked corpus includes three independent real applications: 4,979 lines of
+clox, 3,206 lines of cJSON, and 2,848 lines of LZ4. clox passes all 246 vendored
+Crafting Interpreters tests. cJSON parses, traverses, prints, and frees a document.
+LZ4 repeatedly compresses and decompresses 8 MiB and verifies every byte.
 
 ## Validation and comparison
 
@@ -49,7 +54,7 @@ python3 src/dialects/c/c_ast_to_coil.py tests/c/fib.c > /tmp/fib.coil
 python3 scripts/c-dialect.py
 ```
 
-The script verifies that translation succeeds, that no object/embedded-C escape
-hatch appears, optionally builds/runs with `coil`, and reports size and elapsed
-time beside `clang -O2`. Performance numbers are intentionally local measurements,
-not checked-in claims.
+The script builds every case through both `clang -O3` and the Coil reader/native
+backend, checks exact observable output, runs clox's 246-test suite, and measures
+warmed clox and LZ4 application workloads. It fails if either Coil-generated
+program exceeds the matching Clang binary by more than 30%.
