@@ -50,6 +50,26 @@ clox, 3,206 lines of cJSON, and 2,848 lines of LZ4. clox passes all 246 vendored
 Crafting Interpreters tests. cJSON parses, traverses, prints, and frees a document.
 LZ4 repeatedly compresses and decompresses 8 MiB and verifies every byte.
 
+## Language coverage baseline
+
+`scripts/c-conformance.py` fetches immutable TinyCC and c-testsuite revisions into
+the ignored `build/conformance` cache, compiles each applicable test through this
+reader, executes it natively, and compares its ordered stdout/stderr with upstream
+expectations. Unsupported C features count as failures. Explicit skips are limited
+to platform assembly, diagnostic/bounds/linker harnesses, invalid tests that TinyCC
+itself skips, and multi-translation-unit tests that do not fit this reader's declared
+whole-program model.
+
+The current [full baseline](../../../tests/c/conformance/BASELINE.md) is 240/330
+(72.7%) overall: 181/219 (82.6%) for portable c-testsuite cases and 59/111
+(53.2%) for TinyCC's broader native regression corpus. These are frozen-corpus pass
+rates, not a claim of ISO C conformance.
+
+```sh
+python3 scripts/c-conformance.py --suite all \
+  --write-report tests/c/conformance/BASELINE.md
+```
+
 ## Validation and comparison
 
 ```sh
