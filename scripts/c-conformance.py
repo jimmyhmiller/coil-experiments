@@ -35,6 +35,7 @@ TINYCC_SKIPS = {
     "70": "expected output requires TCC-only __TINYC__ binary floating literals",
     "71": "upstream expectation adds output absent from the source program",
     "76": "upstream expectation adds output absent from the source program",
+    "79": "expects TCC allocator reuse after VLA lifetime; Clang -O3 differs",
     "85": "x86 inline assembly",
     "96": "diagnostic-driver test (-dt), not a native program",
     "98": "i386 register-extension ABI test",

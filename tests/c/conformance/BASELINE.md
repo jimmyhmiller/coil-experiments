@@ -5,7 +5,7 @@ This is a reproducible corpus pass rate, not an ISO conformance percentage.
 | Suite | Revision | Passed | Applicable | Pass rate | Explicit skips |
 | --- | --- | ---: | ---: | ---: | ---: |
 | c-testsuite | `5c7275656d751de0e68b2d340a95b5681858ed07` | 205 | 219 | 93.6% | 1 |
-| tinycc | `2ba12e83b3599ca8f5d50c179fe5138fe956f0c9` | 97 | 107 | 90.7% | 30 |
+| tinycc | `2ba12e83b3599ca8f5d50c179fe5138fe956f0c9` | 96 | 106 | 90.6% | 31 |
 
 ## c-testsuite
 
@@ -36,8 +36,8 @@ This is a reproducible corpus pass rate, not an ISO conformance percentage.
 
 ## tinycc
 
-- outcomes: compile-fail=4, compile-timeout=2, output-mismatch=4, pass=97
-- explicit non-frontend/platform skips: 30
+- outcomes: compile-fail=4, compile-timeout=2, output-mismatch=4, pass=96
+- explicit non-frontend/platform skips: 31
 
 ### Failures
 

@@ -12,6 +12,22 @@ coil build tests/c/fib.c --use experiments.c.lang -o /tmp/fib
 /tmp/fib
 ```
 
+Multiple C translation units use the linkage-aware build driver:
+
+```sh
+python3 scripts/c-build.py src/main.c src/render.c src/game.c -o /tmp/game
+```
+
+Each source is preprocessed and type-checked by clang as an independent C
+translation unit. The driver builds a program-wide symbol index, validates
+external declarations, selects the owner of each tentative global definition,
+gives `static` functions and globals unit-local identities, and then lowers the
+units into one Coil native compilation. Compiling them together preserves Coil's
+whole-program optimization and emits the runtime only once; it does not concatenate
+C source or change preprocessing, tag, `static`, or tentative-definition scope.
+`--cflag=-Iinclude` and `--cflag=-DFEATURE=1` pass preprocessing options, while
+`--link-flag=-lSDL2` passes native libraries to Coil's final linker invocation.
+
 The Python helper is parser glue only and must be run from the workspace root.
 `clang` and `python3` are compile-time dependencies; produced executables need
 neither. Includes and macros work because clang performs preprocessing first.
@@ -38,12 +54,11 @@ external C variadics such as `printf` through Coil's C ABI support.
 ## Explicit limitations
 
 This is not yet a conforming TCC-scale C implementation. Bitfields, VLAs,
-atomics, complex numbers, TLS, GNU statement expressions, arbitrary irreducible
-goto graphs, and every packed/over-aligned layout are not complete. Unions use
+atomics, GNU extensions, complex numbers, TLS, arbitrary irreducible goto graphs,
+and packed/over-aligned layouts are not complete. Unions use
 overlaid member access on storage whose ordinary Coil struct supplies sufficient
-size/alignment for the validated corpus. `static` local identity and C's
-tentative-definition/coalescing rules also remain incomplete. Diagnostics name
-the first unsupported typed-AST node instead of silently invoking C codegen.
+size/alignment for the validated corpus. Diagnostics name the first unsupported
+typed-AST node instead of silently invoking C codegen.
 
 The checked corpus includes three independent real applications: 4,979 lines of
 clox, 3,206 lines of cJSON, and 2,848 lines of LZ4. clox passes all 246 vendored
@@ -57,12 +72,13 @@ the ignored `build/conformance` cache, compiles each applicable test through thi
 reader, executes it natively, and compares its ordered stdout/stderr with upstream
 expectations. Unsupported C features count as failures. Explicit skips are limited
 to platform assembly, TCC-only extensions and harnesses, upstream source/expectation
-mismatches, invalid tests that TinyCC itself skips, and multi-translation-unit tests
-that do not fit this reader's declared whole-program model.
+mismatches, invalid tests that TinyCC itself skips, and linker/multi-translation-unit
+tests outside this single-source harness. Multi-unit behavior is covered separately
+by `scripts/c-multi-unit.py`.
 
-The current [full baseline](../../../tests/c/conformance/BASELINE.md) is 302/326
-(92.6%) overall: 205/219 (93.6%) for portable c-testsuite cases and 97/107
-(90.7%) for TinyCC's broader native regression corpus. These are frozen-corpus pass
+The current [full baseline](../../../tests/c/conformance/BASELINE.md) is 301/325
+(92.6%) overall: 205/219 (93.6%) for portable c-testsuite cases and 96/106
+(90.6%) for TinyCC's broader native regression corpus. These are frozen-corpus pass
 rates, not a claim of ISO C conformance.
 
 ```sh
@@ -74,11 +90,12 @@ python3 scripts/c-conformance.py --suite all \
 
 ```sh
 python3 src/dialects/c/c_ast_to_coil.py tests/c/fib.c > /tmp/fib.coil
+python3 scripts/c-multi-unit.py
 python3 scripts/c-dialect.py
 ```
 
 The script builds every case through both `clang -O3` and the Coil reader/native
 backend, checks exact observable output, runs clox's 246-test suite, and measures
 warmed clox and LZ4 application workloads. The current validation run measured
-clox at 0.98× and LZ4 at 1.03× the matching Clang time. The gate rejects either
+clox at 1.01× and LZ4 at 0.99× the matching Clang time. The gate rejects either
 Coil-generated program exceeding Clang by more than 15%.
