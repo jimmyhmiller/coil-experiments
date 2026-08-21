@@ -35,6 +35,19 @@ class Gen:
       return name({'name':tag}) if not s.startswith('enum ') else 'i32'
     return name({'name':s})
   def cast(self,ty,x): return f'(primitive/cast {self.typ(ty)} {x})'
+  def aliasable(self,t):
+    return t in ('bool','i8','u8','i16','u16','i32','u32','i64','u64','f32','f64') or t.startswith(('(ptr ','(fnptr '))
+  def aliasable_node(self,n):
+    if n.get('kind')=='MemberExpr':
+      base=self.typ(children(n)[0].get('type'))
+      record=base[5:-1] if base.startswith('(ptr ') else base
+      if self.records.get(record,{}).get('tagUsed')=='union': return False
+    return self.aliasable(self.typ(n.get('type')))
+  def load(self,n,p):
+    t=self.typ(n.get('type'))
+    return f'(primitive/alias-load {t} {p})' if self.aliasable_node(n) else f'(load {p})'
+  def store(self,n,p,v):
+    return f'(primitive/alias-store! {p} {v})' if self.aliasable_node(n) else f'(store! {p} {v})'
   def fun_name(self,n):
     z=name(n)
     return z if z=='main' or z not in self.funcs else 'c_'+z
@@ -103,11 +116,11 @@ class Gen:
         if qt.strip().startswith('void (') and z not in self.defined_func_names:
           return f'(primitive/linker-address {z})'
         return raw
-      return f'(load {self.lv(n)})'
+      return self.load(n,self.lv(n))
     if k=='UnaryOperator':
       op=n.get('opcode'); x=ins[0]
       if op=='&': return self.lv(x)
-      if op=='*': return f'(load {self.expr(x)})'
+      if op=='*': return self.load(n,self.expr(x))
       if op=='!': return f'(not {self.truth(self.expr(x),x)})'
       if op=='~': return f'(primitive/inot {self.expr(x)})'
       if op in ('++','--','post++','post--'):
@@ -115,7 +128,7 @@ class Gen:
         xt=self.typ(x.get('type'))
         step=f'(primitive/index {old} {d})' if xt.startswith('(ptr ') else f'({"+" if d>0 else "-"} {old} (primitive/cast {xt} 1))'
         result=old if n.get('isPostfix') or op.startswith('post') else new
-        return f'(let [{p} {l} {old} (load {p}) {new} {step}] (store! {p} {new}) {result})'
+        return f'(let [{p} {l} {old} {self.load(x,p)} {new} {step}] {self.store(x,p,new)} {result})'
       if op=='-':
         xt=self.typ(x.get('type'))
         return f'(* {self.expr(x)} (primitive/cast {xt} -1))' if xt in ('f32','f64') else f'(- (primitive/cast {xt} 0) {self.expr(x)})'
@@ -125,12 +138,12 @@ class Gen:
       mp={'&&':'and','||':'or','%':'primitive/irem','<<':'<<','>>':'>>','&':'&','|':'|','^':'^','==':'=','!=':'!=','<':'<','>':'>','<=':'<=','>=':'>='}
       if op=='=':
         p=self.fresh('assign_ptr'); value=self.fresh('assign_value')
-        return f'(let [{p} {self.lv(ins[0])} {value} {b}] (store! {p} {value}) {value})'
+        return f'(let [{p} {self.lv(ins[0])} {value} {b}] {self.store(ins[0],p,value)} {value})'
       if k=='CompoundAssignOperator':
         base=op[:-1]; l=self.lv(ins[0]); at=self.typ(ins[0].get('type')); p=self.fresh('assign_ptr'); old=self.fresh('assign_old'); rhs=self.fresh('assign_rhs'); value=self.fresh('assign_value')
         ct=self.typ(n.get('computeLHSType') or ins[0].get('type'))
         calc=f'(primitive/index {old} {"(- 0 (primitive/cast i64 "+rhs+"))" if base=="-" else "(primitive/cast i64 "+rhs+")"})' if at.startswith('(ptr ') and base in ('+','-') else f'(primitive/cast {at} ({mp.get(base,base)} (primitive/cast {ct} {old}) (primitive/cast {ct} {rhs})))'
-        return f'(let [{p} {l} {old} (load {p}) {rhs} {b} {value} {calc}] (store! {p} {value}) {value})'
+        return f'(let [{p} {l} {old} {self.load(ins[0],p)} {rhs} {b} {value} {calc}] {self.store(ins[0],p,value)} {value})'
       if op in ('&&','||'):
         test=f'({mp[op]} {self.truth(a,ins[0])} {self.truth(b,ins[1])})'
         return self.cast(n.get('type'),f'(if {test} 1 0)')
@@ -155,7 +168,7 @@ class Gen:
         return self.cast(n.get('type'),f'(if ({mp[op]} {a} {b}) 1 0)')
       return f'({mp.get(op,op)} {a} {b})'
     if k=='ConditionalOperator': return f'(if {self.truth(self.expr(ins[0]),ins[0])} {self.expr(ins[1])} {self.expr(ins[2])})'
-    if k=='ArraySubscriptExpr' or k=='MemberExpr': return f'(load {self.lv(n)})'
+    if k=='ArraySubscriptExpr' or k=='MemberExpr': return self.load(n,self.lv(n))
     if k=='CallExpr':
       cal=ins[0]; args=' '.join(self.expr(x) for x in ins[1:])
       decl=self.direct_decl(cal)
@@ -318,6 +331,10 @@ class Gen:
   def function(self,n,vararg_types=(),special_name=None):
     z=self.fun_name(n); pars=children(n,'ParmVarDecl'); body=next((x for x in children(n) if x.get('kind')=='CompoundStmt'),None)
     if special_name: z=special_name
+    attrs={x.get('kind') for x in children(n) if x.get('kind','').endswith('Attr')}
+    self_recursive=body is not None and any(x.get('kind')=='DeclRefExpr' and name(x.get('referencedDecl',{}))==name(n) for x in self.walk(body))
+    small_static=body is not None and n.get('storageClass')=='static' and sum(1 for _ in self.walk(n))<=128 and not self_recursive
+    inline=' :inline (Always)' if 'AlwaysInlineAttr' in attrs or small_static else (' :inline (Hint)' if 'InlineAttr' in attrs else '')
     qt=n.get('type',{}).get('qualType','int ()'); ret=self.typ({'qualType':qt.split('(',1)[0].strip()}); args=' '.join(f'({name(p)} {self.typ(p.get("type"))})' for p in pars)
     if vararg_types: args+=' '+' '.join(f'(__va{i} {t})' for i,t in enumerate(vararg_types))
     if body is None:
@@ -342,7 +359,7 @@ class Gen:
       if r.get('kind')=='ParmVarDecl': r['name']=pn+'__c'
     previous=self.current_varargs; previous_labels=self.current_labels; self.current_varargs=va_names
     self.current_labels={x.get('declId'):f':goto-{name(x)}-{self.fresh("label")}' for x in self.walk(body) if x.get('kind')=='LabelStmt'}
-    result=f'(defn {z} [{args}] (-> {ret}) (let [{aliases}] {copies} (coil.control.scope :return {self.stmt(body)} (primitive/zeroed {ret}))))'
+    result=f'(defn {z}{inline} [{args}] (-> {ret}) (let [{aliases}] {copies} (coil.control.scope :return {self.stmt(body)} (primitive/zeroed {ret}))))'
     self.current_varargs=previous; self.current_labels=previous_labels
     return result
   def walk(self,n):

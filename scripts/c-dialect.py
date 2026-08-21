@@ -82,5 +82,5 @@ with tempfile.TemporaryDirectory() as temporary:
     print(f"clox (4,979 lines): 246 tests pass; Coil/clang time {clox_ratio:.2f}x")
 
     # Both are sustained, warmed application workloads, not process-startup timing.
-    if lz4_ratio > 1.30 or clox_ratio > 1.30:
-        raise SystemExit("C native performance exceeded the 30% margin")
+    if lz4_ratio > 1.15 or clox_ratio > 1.15:
+        raise SystemExit("C native performance exceeded the 15% margin")
