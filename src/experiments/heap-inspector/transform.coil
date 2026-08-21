@@ -1,0 +1,289 @@
+(module experiments.heap-inspector.transform)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.result" :use *)
+(import "experiments.heap-inspector.runtime" :use *)
+
+(defn same? [(a (slice u8)) (b (slice u8))] (-> bool)
+  (if (!= (slice-len a) (slice-len b))
+      false
+      (let [(mut i) 0
+            (mut ok) true]
+        (loop (if (or (>= (load i) (slice-len a)) (not (load ok)))
+                  (break)
+                  (do
+                    (if (= (slice-get a (load i)) (slice-get b (load i))) 0 (set! ok false))
+                    (set! i (+ (load i) 1)))))
+        (load ok))))
+(defn last-start [(s (slice u8))] (-> i64)
+  (let [(mut i) 0
+        (mut at) 0]
+    (loop (if (>= (load i) (slice-len s))
+              (break)
+              (do
+                (let [c (primitive/cast i64 (slice-get s (load i)))]
+                  (if (or (= c 47) (= c 46)) (set! at (+ (load i) 1)) 0))
+                (set! i (+ (load i) 1)))))
+    (load at)))
+(defn last-name [(c Code)] (-> (slice u8))
+  (let [s (primitive/code-str c)] (subslice s (last-start s) (slice-len s))))
+(defn alloc-decl? [(h Code) (name (slice u8))] (-> bool)
+  (if (not (primitive/code-sym? h))
+      false
+      (let [d (primitive/code-decl h)]
+        (and (primitive/code-list? d)
+             (>= (primitive/code-count d) 5)
+             (primitive/code-eq (primitive/code-nth d 1) `coil.alloc)
+             (primitive/code-eq (primitive/code-nth d 2) `fn)
+             (same? (last-name h) name)))))
+(defn runtime-marker? [(h Code)] (-> bool)
+  (if (not (primitive/code-sym? h))
+      false
+      (let [d (primitive/code-decl h)]
+        (and (primitive/code-list? d)
+             (>= (primitive/code-count d) 5)
+             (primitive/code-eq (primitive/code-nth d 1) `experiments.heap-inspector.runtime)
+             (or (same? (last-name h) "track-create")
+                 (same? (last-name h) "track-destroy"))))))
+(defn struct-code? [(T Code)] (-> bool)
+  (let [d (primitive/code-decl T)]
+    (and (primitive/code-list? d)
+         (>= (primitive/code-count d) 3)
+         (primitive/code-eq (primitive/code-nth d 2) `struct))))
+(defn slice-u8? [(T Code)] (-> bool)
+  (and (primitive/code-list? T)
+       (= (primitive/code-count T) 2)
+       (same? (last-name (primitive/code-nth T 0)) "slice")
+       (or (primitive/code-eq (primitive/code-nth T 1) `u8)
+           (primitive/code-eq (primitive/code-nth T 1) `:u8))))
+(defn field-lines [(T Code) (p Code) (i i64) (n i64)] (-> Code)
+  (let [out (primitive/code-list-new)
+        (mut at) i]
+    (loop (if (>= (load at) n)
+              (break)
+              (let [nm (primitive/code-field-name T (load at))
+                    k (primitive/code-field-kind T (load at))
+                    ft (primitive/code-field-type T (load at))
+                    v `(load (field ~p ~nm))
+                    part
+                      (if (primitive/code-eq ft `bool)
+                          `((print-text ~(primitive/code-str nm)) (printf c"=%s " (if ~v c"true" c"false")))
+                          (if (or (primitive/code-eq ft `i64) (primitive/code-eq ft `:i64))
+                              `((print-text ~(primitive/code-str nm)) (printf c"=%ld " ~v))
+                              (if (or (primitive/code-eq ft `f64) (primitive/code-eq ft `:f64))
+                                  `((print-text ~(primitive/code-str nm)) (printf c"=%g " ~v))
+                                  (if (slice-u8? ft)
+                                      `((print-text ~(primitive/code-str nm)) (printf c"=\"")
+                                          (print-text ~v)
+                                          (printf c"\" "))
+                                      (if (= k 5)
+                                          `((print-text ~(primitive/code-str nm)) (printf c"=ptr(0x%lx) "
+                                                                                          (primitive/cast i64 ~v)))
+                                          `((print-text ~(primitive/code-str nm)) (printf c"=<unsupported> ")))))))
+                    (mut j) 0]
+                (loop (if (>= (load j) (primitive/code-count part))
+                          (break)
+                          (do
+                            (primitive/code-list-push! out (primitive/code-nth part (load j)))
+                            (set! j (+ (load j) 1)))))
+                (set! at (+ (load at) 1)))))
+    (primitive/code-list-done out)))
+(defn field-registrations [(T Code) (tid Code) (i i64) (n i64)] (-> Code)
+  (let [out (primitive/code-list-new)
+        (mut at) i]
+    (loop (if (>= (load at) n)
+              (break)
+              (let [nm (primitive/code-field-name T (load at))
+                    ft (primitive/code-field-type T (load at))]
+                (primitive/code-list-push! out
+                                           `(register-field ~tid
+                                                            ~(load at)
+                                                            ~(primitive/code-str nm)
+                                                            ~(primitive/code-str ft)
+                                                            (primitive/offsetof ~T ~nm)))
+                (set! at (+ (load at) 1)))))
+    (primitive/code-list-done out)))
+
+; A plan entry is `(TYPE SHOW-FN METADATA-FN)`. Discover first, then rewrite,
+; keeping the recursive metaprogram entirely Code -> Code.
+(defn plan-find [(T Code) (plan Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `:unknown
+      (let [entry (primitive/code-nth plan i)]
+        (if (primitive/code-eq (primitive/code-nth entry 0) T)
+            entry
+            (plan-find T plan (+ i 1) n)))))
+(defn hi-discover-allocations [(e Code) (plan Code)] (-> Code)
+  (if (not (primitive/code-list? e))
+      plan
+      (if (= (primitive/code-count e) 0)
+          plan
+          (let [h (primitive/code-nth e 0)
+                et (primitive/type-of e)
+                T
+                  (if (and (primitive/code-list? et)
+                           (= (primitive/code-count et) 2)
+                           (same? (last-name (primitive/code-nth et 0)) "Option"))
+                      (let [p (primitive/code-nth et 1)]
+                        (if (and (primitive/code-list? p)
+                                 (= (primitive/code-count p) 2)
+                                 (same? (last-name (primitive/code-nth p 0)) "ptr")
+                                 (struct-code? (primitive/code-nth p 1)))
+                            (primitive/code-nth p 1)
+                            `:unknown))
+                      `:unknown)
+                next
+                  (if (and (alloc-decl? h "create")
+                           (and (not (primitive/code-eq T `:unknown))
+                                (primitive/code-eq (plan-find T plan 0 (primitive/code-count plan)) `:unknown)))
+                      `(~@plan (~T ~(primitive/fresh-identifier "inspector_show")
+                                  ~(primitive/fresh-identifier "inspector_metadata")))
+                      plan)]
+            (if (runtime-marker? h)
+                next
+                (let [(mut i) 0
+                      (mut found) next]
+                  (loop (if (>= (load i) (primitive/code-count e))
+                            (break)
+                            (do
+                              (set! found
+                                    (hi-discover-allocations (primitive/code-nth e (load i))
+                                                             (load found)))
+                              (set! i (+ (load i) 1)))))
+                  (load found)))))))
+(defn plan-defs [(plan Code) (i i64) (n i64)] (-> Code)
+  (let [out (primitive/code-list-new)
+        (mut at) i]
+    (loop (if (>= (load at) n)
+              (break)
+              (let [entry (primitive/code-nth plan (load at))
+                    T (primitive/code-nth entry 0)
+                    show (primitive/code-nth entry 1)
+                    metadata (primitive/code-nth entry 2)
+                    q (primitive/fresh-identifier "inspector_value")
+                    tid (primitive/fresh-identifier "inspector_type")]
+                (primitive/code-list-push! out
+                                           `(defn ~show [(raw (ptr i8))] (-> i64)
+                                              (let [~q (primitive/cast (ptr ~T) raw)]
+                                                (print-text ~(primitive/code-str T))
+                                                (printf c" { ")
+                                                ~@(field-lines T q 0 (primitive/code-field-count T))
+                                                (printf c"}\n")
+                                                0)))
+                (primitive/code-list-push! out
+                                           `(defn ~metadata [] (-> i64)
+                                              (let [~tid
+                                                      (register-type ~(primitive/code-str T)
+                                                                     (primitive/sizeof ~T)
+                                                                     (primitive/alignof ~T)
+                                                                     ~(primitive/code-field-count T))]
+                                                ~@(field-registrations T tid 0 (primitive/code-field-count T))
+                                                ~tid)))
+                (set! at (+ (load at) 1)))))
+    (primitive/code-list-done out)))
+(defn rewrite [(e Code) (plan Code)] (-> Code)
+  (if (not (primitive/code-list? e))
+      e
+      (if (= (primitive/code-count e) 0)
+          e
+          (let [h (primitive/code-nth e 0)
+                et (primitive/type-of e)
+                T
+                  (if (and (primitive/code-list? et)
+                           (= (primitive/code-count et) 2)
+                           (same? (last-name (primitive/code-nth et 0)) "Option"))
+                      (let [p (primitive/code-nth et 1)]
+                        (if (and (primitive/code-list? p)
+                                 (= (primitive/code-count p) 2)
+                                 (same? (last-name (primitive/code-nth p 0)) "ptr")
+                                 (struct-code? (primitive/code-nth p 1)))
+                            (primitive/code-nth p 1)
+                            `:unknown))
+                      `:unknown)]
+            (if (runtime-marker? h)
+                e
+                (if (and (alloc-decl? h "create") (not (primitive/code-eq T `:unknown)))
+                    (let [entry (plan-find T plan 0 (primitive/code-count plan))]
+                      `(track-create [~T]
+                                     ~e
+                                     (~(primitive/code-nth entry 2))
+                                     (primitive/fnptr-of ~(primitive/code-nth entry 1))))
+                    (if (and (alloc-decl? h "destroy") (= (primitive/code-count e) 3))
+                        (let [pt (primitive/type-of (primitive/code-nth e 2))
+                              DT
+                                (if (and (primitive/code-list? pt)
+                                         (= (primitive/code-count pt) 2)
+                                         (same? (last-name (primitive/code-nth pt 0)) "ptr")
+                                         (struct-code? (primitive/code-nth pt 1)))
+                                    (primitive/code-nth pt 1)
+                                    `:unknown)]
+                          (if (primitive/code-eq DT `:unknown)
+                              (let [out (primitive/code-list-new)
+                                    (mut i) 0]
+                                (loop (if (>= (load i) (primitive/code-count e))
+                                          (break)
+                                          (do
+                                            (primitive/code-list-push! out
+                                                                       (rewrite (primitive/code-nth e (load i)) plan))
+                                            (set! i (+ (load i) 1)))))
+                                (let [done (primitive/code-list-done out)]
+                                  (if (primitive/code-vector? e) `[~@done] done)))
+                              `(track-destroy [~DT]
+                                              ~(rewrite (primitive/code-nth e 1) plan)
+                                              ~(rewrite (primitive/code-nth e 2) plan))))
+                        (let [out (primitive/code-list-new)
+                              (mut i) 0]
+                          (loop (if (>= (load i) (primitive/code-count e))
+                                    (break)
+                                    (do
+                                      (primitive/code-list-push! out (rewrite (primitive/code-nth e (load i)) plan))
+                                      (set! i (+ (load i) 1)))))
+                          (let [done (primitive/code-list-done out)]
+                            (if (primitive/code-vector? e) `[~@done] done))))))))))
+(defn own? [(m Code)] (-> bool)
+  (let [name (primitive/code-nth m 0)]
+    (or (primitive/code-eq name `experiments.heap-inspector.runtime)
+        (primitive/code-eq name `experiments.heap-inspector.transform))))
+(defn any-user? [(m Code)] (-> bool)
+  (let [(mut i) 1
+        (mut found) false]
+    (loop (if (>= (load i) (primitive/code-count m))
+              (break)
+              (if (primitive/code-from-user? (primitive/code-nth m (load i)))
+                  (do (set! found true) (break))
+                  (set! i (+ (load i) 1)))))
+    (load found)))
+(defn xf-mod [(m Code)] (-> Code)
+  (if (or (<= (primitive/code-count m) 1)
+          (own? m)
+          (not (any-user? m)))
+      m
+      (let [plan (hi-discover-allocations m `())]
+        (let [out (primitive/code-list-new)
+              (mut i) 1]
+          (primitive/code-list-push! out (primitive/code-nth m 0))
+          (loop (if (>= (load i) (primitive/code-count m))
+                    (break)
+                    (do
+                      (primitive/code-list-push! out (rewrite (primitive/code-nth m (load i)) plan))
+                      (set! i (+ (load i) 1)))))
+          (let [defs (plan-defs plan 0 (primitive/code-count plan))
+                (mut j) 0]
+            (loop (if (>= (load j) (primitive/code-count defs))
+                      (break)
+                      (do
+                        (primitive/code-list-push! out (primitive/code-nth defs (load j)))
+                        (set! j (+ (load j) 1))))))
+          (primitive/code-list-done out)))))
+(defn xf-mods [(ms Code) (i i64) (n i64)] (-> Code)
+  (let [out (primitive/code-list-new)
+        (mut at) i]
+    (loop (if (>= (load at) n)
+              (break)
+              (do
+                (primitive/code-list-push! out (xf-mod (primitive/code-nth ms (load at))))
+                (set! at (+ (load at) 1)))))
+    (primitive/code-list-done out)))
+(defn heap-inspector-transform [(mods Code)] (-> Code)
+  `(do ~@(xf-mods mods 0 (primitive/code-count mods))))
+(transform heap-inspector-transform)

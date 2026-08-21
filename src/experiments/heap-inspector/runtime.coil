@@ -1,0 +1,182 @@
+(module experiments.heap-inspector.runtime)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :use *)
+(import "coil.result" :use *)
+
+(extern printf :cc c [(ptr i8) ...] (-> i32))
+
+(defstruct Entry
+  [(id i64)
+   (p (ptr i8))
+   (type-id i64)
+   (live bool)
+   (show (fnptr c [(ptr i8)] i64))])
+(defstruct TypeInfo [(name (slice u8)) (size i64) (align i64) (fields i64)])
+(defstruct FieldInfo
+  [(type-id i64)
+   (index i64)
+   (name (slice u8))
+   (type-name (slice u8))
+   (offset i64)])
+
+; Deliberately bounded: this is an experiment and avoids making registry allocations
+; recursively inspectable. The transform excludes this package in any case.
+(defn entries [] (-> (ptr (array Entry 4096)))
+  (alloc/static (array Entry 4096)))
+(defn types [] (-> (ptr (array TypeInfo 256)))
+  (alloc/static (array TypeInfo 256)))
+(defn fields [] (-> (ptr (array FieldInfo 4096)))
+  (alloc/static (array FieldInfo 4096)))
+(defn entry-n [] (-> (ptr i64))
+  (alloc/static i64))
+(defn type-n [] (-> (ptr i64))
+  (alloc/static i64))
+(defn field-n [] (-> (ptr i64))
+  (alloc/static i64))
+(defn next-id [] (-> (ptr i64))
+  (alloc/static i64))
+
+(defn print-text [(s (slice u8))] (-> i64)
+  (printf c"%.*s" (slice-len s) (slice-data s))
+  0)
+
+(defn register-type [(name (slice u8)) (size i64) (align i64) (fields i64)] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (loop (if (>= (load i) (load (type-n)))
+              (break)
+              (let [t (primitive/index (types) (load i))]
+                (if (and (= (.name t) name)
+                         (and (= (.size t) size) (= (.align t) align)))
+                    (do (set! found (load i)) (break))
+                    (set! i (+ (load i) 1))))))
+    (if (>= (load found) 0)
+        (load found)
+        (let [id (load (type-n))
+              t (primitive/index (types) id)]
+          (set! (.name t) name)
+          (set! (.size t) size)
+          (set! (.align t) align)
+          (set! (.fields t) fields)
+          (set! (type-n) (+ id 1))
+          id))))
+
+(defn register-field [(tid i64)
+                      (index i64)
+                      (name (slice u8))
+                      (type-name (slice u8))
+                      (offset i64)] (-> i64)
+  (let [(mut i) 0
+        (mut found) false]
+    (loop (if (>= (load i) (load (field-n)))
+              (break)
+              (let [f (primitive/index (fields) (load i))]
+                (if (and (= (.type-id f) tid) (= (.index f) index))
+                    (do (set! found true) (break))
+                    (set! i (+ (load i) 1))))))
+    (if (load found)
+        0
+        (let [at (load (field-n))
+              f (primitive/index (fields) at)]
+          (set! (.type-id f) tid)
+          (set! (.index f) index)
+          (set! (.name f) name)
+          (set! (.type-name f) type-name)
+          (set! (.offset f) offset)
+          (set! (field-n) (+ at 1))
+          0))))
+
+;; Generated allocation sites call this marker. Keeping the original `create`
+;; beneath a semantically recognizable runtime call makes the transform fixpoint-safe.
+(defn track-create [T] [(o (Option (ptr T)))
+                        (tid i64)
+                        (show (fnptr c [(ptr i8)] i64))] (-> (Option (ptr T)))
+  (match o
+    (None [] (None))
+    (Some [p]
+          (do (register-instance (primitive/cast (ptr i8) p) tid show) (Some p)))))
+
+(defn track-destroy [T] [(a (ptr alloc/Allocator)) (p (ptr T))] (-> i64)
+  (unregister-instance (primitive/cast (ptr i8) p))
+  (alloc/destroy [T] a p))
+
+(defn register-instance [(p (ptr i8)) (tid i64) (show (fnptr c [(ptr i8)] i64))] (-> i64)
+  (let [i (load (entry-n))
+        e (primitive/index (entries) i)
+        id (+ (load (next-id)) 1)]
+    (set! (next-id) id)
+    (set! (.id e) id)
+    (set! (.p e) p)
+    (set! (.type-id e) tid)
+    (set! (.live e) true)
+    (set! (.show e) show)
+    (set! (entry-n) (+ i 1))
+    id))
+
+(defn unregister-instance [(p (ptr i8))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (load (entry-n)))
+              (break)
+              (let [e (primitive/index (entries) (load i))]
+                (if (and (.live e) (= (primitive/cast i64 (.p e)) (primitive/cast i64 p)))
+                    (set! (.live e) false)
+                    0)
+                (set! i (+ (load i) 1)))))
+    0))
+
+;; Stable, non-generic query API. These print to stdout so they are directly callable
+;; from submitted JIT forms without sharing allocator-owned result memory.
+(defn inspector-list-types [] (-> i64)
+  (printf c"types:\n")
+  (for [i 0 (load (type-n))]
+    (let [t (primitive/index (types) i)
+          (mut live) 0]
+      (for [j 0 (load (entry-n))]
+        (let [e (primitive/index (entries) j)]
+          (if (and (.live e) (= (.type-id e) i)) (set! live (+ (load live) 1)) 0)))
+      (printf c"  type=%ld name=" i)
+      (print-text (.name t))
+      (printf c" size=%ld align=%ld fields=%ld live=%ld\n"
+              (.size t)
+              (.align t)
+              (.fields t)
+              (load live))
+      (for [j 0 (load (field-n))]
+        (let [f (primitive/index (fields) j)]
+          (if (= (.type-id f) i)
+              (do
+                (printf c"    field=%ld name=" (.index f))
+                (print-text (.name f))
+                (printf c" type=")
+                (print-text (.type-name f))
+                (printf c" offset=%ld\n" (.offset f)))
+              0)))))
+  0)
+(defn inspector-list-instances [] (-> i64)
+  (printf c"instances:\n")
+  (for [i 0 (load (entry-n))]
+    (let [e (primitive/index (entries) i)]
+      (if (.live e) (printf c"  id=%ld type=%ld ptr=0x%lx\n" (.id e) (.type-id e) (primitive/cast i64 (.p e))) 0)))
+  0)
+(defn inspector-inspect [(id i64)] (-> i64)
+  (let [(mut i) 0
+        (mut found) false]
+    (loop (if (>= (load i) (load (entry-n)))
+              (break)
+              (let [e (primitive/index (entries) (load i))]
+                (if (and (.live e) (= (.id e) id))
+                    (do
+                      (printf c"id=%ld type=%ld ptr=0x%lx " id (.type-id e) (primitive/cast i64 (.p e)))
+                      (primitive/call-ptr (.show e) (.p e))
+                      (set! found true)
+                      (break))
+                    0)
+                (set! i (+ (load i) 1)))))
+    (if (load found) 0 (do (printf c"instance %ld is not live\n" id) 1))))
+
+;; JIT submissions reach the host registry through dlsym(RTLD_DEFAULT). Importing
+;; this module in a submission would create a second set of `alloc/static` cells.
+(export-c [inspector-list-types :as "coil_inspector_list_types"]
+          [inspector-list-instances :as "coil_inspector_list_instances"]
+          [inspector-inspect :as "coil_inspector_inspect"])
