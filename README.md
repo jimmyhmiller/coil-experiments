@@ -26,6 +26,12 @@ coil run tests/brainfuck/hello.bf --use experiments.brainfuck.lang
 coil run experiments.brainfuck.lang tests/brainfuck/hello.bf   # print the emitted Coil
 ```
 
+### `src/dialects/c/` — an experimental native C reader
+Clang preprocessing and typed-AST semantics at metaprogram time, followed by
+source-to-source lowering to inspectable Coil and Coil-native code generation.
+The initial C11 subset and its explicit limitations are documented in
+[`src/dialects/c/README.md`](src/dialects/c/README.md).
+
 ### `src/apps/` — applications
 - `chip8/` — CHIP-8 emulator with an AppKit GUI
 - `clox/` — the Crafting Interpreters bytecode VM, at rough parity with `-O2` C
