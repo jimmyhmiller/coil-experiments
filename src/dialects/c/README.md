@@ -27,19 +27,20 @@ Static/global storage has native process lifetime and zero initialization.
 
 ## Explicit limitations
 
-This is not yet a conforming C implementation. Aggregate/designated/string/global
-initializers (beyond zero initialization), unions, bitfields, anonymous records,
+This is not yet a conforming C implementation. Designated/nested/global aggregate
+initializers, unions, bitfields, anonymous records,
 switch/goto/labels, VLAs, atomics, complex numbers, TLS, GNU statement expressions,
 and exact signed/unsigned usual-arithmetic-conversion insertion remain unsupported.
 Struct layout currently relies on Coil matching the target C ABI; packed/aligned
-attributes are not represented. Local aggregate initializer lists currently zero
-the aggregate rather than applying elements. `static` local identity and C's
+attributes are not represented. Local fixed-array and named-record positional
+initializers are applied; designated, nested, and global aggregate initializers
+remain unsupported. `static` local identity and C's
 tentative-definition/coalescing rules are incomplete. Diagnostics deliberately
 name the first unsupported typed-AST node instead of silently invoking C codegen.
 
 Consequently clox and other substantial C applications are milestone targets,
-not claimed passing targets. The three fixtures under `tests/c` exercise the
-frontend; `smoke.c` and `pointers.c` also document initializer work still needed.
+not claimed passing targets. All three fixtures under `tests/c` build with the
+dialect and are compared byte-for-byte (output, diagnostics, and exit status) with clang.
 
 ## Validation and comparison
 

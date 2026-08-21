@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import pathlib, shutil, subprocess, tempfile, time
 ROOT=pathlib.Path(__file__).resolve().parents[1]
-CASES=[ROOT/'tests/c/fib.c']
+CASES=sorted((ROOT/'tests/c').glob('*.c'))
 with tempfile.TemporaryDirectory() as td:
   td=pathlib.Path(td)
   for src in CASES:
@@ -9,13 +9,15 @@ with tempfile.TemporaryDirectory() as td:
     assert '(module c_program)' in generated and 'ast-dump' not in generated
     print(f'{src.name}: translated {len(generated)} bytes')
     clang=td/(src.stem+'-clang'); subprocess.run(['clang','-O2',str(src),'-o',clang],check=True)
-    t=time.perf_counter(); p=subprocess.run([clang]); elapsed=time.perf_counter()-t
+    t=time.perf_counter(); p=subprocess.run([clang],capture_output=True); elapsed=time.perf_counter()-t
+    expected=(p.returncode,p.stdout,p.stderr)
     print(f'  clang -O2: exit={p.returncode} size={clang.stat().st_size} run={elapsed*1000:.2f}ms')
     coil=shutil.which('coil')
     if coil:
       native=td/(src.stem+'-coil')
       b=subprocess.run([coil,'build',str(src),'--use','experiments.c.lang','-o',native],cwd=ROOT,capture_output=True,text=True)
       if b.returncode: raise SystemExit(b.stderr or b.stdout)
-      t=time.perf_counter(); p=subprocess.run([native]); elapsed=time.perf_counter()-t
+      t=time.perf_counter(); p=subprocess.run([native],capture_output=True); elapsed=time.perf_counter()-t
+      assert (p.returncode,p.stdout,p.stderr)==expected, f'{src.name}: Coil output differs from clang'
       print(f'  Coil native: exit={p.returncode} size={native.stat().st_size} run={elapsed*1000:.2f}ms')
     else: print('  Coil native: skipped (coil not on PATH)')

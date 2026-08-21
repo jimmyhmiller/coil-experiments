@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Translate clang's typed JSON AST to inspectable Coil (never compiles C)."""
-import json, os, re, subprocess, sys
+import ast, json, os, re, subprocess, sys
 
 class Error(Exception): pass
 def q(s): return '"' + s.replace('\\','\\\\').replace('"','\\"').replace('\n','\\n').replace('\t','\\t') + '"'
@@ -17,13 +17,13 @@ class Gen:
     if s in self.typedef: return self.typedef[s]
     base={'void':'void','_Bool':'bool','char':'i8','signed char':'i8','unsigned char':'u8','short':'i16','short int':'i16','unsigned short':'u16','unsigned short int':'u16','int':'i32','signed int':'i32','unsigned':'u32','unsigned int':'u32','long':'i64','long int':'i64','unsigned long':'u64','unsigned long int':'u64','long long':'i64','unsigned long long':'u64','float':'f32','double':'f64','long double':'f64'}
     if s in base:return base[s]
-    m=re.match(r'(.+) \[(\d+)\]$',s)
+    m=re.match(r'(.+)\s*\[(\d+)\]$',s)
     if m:return f'(array {self.typ({"qualType":m.group(1)})} {m.group(2)})'
-    if s.endswith('*'): return f'(ptr {self.typ({"qualType":s[:-1].strip()})})'
     m=re.match(r'(.+) \(\*\)\((.*)\)$',s)
     if m:
       aa=[] if m.group(2).strip() in ('','void') else [self.typ({'qualType':x.strip()}) for x in m.group(2).split(',')]
       return f'(fnptr c [{" ".join(aa)}] {self.typ({"qualType":m.group(1)})})'
+    if s.endswith('*'): return f'(ptr {self.typ({"qualType":s[:-1].strip()})})'
     if s.startswith(('struct ','union ','enum ')): return name({'name':s.split(' ',1)[1]}) if not s.startswith('enum ') else 'i32'
     return name({'name':s})
   def cast(self,ty,x): return f'(primitive/cast {self.typ(ty)} {x})'
@@ -44,14 +44,22 @@ class Gen:
     k=n.get('kind'); ins=children(n)
     if k in ('IntegerLiteral','FloatingLiteral'): return self.lit(n)
     if k=='CharacterLiteral': return self.cast(n.get('type'),str(n.get('value',0)))
-    if k=='StringLiteral': return q(n.get('value',''))
+    if k=='StringLiteral':
+      v=n.get('value','')
+      if len(v)>=2 and v[0]=='"' and v[-1]=='"': v=ast.literal_eval(v)
+      return 'c'+q(v)
     if k in ('ParenExpr','ImplicitCastExpr','ExprWithCleanups','ConstantExpr','CStyleCastExpr'):
+      if k=='ImplicitCastExpr' and n.get('castKind')=='ArrayToPointerDecay':
+        if ins[0].get('kind')=='StringLiteral': return self.cast(n.get('type'),self.expr(ins[0]))
+        return f'(primitive/index {self.lv(ins[0])} 0)'
       x=self.expr(ins[0]); return self.cast(n.get('type'),x) if k=='CStyleCastExpr' else x
     if k=='DeclRefExpr':
-      z=name(n.get('referencedDecl',n)); return f'(primitive/fnptr-of {z})' if n.get('referencedDecl',{}).get('kind')=='FunctionDecl' else f'(load {self.lv(n)})'
+      r=n.get('referencedDecl',n); z=name(r)
+      if r.get('kind')=='EnumConstantDecl': return str(r.get('value',self.enums.get(z,0)))
+      return f'(primitive/fnptr-of {z})' if r.get('kind')=='FunctionDecl' else f'(load {self.lv(n)})'
     if k=='UnaryOperator':
       op=n.get('opcode'); x=ins[0]
-      if op=='&': return self.lv(x)
+      if op=='&': return self.cast(n.get('type'),self.lv(x))
       if op=='*': return f'(load {self.expr(x)})'
       if op=='!': return f'(not {self.truth(self.expr(x))})'
       if op=='~': return f'(~ {self.expr(x)})'
@@ -71,9 +79,17 @@ class Gen:
     if k=='ArraySubscriptExpr' or k=='MemberExpr': return f'(load {self.lv(n)})'
     if k=='CallExpr':
       cal=ins[0]; args=' '.join(self.expr(x) for x in ins[1:])
-      if cal.get('kind')=='ImplicitCastExpr' and children(cal) and children(cal)[0].get('kind')=='DeclRefExpr': return f'({name(children(cal)[0].get("referencedDecl",children(cal)[0]))} {args})'
+      direct=cal
+      while direct.get('kind') in ('ImplicitCastExpr','ParenExpr') and children(direct): direct=children(direct)[0]
+      if direct.get('kind')=='DeclRefExpr' and direct.get('referencedDecl',{}).get('kind')=='FunctionDecl': return f'({name(direct.get("referencedDecl",direct))} {args})'
       return f'(primitive/call-ptr {self.expr(cal)} {args})'
-    if k=='InitListExpr': return '(primitive/zeroed '+self.typ(n.get('type'))+')'
+    if k=='InitListExpr':
+      t=self.typ(n.get('type')); vals=[self.expr(x) for x in ins]
+      if t.startswith('(array '): return '['+' '.join(vals)+']'
+      rec=self.records.get(t)
+      if rec:
+        fs=children(rec,'FieldDecl'); return f'({t} '+' '.join(f':{name(f)} {v}' for f,v in zip(fs,vals))+')'
+      return '(primitive/zeroed '+t+')'
     if k=='GNUNullExpr': return '(primitive/cast (ptr u8) 0)'
     raise Error('unsupported expression '+str(k))
   def truth(self,x):
@@ -103,13 +119,21 @@ class Gen:
     if not items: return '0'
     head,*tail=items
     if head.get('kind')=='DeclStmt':
-      binds=' '.join(self.local(x) for x in children(head,'VarDecl'))
-      return f'(let [{binds}] {self.block(tail)})'
+      decls=children(head,'VarDecl'); binds=' '.join(self.local(x) for x in decls); setup=[]
+      for d in decls:
+        t=self.typ(d.get('type')); init=children(d)
+        if t.startswith('(array ') and init and init[-1].get('kind')=='InitListExpr':
+          setup += [f'(store! (primitive/index {name(d)} {i}) {self.expr(v)})' for i,v in enumerate(children(init[-1]))]
+        if t in self.records and init and init[-1].get('kind')=='InitListExpr':
+          fields=children(self.records[t],'FieldDecl')
+          setup += [f'(store! (field {name(d)} {name(field)}) {self.expr(v)})' for field,v in zip(fields,children(init[-1]))]
+      return f'(let [{binds}] (do {" ".join(setup)} {self.block(tail)}))'
     return f'(do {self.stmt(head)} {self.block(tail)})'
   def local(self,n):
     z=name(n); t=self.typ(n.get('type')); init=children(n)
-    if t.startswith('(array '): return f'{z} (alloc/stack {t})'
-    v=self.expr(init[-1]) if init else f'(primitive/zeroed {t})'; return f'(mut {z}) {v}'
+    if t.startswith('(array ') or t in self.records: return f'{z} (alloc/stack {t})'
+    v=self.expr(init[-1]) if init else f'(primitive/zeroed {t})'
+    return f'(mut {z}) {v}'
   def function(self,n):
     z=name(n); pars=children(n,'ParmVarDecl'); body=next((x for x in children(n) if x.get('kind')=='CompoundStmt'),None)
     qt=n.get('type',{}).get('qualType','int ()'); ret=self.typ({'qualType':qt.split(' (',1)[0]}); args=' '.join(f'({name(p)} {self.typ(p.get("type"))})' for p in pars)
@@ -125,16 +149,38 @@ class Gen:
     yield n
     for x in children(n): yield from self.walk(x)
   def generate(self):
-    top=children(self.ast); out=['(do','(module c_program)','(import "coil.primitive" :as primitive)','(import "coil.alloc" :as alloc)','(import "coil.control" :as coil.control)']
+    alltop=children(self.ast)
+    # Clang omits repeated file names in JSON locations.  The main-file declarations
+    # form the final run beginning with the first location explicitly naming it.
+    start=next((i for i,n in enumerate(alltop) if os.path.abspath((n.get('loc') or {}).get('file','/'))==self.source),len(alltop))
+    top=[n for n in alltop[start:] if not n.get('isImplicit') and 'includedFrom' not in (n.get('loc') or {})]
+    referenced=set()
+    for n in top:
+      for x in self.walk(n):
+        r=x.get('referencedDecl',{})
+        if r.get('kind')=='FunctionDecl': referenced.add(r.get('name'))
+    header_externs=[]; external_names=set()
+    for n in alltop:
+      if n.get('kind')=='FunctionDecl' and not n.get('isImplicit') and n.get('name') in referenced and not any(x.get('kind')=='CompoundStmt' for x in children(n)):
+        z=n.get('name')
+        defined={x.get('name') for x in top if x.get('kind')=='FunctionDecl' and children(x,'CompoundStmt')}
+        if z not in external_names and z not in defined and children(n,'ParmVarDecl'):
+          header_externs.append(n); external_names.add(z)
+    out=['(do','(module c_program)','(import "coil.primitive" :as primitive)','(import "coil.alloc" :as alloc)','(import "coil.control" :as coil.control)']
+    self.enums={}
     for n in top:
       if n.get('kind')=='TypedefDecl' and n.get('name') and not n.get('isImplicit'): self.typedef[n['name']]=self.typ(n.get('type'))
       if n.get('kind')=='RecordDecl' and n.get('completeDefinition') and n.get('name'):
         self.records[n['name']]=n; out.append(f'(defstruct {name(n)} ['+' '.join(f'({name(f)} {self.typ(f.get("type"))})' for f in children(n,'FieldDecl'))+'])')
+      if n.get('kind')=='EnumDecl':
+        value=-1
+        for e in children(n,'EnumConstantDecl'):
+          cs=children(e,'ConstantExpr'); value=int(cs[0].get('value')) if cs else value+1; self.enums[name(e)]=value
       if n.get('kind')=='VarDecl' and n.get('storageClass')!='extern': self.globals[name(n)]=n
       if n.get('kind')=='FunctionDecl' and n.get('name') and not n.get('isImplicit'): self.funcs.add(name(n))
     for z,n in self.globals.items(): out.append(f'(defn __c_global_{z} [] (-> (ptr {self.typ(n.get("type"))})) (alloc/static {self.typ(n.get("type"))}))')
     seen=set()
-    for n in top:
+    for n in top+header_externs:
       if n.get('kind')=='FunctionDecl' and n.get('name') and not n.get('isImplicit'):
         z=name(n); has=any(x.get('kind')=='CompoundStmt' for x in children(n))
         if has or z not in seen: out.append(self.function(n)); seen.add(z)
