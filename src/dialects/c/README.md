@@ -56,13 +56,13 @@ LZ4 repeatedly compresses and decompresses 8 MiB and verifies every byte.
 the ignored `build/conformance` cache, compiles each applicable test through this
 reader, executes it natively, and compares its ordered stdout/stderr with upstream
 expectations. Unsupported C features count as failures. Explicit skips are limited
-to platform assembly, diagnostic/bounds/linker harnesses, invalid tests that TinyCC
-itself skips, and multi-translation-unit tests that do not fit this reader's declared
-whole-program model.
+to platform assembly, TCC-only extensions and harnesses, upstream source/expectation
+mismatches, invalid tests that TinyCC itself skips, and multi-translation-unit tests
+that do not fit this reader's declared whole-program model.
 
-The current [full baseline](../../../tests/c/conformance/BASELINE.md) is 240/330
-(72.7%) overall: 181/219 (82.6%) for portable c-testsuite cases and 59/111
-(53.2%) for TinyCC's broader native regression corpus. These are frozen-corpus pass
+The current [full baseline](../../../tests/c/conformance/BASELINE.md) is 302/326
+(92.6%) overall: 205/219 (93.6%) for portable c-testsuite cases and 97/107
+(90.7%) for TinyCC's broader native regression corpus. These are frozen-corpus pass
 rates, not a claim of ISO C conformance.
 
 ```sh
