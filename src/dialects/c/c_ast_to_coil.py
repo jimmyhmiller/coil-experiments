@@ -167,7 +167,7 @@ class Gen:
       v=f'(if (!= [i64] (primitive/cast i64 (& {raw} (primitive/cast {t} {1<<(width-1)}))) (primitive/cast i64 0)) (- {raw} (primitive/cast {t} {limit})) {raw})' if signed else raw
     return f'(primitive/alias-store! {p} {v})' if self.aliasable_node(n) else f'(store! {p} {v})'
   def fnptr_bits(self,t,value):
-    return f'(let [p (alloc/stack {t})] (store! p {value}) (load (primitive/cast (ptr i64) p)))'
+    return f'(let [p (primitive/alloc-stack {t})] (store! p {value}) (load (primitive/cast (ptr i64) p)))'
   def atomic_call(self,op,t,args):
     if t.startswith('(ptr '):
       element=t[5:-1]
@@ -285,7 +285,7 @@ class Gen:
       if dst.startswith('(fnptr ') and src!=dst:
         storage=src if src.startswith(('(ptr ','(fnptr ')) else '(ptr i8)'
         value=x if storage==src else f'(primitive/cast {storage} {x})'
-        return f'(let [p (alloc/stack {storage})] (store! p {value}) (load (primitive/cast (ptr {dst}) p)))'
+        return f'(let [p (primitive/alloc-stack {storage})] (store! p {value}) (load (primitive/cast (ptr {dst}) p)))'
       casts=('IntegralCast','FloatingCast','IntegralToFloating','FloatingToIntegral','PointerToIntegral','IntegralToPointer','BitCast','NullToPointer','IntegralToBoolean','PointerToBoolean','FloatingToBoolean')
       if dst=='bool':
         if src=='bool': return x
@@ -407,7 +407,7 @@ class Gen:
       if '...' in cal_spelling or (re.search(r'\(\s*\*\s*\)\s*\(\s*\)$',cal_spelling) and len(ins)>1):
         arg_types=' '.join(self.typ(x.get('type')) for x in ins[1:]); ret=self.typ(n.get('type'))
         target=f'(fnptr c [{arg_types}] {"i64" if ret=="void" else ret})'; source=self.typ(cal.get('type'))
-        callee=f'(let [p (alloc/stack {source})] (store! p {callee}) (load (primitive/cast (ptr {target}) p)))'
+        callee=f'(let [p (primitive/alloc-stack {source})] (store! p {callee}) (load (primitive/cast (ptr {target}) p)))'
       return f'(primitive/call-ptr {callee} {args})'
     if k=='AtomicExpr':
       op=n.get('name'); values=[self.expr(x) for x in ins]
@@ -641,7 +641,7 @@ class Gen:
       return f'(do (coil.control.scope {target} {self.block(items[:label_index])}) {self.block(suffix)})'
     return f'(do {self.stmt(head)} {self.block(tail)})'
   def local(self,n):
-    return f'{name(n)} (alloc/stack {self.typ(n.get("type"))})'
+    return f'{name(n)} (primitive/alloc-stack {self.typ(n.get("type"))})'
   def string_array_setup(self,place,t,value):
     match=re.match(r'^\(array (i8|u8|i32|u32) (\d+)\)$',t)
     if match is None: return None
@@ -682,7 +682,7 @@ class Gen:
     return [f'(store! {z} {self.expr(value)})']
   def global_accessor(self,z,n):
     t=self.typ(n.get('type')); init=children(n)
-    if not init: return f'(defn __c_global_{z} [] (-> (ptr {t})) (alloc/static {t}))'
+    if not init: return f'(defn __c_global_{z} [] (-> (ptr {t})) (primitive/alloc-static {t}))'
     value=init[-1]; setup=[]
     string_setup=self.string_array_setup('cell',t,value) if value.get('kind')=='StringLiteral' else None
     if string_setup is not None:
@@ -692,7 +692,7 @@ class Gen:
     elif t in self.records and value.get('kind')=='InitListExpr':
       setup=self.aggregate_setup('cell',n,value)
     else: setup=[f'(store! cell {self.expr(value)})']
-    return f'(defn __c_global_{z} [] (-> (ptr {t})) (let [cell (alloc/static {t}) initialized (alloc/static bool)] (if (not (load initialized)) (do (store! initialized true) {" ".join(setup)} 0) 0) cell))'
+    return f'(defn __c_global_{z} [] (-> (ptr {t})) (let [cell (primitive/alloc-static {t}) initialized (primitive/alloc-static bool)] (if (not (load initialized)) (do (store! initialized true) {" ".join(setup)} 0) 0) cell))'
   def function(self,n,vararg_types=(),special_name=None):
     z=self.fun_name(n); pars=children(n,'ParmVarDecl'); body=next((x for x in children(n) if x.get('kind')=='CompoundStmt'),None)
     if special_name: z=special_name
@@ -729,17 +729,17 @@ class Gen:
     self.scope_places.update({original_local_names[x.get('id')]:(name(x),self.typ(x.get('type'))) for x in locals if x.get('id')})
     self.vla_ids={x.get('id') for x in locals if self.vla_parts(x)}
     self.vla_save_names={x.get('id'):f'{name(x)}__stack' for x in locals if x.get('id') in self.vla_ids}
-    aliases=' '.join(f'{name(p)}__c (alloc/stack {self.typ(p.get("type"))})' for p in pars)
-    aliases+=' '+' '.join(f'{name(x)} (alloc/stack {self.typ(x.get("type"))})' for x in locals)
-    aliases+=' '+' '.join(f'{save} (alloc/stack (ptr i8))' for save in self.vla_save_names.values())
+    aliases=' '.join(f'{name(p)}__c (primitive/alloc-stack {self.typ(p.get("type"))})' for p in pars)
+    aliases+=' '+' '.join(f'{name(x)} (primitive/alloc-stack {self.typ(x.get("type"))})' for x in locals)
+    aliases+=' '+' '.join(f'{save} (primitive/alloc-stack (ptr i8))' for save in self.vla_save_names.values())
     previous_compounds=self.compound_places; self.compound_places={x.get('id'):f'__c_compound_{i}' for i,x in enumerate(compounds)}
-    aliases+=' '+' '.join(f'{self.compound_places[x.get("id")]} (alloc/stack {self.typ(x.get("type"))})' for x in compounds)
+    aliases+=' '+' '.join(f'{self.compound_places[x.get("id")]} (primitive/alloc-stack {self.typ(x.get("type"))})' for x in compounds)
     previous_temporaries=self.temporary_places; self.temporary_places={x.get('id'):f'__c_temporary_{i}' for i,x in enumerate(temporaries)}
-    aliases+=' '+' '.join(f'{self.temporary_places[x.get("id")]} (alloc/stack {self.typ(x.get("type"))})' for x in temporaries)
+    aliases+=' '+' '.join(f'{self.temporary_places[x.get("id")]} (primitive/alloc-stack {self.typ(x.get("type"))})' for x in temporaries)
     va_names=[f'__va{i}__c' for i in range(len(vararg_types))]
-    aliases+=' '+' '.join(f'{va_names[i]} (alloc/stack {t})' for i,t in enumerate(vararg_types))
+    aliases+=' '+' '.join(f'{va_names[i]} (primitive/alloc-stack {t})' for i,t in enumerate(vararg_types))
     va_counter_names={t:f'__c_va_counter_{i}' for i,t in enumerate(dict.fromkeys(vararg_types))}
-    aliases+=' '+' '.join(f'{counter} (alloc/stack i64)' for counter in va_counter_names.values())
+    aliases+=' '+' '.join(f'{counter} (primitive/alloc-stack i64)' for counter in va_counter_names.values())
     copy_values=[name(p) if abi_types[i]==self.typ(p.get('type')) else self.cast(p.get('type'),name(p)) for i,p in enumerate(pars)]
     copies=' '.join(f'(store! {name(p)}__c {copy_values[i]})' for i,p in enumerate(pars))
     copies+=' '+' '.join(f'(store! {va_names[i]} __va{i})' for i in range(len(vararg_types)))
