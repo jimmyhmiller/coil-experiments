@@ -26,6 +26,14 @@ coil run tests/brainfuck/hello.bf --use experiments.brainfuck.lang
 coil run experiments.brainfuck.lang tests/brainfuck/hello.bf   # print the emitted Coil
 ```
 
+### `src/dialects/c/` — a native C frontend
+A whole-program C11 frontend written in Coil. Clang preprocesses, type-checks,
+and emits a typed JSON AST for each translation unit; ordinary Coil code parses,
+links, and lowers those independent units before Coil's native backend builds the
+executable. The pinned integration gate builds Doom Generic as 81 translation
+units and verifies its exact 1,000-frame framebuffer hash. See
+[`src/dialects/c/README.md`](src/dialects/c/README.md).
+
 ### `src/apps/` — applications
 - `chip8/` — CHIP-8 emulator with an AppKit GUI
 - `clox/` — the Crafting Interpreters bytecode VM, at rough parity with `-O2` C

@@ -1,0 +1,3970 @@
+;; Lower a Clang typed JSON AST to ordinary Coil.  Clang owns preprocessing and
+;; C type checking; this module owns all language lowering.  It never reads C
+;; source and never invokes a compiler or subprocess.
+(module experiments.c.lower)
+
+(import "experiments.c.ast" :as ast)
+(import "experiments.c.type" :as ct)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.hashmap" :as hm)
+(import "coil.slice" :as slice)
+(import "coil.str" :as str)
+(import "coil.result" :use *)
+
+(export LowerConfig
+        LowerError
+        default-config
+        lower
+        lower-fragment
+        lower-error-node
+        lower-error-message)
+
+;; The linker supplies newline-delimited symbol ownership after it has indexed
+;; every translation unit.  This keeps lowering independent from its map type.
+(defstruct LowerConfig
+  [(module-name (slice u8))
+   (source-root (slice u8))
+   (unit i64)
+   (fragment bool)
+   (wrap-main bool)
+   (defined-functions (slice u8))
+   (defined-globals (slice u8))
+   (owned-globals (slice u8))
+   (emit-functions (slice u8))
+   (variadic-specs (slice u8))])
+
+(defstruct LowerError [(node i64) (message (slice u8))])
+
+(defn lower-error-node [(error LowerError)] (-> i64)
+  (.node error))
+(defn lower-error-message [(error LowerError)] (-> (slice u8))
+  (.message error))
+
+(defn default-config [] (-> LowerConfig)
+  (LowerConfig
+    :module-name "c_program"
+    :source-root ""
+    :unit 0
+    :fragment false
+    :wrap-main true
+    :defined-functions ""
+    :defined-globals ""
+    :owned-globals ""
+    :emit-functions ""
+    :variadic-specs ""))
+
+(defstruct Symbol
+  [(node i64)
+   (target (slice u8))
+   (type (ptr ct/CType))
+   (function bool)
+   (internal bool)
+   (local bool)
+   (external bool)])
+
+(defstruct SwitchSegment
+  [(default bool)
+   (range bool)
+   (low i64)
+   (high i64)
+   (body (al/ArrayList i64))])
+
+(defstruct Context
+  [(a (dyn alloc/Allocator))
+   (tree ast/Ast)
+   (cfg LowerConfig)
+   (out str/StrBuf)
+   (externs str/StrBuf)
+   (types (hm/HashMap (slice u8) (ptr ct/CType)))
+   (typedefs (hm/HashMap (slice u8) (ptr ct/CType)))
+   (enum-values (hm/HashMap (slice u8) i64))
+   (symbols (hm/HashMap (slice u8) Symbol))
+   (labels (hm/HashMap (slice u8) (slice u8)))
+   (goto-label-nodes (hm/HashMap (slice u8) i64))
+   (goto-flags (hm/HashMap (slice u8) (slice u8)))
+   (goto-ids (al/ArrayList (slice u8)))
+   (defined-names (hm/HashMap (slice u8) bool))
+   (external-names (hm/HashMap (slice u8) bool))
+   (emitted-globals (hm/HashMap (slice u8) bool))
+   (record-names (hm/HashMap (slice u8) (slice u8)))
+   (anonymous-records (hm/HashMap (slice u8) (slice u8)))
+   (record-nodes (hm/HashMap (slice u8) i64))
+   (expression-places (hm/HashMap (slice u8) (slice u8)))
+   (top (al/ArrayList i64))
+   (top-files (al/ArrayList (slice u8)))
+   (records (al/ArrayList i64))
+   (static-locals (al/ArrayList i64))
+   (constructors (al/ArrayList (slice u8)))
+   (destructors (al/ArrayList (slice u8)))
+   (break-labels (al/ArrayList (slice u8)))
+   (continue-labels (al/ArrayList (slice u8)))
+   (current-vararg-names (al/ArrayList (slice u8)))
+   (current-vararg-types (al/ArrayList (ptr ct/CType)))
+   (va-counter-types (al/ArrayList (slice u8)))
+   (va-counter-names (al/ArrayList (slice u8)))
+   (current-varargs-active bool)
+   (goto-dispatch bool)
+   (current-file (slice u8))
+   (serial i64)
+   (failed bool)
+   (error-node i64)
+   (error-message (slice u8))])
+
+(defn text=? [(x (slice u8)) (y (slice u8))] (-> bool)
+  (str/str-eq x y))
+(defn present? [(x (slice u8))] (-> bool)
+  (> (slice/slice-len x) 0))
+(defn ends-with? [(value (slice u8)) (suffix (slice u8))] (-> bool)
+  (let [n (slice/slice-len value)
+        m (slice/slice-len suffix)]
+    (and (>= n m) (text=? (slice/subslice value (- n m) n) suffix))))
+(defn text-option [(x (Option (slice u8)))] (-> (slice u8))
+  (match x (Some [value] value) (None [] "")))
+(defn kind [(c (ptr Context)) (node i64)] (-> (slice u8))
+  (ast/ast-field-text (.tree c) node "kind"))
+(defn property [(c (ptr Context)) (node i64) (name (slice u8))] (-> (slice u8))
+  (ast/ast-field-text (.tree c) node name))
+(defn number-property [(c (ptr Context)) (node i64) (name (slice u8))] (-> (slice u8))
+  (ast/ast-field-number-text (.tree c) node name))
+(defn child-count [(c (ptr Context)) (node i64)] (-> i64)
+  (ast/ast-children-count (.tree c) node))
+(defn child [(c (ptr Context)) (node i64) (index i64)] (-> i64)
+  (ast/ast-child (.tree c) node index))
+(defn implicit? [(c (ptr Context)) (node i64)] (-> bool)
+  (ast/ast-field-bool (.tree c) node "isImplicit"))
+
+(defn metadata-node? [(c (ptr Context)) (node i64)] (-> bool)
+  (let [k (kind c node)]
+    (or (ends-with? k "Attr") (ends-with? k "Comment"))))
+
+(defn initializer-node [(c (ptr Context)) (node i64)] (-> i64)
+  (let [(mut i) 0
+        n (child-count c node)
+        (mut result) -1
+        (mut current) (ast/ast-first-child (.tree c) node)]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (if (not (metadata-node? c (load current)))
+                    (store! result (load current))
+                    0)
+                (store! current (ast/ast-next-node (.tree c) (load current)))
+                (store! i (+ (load i) 1)))))
+    (load result)))
+
+(defn put! [(b (mut str/StrBuf)) (text (slice u8))] (-> i64)
+  (str/sb-push-str! (mut b) text))
+(defn byte! [(b (mut str/StrBuf)) (value i64)] (-> i64)
+  (str/sb-push-byte! (mut b) (primitive/cast u8 value)))
+(defn finish [(b (mut str/StrBuf))] (-> (slice u8))
+  (str/sb-finish! (mut b)))
+
+(defn fail! [(c (ptr Context)) (node i64) (message (slice u8))] (-> i64)
+  (if (not (.failed c))
+      (do
+        (set! (.failed c) true)
+        (set! (.error-node c) node)
+        (set! (.error-message c) message))
+      0)
+  0)
+
+(defn identifier! [(b (mut str/StrBuf)) (name (slice u8))] (-> i64)
+  (let [(mut i) 0
+        n (slice/slice-len name)]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [x (primitive/cast i64 (slice/slice-get name (load i)))]
+                (if (or (and (>= x 48) (<= x 57))
+                        (and (>= x 65) (<= x 90))
+                        (and (>= x 97) (<= x 122))
+                        (= x 95))
+                    (byte! (mut b) x)
+                    (byte! (mut b) 95))
+                (store! i (+ (load i) 1)))))
+    0))
+
+(defn make-name [(c (ptr Context)) (prefix (slice u8)) (name (slice u8))] (-> (slice u8))
+  (let [(mut b) (str/sb-new (.a c))]
+    (put! (mut b) prefix)
+    (identifier! (mut b) name)
+    (finish (mut b))))
+
+(defn make-unit-name [(c (ptr Context)) (prefix (slice u8)) (name (slice u8))] (-> (slice u8))
+  (let [(mut b) (str/sb-new (.a c))]
+    (put! (mut b) prefix)
+    (str/sb-push-i64! (mut b) (.unit (.cfg c)))
+    (put! (mut b) "_")
+    (identifier! (mut b) name)
+    (finish (mut b))))
+
+;; Anonymous tags have no C linkage name.  Hash the stable source location so a
+;; definition from a shared header has the same compact name in every unit.
+;; FNV-1a's full 64 bits make accidental collisions negligible without inflating
+;; every generated type use with the decimal spelling of every path byte.
+(defn make-location-name [(c (ptr Context)) (prefix (slice u8)) (node i64)] (-> (slice u8))
+  (let [(mut b) (str/sb-new (.a c))
+        (mut i) 0
+        file (.current-file c)
+        (mut hash) (primitive/cast u64 0xcbf29ce484222325)
+        location (ast/ast-field (.tree c) node "loc")]
+    (put! (mut b) prefix)
+    (loop (if (>= (load i) (slice/slice-len file))
+              (break)
+              (do
+                (store! hash
+                        (* (primitive/ixor (load hash)
+                                           (primitive/cast u64 (slice/slice-get file (load i))))
+                           (primitive/cast u64 0x100000001b3)))
+                (store! i (+ (load i) 1)))))
+    (set! i 60)
+    (loop (if (< (load i) 0)
+              (break)
+              (do
+                (byte! (mut b)
+                       (hex-digit (primitive/cast i64
+                                                  (primitive/iand (primitive/ishr (load hash)
+                                                                                  (primitive/cast u64 (load i)))
+                                                                  (primitive/cast u64 15)))))
+                (store! i (- (load i) 4)))))
+    (put! (mut b) "_")
+    (if (>= location 0) (put! (mut b) (number-property c location "offset")) 0)
+    (finish (mut b))))
+
+(defn fresh-name [(c (ptr Context)) (prefix (slice u8))] (-> (slice u8))
+  (let [number (.serial c)
+        (mut b) (str/sb-new (.a c))]
+    (set! (.serial c) (+ number 1))
+    (put! (mut b) prefix)
+    (str/sb-push-i64! (mut b) number)
+    (finish (mut b))))
+
+(defn fresh-unit-name [(c (ptr Context)) (prefix (slice u8))] (-> (slice u8))
+  (let [number (.serial c)
+        (mut b) (str/sb-new (.a c))]
+    (set! (.serial c) (+ number 1))
+    (put! (mut b) prefix)
+    (str/sb-push-i64! (mut b) (.unit (.cfg c)))
+    (put! (mut b) "_")
+    (str/sb-push-i64! (mut b) number)
+    (finish (mut b))))
+
+;; Exact whole-line lookup for the linker's compact symbol sets.
+(defn line-member? [(lines (slice u8)) (name (slice u8))] (-> bool)
+  (let [(mut at) 0
+        n (slice/slice-len lines)
+        (mut found) false]
+    (loop (if (or (load found) (>= (load at) n))
+              (break)
+              (let [start (load at)
+                    (mut stop) (load at)]
+                (loop (if (or (>= (load stop) n)
+                              (= (primitive/cast i64 (slice/slice-get lines (load stop))) 10))
+                          (break)
+                          (store! stop (+ (load stop) 1))))
+                (if (text=? (slice/subslice lines start (load stop)) name)
+                    (store! found true)
+                    0)
+                (store! at (+ (load stop) 1)))))
+    (load found)))
+
+(defn tab-field [(line (slice u8)) (wanted i64)] (-> (slice u8))
+  (let [(mut at) 0
+        n (slice/slice-len line)
+        (mut index) 0
+        (mut start) 0
+        (mut result) ""]
+    (loop (if (> (load at) n)
+              (break)
+              (do
+                (if (or (= (load at) n)
+                        (= (slice/slice-get line (load at)) (primitive/cast u8 #\tab)))
+                    (do
+                      (if (= (load index) wanted)
+                          (do
+                            (store! result (slice/subslice line (load start) (load at)))
+                            (break))
+                          0)
+                      (store! index (+ (load index) 1))
+                      (store! start (+ (load at) 1)))
+                    0)
+                (store! at (+ (load at) 1)))))
+    (load result)))
+
+(defn tab-field-count [(line (slice u8))] (-> i64)
+  (let [(mut count) 1
+        (mut i) 0
+        n (slice/slice-len line)]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (if (= (slice/slice-get line (load i)) (primitive/cast u8 #\tab))
+                    (store! count (+ (load count) 1))
+                    0)
+                (store! i (+ (load i) 1)))))
+    (load count)))
+
+(defn variadic-call-target [(c (ptr Context))
+                            (name (slice u8))
+                            (call-node i64)
+                            (fixed i64)] (-> (slice u8))
+  (let [specs (.variadic-specs (.cfg c))
+        (mut at) 0
+        n (slice/slice-len specs)
+        (mut target) ""]
+    (loop (if (or (present? (load target)) (>= (load at) n))
+              (break)
+              (let [start (load at)
+                    (mut stop) (load at)]
+                (loop (if (or (>= (load stop) n)
+                              (= (slice/slice-get specs (load stop)) (primitive/cast u8 #\newline)))
+                          (break)
+                          (store! stop (+ (load stop) 1))))
+                (let [line (slice/subslice specs start (load stop))
+                      fields (tab-field-count line)
+                      extras (- (child-count c call-node) (+ fixed 1))]
+                  (if (and (text=? (tab-field line 0) name) (= (- fields 2) extras))
+                      (let [(mut i) 0
+                            (mut matches) true]
+                        (loop (if (or (not (load matches)) (>= (load i) extras))
+                                  (break)
+                                  (do
+                                    (if (not (text=? (tab-field line (+ (load i) 2))
+                                                     (node-type-text c
+                                                                     (child c
+                                                                            call-node
+                                                                            (+ (+ fixed 1) (load i))))))
+                                        (store! matches false)
+                                        0)
+                                    (store! i (+ (load i) 1)))))
+                        (if (load matches) (store! target (tab-field line 1)) 0))
+                      0))
+                (store! at (+ (load stop) 1)))))
+    (load target)))
+
+(defn forwarded-call-target [(c (ptr Context)) (name (slice u8))] (-> (slice u8))
+  (let [specs (.variadic-specs (.cfg c))
+        (mut at) 0
+        n (slice/slice-len specs)
+        wanted (al/al-len (.current-vararg-types c))
+        (mut target) ""]
+    (loop (if (or (present? (load target)) (>= (load at) n))
+              (break)
+              (let [start (load at)
+                    (mut stop) (load at)]
+                (loop (if (or (>= (load stop) n)
+                              (= (slice/slice-get specs (load stop)) (primitive/cast u8 #\newline)))
+                          (break)
+                          (store! stop (+ (load stop) 1))))
+                (let [line (slice/subslice specs start (load stop))
+                      fields (tab-field-count line)]
+                  (if (and (text=? (tab-field line 0) name) (= (- fields 2) wanted))
+                      (let [(mut i) 0
+                            (mut matches) true]
+                        (loop (if (or (not (load matches)) (>= (load i) wanted))
+                                  (break)
+                                  (let [candidate (parse-type c -1 (tab-field line (+ (load i) 2)))]
+                                    (if (not (text=? (type-text c candidate)
+                                                     (type-text c
+                                                                (al/al-get (.current-vararg-types c) (load i)))))
+                                        (store! matches false)
+                                        0)
+                                    (store! i (+ (load i) 1)))))
+                        (if (load matches) (store! target (tab-field line 1)) 0))
+                      0))
+                (store! at (+ (load stop) 1)))))
+    (load target)))
+
+(defn node-type-text [(c (ptr Context)) (node i64)] (-> (slice u8))
+  (let [type-object (ast/ast-field (.tree c) node "type")]
+    (if (< type-object 0)
+        "int"
+        (let [desugared (property c type-object "desugaredQualType")]
+          (if (present? desugared)
+              desugared
+              (let [qualified (property c type-object "qualType")]
+                (if (present? qualified) qualified "int")))))))
+
+;; Replace Clang's parenthesized anonymous-tag base while retaining every
+;; declarator token after it (arrays, pointers, and function suffixes).  This is
+;; token grammar, not source or regular-expression parsing.
+(defn anonymous-type-alias [(c (ptr Context))
+                            (spelling (slice u8))
+                            (target (slice u8))] (-> (slice u8))
+  (let [(mut lexer) (ast/c-type-lexer spelling)
+        (mut depth) 0
+        (mut token) (ast/c-type-next (mut lexer))
+        (mut out) (str/sb-new (.a c))]
+    (loop (if (or (text=? (load token) "const")
+                  (text=? (load token) "volatile")
+                  (text=? (load token) "restrict")
+                  (text=? (load token) "_Atomic"))
+              (store! token (ast/c-type-next (mut lexer)))
+              (break)))
+    (if (or (text=? (load token) "struct") (text=? (load token) "union"))
+        (do
+          (store! token (ast/c-type-next (mut lexer)))
+          (loop (if (or (not (present? (load token))) (text=? (load token) "("))
+                    (break)
+                    (store! token (ast/c-type-next (mut lexer)))))
+          (if (text=? (load token) "(")
+              (do
+                (store! depth 1)
+                (loop (if (= (load depth) 0)
+                          (break)
+                          (let [part (ast/c-type-next (mut lexer))]
+                            (if (not (present? part))
+                                (break)
+                                (cond (text=? part "(") (store! depth (+ (load depth) 1))
+                                      (text=? part ")") (store! depth (- (load depth) 1))
+                                      :else 0))))))
+              0))
+        0)
+    (put! (mut out) target)
+    (loop (let [part (ast/c-type-next (mut lexer))]
+            (if (not (present? part))
+                (break)
+                (do (put! (mut out) " ") (put! (mut out) part)))))
+    (finish (mut out))))
+
+(defn anonymous-tag-key [(c (ptr Context)) (spelling (slice u8))] (-> (slice u8))
+  (let [(mut lexer) (ast/c-type-lexer spelling)
+        (mut token) ""
+        (mut depth) 0
+        (mut out) (str/sb-new (.a c))]
+    (loop (store! token (ast/c-type-next (mut lexer)))
+      (if (or (not (present? (load token))) (text=? (load token) "(")) (break) 0))
+    (if (text=? (load token) "(")
+        (do
+          (store! depth 1)
+          (loop (if (= (load depth) 0)
+                    (break)
+                    (let [part (ast/c-type-next (mut lexer))]
+                      (if (not (present? part))
+                          (break)
+                          (cond (text=? part "(") (store! depth (+ (load depth) 1))
+                                (text=? part ")") (store! depth (- (load depth) 1))
+                                (or (text=? part "unnamed")
+                                    (text=? part "struct")
+                                    (text=? part "union")
+                                    (text=? part "at"))
+                                  0
+                                :else
+                                  (do
+                                    (put! (mut out) part)
+                                    (put! (mut out) "|"))))))))
+        0)
+    (finish (mut out))))
+
+(defn anonymous-enum? [(spelling (slice u8))] (-> bool)
+  (let [(mut lexer) (ast/c-type-lexer spelling)
+        (mut token) (ast/c-type-next (mut lexer))]
+    (loop (if (or (text=? (load token) "const")
+                  (text=? (load token) "volatile")
+                  (text=? (load token) "restrict")
+                  (text=? (load token) "_Atomic"))
+              (store! token (ast/c-type-next (mut lexer)))
+              (break)))
+    (if (not (text=? (load token) "enum"))
+        false
+        (do
+          (store! token (ast/c-type-next (mut lexer)))
+          (loop (if (or (not (present? (load token))) (text=? (load token) "("))
+                    (break)
+                    (store! token (ast/c-type-next (mut lexer)))))
+          (text=? (load token) "(")))))
+
+(defn parse-type [(c (ptr Context)) (node i64) (spelling (slice u8))] (-> (ptr ct/CType))
+  (match (hm/hm-get (.types c) spelling)
+    (Some [cached] cached)
+    (None []
+          (let [(mut parsed) (ct/parse-type (.a c) spelling)]
+            (if (or (= (primitive/cast i64 (load parsed)) 0)
+                    (= (ct/type-kind (load parsed)) ct/CTYPE-INVALID))
+                (match (hm/hm-get (.record-names c) spelling)
+                  (Some [target] (store! parsed (ct/parse-type (.a c) target)))
+                  (None []
+                        (let [key (anonymous-tag-key c spelling)]
+                          (if (present? key)
+                              (match (hm/hm-get (.anonymous-records c) key)
+                                (Some [target]
+                                      (store! parsed
+                                              (ct/parse-type (.a c)
+                                                             (anonymous-type-alias c spelling target))))
+                                (None [] 0))
+                              0))))
+                0)
+            (if (and (= (ct/type-kind (load parsed)) ct/CTYPE-INVALID)
+                     (anonymous-enum? spelling))
+                (store! parsed (ct/parse-type (.a c) "int"))
+                0)
+            (if (or (= (primitive/cast i64 (load parsed)) 0)
+                    (= (ct/type-kind (load parsed)) ct/CTYPE-INVALID))
+                (fail! c node "invalid Clang C type spelling")
+                0)
+            (hm/hm-put! (mut (.types c)) spelling (load parsed))
+            (load parsed)))))
+
+(defn node-type [(c (ptr Context)) (node i64)] (-> (ptr ct/CType))
+  (parse-type c node (node-type-text c node)))
+
+(defn resolved-type [(c (ptr Context)) (value (ptr ct/CType))] (-> (ptr ct/CType))
+  (if (= (ct/type-kind value) ct/CTYPE-NAMED)
+      (match (hm/hm-get (.typedefs c) (ct/type-name value))
+        (Some [underlying] (resolved-type c underlying))
+        (None [] value))
+      value))
+
+(defn numeric-type! [(b (mut str/StrBuf)) (kind-value i64) (bits i64)] (-> i64)
+  (cond (= kind-value ct/CTYPE-VOID) (put! (mut b) "void")
+        (= kind-value ct/CTYPE-BOOL) (put! (mut b) "bool")
+        (= kind-value ct/CTYPE-FLOAT) (put! (mut b) (if (= bits 32) "f32" "f64"))
+        (= kind-value ct/CTYPE-UNSIGNED)
+          (put! (mut b)
+                (cond (= bits 8) "u8"
+                      (= bits 16) "u16"
+                      (= bits 32) "u32"
+                      :else "u64"))
+        :else
+          (put! (mut b)
+                (cond (= bits 8) "i8"
+                      (= bits 16) "i16"
+                      (= bits 32) "i32"
+                      :else "i64"))))
+
+(defn builtin-named! [(b (mut str/StrBuf)) (name (slice u8))] (-> bool)
+  (cond (or (text=? name "size_t")
+            (text=? name "uintptr_t")
+            (text=? name "uint64_t")
+            (text=? name "uint_fast64_t"))
+          (do (put! (mut b) "u64") true)
+        (or (text=? name "ptrdiff_t")
+            (text=? name "intptr_t")
+            (text=? name "int64_t")
+            (text=? name "int_fast64_t"))
+          (do (put! (mut b) "i64") true)
+        (or (text=? name "uint32_t") (text=? name "uint_fast32_t")) (do (put! (mut b) "u32") true)
+        (or (text=? name "int32_t") (text=? name "int_fast32_t")) (do (put! (mut b) "i32") true)
+        (text=? name "uint16_t") (do (put! (mut b) "u16") true)
+        (text=? name "int16_t") (do (put! (mut b) "i16") true)
+        (text=? name "uint8_t") (do (put! (mut b) "u8") true)
+        (text=? name "int8_t") (do (put! (mut b) "i8") true)
+        :else false))
+
+(defn type! [(c (ptr Context)) (b (mut str/StrBuf)) (value (ptr ct/CType))] (-> i64)
+  (let [type-kind (ct/type-kind value)]
+    (cond (or (= type-kind ct/CTYPE-VOID)
+              (= type-kind ct/CTYPE-BOOL)
+              (= type-kind ct/CTYPE-SIGNED)
+              (= type-kind ct/CTYPE-UNSIGNED)
+              (= type-kind ct/CTYPE-FLOAT))
+            (numeric-type! (mut b) type-kind (ct/type-bits value))
+          (= type-kind ct/CTYPE-ENUM) (put! (mut b) "i32")
+          (= type-kind ct/CTYPE-POINTER)
+            (let [inner (ct/type-child value)]
+              (if (= (ct/type-kind inner) ct/CTYPE-FUNCTION)
+                  (function-pointer-type! c (mut b) inner)
+                  (do
+                    (put! (mut b) "(ptr ")
+                    (if (= (ct/type-kind inner) ct/CTYPE-VOID)
+                        (put! (mut b) "i8")
+                        (type! c (mut b) inner))
+                    (put! (mut b) ")"))))
+          (= type-kind ct/CTYPE-ARRAY)
+            (do
+              (put! (mut b) "(array ")
+              (type! c (mut b) (ct/type-child value))
+              (put! (mut b) " ")
+              (str/sb-push-i64! (mut b)
+                                (if (< (ct/type-bound value) 0)
+                                    0
+                                    (ct/type-bound value)))
+              (put! (mut b) ")"))
+          (= type-kind ct/CTYPE-FUNCTION) (function-pointer-type! c (mut b) value)
+          (= type-kind ct/CTYPE-NAMED)
+            (match (hm/hm-get (.typedefs c) (ct/type-name value))
+              (Some [underlying] (type! c (mut b) underlying))
+              (None []
+                    (if (builtin-named! (mut b) (ct/type-name value))
+                        0
+                        (match (hm/hm-get (.record-names c) (ct/type-name value))
+                          (Some [record-name] (put! (mut b) record-name))
+                          ;; A typedef omitted with a non-project system header is opaque
+                          ;; to generated Coil. C has already rejected illegal by-value
+                          ;; use of incomplete types, so its ABI representation is a byte.
+                          (None [] (put! (mut b) "i8"))))))
+          :else
+            (if (text=? (ct/type-name value) "__va_list_tag")
+                (put! (mut b) "i8")
+                (match (hm/hm-get (.record-names c) (ct/type-name value))
+                  (Some [record-name] (put! (mut b) record-name))
+                  (None []
+                        (if (or (= type-kind ct/CTYPE-RECORD) (= type-kind ct/CTYPE-UNION))
+                            (do
+                              (put! (mut b) "c_record_")
+                              (identifier! (mut b) (ct/type-name value)))
+                            (identifier! (mut b) (ct/type-name value)))))))))
+
+(defn function-pointer-type! [(c (ptr Context))
+                              (b (mut str/StrBuf))
+                              (value (ptr ct/CType))] (-> i64)
+  (put! (mut b) "(fnptr c [")
+  (let [(mut i) 0
+        params (ct/type-parameters value)]
+    (loop (if (>= (load i) (al/al-len params))
+              (break)
+              (do
+                (if (> (load i) 0) (put! (mut b) " ") 0)
+                (type! c (mut b) (al/al-get params (load i)))
+                (store! i (+ (load i) 1))))))
+  (put! (mut b) "] ")
+  (let [return-type (ct/type-child value)]
+    (if (= (ct/type-kind return-type) ct/CTYPE-VOID)
+        (put! (mut b) "i64")
+        (type! c (mut b) return-type)))
+  (put! (mut b) ")"))
+
+(defn type-of-kind? [(value (ptr ct/CType)) (wanted i64)] (-> bool)
+  (= (ct/type-kind value) wanted))
+(defn scalar? [(value (ptr ct/CType))] (-> bool)
+  (let [kind-value (ct/type-kind value)]
+    (or (= kind-value ct/CTYPE-VOID)
+        (= kind-value ct/CTYPE-BOOL)
+        (= kind-value ct/CTYPE-SIGNED)
+        (= kind-value ct/CTYPE-UNSIGNED)
+        (= kind-value ct/CTYPE-FLOAT)
+        (= kind-value ct/CTYPE-ENUM)
+        (= kind-value ct/CTYPE-POINTER)
+        (= kind-value ct/CTYPE-FUNCTION))))
+
+;; Clang omits repeated location filenames.  Carry the most recent explicit file
+;; across top-level siblings, exactly as its JSON AST encoding requires.
+(defn project-file? [(c (ptr Context)) (file (slice u8))] (-> bool)
+  (let [roots (.source-root (.cfg c))]
+    (if (not (present? roots))
+        true
+        (let [(mut at) 0
+              n (slice/slice-len roots)
+              (mut found) false]
+          (loop (if (or (load found) (>= (load at) n))
+                    (break)
+                    (let [start (load at)
+                          (mut stop) (load at)]
+                      (loop (if (or (>= (load stop) n)
+                                    (= (primitive/cast i64 (slice/slice-get roots (load stop))) 10))
+                                (break)
+                                (store! stop (+ (load stop) 1))))
+                      (if (and (> (load stop) start)
+                               (str/starts-with file (slice/subslice roots start (load stop))))
+                          (store! found true)
+                          0)
+                      (store! at (+ (load stop) 1)))))
+          (load found)))))
+
+(defn complete-record? [(c (ptr Context)) (node i64)] (-> bool)
+  (and (text=? (kind c node) "RecordDecl")
+       (ast/ast-field-bool (.tree c) node "completeDefinition")))
+
+(defn record-key [(c (ptr Context)) (node i64)] (-> (slice u8))
+  (let [name (property c node "name")
+        id (property c node "id")]
+    (if (present? name)
+        (let [(mut b) (str/sb-new (.a c))]
+          (put! (mut b) (property c node "tagUsed"))
+          (put! (mut b) " ")
+          (put! (mut b) name)
+          (finish (mut b)))
+        id)))
+
+(defn rename-record! [(c (ptr Context)) (node i64) (target (slice u8))] (-> i64)
+  (let [key (record-key c node)]
+    (match (hm/hm-get (.record-names c) key)
+      (Some [previous] (hm/hm-put! (mut (.record-names c)) previous target))
+      (None [] 0))
+    (hm/hm-put! (mut (.record-names c)) key target)
+    (hm/hm-put! (mut (.record-names c)) target target)
+    (hm/hm-put! (mut (.record-nodes c)) target node))
+  0)
+
+(defn bind-anonymous-initializers! [(c (ptr Context))
+                                    (node i64)
+                                    (target (slice u8))
+                                    (wanted-key (slice u8))] (-> i64)
+  (let [type-object (ast/ast-field (.tree c) node "type")]
+    (if (>= type-object 0)
+        (do
+          (let [qualified (property c type-object "qualType")]
+            (if (and (present? qualified)
+                     (text=? (anonymous-tag-key c qualified) wanted-key))
+                (hm/hm-put! (mut (.record-names c))
+                            qualified
+                            (anonymous-type-alias c qualified target))
+                0))
+          (let [desugared (property c type-object "desugaredQualType")]
+            (if (and (present? desugared)
+                     (text=? (anonymous-tag-key c desugared) wanted-key))
+                (hm/hm-put! (mut (.record-names c))
+                            desugared
+                            (anonymous-type-alias c desugared target))
+                0)))
+        0))
+  (let [(mut i) 0
+        n (child-count c node)
+        (mut current) (ast/ast-first-child (.tree c) node)]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (bind-anonymous-initializers! c (load current) target wanted-key)
+                (store! current (ast/ast-next-node (.tree c) (load current)))
+                (store! i (+ (load i) 1))))))
+  0)
+
+(defn bind-anonymous-record! [(c (ptr Context)) (record i64) (declaration i64)] (-> i64)
+  (let [type-object (ast/ast-field (.tree c) declaration "type")]
+    (if (>= type-object 0)
+        (let [anonymous-key (anonymous-tag-key c (node-type-text c declaration))]
+          (if (present? anonymous-key)
+              (let [canonical
+                      (make-name c
+                                 "c_anonymous_record_"
+                                 (node-type-text c declaration))]
+                (rename-record! c record canonical)
+                (hm/hm-put! (mut (.anonymous-records c)) anonymous-key canonical)
+                (let [qualified (property c type-object "qualType")]
+                  (if (present? qualified)
+                      (hm/hm-put! (mut (.record-names c))
+                                  qualified
+                                  (anonymous-type-alias c qualified canonical))
+                      0))
+                (let [desugared (property c type-object "desugaredQualType")]
+                  (if (present? desugared)
+                      (hm/hm-put! (mut (.record-names c))
+                                  desugared
+                                  (anonymous-type-alias c desugared canonical))
+                      0))
+                (bind-anonymous-initializers! c declaration canonical anonymous-key))
+              0))
+        0))
+  0)
+
+(defn declaration-search-container? [(value (slice u8))] (-> bool)
+  (or (text=? value "TranslationUnitDecl")
+      (text=? value "FunctionDecl")
+      (text=? value "CompoundStmt")
+      (text=? value "DeclStmt")
+      (text=? value "RecordDecl")
+      (text=? value "TypedefDecl")
+      (text=? value "EnumDecl")
+      (text=? value "IfStmt")
+      (text=? value "WhileStmt")
+      (text=? value "DoStmt")
+      (text=? value "ForStmt")
+      (text=? value "SwitchStmt")
+      (text=? value "CaseStmt")
+      (text=? value "DefaultStmt")
+      (text=? value "LabelStmt")
+      (text=? value "AttributedStmt")
+      (text=? value "CapturedStmt")
+      (text=? value "StmtExpr")))
+
+(defn collect-records! [(c (ptr Context)) (node i64)] (-> i64)
+  ;; Local enum declarations share this declaration-only walk; file-scope enums
+  ;; are collected from the translation-unit children below.
+  (if (text=? (kind c node) "EnumDecl") (collect-enums! c node) 0)
+  (if (complete-record? c node)
+      (let [key (record-key c node)]
+        (match (hm/hm-get (.record-names c) key)
+          (Some [_] 0)
+          (None []
+                (let [name (property c node "name")
+                      target
+                        (if (present? name)
+                            (make-name c "c_record_" name)
+                            (fresh-unit-name c "c_anonymous_record_"))]
+                  (hm/hm-put! (mut (.record-names c)) key target)
+                  (hm/hm-put! (mut (.record-names c)) target target)
+                  (hm/hm-put! (mut (.record-nodes c)) target node)
+                  (let [plain (property c node "name")]
+                    (if (present? plain)
+                        (hm/hm-put! (mut (.record-names c)) plain target)
+                        0))
+                  (al/al-push! (mut (.records c)) node)))))
+      0)
+  (let [container-kind (kind c node)]
+    (if (declaration-search-container? container-kind)
+        (let [(mut i) 0
+              n (child-count c node)
+              (mut current) (ast/ast-first-child (.tree c) node)
+              (mut pending-anonymous) ""
+              (mut pending-node) -1]
+          (loop (if (>= (load i) n)
+                    (break)
+                    (let [candidate (load current)]
+                      (collect-records! c candidate)
+                      (if (and (complete-record? c candidate)
+                               (not (present? (property c candidate "name"))))
+                          (match (hm/hm-get (.record-names c) (record-key c candidate))
+                            (Some [target]
+                                  (do
+                                    (store! pending-anonymous target)
+                                    (store! pending-node candidate)))
+                            (None [] 0))
+                          (if (and (present? (load pending-anonymous))
+                                   (or (text=? (kind c candidate) "FieldDecl")
+                                       (text=? (kind c candidate) "VarDecl")))
+                              (do
+                                (bind-anonymous-record! c (load pending-node) candidate)
+                                (store! pending-anonymous "")
+                                (store! pending-node -1))
+                              0))
+                      (store! current (ast/ast-next-node (.tree c) (load current)))
+                      (store! i (+ (load i) 1))))))
+        0))
+  0)
+
+(defn collect-top! [(c (ptr Context))] (-> i64)
+  (let [root (ast/ast-root (.tree c))
+        (mut in-project) false
+        (mut current-path) ""
+        (mut i) 0
+        n (child-count c root)
+        (mut current) (ast/ast-first-child (.tree c) root)
+        (mut pending-anonymous) -1]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [node (load current)
+                    location (ast/ast-field (.tree c) node "loc")
+                    path (if (< location 0) "" (property c location "file"))]
+                (if (present? path)
+                    (do
+                      (store! current-path path)
+                      (set! in-project (project-file? c path)))
+                    0)
+                (if (and (load in-project) (not (implicit? c node)))
+                    (do
+                      (al/al-push! (mut (.top c)) node)
+                      (al/al-push! (mut (.top-files c)) (load current-path))
+                      (collect-records! c node)
+                      (if (and (complete-record? c node)
+                               (not (present? (property c node "name"))))
+                          (store! pending-anonymous node)
+                          (if (and (>= (load pending-anonymous) 0)
+                                   (text=? (kind c node) "VarDecl"))
+                              (do
+                                (bind-anonymous-record! c (load pending-anonymous) node)
+                                (store! pending-anonymous -1))
+                              0)))
+                    0)
+                (store! current (ast/ast-next-node (.tree c) node))
+                (store! i (+ (load i) 1)))))
+    0))
+
+(defn collect-typedef! [(c (ptr Context)) (node i64)] (-> i64)
+  (if (text=? (kind c node) "TypedefDecl")
+      (let [name (property c node "name")
+            spelling (node-type-text c node)]
+        (if (present? name)
+            (if (text=? name spelling)
+                (let [(mut i) 0
+                      n (child-count c node)
+                      (mut current) (ast/ast-first-child (.tree c) node)
+                      (mut linked) false]
+                  (loop (if (or (load linked) (>= (load i) n))
+                            (break)
+                            (let [owned (ast/ast-field (.tree c) (load current) "ownedTagDecl")]
+                              (if (>= owned 0)
+                                  (if (text=? (kind c owned) "EnumDecl")
+                                      (do
+                                        (hm/hm-put! (mut (.typedefs c))
+                                                    name
+                                                    (parse-type c node "int"))
+                                        (store! linked true))
+                                      (let [id (property c owned "id")]
+                                        (match (hm/hm-get (.record-names c) id)
+                                          (Some [target]
+                                                (do
+                                                  (if (not (present? (property c owned "name")))
+                                                      (match (hm/hm-get (.record-nodes c) target)
+                                                        (Some [record]
+                                                              (rename-record! c
+                                                                              record
+                                                                              (make-location-name c "c_record_" node)))
+                                                        (None [] 0))
+                                                      0)
+                                                  (match (hm/hm-get (.record-names c) id)
+                                                    (Some [canonical]
+                                                          (hm/hm-put! (mut (.record-names c)) name canonical))
+                                                    (None []
+                                                          (hm/hm-put! (mut (.record-names c)) name target)))
+                                                  (store! linked true)))
+                                          (None [] 0))))
+                                  0)
+                              (store! current (ast/ast-next-node (.tree c) (load current)))
+                              (store! i (+ (load i) 1)))))
+                  (if (not (load linked))
+                      (hm/hm-put! (mut (.typedefs c)) name (parse-type c node spelling))
+                      0))
+                (hm/hm-put! (mut (.typedefs c)) name (parse-type c node spelling)))
+            0))
+      0)
+  0)
+
+;; Type spellings in project declarations retain typedef names such as FILE,
+;; size_t, and time_t. Keep aliases from every header for type lowering, while
+;; still restricting emitted declarations and definitions to project roots.
+(defn collect-header-typedefs! [(c (ptr Context)) (node i64)] (-> i64)
+  (if (text=? (kind c node) "TypedefDecl")
+      (let [name (property c node "name")
+            spelling (node-type-text c node)]
+        (if (and (present? name) (present? spelling) (not (text=? name spelling)))
+            (let [parsed (ct/parse-type (.a c) spelling)]
+              (if (not (= (ct/type-kind parsed) ct/CTYPE-INVALID))
+                  (if (and (or (= (ct/type-kind parsed) ct/CTYPE-RECORD)
+                               (= (ct/type-kind parsed) ct/CTYPE-UNION))
+                           (not (hm/hm-contains? (.record-names c) (ct/type-name parsed))))
+                      (hm/hm-put! (mut (.typedefs c))
+                                  name
+                                  (ct/parse-type (.a c) "char"))
+                      (hm/hm-put! (mut (.typedefs c)) name parsed))
+                  0))
+            0))
+      0)
+  (if (text=? (kind c node) "TranslationUnitDecl")
+      (let [(mut i) 0
+            n (child-count c node)
+            (mut current) (ast/ast-first-child (.tree c) node)]
+        (loop (if (>= (load i) n)
+                  (break)
+                  (do
+                    (collect-header-typedefs! c (load current))
+                    (store! current (ast/ast-next-node (.tree c) (load current)))
+                    (store! i (+ (load i) 1))))))
+      0)
+  0)
+
+(defn enum-explicit-value [(c (ptr Context)) (node i64)] (-> (Option i64))
+  (let [(mut i) 0
+        n (child-count c node)
+        (mut result) (None [i64])]
+    (loop (if (or (>= (load i) n)
+                  (match (load result) (Some [_] true) (None [] false)))
+              (break)
+              (let [candidate (child c node (load i))]
+                (if (text=? (kind c candidate) "ConstantExpr")
+                    (let [value (property c candidate "value")]
+                      (if (present? value) (store! result (str/str-parse-int value)) 0))
+                    0)
+                (store! i (+ (load i) 1)))))
+    (load result)))
+
+(defn collect-enums! [(c (ptr Context)) (node i64)] (-> i64)
+  (if (text=? (kind c node) "EnumDecl")
+      (let [(mut i) 0
+            n (child-count c node)
+            (mut value) -1]
+        (loop (if (>= (load i) n)
+                  (break)
+                  (let [candidate (child c node (load i))]
+                    (if (text=? (kind c candidate) "EnumConstantDecl")
+                        (do
+                          (match (enum-explicit-value c candidate)
+                            (Some [explicit] (store! value explicit))
+                            (None [] (store! value (+ (load value) 1))))
+                          (let [id (property c candidate "id")
+                                name (property c candidate "name")]
+                            (if (present? id)
+                                (hm/hm-put! (mut (.enum-values c)) id (load value))
+                                0)
+                            (if (present? name)
+                                (hm/hm-put! (mut (.enum-values c)) name (load value))
+                                0)))
+                        0)
+                    (store! i (+ (load i) 1))))))
+      0)
+  (if (text=? (kind c node) "TranslationUnitDecl")
+      (let [(mut i) 0
+            n (child-count c node)
+            (mut current) (ast/ast-first-child (.tree c) node)]
+        (loop (if (>= (load i) n)
+                  (break)
+                  (do
+                    (collect-enums! c (load current))
+                    (store! current (ast/ast-next-node (.tree c) (load current)))
+                    (store! i (+ (load i) 1))))))
+      0)
+  0)
+
+(defn has-body [(c (ptr Context)) (node i64)] (-> i64)
+  (let [(mut found) -1
+        (mut i) 0
+        n (child-count c node)
+        (mut current) (ast/ast-first-child (.tree c) node)]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (if (text=? (kind c (load current)) "CompoundStmt")
+                    (store! found (load current))
+                    0)
+                (store! current (ast/ast-next-node (.tree c) (load current)))
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn declaration-target [(c (ptr Context)) (node i64) (function bool)] (-> (slice u8))
+  (let [name (property c node "name")
+        storage (property c node "storageClass")]
+    (if (text=? storage "static")
+        (make-unit-name c (if function "c_static_fn_" "c_static_global_") name)
+        (if (and function (text=? name "main"))
+            "c_user_main"
+            (make-name c (if function "c_" "c_global_") name)))))
+
+(defn index-symbol! [(c (ptr Context)) (node i64) (function bool)] (-> i64)
+  (let [id (property c node "id")
+        name (property c node "name")]
+    (if (and (present? id) (present? name))
+        (let [external
+                (and (not function)
+                     (not (text=? (property c node "storageClass") "static"))
+                     (present? (.defined-globals (.cfg c)))
+                     (not (line-member? (.defined-globals (.cfg c)) name)))
+              symbol
+                (Symbol
+                  :node node
+                  :target (if external name (declaration-target c node function))
+                  :type (node-type c node)
+                  :function function
+                  :internal (text=? (property c node "storageClass") "static")
+                  :local false
+                  :external external)]
+          (hm/hm-put! (mut (.symbols c)) id symbol))
+        0))
+  0)
+
+(defn index! [(c (ptr Context))] (-> i64)
+  (let [(mut i) 0
+        n (al/al-len (.top c))]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [node (al/al-get (.top c) (load i))
+                    k (kind c node)]
+                (set! (.current-file c) (al/al-get (.top-files c) (load i)))
+                (cond (text=? k "TypedefDecl") (collect-typedef! c node)
+                      (text=? k "FunctionDecl")
+                        (do
+                          (index-symbol! c node true)
+                          (if (>= (has-body c node) 0)
+                              (hm/hm-put! (mut (.defined-names c))
+                                          (property c node "name")
+                                          true)
+                              0))
+                      (text=? k "VarDecl") (index-symbol! c node false)
+                      :else 0)
+                (store! i (+ (load i) 1)))))
+    0))
+
+(defn function-defined-here? [(c (ptr Context)) (name (slice u8))] (-> bool)
+  (let [(mut i) 0
+        n (al/al-len (.top c))
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) n))
+              (break)
+              (let [node (al/al-get (.top c) (load i))]
+                (if (and (text=? (kind c node) "FunctionDecl")
+                         (text=? (property c node "name") name)
+                         (>= (has-body c node) 0))
+                    (store! found true)
+                    0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn function-defined? [(c (ptr Context)) (name (slice u8))] (-> bool)
+  (or (hm/hm-contains? (.defined-names c) name)
+      (line-member? (.defined-functions (.cfg c)) name)))
+
+(defn emit-parameter-types! [(c (ptr Context))
+                             (b (mut str/StrBuf))
+                             (function-type (ptr ct/CType))] (-> i64)
+  (let [parameters (ct/type-parameters function-type)
+        (mut i) 0]
+    (loop (if (>= (load i) (al/al-len parameters))
+              (break)
+              (do
+                (if (> (load i) 0) (put! (mut b) " ") 0)
+                (type! c (mut b) (al/al-get parameters (load i)))
+                (store! i (+ (load i) 1)))))
+    (if (ct/type-variadic? function-type)
+        (do
+          (if (> (al/al-len parameters) 0) (put! (mut b) " ") 0)
+          (put! (mut b) "..."))
+        0)
+    0))
+
+(defn emit-return-type! [(c (ptr Context))
+                         (b (mut str/StrBuf))
+                         (function-type (ptr ct/CType))] (-> i64)
+  (let [result (ct/type-child function-type)]
+    (if (= (ct/type-kind result) ct/CTYPE-VOID)
+        (put! (mut b) "i64")
+        (type! c (mut b) result))))
+
+(defn va-list-type? [(c (ptr Context)) (value (ptr ct/CType))] (-> bool)
+  (let [resolved (resolved-type c value)]
+    (and (= (ct/type-kind resolved) ct/CTYPE-POINTER)
+         (let [pointee (resolved-type c (ct/type-child resolved))]
+           (and (= (ct/type-kind pointee) ct/CTYPE-RECORD)
+                (text=? (ct/type-name pointee) "__va_list_tag"))))))
+
+(defn function-takes-va-list? [(c (ptr Context)) (value (ptr ct/CType))] (-> bool)
+  (and (= (ct/type-kind value) ct/CTYPE-FUNCTION)
+       (let [parameters (ct/type-parameters value)
+             count (al/al-len parameters)]
+         (and (> count 0) (va-list-type? c (al/al-get parameters (- count 1)))))))
+
+(defn standard-va-format? [(name (slice u8))] (-> bool)
+  (or (text=? name "vfprintf")
+      (or (text=? name "vprintf")
+          (or (text=? name "vsprintf") (text=? name "vsnprintf")))))
+
+(defn ensure-va-format-external! [(c (ptr Context)) (declaration i64)] (-> i64)
+  (let [name (property c declaration "name")
+        target (slice/subslice name 1 (slice/slice-len name))]
+    (if (hm/hm-contains? (.external-names c) target)
+        0
+        (let [function-type (node-type c declaration)
+              parameters (ct/type-parameters function-type)
+              count (al/al-len parameters)
+              (mut i) 0]
+          (hm/hm-put! (mut (.external-names c)) target true)
+          (put! (mut (.externs c)) "(extern ")
+          (identifier! (mut (.externs c)) target)
+          (put! (mut (.externs c)) " :cc c [")
+          (loop (if (>= (load i) (- count 1))
+                    (break)
+                    (do
+                      (if (> (load i) 0) (put! (mut (.externs c)) " ") 0)
+                      (type! c (mut (.externs c)) (al/al-get parameters (load i)))
+                      (store! i (+ (load i) 1)))))
+          (if (> count 1) (put! (mut (.externs c)) " ") 0)
+          (put! (mut (.externs c)) "...] (-> ")
+          (emit-return-type! c (mut (.externs c)) function-type)
+          (put! (mut (.externs c)) "))\n"))))
+  0)
+
+(defn builtin-function? [(name (slice u8))] (-> bool)
+  (str/starts-with name "__builtin_"))
+
+(defn ensure-external! [(c (ptr Context)) (declaration i64)] (-> i64)
+  (let [name (property c declaration "name")]
+    (if (or (not (present? name))
+            (builtin-function? name)
+            (function-defined? c name)
+            (hm/hm-contains? (.external-names c) name))
+        0
+        (let [function-type (node-type c declaration)]
+          (hm/hm-put! (mut (.external-names c)) name true)
+          (put! (mut (.externs c)) "(extern ")
+          (identifier! (mut (.externs c)) name)
+          (put! (mut (.externs c)) " :cc c [")
+          (emit-parameter-types! c (mut (.externs c)) function-type)
+          (put! (mut (.externs c)) "] (-> ")
+          (emit-return-type! c (mut (.externs c)) function-type)
+          (put! (mut (.externs c)) "))\n"))))
+  0)
+
+(defn referenced-declaration [(c (ptr Context)) (node i64)] (-> i64)
+  (ast/ast-field (.tree c) node "referencedDecl"))
+
+(defn reference-symbol [(c (ptr Context)) (node i64)] (-> Symbol)
+  (let [declaration (referenced-declaration c node)
+        id (if (< declaration 0) "" (property c declaration "id"))]
+    (match (hm/hm-get (.symbols c) id)
+      (Some [symbol] symbol)
+      (None []
+            (let [name
+                    (if (< declaration 0)
+                        (property c node "name")
+                        (property c declaration "name"))
+                  declaration-kind
+                    (if (< declaration 0)
+                        ""
+                        (kind c declaration))
+                  function (text=? declaration-kind "FunctionDecl")
+                  storage
+                    (if (< declaration 0)
+                        ""
+                        (property c declaration "storageClass"))
+                  target
+                    (if function
+                        (if (text=? storage "static")
+                            (make-unit-name c "c_static_fn_" name)
+                            (if (text=? name "main")
+                                "c_user_main"
+                                (if (function-defined? c name)
+                                    (make-name c "c_" name)
+                                    name)))
+                        (if (text=? storage "static")
+                            (make-unit-name c "c_static_global_" name)
+                            (if (and (present? (.defined-globals (.cfg c)))
+                                     (not (line-member? (.defined-globals (.cfg c)) name)))
+                                name
+                                (make-name c "c_global_" name))))
+                  external
+                    (and (not function)
+                         (not (text=? storage "static"))
+                         (present? (.defined-globals (.cfg c)))
+                         (not (line-member? (.defined-globals (.cfg c)) name)))]
+              (if function (ensure-external! c declaration) 0)
+              (Symbol
+                :node declaration
+                :target target
+                :type
+                  (if (< declaration 0)
+                      (node-type c node)
+                      (node-type c declaration))
+                :function function
+                :internal (text=? storage "static")
+                :local false
+                :external external))))))
+
+(defn add-local! [(c (ptr Context)) (node i64) (parameter bool)] (-> Symbol)
+  (let [id (property c node "id")
+        name (property c node "name")
+        target (fresh-name c (if parameter "c_param_" "c_local_"))
+        symbol
+          (Symbol
+            :node node
+            :target target
+            :type (node-type c node)
+            :function false
+            :internal false
+            :local true
+            :external false)]
+    (if (present? id) (hm/hm-put! (mut (.symbols c)) id symbol) 0)
+    symbol))
+
+(defn ensure-expression-place! [(c (ptr Context)) (node i64)] (-> i64)
+  (let [id (property c node "id")]
+    (if (and (present? id)
+             (not (hm/hm-contains? (.expression-places c) id)))
+        (hm/hm-put! (mut (.expression-places c))
+                    id
+                    (fresh-name c "c_expression_place_"))
+        0))
+  0)
+
+(defn parseable-node-type? [(c (ptr Context)) (node i64)] (-> bool)
+  (not (str/starts-with (node-type-text c node) "<builtin")))
+
+(defn register-function-locals! [(c (ptr Context)) (node i64)] (-> i64)
+  (let [k (kind c node)]
+    (cond (text=? k "ParmVarDecl") (do (add-local! c node true) 0)
+          (text=? k "LabelStmt")
+            (let [id (property c node "declId")]
+              (if (and (present? id) (not (hm/hm-contains? (.labels c) id)))
+                  (hm/hm-put! (mut (.labels c)) id (fresh-name c ":c_goto_"))
+                  0))
+          (text=? k "VarDecl")
+            (let [storage (property c node "storageClass")
+                  id (property c node "id")]
+              (if (text=? storage "static")
+                  (let [symbol
+                          (Symbol
+                            :node node
+                            :target (fresh-unit-name c "c_static_local_")
+                            :type (node-type c node)
+                            :function false
+                            :internal true
+                            :local false
+                            :external false)]
+                    (hm/hm-put! (mut (.symbols c)) id symbol)
+                    (al/al-push! (mut (.static-locals c)) node))
+                  (if (text=? storage "extern")
+                      0
+                      (do (add-local! c node false) 0))))
+          (or (text=? k "CompoundLiteralExpr")
+              (text=? k "MaterializeTemporaryExpr"))
+            (ensure-expression-place! c node)
+          :else 0))
+  (if (and (> (child-count c node) 0)
+           (or (text=? (kind c node) "ImplicitCastExpr")
+               (text=? (kind c node) "CStyleCastExpr")))
+      (let [source (child c node 0)
+            cast-kind (property c node "castKind")
+            target-fn
+              (and (parseable-node-type? c node)
+                   (function-pointer? c (node-type c node)))
+            source-fn
+              (and (parseable-node-type? c source)
+                   (function-pointer? c (node-type c source)))]
+        (if (and (text=? cast-kind "PointerToBoolean") source-fn)
+            (ensure-expression-place! c source)
+            0)
+        (if (and target-fn
+                 (not (or (text=? cast-kind "FunctionToPointerDecay")
+                          (text=? cast-kind "NoOp")
+                          (text=? cast-kind "BuiltinFnToFnPtr"))))
+            (match (integer-constant c source)
+              (Some [number] (if (!= number 0) (ensure-expression-place! c node) 0))
+              (None [] (ensure-expression-place! c node)))
+            0)
+        (if (and source-fn (not target-fn))
+            (ensure-expression-place! c source)
+            0))
+      0)
+  (if (and (text=? (kind c node) "BinaryOperator")
+           (comparison? (property c node "opcode"))
+           (>= (child-count c node) 2)
+           (parseable-node-type? c (child c node 0))
+           (function-pointer? c (node-type c (child c node 0))))
+      (do
+        (ensure-expression-place! c (child c node 0))
+        (ensure-expression-place! c (child c node 1)))
+      0)
+  (let [(mut i) 0
+        n (child-count c node)
+        (mut current) (ast/ast-first-child (.tree c) node)]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (register-function-locals! c (load current))
+                (store! current (ast/ast-next-node (.tree c) (load current)))
+                (store! i (+ (load i) 1))))))
+  0)
+
+(defn hex-digit [(value i64)] (-> i64)
+  (if (< value 10) (+ 48 value) (+ 65 (- value 10))))
+
+(defn c-string-byte! [(b (mut str/StrBuf)) (value i64)] (-> i64)
+  (put! (mut b) "\\x")
+  (byte! (mut b) (hex-digit (primitive/udiv value 16)))
+  (byte! (mut b) (hex-digit (primitive/urem value 16)))
+  (put! (mut b) ";"))
+
+(defn hex-value [(value i64)] (-> i64)
+  (cond (and (>= value 48) (<= value 57)) (- value 48)
+        (and (>= value 65) (<= value 70)) (+ 10 (- value 65))
+        (and (>= value 97) (<= value 102)) (+ 10 (- value 97))
+        :else -1))
+
+;; Decode the JSON string token and then the C spelling held by StringLiteral.
+;; Every output unit uses Coil's explicit byte escape, so encoding is lossless.
+(defn string-literal! [(c (ptr Context)) (b (mut str/StrBuf)) (node i64)] (-> i64)
+  (let [raw (property c node "value")
+        (mut json) (str/sb-new (.a c))
+        (mut i) 0
+        n (slice/slice-len raw)]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [x (primitive/cast i64 (slice/slice-get raw (load i)))]
+                (if (and (= x 92) (< (+ (load i) 1) n))
+                    (let [next (primitive/cast i64 (slice/slice-get raw (+ (load i) 1)))]
+                      (cond (= next 110) (byte! (mut json) 10)
+                            (= next 114) (byte! (mut json) 13)
+                            (= next 116) (byte! (mut json) 9)
+                            (= next 98) (byte! (mut json) 8)
+                            (= next 102) (byte! (mut json) 12)
+                            :else (byte! (mut json) next))
+                      (store! i (+ (load i) 2)))
+                    (do (byte! (mut json) x) (store! i (+ (load i) 1)))))))
+    (let [spelling (finish (mut json))
+          length (slice/slice-len spelling)
+          (mut at) 0]
+      (loop (if (or (>= (load at) length)
+                    (= (primitive/cast i64 (slice/slice-get spelling (load at))) 34))
+                (break)
+                (store! at (+ (load at) 1))))
+      (if (< (load at) length) (store! at (+ (load at) 1)) 0)
+      (put! (mut b) "c\"")
+      (loop (if (>= (load at) length)
+                (break)
+                (let [x (primitive/cast i64 (slice/slice-get spelling (load at)))]
+                  (if (= x 34)
+                      (break)
+                      (if (and (= x 92) (< (+ (load at) 1) length))
+                          (let [escape
+                                  (primitive/cast i64
+                                                  (slice/slice-get spelling (+ (load at) 1)))]
+                            (cond (= escape 110)
+                                    (do
+                                      (c-string-byte! (mut b) 10)
+                                      (store! at (+ (load at) 2)))
+                                  (= escape 114)
+                                    (do
+                                      (c-string-byte! (mut b) 13)
+                                      (store! at (+ (load at) 2)))
+                                  (= escape 116)
+                                    (do
+                                      (c-string-byte! (mut b) 9)
+                                      (store! at (+ (load at) 2)))
+                                  (= escape 120)
+                                    (let [(mut cursor) (+ (load at) 2)
+                                          (mut value) 0]
+                                      (loop (if (>= (load cursor) length)
+                                                (break)
+                                                (let [digit
+                                                        (hex-value (primitive/cast i64
+                                                                                   (slice/slice-get spelling
+                                                                                                    (load cursor))))]
+                                                  (if (< digit 0)
+                                                      (break)
+                                                      (do
+                                                        (store! value (+ (* (load value) 16) digit))
+                                                        (store! cursor (+ (load cursor) 1)))))))
+                                      (c-string-byte! (mut b) (primitive/urem (load value) 256))
+                                      (store! at (load cursor)))
+                                  (and (>= escape 48) (<= escape 55))
+                                    (let [(mut cursor) (+ (load at) 1)
+                                          (mut value) 0
+                                          (mut digits) 0]
+                                      (loop (if (or (>= (load cursor) length) (>= (load digits) 3))
+                                                (break)
+                                                (let [digit
+                                                        (primitive/cast i64
+                                                                        (slice/slice-get spelling (load cursor)))]
+                                                  (if (or (< digit 48) (> digit 55))
+                                                      (break)
+                                                      (do
+                                                        (store! value (+ (* (load value) 8) (- digit 48)))
+                                                        (store! digits (+ (load digits) 1))
+                                                        (store! cursor (+ (load cursor) 1)))))))
+                                      (c-string-byte! (mut b) (primitive/urem (load value) 256))
+                                      (store! at (load cursor)))
+                                  :else
+                                    (do
+                                      (c-string-byte! (mut b) escape)
+                                      (store! at (+ (load at) 2)))))
+                          (do
+                            (c-string-byte! (mut b) x)
+                            (store! at (+ (load at) 1))))))))
+      (put! (mut b) "\"")
+      0)))
+
+(defn load-place! [(c (ptr Context)) (b (mut str/StrBuf)) (node i64)] (-> i64)
+  (let [value-type (node-type c node)]
+    (if (scalar? value-type)
+        (do
+          (put! (mut b) "(primitive/alias-load ")
+          (type! c (mut b) value-type)
+          (put! (mut b) " ")
+          (lvalue! c (mut b) node)
+          (put! (mut b) ")"))
+        (do
+          (put! (mut b) "(load ")
+          (lvalue! c (mut b) node)
+          (put! (mut b) ")")))))
+
+(defn union-value? [(c (ptr Context)) (node i64)] (-> bool)
+  (let [(mut value-type) (node-type c node)]
+    (if (= (ct/type-kind (load value-type)) ct/CTYPE-POINTER)
+        (store! value-type (ct/type-child (load value-type)))
+        0)
+    (let [(mut name) (str/sb-new (.a c))]
+      (type! c (mut name) (load value-type))
+      (match (hm/hm-get (.record-nodes c) (finish (mut name)))
+        (Some [record] (text=? (property c record "tagUsed") "union"))
+        (None [] false)))))
+
+(defn generic-selected [(c (ptr Context)) (node i64)] (-> i64)
+  (let [(mut i) 1
+        n (child-count c node)
+        (mut selected) -1]
+    (loop (if (or (>= (load selected) 0) (>= (load i) n))
+              (break)
+              (let [association (child c node (load i))]
+                (if (ast/ast-field-bool (.tree c) association "selected")
+                    (let [count (child-count c association)]
+                      (if (> count 0)
+                          (store! selected (child c association (- count 1)))
+                          0))
+                    0)
+                (store! i (+ (load i) 1)))))
+    (load selected)))
+
+(defn expression-place [(c (ptr Context)) (node i64)] (-> (slice u8))
+  (match (hm/hm-get (.expression-places c) (property c node "id"))
+    (Some [place] place)
+    (None [] "")))
+
+(defn lvalue! [(c (ptr Context)) (b (mut str/StrBuf)) (node i64)] (-> i64)
+  (let [k (kind c node)]
+    (cond (text=? k "DeclRefExpr")
+            (let [symbol (reference-symbol c node)]
+              (if (.external symbol)
+                  (do
+                    (put! (mut b) "(primitive/cast (ptr ")
+                    (type! c (mut b) (.type symbol))
+                    (put! (mut b) ") (primitive/linker-address ")
+                    (identifier! (mut b) (.target symbol))
+                    (put! (mut b) "))"))
+                  (if (.local symbol)
+                      (put! (mut b) (.target symbol))
+                      (do
+                        (put! (mut b) "(")
+                        (put! (mut b) (.target symbol))
+                        (put! (mut b) ")")))))
+          (text=? k "UnaryOperator")
+            (if (text=? (property c node "opcode") "*")
+                (expr! c (mut b) (child c node 0))
+                (do
+                  (fail! c node "unsupported unary C lvalue")
+                  (put! (mut b) "(primitive/cast (ptr i8) 0)")))
+          (text=? k "ArraySubscriptExpr")
+            (let [base (child c node 0)
+                  index (child c node 1)
+                  base-type (resolved-type c (node-type c base))]
+              (if (and (= (ct/type-kind base-type) ct/CTYPE-POINTER)
+                       (= (ct/type-kind (resolved-type c (ct/type-child base-type)))
+                          ct/CTYPE-ARRAY))
+                  (do
+                    (put! (mut b) "(primitive/cast (ptr ")
+                    (type! c (mut b) (node-type c node))
+                    (put! (mut b) ") (primitive/index (primitive/cast (ptr i8) ")
+                    (expr! c (mut b) base)
+                    (put! (mut b) ") (* (primitive/cast i64 ")
+                    (expr! c (mut b) index)
+                    (put! (mut b) ") (primitive/sizeof ")
+                    (type! c (mut b) (node-type c node))
+                    (put! (mut b) "))))"))
+                  (do
+                    (put! (mut b) "(primitive/index ")
+                    (expr! c (mut b) base)
+                    (put! (mut b) " (primitive/cast i64 ")
+                    (expr! c (mut b) index)
+                    (put! (mut b) "))"))))
+          (text=? k "StringLiteral") (string-literal! c (mut b) node)
+          (text=? k "MemberExpr")
+            (let [base (child c node 0)]
+              (if (union-value? c base)
+                  (do
+                    (put! (mut b) "(primitive/cast (ptr ")
+                    (type! c (mut b) (node-type c node))
+                    (put! (mut b) ") ")
+                    (if (ast/ast-field-bool (.tree c) node "isArrow")
+                        (expr! c (mut b) base)
+                        (lvalue! c (mut b) base))
+                    (put! (mut b) ")"))
+                  (do
+                    (put! (mut b) "(field ")
+                    (if (ast/ast-field-bool (.tree c) node "isArrow")
+                        (expr! c (mut b) base)
+                        (lvalue! c (mut b) base))
+                    (put! (mut b) " c_field_")
+                    (identifier! (mut b) (property c node "name"))
+                    (put! (mut b) ")"))))
+          (text=? k "GenericSelectionExpr")
+            (let [selected (generic-selected c node)]
+              (if (>= selected 0)
+                  (lvalue! c (mut b) selected)
+                  (do
+                    (fail! c node "generic selection has no selected expression")
+                    (put! (mut b) "(primitive/cast (ptr i8) 0)"))))
+          (or (text=? k "CompoundLiteralExpr") (text=? k "MaterializeTemporaryExpr"))
+            (let [place (expression-place c node)]
+              (if (not (present? place))
+                  (do
+                    (fail! c node "C temporary has no storage")
+                    (put! (mut b) "(primitive/cast (ptr i8) 0)"))
+                  (do
+                    (put! (mut b) "(do ")
+                    (if (> (child-count c node) 0)
+                        (initialize-at! c (mut b) place (node-type c node) (child c node 0))
+                        (put! (mut b) "0"))
+                    (put! (mut b) " ")
+                    (put! (mut b) place)
+                    (put! (mut b) ")"))))
+          (and (text=? k "PredefinedExpr") (> (child-count c node) 0)) (lvalue! c (mut b) (child c node 0))
+          (or (text=? k "ParenExpr")
+              (text=? k "ImplicitCastExpr")
+              (text=? k "ExprWithCleanups")
+              (text=? k "ConstantExpr")
+              (text=? k "CStyleCastExpr"))
+            (lvalue! c (mut b) (child c node 0))
+          (text=? k "ConditionalOperator")
+            (do
+              (put! (mut b) "(if ")
+              (truth! c (mut b) (child c node 0))
+              (put! (mut b) " ")
+              (lvalue! c (mut b) (child c node 1))
+              (put! (mut b) " ")
+              (lvalue! c (mut b) (child c node 2))
+              (put! (mut b) ")"))
+          :else
+            (do
+              (fail! c node "unsupported C lvalue")
+              (put! (mut b) "(primitive/cast (ptr i8) 0)")))))
+
+(defn floating? [(value (ptr ct/CType))] (-> bool)
+  (= (ct/type-kind value) ct/CTYPE-FLOAT))
+(defn unsigned? [(value (ptr ct/CType))] (-> bool)
+  (= (ct/type-kind value) ct/CTYPE-UNSIGNED))
+(defn pointer? [(value (ptr ct/CType))] (-> bool)
+  (= (ct/type-kind value) ct/CTYPE-POINTER))
+(defn function-pointer? [(c (ptr Context)) (value (ptr ct/CType))] (-> bool)
+  (let [core (resolved-type c value)]
+    (and (pointer? core)
+         (= (ct/type-kind (resolved-type c (ct/type-child core)))
+            ct/CTYPE-FUNCTION))))
+(defn function-value? [(c (ptr Context)) (value (ptr ct/CType))] (-> bool)
+  (let [core (resolved-type c value)]
+    (or (= (ct/type-kind core) ct/CTYPE-FUNCTION)
+        (function-pointer? c core))))
+
+(defn function-pointer-bits! [(c (ptr Context))
+                              (b (mut str/StrBuf))
+                              (node i64)] (-> i64)
+  (let [place (expression-place c node)]
+    (if (not (present? place))
+        (do
+          (fail! c node "function pointer expression has no reinterpretation storage")
+          (put! (mut b) "(primitive/cast i64 0)"))
+        (do
+          (put! (mut b) "(do (primitive/alias-store! ")
+          (put! (mut b) place)
+          (put! (mut b) " ")
+          (expr! c (mut b) node)
+          (put! (mut b) ") (primitive/alias-load i64 (primitive/cast (ptr i64) ")
+          (put! (mut b) place)
+          (put! (mut b) ")))")))))
+
+(defn reinterpret-as-function-pointer! [(c (ptr Context))
+                                        (b (mut str/StrBuf))
+                                        (node i64)
+                                        (source i64)] (-> i64)
+  (let [place (expression-place c node)]
+    (if (not (present? place))
+        (do
+          (fail! c node "function pointer cast has no reinterpretation storage")
+          (put! (mut b) "(primitive/zeroed ")
+          (type! c (mut b) (node-type c node))
+          (put! (mut b) ")"))
+        (do
+          (put! (mut b) "(do (primitive/alias-store! (primitive/cast (ptr ")
+          ;; Function-pointer values already occupy the full ABI word.  Other
+          ;; scalar values must first undergo C's integer/pointer conversion
+          ;; to that word width; storing a narrow integer directly would
+          ;; leave the high bytes of the function pointer uninitialized.
+          (if (function-value? c (node-type c source))
+              (type! c (mut b) (node-type c source))
+              (put! (mut b) "i64"))
+          (put! (mut b) ") ")
+          (put! (mut b) place)
+          (put! (mut b) ") ")
+          (if (function-value? c (node-type c source))
+              0
+              (put! (mut b) "(primitive/cast i64 "))
+          (expr! c (mut b) source)
+          (if (function-value? c (node-type c source)) 0 (put! (mut b) ")"))
+          (put! (mut b) ") (primitive/alias-load ")
+          (type! c (mut b) (node-type c node))
+          (put! (mut b) " ")
+          (put! (mut b) place)
+          (put! (mut b) "))")))))
+
+(defn direct-declaration [(c (ptr Context)) (node i64)] (-> i64)
+  (let [k (kind c node)]
+    (if (text=? k "DeclRefExpr")
+        (let [declaration (referenced-declaration c node)]
+          (if (and (>= declaration 0)
+                   (text=? (kind c declaration) "FunctionDecl"))
+              declaration
+              -1))
+        (if (and (= (child-count c node) 1)
+                 (or (text=? k "ImplicitCastExpr")
+                     (text=? k "ParenExpr")
+                     (text=? k "ConstantExpr")
+                     (text=? k "ExprWithCleanups")))
+            (direct-declaration c (child c node 0))
+            -1))))
+
+(defn binary-primitive [(operator (slice u8)) (is-unsigned bool)] (-> (slice u8))
+  (cond (text=? operator "%") (if is-unsigned "primitive/urem" "primitive/irem")
+        (text=? operator "/") (if is-unsigned "primitive/udiv" "primitive/idiv")
+        (text=? operator "&") "primitive/iand"
+        (text=? operator "|") "primitive/ior"
+        (text=? operator "^") "primitive/ixor"
+        (text=? operator "<<") "primitive/ishl"
+        (text=? operator ">>") "primitive/ishr"
+        :else operator))
+
+(defn comparison? [(operator (slice u8))] (-> bool)
+  (or (text=? operator "==")
+      (text=? operator "!=")
+      (text=? operator "<")
+      (text=? operator ">")
+      (text=? operator "<=")
+      (text=? operator ">=")))
+
+(defn comparison! [(c (ptr Context))
+                   (b (mut str/StrBuf))
+                   (operator (slice u8))
+                   (left i64)
+                   (right i64)] (-> i64)
+  (let [operand-type (resolved-type c (node-type c left))
+        float (floating? operand-type)]
+    (if (and float (or (text=? operator "==") (text=? operator "!=")))
+        (do
+          (if (text=? operator "!=") (put! (mut b) "(not ") 0)
+          (put! (mut b) "(primitive/fcmp-eq ")
+          (expr! c (mut b) left)
+          (put! (mut b) " ")
+          (expr! c (mut b) right)
+          (put! (mut b) ")")
+          (if (text=? operator "!=") (put! (mut b) ")") 0))
+        (do
+          (put! (mut b) "(")
+          (put! (mut b) (if (text=? operator "==") "=" operator))
+          (if (text=? operator "!=")
+              (do
+                (put! (mut b) " [")
+                (if (pointer? operand-type)
+                    (put! (mut b) "i64")
+                    (type! c (mut b) operand-type))
+                (put! (mut b) "] "))
+              (put! (mut b) " "))
+          (if (function-pointer? c operand-type)
+              (function-pointer-bits! c (mut b) left)
+              (do
+                (if (pointer? operand-type) (put! (mut b) "(primitive/cast i64 ") 0)
+                (expr! c (mut b) left)
+                (if (pointer? operand-type) (put! (mut b) ")") 0)))
+          (put! (mut b) " ")
+          (if (function-pointer? c operand-type)
+              (function-pointer-bits! c (mut b) right)
+              (do
+                (if (pointer? operand-type) (put! (mut b) "(primitive/cast i64 ") 0)
+                (expr! c (mut b) right)
+                (if (pointer? operand-type) (put! (mut b) ")") 0)))
+          (put! (mut b) ")")))))
+
+(defn truth! [(c (ptr Context)) (b (mut str/StrBuf)) (node i64)] (-> i64)
+  (let [value-type (resolved-type c (node-type c node))]
+    (cond (= (ct/type-kind value-type) ct/CTYPE-BOOL) (expr! c (mut b) node)
+          (floating? value-type)
+            (do
+              (put! (mut b) "(let [c_truth_value ")
+              (expr! c (mut b) node)
+              (put! (mut b) "] (not (primitive/fcmp-eq c_truth_value (primitive/cast ")
+              (type! c (mut b) value-type)
+              (put! (mut b) " 0))))"))
+          (function-pointer? c value-type)
+            (do
+              (put! (mut b) "(!= [i64] ")
+              (function-pointer-bits! c (mut b) node)
+              (put! (mut b) " (primitive/cast i64 0))"))
+          :else
+            (do
+              (put! (mut b) "(!= [i64] (primitive/cast i64 ")
+              (expr! c (mut b) node)
+              (put! (mut b) ") (primitive/cast i64 0))")))))
+
+(defn store-place! [(c (ptr Context))
+                    (b (mut str/StrBuf))
+                    (node i64)
+                    (value (slice u8))] (-> i64)
+  (if (scalar? (node-type c node))
+      (do
+        (put! (mut b) "(primitive/alias-store! ")
+        (lvalue! c (mut b) node)
+        (put! (mut b) " ")
+        (put! (mut b) value)
+        (put! (mut b) ")"))
+      (do
+        (put! (mut b) "(store! ")
+        (lvalue! c (mut b) node)
+        (put! (mut b) " ")
+        (put! (mut b) value)
+        (put! (mut b) ")"))))
+
+(defn emit-expression-to-text [(c (ptr Context)) (node i64)] (-> (slice u8))
+  (let [(mut b) (str/sb-new (.a c))]
+    (expr! c (mut b) node)
+    (finish (mut b))))
+
+(defn assignment! [(c (ptr Context))
+                   (b (mut str/StrBuf))
+                   (left i64)
+                   (right i64)] (-> i64)
+  (let [value (emit-expression-to-text c right)]
+    (put! (mut b) "(let [c_assignment_value ")
+    (put! (mut b) value)
+    (put! (mut b) "] ")
+    (store-place! c (mut b) left "c_assignment_value")
+    (put! (mut b) " c_assignment_value)")))
+
+(defn arithmetic! [(c (ptr Context))
+                   (b (mut str/StrBuf))
+                   (operator (slice u8))
+                   (left i64)
+                   (right i64)] (-> i64)
+  (let [left-type (node-type c left)
+        right-type (node-type c right)]
+    (cond (and (pointer? left-type)
+               (or (text=? operator "+") (text=? operator "-"))
+               (not (pointer? right-type)))
+            (do
+              (put! (mut b) "(primitive/index ")
+              (expr! c (mut b) left)
+              (put! (mut b) " (primitive/cast i64 ")
+              (if (text=? operator "-")
+                  (put! (mut b) "(- (primitive/cast i64 0) (primitive/cast i64 ")
+                  0)
+              (expr! c (mut b) right)
+              (if (text=? operator "-") (put! (mut b) "))") 0)
+              (put! (mut b) "))"))
+          (and (pointer? right-type) (text=? operator "+"))
+            (do
+              (put! (mut b) "(primitive/index ")
+              (expr! c (mut b) right)
+              (put! (mut b) " (primitive/cast i64 ")
+              (expr! c (mut b) left)
+              (put! (mut b) "))"))
+          (and (pointer? left-type) (pointer? right-type) (text=? operator "-"))
+            (do
+              (put! (mut b) "(primitive/idiv (- (primitive/cast i64 ")
+              (expr! c (mut b) left)
+              (put! (mut b) ") (primitive/cast i64 ")
+              (expr! c (mut b) right)
+              (put! (mut b) ")) (primitive/sizeof ")
+              (type! c (mut b) (ct/type-child left-type))
+              (put! (mut b) "))"))
+          :else
+            (do
+              (put! (mut b) "(")
+              (put! (mut b) (binary-primitive operator (unsigned? left-type)))
+              (put! (mut b) " (primitive/cast ")
+              (type! c (mut b) left-type)
+              (put! (mut b) " ")
+              (expr! c (mut b) left)
+              (put! (mut b) ")")
+              (put! (mut b) " (primitive/cast ")
+              (type! c (mut b) left-type)
+              (put! (mut b) " ")
+              (expr! c (mut b) right)
+              (put! (mut b) "))")))))
+
+(defn builtin-call! [(c (ptr Context))
+                     (b (mut str/StrBuf))
+                     (name (slice u8))
+                     (node i64)] (-> bool)
+  (cond (text=? name "__builtin_expect") (do (expr! c (mut b) (child c node 1)) true)
+        (or (text=? name "__builtin_memcpy") (text=? name "__builtin_memmove"))
+          (do
+            (put! (mut b) "(")
+            (put! (mut b) (if (text=? name "__builtin_memcpy") "memcpy" "memmove"))
+            (let [(mut i) 1]
+              (loop (if (>= (load i) (child-count c node))
+                        (break)
+                        (do
+                          (put! (mut b) " ")
+                          (expr! c (mut b) (child c node (load i)))
+                          (store! i (+ (load i) 1))))))
+            (put! (mut b) ")")
+            true)
+        (or (text=? name "__builtin_nan") (text=? name "__builtin_nanf"))
+          (do
+            (put! (mut b) "(primitive/fdiv (primitive/cast ")
+            (type! c (mut b) (node-type c node))
+            (put! (mut b) " 0) (primitive/cast ")
+            (type! c (mut b) (node-type c node))
+            (put! (mut b) " 0))")
+            true)
+        (text=? name "__builtin_isnan")
+          (do
+            (put! (mut b) "(let [c_builtin_value ")
+            (expr! c (mut b) (child c node 1))
+            (put! (mut b) "] (if (not (primitive/fcmp-eq c_builtin_value c_builtin_value)) ")
+            (put! (mut b) "(primitive/cast i32 1) (primitive/cast i32 0)))")
+            true)
+        (or (text=? name "__builtin_isinf") (text=? name "__builtin_isinf_sign"))
+          (do
+            (put! (mut b) "(let [c_builtin_value ")
+            (expr! c (mut b) (child c node 1))
+            (put! (mut b) " c_builtin_delta (primitive/fsub c_builtin_value c_builtin_value)] ")
+            (put! (mut b) "(if (and (primitive/fcmp-eq c_builtin_value c_builtin_value) ")
+            (put! (mut b) "(not (primitive/fcmp-eq c_builtin_delta c_builtin_delta))) ")
+            (if (text=? name "__builtin_isinf_sign")
+                (put! (mut b)
+                      "(if (> c_builtin_value (primitive/cast f64 0)) (primitive/cast i32 1) (primitive/cast i32 -1)) ")
+                (put! (mut b) "(primitive/cast i32 1) "))
+            (put! (mut b) "(primitive/cast i32 0)))")
+            true)
+        (text=? name "__builtin_va_start")
+          (do
+            (put! (mut b) "(do")
+            (let [(mut i) 0]
+              (loop (if (>= (load i) (al/al-len (.va-counter-names c)))
+                        (break)
+                        (do
+                          (put! (mut b) " (primitive/alias-store! ")
+                          (put! (mut b) (al/al-get (.va-counter-names c) (load i)))
+                          (put! (mut b) " (primitive/cast i64 0))")
+                          (store! i (+ (load i) 1))))))
+            (put! (mut b) " 0)")
+            true)
+        (text=? name "__builtin_va_end") (do (put! (mut b) "0") true)
+        (text=? name "__builtin_alloca")
+          (do
+            (put! (mut b) "(primitive/alloc-stack ")
+            (expr! c (mut b) (child c node 1))
+            (put! (mut b) ")")
+            true)
+        :else false))
+
+(defn emit-va-selection! [(c (ptr Context))
+                          (b (mut str/StrBuf))
+                          (matches (al/ArrayList (slice u8)))
+                          (value-type (ptr ct/CType))
+                          (index i64)] (-> i64)
+  (if (>= index (- (al/al-len matches) 1))
+      (do
+        (put! (mut b) "(primitive/alias-load ")
+        (type! c (mut b) value-type)
+        (put! (mut b) " ")
+        (put! (mut b) (al/al-get matches index))
+        (put! (mut b) ")"))
+      (do
+        (put! (mut b) "(if (= c_va_index (primitive/cast i64 ")
+        (str/sb-push-i64! (mut b) index)
+        (put! (mut b) ")) ")
+        (put! (mut b) "(primitive/alias-load ")
+        (type! c (mut b) value-type)
+        (put! (mut b) " ")
+        (put! (mut b) (al/al-get matches index))
+        (put! (mut b) ") ")
+        (emit-va-selection! c (mut b) matches value-type (+ index 1))
+        (put! (mut b) ")"))))
+
+(defn va-arg! [(c (ptr Context)) (b (mut str/StrBuf)) (node i64)] (-> i64)
+  (let [wanted (node-type c node)
+        wanted-text (type-text c wanted)
+        (mut matches) (al/al-new [(slice u8)] (.a c))
+        (mut counter) ""
+        (mut i) 0]
+    (loop (if (>= (load i) (al/al-len (.current-vararg-names c)))
+              (break)
+              (do
+                (if (text=? (type-text c (al/al-get (.current-vararg-types c) (load i)))
+                            wanted-text)
+                    (al/al-push! (mut matches)
+                                 (al/al-get (.current-vararg-names c) (load i)))
+                    0)
+                (store! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (al/al-len (.va-counter-types c)))
+              (break)
+              (do
+                (if (text=? (al/al-get (.va-counter-types c) (load i)) wanted-text)
+                    (store! counter (al/al-get (.va-counter-names c) (load i)))
+                    0)
+                (store! i (+ (load i) 1)))))
+    (if (= (al/al-len matches) 0)
+        (do
+          (put! (mut b) "(primitive/zeroed ")
+          (type! c (mut b) wanted)
+          (put! (mut b) ")"))
+        (do
+          (put! (mut b) "(let [c_va_index (primitive/alias-load i64 ")
+          (put! (mut b) (load counter))
+          (put! (mut b) ")] ")
+          (put! (mut b) "(primitive/alias-store! ")
+          (put! (mut b) (load counter))
+          (put! (mut b) " (+ c_va_index (primitive/cast i64 1))) ")
+          (emit-va-selection! c (mut b) (load matches) wanted 0)
+          (put! (mut b) ")")))
+    0))
+
+(defn call! [(c (ptr Context)) (b (mut str/StrBuf)) (node i64)] (-> i64)
+  (let [callee (child c node 0)
+        declaration (direct-declaration c callee)
+        name (if (< declaration 0) "" (property c declaration "name"))]
+    (if (and (present? name) (builtin-call! c (mut b) name node))
+        0
+        (do
+          (if (>= declaration 0)
+              (let [temporary-node
+                      (if (text=? (kind c callee) "DeclRefExpr")
+                          callee
+                          (let [(mut current) callee]
+                            (loop (if (text=? (kind c (load current)) "DeclRefExpr")
+                                      (break)
+                                      (store! current (child c (load current) 0))))
+                            (load current)))
+                    symbol (reference-symbol c temporary-node)
+                    function-type (node-type c declaration)
+                    forwards
+                      (and (.current-varargs-active c)
+                           (function-takes-va-list? c function-type))
+                    forwarded-target
+                      (if (and forwards (function-defined? c name))
+                          (forwarded-call-target c (.target symbol))
+                          "")
+                    va-format
+                      (and forwards
+                           (standard-va-format? name)
+                           (not (function-defined? c name)))]
+                (if va-format (ensure-va-format-external! c declaration) 0)
+                (put! (mut b) "(")
+                (cond va-format
+                        (identifier! (mut b)
+                                     (slice/subslice name 1 (slice/slice-len name)))
+                      (present? forwarded-target) (put! (mut b) forwarded-target)
+                      forwards
+                        (do
+                          (fail! c node "missing linked va_list specialization")
+                          (put! (mut b) (.target symbol)))
+                      (and (= (ct/type-kind function-type) ct/CTYPE-FUNCTION)
+                           (ct/type-variadic? function-type)
+                           (function-defined? c name))
+                        (let [target
+                                (variadic-call-target c
+                                                      (.target symbol)
+                                                      node
+                                                      (al/al-len (ct/type-parameters function-type)))]
+                          (if (present? target)
+                              (put! (mut b) target)
+                              (do
+                                (fail! c node "missing linked variadic specialization")
+                                (put! (mut b) (.target symbol)))))
+                      :else (put! (mut b) (.target symbol)))
+                (let [(mut i) 1
+                      argument-end
+                        (if va-format
+                            (- (child-count c node) 1)
+                            (child-count c node))]
+                  (loop (if (>= (load i) argument-end)
+                            (break)
+                            (do
+                              (put! (mut b) " ")
+                              (expr! c (mut b) (child c node (load i)))
+                              (store! i (+ (load i) 1)))))
+                  (if (or va-format (present? forwarded-target))
+                      (let [(mut i) 0]
+                        (loop (if (>= (load i) (al/al-len (.current-vararg-names c)))
+                                  (break)
+                                  (do
+                                    (put! (mut b) " (primitive/alias-load ")
+                                    (type! c
+                                           (mut b)
+                                           (al/al-get (.current-vararg-types c) (load i)))
+                                    (put! (mut b) " ")
+                                    (put! (mut b)
+                                          (al/al-get (.current-vararg-names c) (load i)))
+                                    (put! (mut b) ")")
+                                    (store! i (+ (load i) 1))))))
+                      0)))
+              (do
+                (put! (mut b) "(primitive/call-ptr ")
+                (expr! c (mut b) callee)
+                (let [(mut i) 1]
+                  (loop (if (>= (load i) (child-count c node))
+                            (break)
+                            (do
+                              (put! (mut b) " ")
+                              (expr! c (mut b) (child c node (load i)))
+                              (store! i (+ (load i) 1))))))))
+          (put! (mut b) ")")))))
+
+(defn compound-value! [(c (ptr Context))
+                       (b (mut str/StrBuf))
+                       (body i64)
+                       (result-type (ptr ct/CType))] (-> i64)
+  (let [n (child-count c body)
+        (mut i) 0]
+    (if (= n 0)
+        (do
+          (put! (mut b) "(primitive/zeroed ")
+          (type! c (mut b) result-type)
+          (put! (mut b) ")"))
+        (do
+          (put! (mut b) "(do")
+          (loop (if (>= (load i) (- n 1))
+                    (break)
+                    (do
+                      (put! (mut b) " ")
+                      (stmt! c (mut b) (child c body (load i)))
+                      (store! i (+ (load i) 1)))))
+          (put! (mut b) " ")
+          (let [last (child c body (- n 1))]
+            (if (or (= (ct/type-kind (resolved-type c result-type)) ct/CTYPE-VOID)
+                    (text=? (kind c last) "NullStmt"))
+                (stmt! c (mut b) last)
+                (expr! c (mut b) last)))
+          (put! (mut b) ")")))))
+
+(defn expr! [(c (ptr Context)) (b (mut str/StrBuf)) (node i64)] (-> i64)
+  (let [k (kind c node)
+        count (child-count c node)]
+    (cond (or (text=? k "IntegerLiteral")
+              (text=? k "CharacterLiteral")
+              (text=? k "FloatingLiteral"))
+            (do
+              (put! (mut b) "(primitive/cast ")
+              (type! c (mut b) (node-type c node))
+              (put! (mut b) " ")
+              (let [value (property c node "value")]
+                (put! (mut b)
+                      (if (present? value)
+                          value
+                          (let [number (number-property c node "value")]
+                            (if (present? number) number "0")))))
+              (put! (mut b) ")"))
+          (text=? k "StringLiteral") (string-literal! c (mut b) node)
+          (text=? k "DeclRefExpr")
+            (let [declaration (referenced-declaration c node)]
+              (if (and (>= declaration 0)
+                       (text=? (kind c declaration) "EnumConstantDecl"))
+                  (let [id (property c declaration "id")
+                        name (property c declaration "name")]
+                    (match (hm/hm-get (.enum-values c) id)
+                      (Some [value]
+                            (do
+                              (put! (mut b) "(primitive/cast ")
+                              (type! c (mut b) (node-type c node))
+                              (put! (mut b) " ")
+                              (str/sb-push-i64! (mut b) value)
+                              (put! (mut b) ")")))
+                      (None []
+                            (match (hm/hm-get (.enum-values c) name)
+                              (Some [value]
+                                    (do
+                                      (put! (mut b) "(primitive/cast ")
+                                      (type! c (mut b) (node-type c node))
+                                      (put! (mut b) " ")
+                                      (str/sb-push-i64! (mut b) value)
+                                      (put! (mut b) ")")))
+                              (None []
+                                    (do
+                                      (fail! c node "unknown C enum constant")
+                                      (put! (mut b) "0")))))))
+                  (let [symbol (reference-symbol c node)]
+                    (if (.function symbol)
+                        (do
+                          (put! (mut b) "(primitive/fnptr-of ")
+                          (put! (mut b) (.target symbol))
+                          (put! (mut b) ")"))
+                        (load-place! c (mut b) node)))))
+          (or (text=? k "ParenExpr")
+              (text=? k "ExprWithCleanups")
+              (text=? k "ConstantExpr")
+              (text=? k "OpaqueValueExpr"))
+            (if (> count 0) (expr! c (mut b) (child c node 0)) (put! (mut b) "0"))
+          (and (text=? k "PredefinedExpr") (> count 0)) (expr! c (mut b) (child c node 0))
+          (text=? k "GenericSelectionExpr")
+            (let [selected (generic-selected c node)]
+              (if (>= selected 0)
+                  (expr! c (mut b) selected)
+                  (do
+                    (fail! c node "generic selection has no selected expression")
+                    (put! (mut b) "0"))))
+          (text=? k "StmtExpr")
+            (if (and (> count 0) (text=? (kind c (child c node 0)) "CompoundStmt"))
+                (compound-value! c (mut b) (child c node 0) (node-type c node))
+                (do
+                  (fail! c node "statement expression has no body")
+                  (put! (mut b) "0")))
+          (or (text=? k "CompoundLiteralExpr") (text=? k "MaterializeTemporaryExpr")) (load-place! c (mut b) node)
+          (or (text=? k "ImplicitCastExpr") (text=? k "CStyleCastExpr"))
+            (let [cast-kind (property c node "castKind")
+                  source (child c node 0)]
+              (cond (or (text=? cast-kind "LValueToRValue")
+                        (text=? cast-kind "FunctionToPointerDecay")
+                        (text=? cast-kind "NoOp")
+                        (text=? cast-kind "BuiltinFnToFnPtr"))
+                      (expr! c (mut b) source)
+                    (text=? cast-kind "ArrayToPointerDecay")
+                      (do
+                        (put! (mut b) "(primitive/cast ")
+                        (type! c (mut b) (node-type c node))
+                        (put! (mut b) " ")
+                        (lvalue! c (mut b) source)
+                        (put! (mut b) ")"))
+                    (text=? cast-kind "ToVoid")
+                      (do
+                        (put! (mut b) "(do ")
+                        (expr! c (mut b) source)
+                        (put! (mut b) " 0)"))
+                    (or (text=? cast-kind "IntegralToBoolean")
+                        (text=? cast-kind "PointerToBoolean")
+                        (text=? cast-kind "FloatingToBoolean"))
+                      (truth! c (mut b) source)
+                    (function-pointer? c (node-type c node))
+                      (match (integer-constant c source)
+                        (Some [number]
+                              (if (= number 0)
+                                  (do
+                                    (put! (mut b) "(primitive/zeroed ")
+                                    (type! c (mut b) (node-type c node))
+                                    (put! (mut b) ")"))
+                                  (reinterpret-as-function-pointer! c (mut b) node source)))
+                        (None []
+                              (reinterpret-as-function-pointer! c (mut b) node source)))
+                    (function-pointer? c (node-type c source))
+                      (do
+                        (put! (mut b) "(primitive/cast ")
+                        (type! c (mut b) (node-type c node))
+                        (put! (mut b) " ")
+                        (function-pointer-bits! c (mut b) source)
+                        (put! (mut b) ")"))
+                    :else
+                      (do
+                        (put! (mut b) "(primitive/cast ")
+                        (type! c (mut b) (node-type c node))
+                        (put! (mut b) " ")
+                        (expr! c (mut b) source)
+                        (put! (mut b) ")"))))
+          (text=? k "UnaryOperator")
+            (let [operator (property c node "opcode")
+                  operand (child c node 0)
+                  postfix (ast/ast-field-bool (.tree c) node "isPostfix")]
+              (cond (text=? operator "&") (lvalue! c (mut b) operand)
+                    (text=? operator "*")
+                    ;; Dereferencing an object pointer produces an lvalue to load,
+                    ;; but dereferencing a function pointer produces a function
+                    ;; designator.  Clang wraps that designator in a
+                    ;; FunctionToPointerDecay at call sites, so loading here would
+                    ;; incorrectly dereference the function pointer a second time.
+                    (if (= (ct/type-kind (resolved-type c (node-type c node)))
+                           ct/CTYPE-FUNCTION)
+                        (expr! c (mut b) operand)
+                        (load-place! c (mut b) node))
+                      (text=? operator "+")
+                    (expr! c (mut b) operand) (text=? operator "__extension__")
+                    (expr! c (mut b) operand) (text=? operator "-")
+                    (do
+                      (put! (mut b) "(- (primitive/cast ")
+                      (type! c (mut b) (node-type c node))
+                      (put! (mut b) " 0) ")
+                      (expr! c (mut b) operand)
+                      (put! (mut b) ")"))
+                      (text=? operator "~")
+                    (do
+                      (put! (mut b) "(primitive/inot ")
+                      (expr! c (mut b) operand)
+                      (put! (mut b) ")"))
+                      (text=? operator "!")
+                    (do
+                      (put! (mut b) "(if (not ")
+                      (truth! c (mut b) operand)
+                      (put! (mut b) ") (primitive/cast i32 1) (primitive/cast i32 0))"))
+                      (or (text=? operator "++")
+                          (text=? operator "--")
+                          (text=? operator "post++")
+                          (text=? operator "post--"))
+                    (let [place (fresh-name c "c_place_")
+                          old (fresh-name c "c_old_")
+                          new (fresh-name c "c_new_")]
+                      (put! (mut b) "(let [")
+                      (put! (mut b) place)
+                      (put! (mut b) " ")
+                      (lvalue! c (mut b) operand)
+                      (put! (mut b) " ")
+                      (put! (mut b) old)
+                      (put! (mut b) " (primitive/alias-load ")
+                      (type! c (mut b) (node-type c operand))
+                      (put! (mut b) " ")
+                      (put! (mut b) place)
+                      (put! (mut b) ") ")
+                      (put! (mut b) new)
+                      (put! (mut b) " (")
+                      (if (pointer? (node-type c operand))
+                          (do
+                            (put! (mut b) "primitive/index ")
+                            (put! (mut b) old)
+                            (put! (mut b)
+                                  (if (or (text=? operator "++")
+                                          (text=? operator "post++"))
+                                      " (primitive/cast i64 1))] "
+                                      " (primitive/cast i64 -1))] ")))
+                          (do
+                            (put! (mut b)
+                                  (if (or (text=? operator "++")
+                                          (text=? operator "post++"))
+                                      "+"
+                                      "-"))
+                            (put! (mut b) " ")
+                            (put! (mut b) old)
+                            (put! (mut b) " (primitive/cast ")
+                            (type! c (mut b) (node-type c operand))
+                            (put! (mut b) " 1))] ")))
+                      (put! (mut b) "(primitive/alias-store! ")
+                      (put! (mut b) place)
+                      (put! (mut b) " ")
+                      (put! (mut b) new)
+                      (put! (mut b) ") ")
+                      (put! (mut b) (if postfix old new))
+                      (put! (mut b) ")"))
+                      :else
+                    (do
+                      (fail! c node "unsupported C unary operator")
+                      (put! (mut b) "0"))))
+          (text=? k "BinaryOperator")
+            (let [operator (property c node "opcode")
+                  left (child c node 0)
+                  right (child c node 1)]
+              (cond (text=? operator "=") (assignment! c (mut b) left right)
+                    (text=? operator ",")
+                      (do
+                        (put! (mut b) "(do ")
+                        (expr! c (mut b) left)
+                        (put! (mut b) " ")
+                        (expr! c (mut b) right)
+                        (put! (mut b) ")"))
+                    (text=? operator "&&")
+                      (do
+                        (put! (mut b) "(if (and ")
+                        (truth! c (mut b) left)
+                        (put! (mut b) " ")
+                        (truth! c (mut b) right)
+                        (put! (mut b) ") (primitive/cast i32 1) (primitive/cast i32 0))"))
+                    (text=? operator "||")
+                      (do
+                        (put! (mut b) "(if (or ")
+                        (truth! c (mut b) left)
+                        (put! (mut b) " ")
+                        (truth! c (mut b) right)
+                        (put! (mut b) ") (primitive/cast i32 1) (primitive/cast i32 0))"))
+                    (comparison? operator)
+                      (do
+                        (put! (mut b) "(if ")
+                        (comparison! c (mut b) operator left right)
+                        (put! (mut b) " (primitive/cast i32 1) (primitive/cast i32 0))"))
+                    :else (arithmetic! c (mut b) operator left right)))
+          (text=? k "CompoundAssignOperator")
+            (let [operator (property c node "opcode")
+                  left (child c node 0)
+                  right (child c node 1)
+                  place (fresh-name c "c_place_")
+                  old (fresh-name c "c_compound_")
+                  value-name (fresh-name c "c_value_")
+                  length (slice/slice-len operator)
+                  base (slice/subslice operator 0 (- length 1))]
+              (put! (mut b) "(let [")
+              (put! (mut b) place)
+              (put! (mut b) " ")
+              (lvalue! c (mut b) left)
+              (put! (mut b) " ")
+              (put! (mut b) old)
+              (put! (mut b) " (primitive/alias-load ")
+              (type! c (mut b) (node-type c left))
+              (put! (mut b) " ")
+              (put! (mut b) place)
+              (put! (mut b) ")] ")
+              (let [(mut value) (str/sb-new (.a c))]
+                (if (and (pointer? (node-type c left))
+                         (or (text=? base "+") (text=? base "-")))
+                    (do
+                      (put! (mut value) "(primitive/index ")
+                      (put! (mut value) old)
+                      (put! (mut value) " (primitive/cast i64 ")
+                      (if (text=? base "-")
+                          (put! (mut value) "(- (primitive/cast i64 0) (primitive/cast i64 ")
+                          0)
+                      (expr! c (mut value) right)
+                      (if (text=? base "-") (put! (mut value) "))") 0)
+                      (put! (mut value) "))"))
+                    (do
+                      (put! (mut value) "(")
+                      (put! (mut value) (binary-primitive base (unsigned? (node-type c left))))
+                      (put! (mut value) " ")
+                      (put! (mut value) old)
+                      (put! (mut value) " ")
+                      (put! (mut value) "(primitive/cast ")
+                      (type! c (mut value) (node-type c left))
+                      (put! (mut value) " ")
+                      (expr! c (mut value) right)
+                      (put! (mut value) "))")))
+                (let [rendered (finish (mut value))]
+                  ;; A compound assignment is an expression, but its RHS and the
+                  ;; old lvalue are each evaluated exactly once.  Bind the computed
+                  ;; result before storing and returning it rather than rendering
+                  ;; the potentially effectful RHS a second time.
+                  (put! (mut b) "(let [")
+                  (put! (mut b) value-name)
+                  (put! (mut b) " ")
+                  (put! (mut b) rendered)
+                  (put! (mut b) "] ")
+                  (put! (mut b) "(primitive/alias-store! ")
+                  (put! (mut b) place)
+                  (put! (mut b) " ")
+                  (put! (mut b) value-name)
+                  (put! (mut b) ") ")
+                  (put! (mut b) value-name)
+                  (put! (mut b) ")")))
+              (put! (mut b) ")"))
+          (text=? k "ConditionalOperator")
+            (do
+              (put! (mut b) "(if ")
+              (truth! c (mut b) (child c node 0))
+              (put! (mut b) " ")
+              (expr! c (mut b) (child c node 1))
+              (put! (mut b) " ")
+              (expr! c (mut b) (child c node 2))
+              (put! (mut b) ")"))
+          (or (text=? k "ArraySubscriptExpr") (text=? k "MemberExpr")) (load-place! c (mut b) node)
+          (text=? k "CallExpr") (call! c (mut b) node)
+          (text=? k "VAArgExpr") (va-arg! c (mut b) node)
+          (or (text=? k "ImplicitValueInitExpr") (text=? k "InitListExpr"))
+            (do
+              (put! (mut b) "(primitive/zeroed ")
+              (type! c (mut b) (node-type c node))
+              (put! (mut b) ")"))
+          (text=? k "UnaryExprOrTypeTraitExpr")
+            (let [argument-type (ast/ast-field (.tree c) node "argType")]
+              (put! (mut b) "(primitive/cast ")
+              (type! c (mut b) (node-type c node))
+              (put! (mut b) " ")
+              (put! (mut b)
+                    (if (or (text=? (property c node "name") "alignof")
+                            (text=? (property c node "name") "__alignof"))
+                        "(primitive/alignof "
+                        "(primitive/sizeof "))
+              (if (>= argument-type 0)
+                  (type! c (mut b) (parse-type c node (property c argument-type "qualType")))
+                  (type! c (mut b) (node-type c (child c node 0))))
+              (put! (mut b) "))"))
+          (text=? k "GNUNullExpr") (put! (mut b) "(primitive/cast (ptr i8) 0)")
+          :else
+            (do
+              (fail! c node "unsupported C expression")
+              (put! (mut b) "0")))))
+
+(defn type-text [(c (ptr Context)) (value (ptr ct/CType))] (-> (slice u8))
+  (let [(mut b) (str/sb-new (.a c))]
+    (type! c (mut b) value)
+    (finish (mut b))))
+
+(defn declaration-place [(c (ptr Context)) (node i64)] (-> (slice u8))
+  (let [id (property c node "id")]
+    (match (hm/hm-get (.symbols c) id)
+      (Some [symbol]
+            (let [bound symbol
+                  (mut b) (str/sb-new (.a c))]
+              (if (.local bound)
+                  (put! (mut b) (.target bound))
+                  (do
+                    (put! (mut b) "(")
+                    (put! (mut b) (.target bound))
+                    (put! (mut b) ")")))
+              (finish (mut b))))
+      (None [] "(primitive/cast (ptr i8) 0)"))))
+
+(defn record-node-for-type [(c (ptr Context)) (value (ptr ct/CType))] (-> i64)
+  (let [name (type-text c value)]
+    (match (hm/hm-get (.record-nodes c) name)
+      (Some [node] node)
+      (None [] -1))))
+
+(defn nth-record-field [(c (ptr Context)) (record i64) (wanted i64)] (-> i64)
+  (let [(mut i) 0
+        (mut seen) 0
+        n (child-count c record)
+        (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0))
+              (break)
+              (let [candidate (child c record (load i))]
+                (if (text=? (kind c candidate) "FieldDecl")
+                    (if (= (load seen) wanted)
+                        (store! found candidate)
+                        (store! seen (+ (load seen) 1)))
+                    0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn write-value-at! [(c (ptr Context))
+                       (b (mut str/StrBuf))
+                       (place (slice u8))
+                       (value-type (ptr ct/CType))
+                       (value-text (slice u8))] (-> i64)
+  (if (scalar? value-type)
+      (do
+        (put! (mut b) "(primitive/alias-store! ")
+        (put! (mut b) place)
+        (if (function-pointer? c value-type)
+            (do (put! (mut b) " ") (put! (mut b) value-text) (put! (mut b) ")"))
+            (do
+              (put! (mut b) " (primitive/cast ")
+              (type! c (mut b) value-type)
+              (put! (mut b) " ")
+              (put! (mut b) value-text)
+              (put! (mut b) "))"))))
+      (do
+        (put! (mut b) "(store! ")
+        (put! (mut b) place)
+        (put! (mut b) " ")
+        (put! (mut b) value-text)
+        (put! (mut b) ")"))))
+
+(defn sub-place [(c (ptr Context))
+                 (place (slice u8))
+                 (index i64)
+                 (field-name (slice u8))] (-> (slice u8))
+  (let [(mut b) (str/sb-new (.a c))]
+    (if (present? field-name)
+        (do
+          (put! (mut b) "(field ")
+          (put! (mut b) place)
+          (put! (mut b) " c_field_")
+          (identifier! (mut b) field-name)
+          (put! (mut b) ")"))
+        (do
+          (put! (mut b) "(primitive/index ")
+          (put! (mut b) place)
+          (put! (mut b) " ")
+          (str/sb-push-i64! (mut b) index)
+          (put! (mut b) ")")))
+    (finish (mut b))))
+
+(defn initializer-count [(c (ptr Context)) (node i64)] (-> i64)
+  (let [direct (child-count c node)]
+    (if (> direct 0)
+        direct
+        (let [filler (ast/ast-array-field-count (.tree c) node "array_filler")]
+          (if (> filler 0) (- filler 1) 0)))))
+
+(defn initializer-value [(c (ptr Context)) (node i64) (index i64)] (-> i64)
+  (if (> (child-count c node) 0)
+      (child c node index)
+      ;; Clang stores a reusable implicit filler in slot zero, followed by the
+      ;; semantically positioned elements through the last explicit initializer.
+      (ast/ast-array-field-nth (.tree c) node "array_filler" (+ index 1))))
+
+(defn record-field-count [(c (ptr Context)) (record i64)] (-> i64)
+  (let [(mut i) 0
+        (mut fields) 0
+        n (child-count c record)]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (if (text=? (kind c (child c record (load i))) "FieldDecl")
+                    (store! fields (+ (load fields) 1))
+                    0)
+                (store! i (+ (load i) 1)))))
+    (load fields)))
+
+(defn record-field-place [(c (ptr Context))
+                          (place (slice u8))
+                          (target-type (ptr ct/CType))
+                          (record-field i64)] (-> (slice u8))
+  (if (= (ct/type-kind target-type) ct/CTYPE-UNION)
+      (let [(mut b) (str/sb-new (.a c))]
+        (put! (mut b) "(primitive/cast (ptr ")
+        (type! c (mut b) (node-type c record-field))
+        (put! (mut b) ") ")
+        (put! (mut b) place)
+        (put! (mut b) ")")
+        (finish (mut b)))
+      (sub-place c place 0 (property c record-field "name"))))
+
+(defn integer-constant [(c (ptr Context)) (node i64)] (-> (Option i64))
+  (if (< node 0)
+      (Some (primitive/cast i64 0))
+      (let [k (kind c node)
+            value (property c node "value")]
+        (if (present? value)
+            (str/str-parse-int value)
+            (cond (text=? k "ImplicitValueInitExpr") (Some (primitive/cast i64 0))
+                  (text=? k "DeclRefExpr")
+                    (let [declaration (referenced-declaration c node)
+                          id (if (>= declaration 0) (property c declaration "id") "")
+                          name
+                            (if (>= declaration 0)
+                                (property c declaration "name")
+                                (property c node "name"))]
+                      (match (hm/hm-get (.enum-values c) id)
+                        (Some [number] (Some number))
+                        (None []
+                              (match (hm/hm-get (.enum-values c) name)
+                                (Some [number] (Some number))
+                                (None [] (None [i64]))))))
+                  (and (= (child-count c node) 1)
+                       (or (text=? k "ImplicitCastExpr")
+                           (text=? k "CStyleCastExpr")
+                           (text=? k "ConstantExpr")
+                           (text=? k "ParenExpr")
+                           (text=? k "ExprWithCleanups")))
+                    (integer-constant c (child c node 0))
+                  (and (= (child-count c node) 1) (text=? k "UnaryOperator"))
+                    (match (integer-constant c (child c node 0))
+                      (None [] (None [i64]))
+                      (Some [number]
+                            (let [operator (property c node "opcode")]
+                              (cond (text=? operator "+") (Some number)
+                                    (text=? operator "-") (Some (- 0 number))
+                                    (text=? operator "~") (Some (primitive/inot number))
+                                    :else (None [i64])))))
+                  :else (None [i64]))))))
+
+(defn integer-storage-bytes [(c (ptr Context)) (value (ptr ct/CType))] (-> i64)
+  (let [core (resolved-type c value)
+        k (ct/type-kind core)]
+    (cond (= k ct/CTYPE-ARRAY)
+            (let [bound (ct/type-bound core)
+                  element (integer-storage-bytes c (ct/type-child core))]
+              (if (or (< bound 0) (< element 0)) -1 (* bound element)))
+          (or (= k ct/CTYPE-SIGNED)
+              (= k ct/CTYPE-UNSIGNED)
+              (= k ct/CTYPE-BOOL)
+              (= k ct/CTYPE-ENUM))
+            (let [bits (if (= k ct/CTYPE-ENUM) 32 (ct/type-bits core))]
+              (if (or (= bits 8) (= bits 16) (= bits 32) (= bits 64))
+                  (/ bits 8)
+                  -1))
+          :else -1)))
+
+(defn packed-zeroes! [(b (mut str/StrBuf)) (count i64)] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) count)
+              (break)
+              (do (c-string-byte! (mut b) 0) (store! i (+ (load i) 1))))))
+  0)
+
+(defn packed-integer-value! [(c (ptr Context))
+                             (b (mut str/StrBuf))
+                             (value-type (ptr ct/CType))
+                             (value i64)] (-> bool)
+  (let [core (resolved-type c value-type)
+        k (ct/type-kind core)]
+    (if (= k ct/CTYPE-ARRAY)
+        (let [bound (ct/type-bound core)
+              element (ct/type-child core)]
+          (if (< bound 0)
+              false
+              (if (or (< value 0) (text=? (kind c value) "ImplicitValueInitExpr"))
+                  (do (packed-zeroes! (mut b) (integer-storage-bytes c core)) true)
+                  (if (not (text=? (kind c value) "InitListExpr"))
+                      false
+                      (let [n (initializer-count c value)
+                            (mut i) 0
+                            (mut valid) true]
+                        (loop (if (or (not (load valid)) (>= (load i) bound))
+                                  (break)
+                                  (do
+                                    (if (< (load i) n)
+                                        (if (not (packed-integer-value! c
+                                                                        (mut b)
+                                                                        element
+                                                                        (initializer-value c value (load i))))
+                                            (store! valid false)
+                                            0)
+                                        (packed-zeroes! (mut b) (integer-storage-bytes c element)))
+                                    (store! i (+ (load i) 1)))))
+                        (load valid))))))
+        (let [bytes (integer-storage-bytes c core)]
+          (if (< bytes 0)
+              false
+              (match (integer-constant c value)
+                (None [] false)
+                (Some [number]
+                      (let [(mut i) 0]
+                        (loop (if (>= (load i) bytes)
+                                  (break)
+                                  (do
+                                    (c-string-byte! (mut b)
+                                                    (primitive/iand (primitive/ishr number (* (load i) 8)) 255))
+                                    (store! i (+ (load i) 1)))))
+                        true))))))))
+
+(defn emit-packed-integer-array! [(c (ptr Context))
+                                  (b (mut str/StrBuf))
+                                  (place (slice u8))
+                                  (target-type (ptr ct/CType))
+                                  (value i64)] (-> bool)
+  (let [bytes (integer-storage-bytes c target-type)]
+    (if (< bytes 64)
+        false
+        (let [(mut data) (str/sb-new (.a c))]
+          (if (not (packed-integer-value! c (mut data) target-type value))
+              false
+              (do
+                (put! (mut b) "(do (mem/memcpy (primitive/cast (ptr i8) ")
+                (put! (mut b) place)
+                (put! (mut b) ") (primitive/cast (ptr i8) c\"")
+                (put! (mut b) (finish (mut data)))
+                (put! (mut b) "\") (primitive/cast i64 ")
+                (str/sb-push-i64! (mut b) bytes)
+                (put! (mut b) ")) 0)")
+                true))))))
+
+(defn function-pointer-initializer-source [(c (ptr Context)) (node i64)] (-> i64)
+  (let [k (kind c node)]
+    (if (and (= (child-count c node) 1)
+             (or (text=? k "ImplicitCastExpr")
+                 (text=? k "CStyleCastExpr")
+                 (text=? k "ParenExpr")
+                 (text=? k "ConstantExpr")
+                 (text=? k "ExprWithCleanups")))
+        (function-pointer-initializer-source c (child c node 0))
+        node)))
+
+(defn initialize-function-pointer! [(c (ptr Context))
+                                    (b (mut str/StrBuf))
+                                    (place (slice u8))
+                                    (target-type (ptr ct/CType))
+                                    (value i64)] (-> i64)
+  (match (integer-constant c value)
+    (Some [number]
+          (if (= number 0)
+              (do
+                (put! (mut b) "(primitive/alias-store! ")
+                (put! (mut b) place)
+                (put! (mut b) " (primitive/zeroed ")
+                (type! c (mut b) target-type)
+                (put! (mut b) "))"))
+              (do
+                (put! (mut b) "(primitive/alias-store! (primitive/cast (ptr i64) ")
+                (put! (mut b) place)
+                (put! (mut b) ") (primitive/cast i64 ")
+                (expr! c (mut b) value)
+                (put! (mut b) "))"))))
+    (None []
+          (let [source (function-pointer-initializer-source c value)]
+            (put! (mut b) "(primitive/alias-store! (primitive/cast (ptr ")
+            (if (function-value? c (node-type c source))
+                (type! c (mut b) (node-type c source))
+                (put! (mut b) "i64"))
+            (put! (mut b) ") ")
+            (put! (mut b) place)
+            (put! (mut b) ") ")
+            (if (function-value? c (node-type c source))
+                0
+                (put! (mut b) "(primitive/cast i64 "))
+            (expr! c (mut b) source)
+            (if (function-value? c (node-type c source)) 0 (put! (mut b) ")"))
+            (put! (mut b) ")")))))
+
+(defn initialize-at! [(c (ptr Context))
+                      (b (mut str/StrBuf))
+                      (place (slice u8))
+                      (target-type (ptr ct/CType))
+                      (value i64)] (-> i64)
+  (if (< value 0)
+      (let [(mut zero) (str/sb-new (.a c))]
+        (put! (mut zero) "(primitive/zeroed ")
+        (type! c (mut zero) target-type)
+        (put! (mut zero) ")")
+        (write-value-at! c (mut b) place target-type (finish (mut zero))))
+      (let [k (kind c value)
+            target-core (resolved-type c target-type)
+            target-record (record-node-for-type c target-type)]
+        (cond (function-pointer? c target-core) (initialize-function-pointer! c (mut b) place target-core value)
+              (and (= (ct/type-kind target-core) ct/CTYPE-ARRAY)
+                   (text=? k "StringLiteral"))
+                (let [(mut literal) (str/sb-new (.a c))
+                      rendered
+                        (do
+                          (string-literal! c (mut literal) value)
+                          (finish (mut literal)))
+                      target-bound (ct/type-bound target-core)
+                      ;; Clang gives a string used in an array initializer the
+                      ;; destination array type.  Count the bytes in our canonical
+                      ;; `c"\xHH;..."` spelling instead, including its trailing NUL.
+                      source-bound (+ (primitive/udiv (- (slice/slice-len rendered) 3) 5) 1)
+                      count
+                        (if (and (>= target-bound 0) (>= source-bound 0))
+                            (if (< target-bound source-bound) target-bound source-bound)
+                            (if (>= target-bound 0) target-bound source-bound))]
+                  (put! (mut b) "(do (store! ")
+                  (put! (mut b) place)
+                  (put! (mut b) " (primitive/zeroed ")
+                  (type! c (mut b) target-type)
+                  (put! (mut b) ")) ")
+                  (put! (mut b) "(mem/memcpy (primitive/cast (ptr i8) ")
+                  (put! (mut b) place)
+                  (put! (mut b) ") (primitive/cast (ptr i8) ")
+                  (put! (mut b) rendered)
+                  (put! (mut b) ") (primitive/cast i64 ")
+                  (str/sb-push-i64! (mut b) count)
+                  (put! (mut b) ")) 0)"))
+              (and (= (ct/type-kind target-core) ct/CTYPE-ARRAY)
+                   (text=? k "InitListExpr")
+                   (emit-packed-integer-array! c (mut b) place target-core value))
+                0
+              (and (= (ct/type-kind target-core) ct/CTYPE-ARRAY)
+                   (text=? k "InitListExpr"))
+                (let [element-type (ct/type-child target-core)
+                      bound (ct/type-bound target-core)
+                      (mut i) 0
+                      n (initializer-count c value)
+                      total (if (and (>= bound 0) (> n bound)) bound n)]
+                  (put! (mut b) "(do")
+                  (if (and (>= bound 0) (< n bound))
+                      (do
+                        (put! (mut b) " (store! ")
+                        (put! (mut b) place)
+                        (put! (mut b) " (primitive/zeroed ")
+                        (type! c (mut b) target-type)
+                        (put! (mut b) "))"))
+                      0)
+                  (loop (if (>= (load i) total)
+                            (break)
+                            (do
+                              (put! (mut b) " ")
+                              (initialize-at! c
+                                              (mut b)
+                                              (sub-place c place (load i) "")
+                                              element-type
+                                              (initializer-value c value (load i)))
+                              (store! i (+ (load i) 1)))))
+                  (put! (mut b) " 0)"))
+              (and (>= target-record 0)
+                   (text=? k "InitListExpr"))
+                (let [record target-record
+                      (mut i) 0
+                      n (initializer-count c value)
+                      union (text=? (property c record "tagUsed") "union")
+                      fields (if union 1 (record-field-count c record))
+                      total (if (< n fields) n fields)]
+                  (put! (mut b) "(do")
+                  (if (< n fields)
+                      (do
+                        (put! (mut b) " (store! ")
+                        (put! (mut b) place)
+                        (put! (mut b) " (primitive/zeroed ")
+                        (type! c (mut b) target-type)
+                        (put! (mut b) "))"))
+                      0)
+                  (loop (if (>= (load i) total)
+                            (break)
+                            (let [record-field (nth-record-field c record (load i))]
+                              (if (< record-field 0)
+                                  0
+                                  (do
+                                    (put! (mut b) " ")
+                                    (initialize-at! c
+                                                    (mut b)
+                                                    (if union
+                                                        (let [(mut field-place) (str/sb-new (.a c))]
+                                                          (put! (mut field-place) "(primitive/cast (ptr ")
+                                                          (type! c (mut field-place) (node-type c record-field))
+                                                          (put! (mut field-place) ") ")
+                                                          (put! (mut field-place) place)
+                                                          (put! (mut field-place) ")")
+                                                          (finish (mut field-place)))
+                                                        (record-field-place c place target-core record-field))
+                                                    (node-type c record-field)
+                                                    (initializer-value c value (load i)))))
+                              (store! i (+ (load i) 1)))))
+                  (put! (mut b) " 0)"))
+              (text=? k "InitListExpr")
+                (let [n (initializer-count c value)]
+                  (if (> n 0)
+                      (initialize-at! c
+                                      (mut b)
+                                      place
+                                      target-type
+                                      (initializer-value c value 0))
+                      (initialize-at! c (mut b) place target-type -1)))
+              :else
+                (write-value-at! c
+                                 (mut b)
+                                 place
+                                 target-type
+                                 (emit-expression-to-text c value))))))
+
+(defn local-initializer! [(c (ptr Context)) (b (mut str/StrBuf)) (node i64)] (-> i64)
+  (let [storage (property c node "storageClass")
+        value (initializer-node c node)]
+    (if (or (text=? storage "static") (text=? storage "extern") (< value 0))
+        0
+        (initialize-at! c
+                        (mut b)
+                        (declaration-place c node)
+                        (node-type c node)
+                        value))))
+
+(defn stack-top [(values (al/ArrayList (slice u8)))] (-> (slice u8))
+  (let [n (al/al-len values)]
+    (if (= n 0) "" (al/al-get values (- n 1)))))
+
+(defn emit-loop! [(c (ptr Context))
+                  (b (mut str/StrBuf))
+                  (condition i64)
+                  (body i64)
+                  (increment i64)
+                  (post-test bool)] (-> i64)
+  (let [break-label (fresh-name c ":c_break_")
+        continue-label (fresh-name c ":c_continue_")]
+    (al/al-push! (mut (.break-labels c)) break-label)
+    (al/al-push! (mut (.continue-labels c)) continue-label)
+    (put! (mut b) "(control/scope ")
+    (put! (mut b) break-label)
+    (put! (mut b) " (loop ")
+    (if (and (not post-test) (>= condition 0))
+        (do
+          (put! (mut b) "(if (not ")
+          (truth! c (mut b) condition)
+          (put! (mut b) ") (control/return-from ")
+          (put! (mut b) break-label)
+          (put! (mut b) " 0) 0) "))
+        0)
+    (put! (mut b) "(control/scope ")
+    (put! (mut b) continue-label)
+    (put! (mut b) " ")
+    (stmt! c (mut b) body)
+    (put! (mut b) ") ")
+    (if (>= increment 0) (expr! c (mut b) increment) 0)
+    (if (and post-test (>= condition 0))
+        (do
+          (put! (mut b) " (if (not ")
+          (truth! c (mut b) condition)
+          (put! (mut b) ") (control/return-from ")
+          (put! (mut b) break-label)
+          (put! (mut b) " 0) 0)"))
+        0)
+    (put! (mut b) "))")
+    (al/al-pop! (mut (.continue-labels c)))
+    (al/al-pop! (mut (.break-labels c)))
+    0))
+
+(defn for-stmt! [(c (ptr Context)) (b (mut str/StrBuf)) (node i64)] (-> i64)
+  (let [n (child-count c node)
+        init (if (> n 0) (child c node 0) -1)
+        condition (if (>= n 3) (child c node (- n 3)) -1)
+        increment (if (>= n 2) (child c node (- n 2)) -1)
+        body (if (> n 0) (child c node (- n 1)) -1)]
+    (put! (mut b) "(do ")
+    (if (and (>= init 0) (present? (kind c init)))
+        (stmt! c (mut b) init)
+        (put! (mut b) "0"))
+    (put! (mut b) " ")
+    (emit-loop! c
+                (mut b)
+                (if (and (>= condition 0) (present? (kind c condition))) condition -1)
+                body
+                (if (and (>= increment 0) (present? (kind c increment))) increment -1)
+                false)
+    (put! (mut b) " 0)")))
+
+(defn switch-new-segment! [(c (ptr Context))
+                           (segments (ptr (al/ArrayList SwitchSegment)))
+                           (default bool)
+                           (range bool)
+                           (low i64)
+                           (high i64)] (-> i64)
+  (al/al-push! [SwitchSegment]
+               (mut segments)
+               (SwitchSegment
+                 :default default
+                 :range range
+                 :low low
+                 :high high
+                 :body (al/al-new [i64] (.a c))))
+  (- (al/al-len (load segments)) 1))
+
+(defn switch-collect-item! [(c (ptr Context))
+                            (segments (ptr (al/ArrayList SwitchSegment)))
+                            (current (ptr i64))
+                            (node i64)] (-> i64)
+  (let [k (kind c node)
+        n (child-count c node)]
+    (cond (text=? k "CaseStmt")
+            (let [range (ast/ast-field-bool (.tree c) node "isGNURange")
+                  statement-index (if range 2 1)
+                  index
+                    (switch-new-segment! c
+                                         segments
+                                         false
+                                         range
+                                         (child c node 0)
+                                         (if range (child c node 1) -1))]
+              (store! current index)
+              (if (> n statement-index)
+                  (switch-collect-item! c
+                                        segments
+                                        current
+                                        (child c node statement-index))
+                  0))
+          (text=? k "DefaultStmt")
+            (let [index (switch-new-segment! c segments true false -1 -1)]
+              (store! current index)
+              (if (> n 0) (switch-collect-item! c segments current (child c node 0)) 0))
+          :else
+            (if (>= (load current) 0)
+                (let [segment (al/al-elem [SwitchSegment] segments (load current))]
+                  (al/al-push! (mut (.body segment)) node))
+                0)))
+  0)
+
+(defn switch-condition! [(c (ptr Context))
+                         (b (mut str/StrBuf))
+                         (segment (ptr SwitchSegment))] (-> i64)
+  (if (.range segment)
+      (do
+        (put! (mut b) "(and (<= ")
+        (expr! c (mut b) (.low segment))
+        (put! (mut b) " c_switch_value) (<= c_switch_value ")
+        (expr! c (mut b) (.high segment))
+        (put! (mut b) "))"))
+      (do
+        (put! (mut b) "(= c_switch_value ")
+        (expr! c (mut b) (.low segment))
+        (put! (mut b) ")"))))
+
+(defn switch-stmt! [(c (ptr Context)) (b (mut str/StrBuf)) (node i64)] (-> i64)
+  (let [value (child c node 0)
+        body (child c node 1)
+        (mut segments) (al/al-new [SwitchSegment] (.a c))
+        (mut current) -1]
+    (if (text=? (kind c body) "CompoundStmt")
+        (let [(mut i) 0
+              n (child-count c body)]
+          (loop (if (>= (load i) n)
+                    (break)
+                    (do
+                      (switch-collect-item! c
+                                            (mut segments)
+                                            (mut current)
+                                            (child c body (load i)))
+                      (store! i (+ (load i) 1))))))
+        (switch-collect-item! c (mut segments) (mut current) body))
+    (let [break-label (fresh-name c ":c_switch_break_")]
+      (al/al-push! (mut (.break-labels c)) break-label)
+      (put! (mut b) "(let [c_switch_value ")
+      (expr! c (mut b) value)
+      (put! (mut b) " (mut c_switch_active) false c_switch_matched ")
+      (let [(mut i) 0
+            (mut cases) 0]
+        (loop (if (>= (load i) (al/al-len segments))
+                  (break)
+                  (let [segment (al/al-elem [SwitchSegment] (mut segments) (load i))]
+                    (if (not (.default segment))
+                        (store! cases (+ (load cases) 1))
+                        0)
+                    (store! i (+ (load i) 1)))))
+        (if (= (load cases) 0)
+            (put! (mut b) "false")
+            (do
+              (put! (mut b) "(or ")
+              (set! i 0)
+              (let [(mut emitted) 0]
+                (loop (if (>= (load i) (al/al-len segments))
+                          (break)
+                          (let [segment
+                                  (al/al-elem [SwitchSegment]
+                                              (mut segments)
+                                              (load i))]
+                            (if (not (.default segment))
+                                (do
+                                  (if (> (load emitted) 0) (put! (mut b) " ") 0)
+                                  (switch-condition! c (mut b) segment)
+                                  (store! emitted (+ (load emitted) 1)))
+                                0)
+                            (store! i (+ (load i) 1)))))
+                (put! (mut b) ")")))))
+      (put! (mut b) "] (control/scope ")
+      (put! (mut b) break-label)
+      (put! (mut b) " (do")
+      (let [(mut i) 0]
+        (loop (if (>= (load i) (al/al-len segments))
+                  (break)
+                  (let [segment (al/al-elem [SwitchSegment] (mut segments) (load i))]
+                    (put! (mut b) " (when (or (load c_switch_active) ")
+                    (if (.default segment)
+                        (put! (mut b) "(not c_switch_matched)")
+                        (switch-condition! c (mut b) segment))
+                    (put! (mut b) ") (store! c_switch_active true)")
+                    (let [(mut j) 0]
+                      (loop (if (>= (load j) (al/al-len (.body segment)))
+                                (break)
+                                (do
+                                  (put! (mut b) " ")
+                                  (stmt! c (mut b) (al/al-get (.body segment) (load j)))
+                                  (store! j (+ (load j) 1))))))
+                    (put! (mut b) ")")
+                    (store! i (+ (load i) 1))))))
+      (put! (mut b) " 0)))")
+      (al/al-pop! (mut (.break-labels c)))
+      0)))
+
+(defn label-target [(c (ptr Context)) (node i64)] (-> (slice u8))
+  (match (hm/hm-get (.labels c) (property c node "declId"))
+    (Some [target] target)
+    (None [] "")))
+
+(defn collect-label-nodes! [(c (ptr Context)) (node i64)] (-> i64)
+  (if (text=? (kind c node) "LabelStmt")
+      (let [id (property c node "declId")]
+        (if (present? id) (hm/hm-put! (mut (.goto-label-nodes c)) id node) 0))
+      0)
+  (let [(mut i) 0
+        n (child-count c node)
+        (mut current) (ast/ast-first-child (.tree c) node)]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (collect-label-nodes! c (load current))
+                (store! current (ast/ast-next-node (.tree c) (load current)))
+                (store! i (+ (load i) 1))))))
+  0)
+
+(defn collect-goto-targets! [(c (ptr Context)) (node i64)] (-> i64)
+  (if (text=? (kind c node) "GotoStmt")
+      (let [id (property c node "targetLabelDeclId")]
+        (if (and (present? id) (not (hm/hm-contains? (.goto-flags c) id)))
+            (do
+              (hm/hm-put! (mut (.goto-flags c)) id (fresh-name c "c_goto_pending_"))
+              (al/al-push! (mut (.goto-ids c)) id))
+            0))
+      0)
+  (let [(mut i) 0
+        n (child-count c node)
+        (mut current) (ast/ast-first-child (.tree c) node)]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (collect-goto-targets! c (load current))
+                (store! current (ast/ast-next-node (.tree c) (load current)))
+                (store! i (+ (load i) 1))))))
+  0)
+
+(defn prepare-goto-dispatch! [(c (ptr Context)) (body i64)] (-> i64)
+  (set! (.goto-label-nodes c)
+        (hm/hm-new [(slice u8) i64] (.a c) (str/str-keyops-borrowed)))
+  (set! (.goto-flags c)
+        (hm/hm-new [(slice u8) (slice u8)] (.a c) (str/str-keyops-borrowed)))
+  (set! (.goto-ids c) (al/al-new [(slice u8)] (.a c)))
+  (collect-label-nodes! c body)
+  (collect-goto-targets! c body)
+  (set! (.goto-dispatch c) (> (al/al-len (.goto-ids c)) 0))
+  0)
+
+(defn contains-label? [(c (ptr Context)) (node i64) (target (slice u8))] (-> bool)
+  (if (and (text=? (kind c node) "LabelStmt")
+           (text=? (property c node "declId") target))
+      true
+      (let [(mut i) 0
+            n (child-count c node)
+            (mut found) false
+            (mut current) (ast/ast-first-child (.tree c) node)]
+        (loop (if (or (load found) (>= (load i) n))
+                  (break)
+                  (do
+                    (if (contains-label? c (load current) target)
+                        (store! found true)
+                        0)
+                    (store! current (ast/ast-next-node (.tree c) (load current)))
+                    (store! i (+ (load i) 1)))))
+        (load found))))
+
+;; Emit the suffix reached by entering a label.  A nested label resumes the
+;; containing compound after its branch as C requires; conditions enclosing the
+;; label are not re-evaluated.  C labels nested in loops/switches need a full CFG
+;; and are rejected rather than silently acquiring different control flow.
+(defn label-continuation! [(c (ptr Context))
+                           (b (mut str/StrBuf))
+                           (node i64)
+                           (target (slice u8))] (-> bool)
+  (let [k (kind c node)]
+    (cond (and (text=? k "LabelStmt") (text=? (property c node "declId") target))
+            (do
+              (if (> (child-count c node) 0)
+                  (stmt! c (mut b) (child c node 0))
+                  (put! (mut b) "0"))
+              true)
+          (text=? k "CompoundStmt")
+            (let [(mut i) 0
+                  n (child-count c node)
+                  (mut found) false]
+              (loop (if (or (load found) (>= (load i) n))
+                        (break)
+                        (let [candidate (child c node (load i))]
+                          (if (contains-label? c candidate target)
+                              (do
+                                (store! found (label-continuation! c (mut b) candidate target))
+                                (let [(mut rest) (+ (load i) 1)]
+                                  (loop (if (>= (load rest) n)
+                                            (break)
+                                            (do
+                                              (put! (mut b) " ")
+                                              (stmt! c (mut b) (child c node (load rest)))
+                                              (store! rest (+ (load rest) 1)))))))
+                              0)
+                          (store! i (+ (load i) 1)))))
+              (load found))
+          (text=? k "IfStmt")
+            (let [(mut branch) 1
+                  n (child-count c node)
+                  (mut found) false]
+              (loop (if (or (load found) (>= (load branch) n))
+                        (break)
+                        (let [candidate (child c node (load branch))]
+                          (if (contains-label? c candidate target)
+                              (store! found (label-continuation! c (mut b) candidate target))
+                              0)
+                          (store! branch (+ (load branch) 1)))))
+              (load found))
+          (or (text=? k "AttributedStmt") (text=? k "CapturedStmt"))
+            (if (> (child-count c node) 0)
+                (label-continuation! c (mut b) (child c node (- (child-count c node) 1)) target)
+                false)
+          :else
+            (do
+              (if (contains-label? c node target)
+                  (fail! c node "goto target nested in unsupported control statement")
+                  0)
+              false))))
+
+(defn open-goto-scopes! [(c (ptr Context)) (b (mut str/StrBuf))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (al/al-len (.goto-ids c)))
+              (break)
+              (let [id (al/al-get (.goto-ids c) (load i))]
+                (match (hm/hm-get (.labels c) id)
+                  (Some [label]
+                        (do
+                          (put! (mut b) "(control/scope ")
+                          (put! (mut b) label)
+                          (put! (mut b) " ")))
+                  (None [] (fail! c -1 "unknown C goto target")))
+                (store! i (+ (load i) 1)))))
+    0))
+
+(defn close-goto-scopes! [(c (ptr Context)) (b (mut str/StrBuf))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (al/al-len (.goto-ids c)))
+              (break)
+              (do (put! (mut b) ")") (store! i (+ (load i) 1))))))
+  0)
+
+(defn emit-goto-dispatch! [(c (ptr Context))
+                           (b (mut str/StrBuf))
+                           (body i64)] (-> i64)
+  (let [done (fresh-name c ":c_goto_done_")
+        (mut i) 0]
+    (put! (mut b) " (control/scope ")
+    (put! (mut b) done)
+    (put! (mut b) " (loop")
+    (loop (if (>= (load i) (al/al-len (.goto-ids c)))
+              (break)
+              (let [id (al/al-get (.goto-ids c) (load i))]
+                (match (hm/hm-get (.goto-flags c) id)
+                  (Some [flag]
+                        (do
+                          (put! (mut b) " (when (primitive/alias-load bool ")
+                          (put! (mut b) flag)
+                          (put! (mut b) ") ")
+                          (put! (mut b) "(primitive/alias-store! ")
+                          (put! (mut b) flag)
+                          (put! (mut b) " false) ")
+                          (open-goto-scopes! c (mut b))
+                          (match (hm/hm-get (.goto-label-nodes c) id)
+                            (Some [label-node]
+                                  (if (not (label-continuation! c (mut b) body id))
+                                      (fail! c label-node "cannot form C goto continuation")
+                                      0))
+                            (None [] (fail! c -1 "unknown C goto label")))
+                          (close-goto-scopes! c (mut b))
+                          (put! (mut b) ")")))
+                  (None [] 0))
+                (store! i (+ (load i) 1)))))
+    (put! (mut b) " (if (or")
+    (set! i 0)
+    (loop (if (>= (load i) (al/al-len (.goto-ids c)))
+              (break)
+              (let [id (al/al-get (.goto-ids c) (load i))]
+                (match (hm/hm-get (.goto-flags c) id)
+                  (Some [flag]
+                        (do
+                          (put! (mut b) " (primitive/alias-load bool ")
+                          (put! (mut b) flag)
+                          (put! (mut b) ")")))
+                  (None [] 0))
+                (store! i (+ (load i) 1)))))
+    (put! (mut b) ") 0 (control/return-from ")
+    (put! (mut b) done)
+    (put! (mut b) " 0))))"))
+  0)
+
+(defn block-items! [(c (ptr Context))
+                    (b (mut str/StrBuf))
+                    (items (al/ArrayList i64))
+                    (start i64)
+                    (end i64)] (-> i64)
+  (let [(mut label-index) -1
+        (mut scan) (- end 1)]
+    ;; Nest scopes from the last label outwards. Every forward goto in the
+    ;; prefix then targets a scope that is already active, including gotos from
+    ;; inside loops and switches.
+    (loop (if (< (load scan) start)
+              (break)
+              (let [candidate (al/al-get items (load scan))]
+                (if (text=? (kind c candidate) "LabelStmt")
+                    (do (store! label-index (load scan)) (break))
+                    0)
+                (store! scan (- (load scan) 1)))))
+    (if (< (load label-index) 0)
+        (do
+          (put! (mut b) "(do")
+          (let [(mut i) start]
+            (loop (if (>= (load i) end)
+                      (break)
+                      (do
+                        (put! (mut b) " ")
+                        (stmt! c (mut b) (al/al-get items (load i)))
+                        (store! i (+ (load i) 1))))))
+          (put! (mut b) " 0)"))
+        (let [label-node (al/al-get items (load label-index))
+              target (label-target c label-node)]
+          (if (not (present? target))
+              (do (fail! c label-node "unregistered C label") (put! (mut b) "0"))
+              (do
+                (put! (mut b) "(do (control/scope ")
+                (put! (mut b) target)
+                (put! (mut b) " ")
+                (block-items! c (mut b) items start (load label-index))
+                (put! (mut b) ") ")
+                (if (> (child-count c label-node) 0)
+                    (stmt! c (mut b) (child c label-node 0))
+                    (put! (mut b) "0"))
+                (put! (mut b) " ")
+                (block-items! c (mut b) items (+ (load label-index) 1) end)
+                (put! (mut b) " 0)")))))
+    0))
+
+(defn compound-stmt! [(c (ptr Context)) (b (mut str/StrBuf)) (node i64)] (-> i64)
+  (let [(mut items) (al/al-new [i64] (.a c))
+        (mut i) 0
+        n (child-count c node)
+        (mut current) (ast/ast-first-child (.tree c) node)]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (al/al-push! (mut items) (load current))
+                (store! current (ast/ast-next-node (.tree c) (load current)))
+                (store! i (+ (load i) 1)))))
+    (if (.goto-dispatch c)
+        (do
+          (put! (mut b) "(do")
+          (set! i 0)
+          (loop (if (>= (load i) n)
+                    (break)
+                    (do
+                      (put! (mut b) " ")
+                      (stmt! c (mut b) (al/al-get items (load i)))
+                      (store! i (+ (load i) 1)))))
+          (put! (mut b) " 0)"))
+        (block-items! c (mut b) items 0 n))))
+
+(defn stmt! [(c (ptr Context)) (b (mut str/StrBuf)) (node i64)] (-> i64)
+  (let [k (kind c node)
+        n (child-count c node)]
+    (cond (text=? k "CompoundStmt") (compound-stmt! c (mut b) node)
+          (text=? k "ReturnStmt")
+            (do
+              (put! (mut b) "(control/return-from :c_return ")
+              (if (> n 0) (expr! c (mut b) (child c node 0)) (put! (mut b) "0"))
+              (put! (mut b) ")"))
+          (text=? k "IfStmt")
+            (do
+              (put! (mut b) "(if ")
+              (truth! c (mut b) (child c node 0))
+              (put! (mut b) " ")
+              (stmt! c (mut b) (child c node 1))
+              (put! (mut b) " ")
+              (if (> n 2) (stmt! c (mut b) (child c node 2)) (put! (mut b) "0"))
+              (put! (mut b) ")"))
+          (text=? k "WhileStmt") (emit-loop! c (mut b) (child c node 0) (child c node 1) -1 false)
+          (text=? k "DoStmt") (emit-loop! c (mut b) (child c node 1) (child c node 0) -1 true)
+          (text=? k "ForStmt") (for-stmt! c (mut b) node)
+          (text=? k "BreakStmt")
+            (let [target (stack-top (.break-labels c))]
+              (if (present? target)
+                  (do
+                    (put! (mut b) "(control/return-from ")
+                    (put! (mut b) target)
+                    (put! (mut b) " 0)"))
+                  (do
+                    (fail! c node "break outside C loop or switch")
+                    (put! (mut b) "0"))))
+          (text=? k "ContinueStmt")
+            (let [target (stack-top (.continue-labels c))]
+              (if (present? target)
+                  (do
+                    (put! (mut b) "(control/return-from ")
+                    (put! (mut b) target)
+                    (put! (mut b) " 0)"))
+                  (do
+                    (fail! c node "continue outside C loop")
+                    (put! (mut b) "0"))))
+          (text=? k "DeclStmt")
+            (do
+              (put! (mut b) "(do")
+              (let [(mut i) 0]
+                (loop (if (>= (load i) n)
+                          (break)
+                          (let [declaration (child c node (load i))]
+                            (if (text=? (kind c declaration) "VarDecl")
+                                (do
+                                  (put! (mut b) " ")
+                                  (local-initializer! c (mut b) declaration))
+                                0)
+                            (store! i (+ (load i) 1)))))
+                (put! (mut b) " 0)")))
+          (text=? k "NullStmt") (put! (mut b) "0")
+          (text=? k "LabelStmt") (if (> n 0) (stmt! c (mut b) (child c node 0)) (put! (mut b) "0"))
+          (or (text=? k "AttributedStmt") (text=? k "CapturedStmt"))
+            (if (> n 0) (stmt! c (mut b) (child c node (- n 1))) (put! (mut b) "0"))
+          (text=? k "SwitchStmt") (switch-stmt! c (mut b) node)
+          (text=? k "GotoStmt")
+            (let [target-id (property c node "targetLabelDeclId")]
+              (if (.goto-dispatch c)
+                  (match (hm/hm-get (.goto-flags c) target-id)
+                    (Some [flag]
+                          (match (hm/hm-get (.labels c) target-id)
+                            (Some [target]
+                                  (do
+                                    (put! (mut b) "(do (primitive/alias-store! ")
+                                    (put! (mut b) flag)
+                                    (put! (mut b) " true) ")
+                                    (put! (mut b) "(control/return-from ")
+                                    (put! (mut b) target)
+                                    (put! (mut b) " 0))")))
+                            (None []
+                                  (do
+                                    (fail! c node "unknown C goto target")
+                                    (put! (mut b) "0")))))
+                    (None []
+                          (do
+                            (fail! c node "unregistered C goto flag")
+                            (put! (mut b) "0"))))
+                  (match (hm/hm-get (.labels c) target-id)
+                    (Some [target]
+                          (do
+                            (put! (mut b) "(control/return-from ")
+                            (put! (mut b) target)
+                            (put! (mut b) " 0)")))
+                    (None []
+                          (do
+                            (fail! c node "unknown C goto target")
+                            (put! (mut b) "0"))))))
+          (text=? k "IndirectGotoStmt") (do (fail! c node "unsupported computed C goto") (put! (mut b) "0"))
+          :else
+            (do
+              (put! (mut b) "(do ")
+              (expr! c (mut b) node)
+              (put! (mut b) " 0)")))))
+
+(defn emit-record! [(c (ptr Context)) (node i64)] (-> i64)
+  (let [key (record-key c node)]
+    (match (hm/hm-get (.record-names c) key)
+      (None [] 0)
+      (Some [target]
+            (do
+              (put! (mut (.out c)) "(defstruct ")
+              (put! (mut (.out c)) target)
+              (put! (mut (.out c)) " [")
+              (let [(mut i) 0
+                    n (child-count c node)
+                    (mut emitted) 0
+                    union (text=? (property c node "tagUsed") "union")
+                    (mut current) (ast/ast-first-child (.tree c) node)]
+                (loop (if (>= (load i) n)
+                          (break)
+                          (let [candidate (load current)]
+                            (if (and (text=? (kind c candidate) "FieldDecl")
+                                     (or (not union) (= (load emitted) 0))
+                                     (not (and (= (ct/type-kind (node-type c candidate)) ct/CTYPE-ARRAY)
+                                               (< (ct/type-bound (node-type c candidate)) 0))))
+                                (do
+                                  (put! (mut (.out c)) "(c_field_")
+                                  (let [name (property c candidate "name")]
+                                    (identifier! (mut (.out c))
+                                                 (if (present? name) name "c_anonymous_member")))
+                                  (put! (mut (.out c)) " ")
+                                  (type! c (mut (.out c)) (node-type c candidate))
+                                  (put! (mut (.out c)) ")")
+                                  (store! emitted (+ (load emitted) 1)))
+                                0)
+                            (store! current (ast/ast-next-node (.tree c) candidate))
+                            (store! i (+ (load i) 1)))))
+                (put! (mut (.out c)) "])\n")))))))
+
+(defn global-owned? [(c (ptr Context)) (node i64)] (-> bool)
+  (let [storage (property c node "storageClass")]
+    (or (text=? storage "static")
+        (not (present? (.owned-globals (.cfg c))))
+        (line-member? (.owned-globals (.cfg c)) (property c node "name")))))
+
+(defn emit-global! [(c (ptr Context)) (node i64)] (-> i64)
+  (let [id (property c node "id")
+        storage (property c node "storageClass")]
+    (match (hm/hm-get (.symbols c) id)
+      (None [] 0)
+      (Some [matched]
+            (let [symbol matched
+                  target (.target symbol)]
+              (if (or (text=? storage "extern")
+                      (not (global-owned? c node))
+                      (hm/hm-contains? (.emitted-globals c) target))
+                  0
+                  (do
+                    (hm/hm-put! (mut (.emitted-globals c)) target true)
+                    (put! (mut (.out c)) "(defn ")
+                    (put! (mut (.out c)) target)
+                    (put! (mut (.out c)) " [] (-> (ptr ")
+                    (type! c (mut (.out c)) (.type symbol))
+                    (put! (mut (.out c)) ")) (let [cell (primitive/alloc-static ")
+                    (type! c (mut (.out c)) (.type symbol))
+                    (put! (mut (.out c)) ") initialized (primitive/alloc-static bool)] ")
+                    (let [initializer (initializer-node c node)]
+                      (if (>= initializer 0)
+                          (do
+                            (put! (mut (.out c)) "(if (not (load initialized)) (do (store! initialized true) ")
+                            (initialize-at! c
+                                            (mut (.out c))
+                                            "cell"
+                                            (.type symbol)
+                                            initializer)
+                            (put! (mut (.out c)) " 0) 0) "))
+                          0))
+                    (put! (mut (.out c)) "cell))\n")))))))
+  0)
+
+(defn function-attribute? [(c (ptr Context)) (node i64) (wanted (slice u8))] (-> bool)
+  (let [(mut i) 0
+        n (child-count c node)
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) n))
+              (break)
+              (do
+                (if (text=? (kind c (child c node (load i))) wanted)
+                    (store! found true)
+                    0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn emit-function-local-bindings! [(c (ptr Context))
+                                     (b (mut str/StrBuf))
+                                     (node i64)] (-> i64)
+  (if (text=? (kind c node) "VarDecl")
+      (let [id (property c node "id")]
+        (match (hm/hm-get (.symbols c) id)
+          (Some [matched]
+                (let [symbol matched]
+                  (if (.local symbol)
+                      (do
+                        (put! (mut b) " ")
+                        (put! (mut b) (.target symbol))
+                        (put! (mut b) " (primitive/alloc-stack ")
+                        (type! c (mut b) (.type symbol))
+                        (put! (mut b) ")"))
+                      0)))
+          (None [] 0)))
+      (if (present? (expression-place c node))
+          (let [place (expression-place c node)]
+            (if (present? place)
+                (do
+                  (put! (mut b) " ")
+                  (put! (mut b) place)
+                  (put! (mut b) " (primitive/alloc-stack ")
+                  (type! c (mut b) (node-type c node))
+                  (put! (mut b) ")"))
+                0))
+          0))
+  (let [(mut i) 0
+        n (child-count c node)
+        (mut current) (ast/ast-first-child (.tree c) node)]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (emit-function-local-bindings! c (mut b) (load current))
+                (store! current (ast/ast-next-node (.tree c) (load current)))
+                (store! i (+ (load i) 1))))))
+  0)
+
+(defn parameter-symbol [(c (ptr Context)) (node i64)] (-> Symbol)
+  (match (hm/hm-get (.symbols c) (property c node "id"))
+    (Some [value] (let [bound value] bound))
+    (None []
+          (Symbol
+            :node node
+            :target "c_missing_parameter"
+            :type (node-type c node)
+            :function false
+            :internal false
+            :local true
+            :external false))))
+
+(defn prepare-varargs! [(c (ptr Context)) (spec (slice u8))] (-> i64)
+  (set! (.current-varargs-active c) (present? spec))
+  (set! (.current-vararg-names c) (al/al-new [(slice u8)] (.a c)))
+  (set! (.current-vararg-types c) (al/al-new [(ptr ct/CType)] (.a c)))
+  (set! (.va-counter-types c) (al/al-new [(slice u8)] (.a c)))
+  (set! (.va-counter-names c) (al/al-new [(slice u8)] (.a c)))
+  (let [(mut i) 2
+        fields (if (present? spec) (tab-field-count spec) 2)]
+    (loop (if (>= (load i) fields)
+              (break)
+              (let [spelling (tab-field spec (load i))
+                    value-type (parse-type c -1 spelling)
+                    type-name (type-text c value-type)
+                    place (fresh-name c "c_va_place_")
+                    (mut known) false
+                    (mut j) 0]
+                (al/al-push! (mut (.current-vararg-names c)) place)
+                (al/al-push! (mut (.current-vararg-types c)) value-type)
+                (loop (if (or (load known) (>= (load j) (al/al-len (.va-counter-types c))))
+                          (break)
+                          (do
+                            (if (text=? (al/al-get (.va-counter-types c) (load j)) type-name)
+                                (store! known true)
+                                0)
+                            (store! j (+ (load j) 1)))))
+                (if (not (load known))
+                    (do
+                      (al/al-push! (mut (.va-counter-types c)) type-name)
+                      (al/al-push! (mut (.va-counter-names c))
+                                   (fresh-name c "c_va_counter_")))
+                    0)
+                (store! i (+ (load i) 1)))))
+    0))
+
+(defn emit-function-as! [(c (ptr Context))
+                         (node i64)
+                         (special-target (slice u8))
+                         (spec (slice u8))] (-> i64)
+  (let [body (has-body c node)
+        name (property c node "name")
+        target
+          (if (present? special-target)
+              special-target
+              (declaration-target c node true))
+        reachability-target (declaration-target c node true)]
+    (if (or (< body 0)
+            (and (present? (.emit-functions (.cfg c)))
+                 (not (line-member? (.emit-functions (.cfg c)) reachability-target))))
+        0
+        (do
+          (prepare-varargs! c spec)
+          (prepare-goto-dispatch! c body)
+          (let [target target]
+            (if (function-attribute? c node "ConstructorAttr")
+                (al/al-push! (mut (.constructors c)) target)
+                0)
+            (if (function-attribute? c node "DestructorAttr")
+                (al/al-push! (mut (.destructors c)) target)
+                0)
+            (put! (mut (.out c)) "(defn ")
+            (put! (mut (.out c)) target)
+            (put! (mut (.out c)) " [")
+            (let [(mut i) 0
+                  n (child-count c node)
+                  (mut parameter-index) 0]
+              (loop (if (>= (load i) n)
+                        (break)
+                        (let [candidate (child c node (load i))]
+                          (if (text=? (kind c candidate) "ParmVarDecl")
+                              (do
+                                (if (> (load parameter-index) 0) (put! (mut (.out c)) " ") 0)
+                                (put! (mut (.out c)) "(c_argument_")
+                                (str/sb-push-i64! (mut (.out c)) (load parameter-index))
+                                (put! (mut (.out c)) " ")
+                                (type! c (mut (.out c)) (node-type c candidate))
+                                (put! (mut (.out c)) ")")
+                                (store! parameter-index (+ (load parameter-index) 1)))
+                              0)
+                          (store! i (+ (load i) 1))))))
+            (let [(mut i) 0]
+              (loop (if (>= (load i) (al/al-len (.current-vararg-names c)))
+                        (break)
+                        (do
+                          (put! (mut (.out c)) " (c_vararg_")
+                          (str/sb-push-i64! (mut (.out c)) (load i))
+                          (put! (mut (.out c)) " ")
+                          (type! c
+                                 (mut (.out c))
+                                 (al/al-get (.current-vararg-types c) (load i)))
+                          (put! (mut (.out c)) ")")
+                          (store! i (+ (load i) 1))))))
+            (put! (mut (.out c)) "] (-> ")
+            (emit-return-type! c (mut (.out c)) (node-type c node))
+            (put! (mut (.out c)) ") (let [")
+            ;; Keep C locals as raw stack places.  Besides preserving mutation,
+            ;; this gives address-taking and array decay their ordinary pointer
+            ;; representation instead of exposing Coil reference types.
+            (let [(mut i) 0
+                  n (child-count c node)
+                  (mut parameter-index) 0]
+              (loop (if (>= (load i) n)
+                        (break)
+                        (let [candidate (child c node (load i))]
+                          (if (text=? (kind c candidate) "ParmVarDecl")
+                              (let [symbol (parameter-symbol c candidate)]
+                                (if (> (load parameter-index) 0) (put! (mut (.out c)) " ") 0)
+                                (put! (mut (.out c)) (.target symbol))
+                                (put! (mut (.out c)) " (primitive/alloc-stack ")
+                                (type! c (mut (.out c)) (.type symbol))
+                                (put! (mut (.out c)) ")")
+                                (store! parameter-index (+ (load parameter-index) 1)))
+                              0)
+                          (store! i (+ (load i) 1))))))
+            (let [(mut i) 0]
+              (loop (if (>= (load i) (al/al-len (.current-vararg-names c)))
+                        (break)
+                        (do
+                          (put! (mut (.out c)) " ")
+                          (put! (mut (.out c)) (al/al-get (.current-vararg-names c) (load i)))
+                          (put! (mut (.out c)) " (primitive/alloc-stack ")
+                          (type! c
+                                 (mut (.out c))
+                                 (al/al-get (.current-vararg-types c) (load i)))
+                          (put! (mut (.out c)) ")")
+                          (store! i (+ (load i) 1))))))
+            (let [(mut i) 0]
+              (loop (if (>= (load i) (al/al-len (.va-counter-names c)))
+                        (break)
+                        (do
+                          (put! (mut (.out c)) " ")
+                          (put! (mut (.out c)) (al/al-get (.va-counter-names c) (load i)))
+                          (put! (mut (.out c)) " (primitive/alloc-stack i64)")
+                          (store! i (+ (load i) 1))))))
+            (emit-function-local-bindings! c (mut (.out c)) body)
+            (let [(mut i) 0]
+              (loop (if (>= (load i) (al/al-len (.goto-ids c)))
+                        (break)
+                        (let [id (al/al-get (.goto-ids c) (load i))]
+                          (match (hm/hm-get (.goto-flags c) id)
+                            (Some [flag]
+                                  (do
+                                    (put! (mut (.out c)) " ")
+                                    (put! (mut (.out c)) flag)
+                                    (put! (mut (.out c)) " (primitive/alloc-stack bool)")))
+                            (None [] 0))
+                          (store! i (+ (load i) 1))))))
+            (put! (mut (.out c)) "] (control/scope :c_return (do")
+            (let [(mut i) 0
+                  n (child-count c node)
+                  (mut parameter-index) 0]
+              (loop (if (>= (load i) n)
+                        (break)
+                        (let [candidate (child c node (load i))]
+                          (if (text=? (kind c candidate) "ParmVarDecl")
+                              (let [symbol (parameter-symbol c candidate)]
+                                (put! (mut (.out c)) " (primitive/alias-store! ")
+                                (put! (mut (.out c)) (.target symbol))
+                                (put! (mut (.out c)) " c_argument_")
+                                (str/sb-push-i64! (mut (.out c)) (load parameter-index))
+                                (put! (mut (.out c)) ")")
+                                (store! parameter-index (+ (load parameter-index) 1)))
+                              0)
+                          (store! i (+ (load i) 1))))))
+            (let [(mut i) 0]
+              (loop (if (>= (load i) (al/al-len (.current-vararg-names c)))
+                        (break)
+                        (do
+                          (put! (mut (.out c)) " (primitive/alias-store! ")
+                          (put! (mut (.out c)) (al/al-get (.current-vararg-names c) (load i)))
+                          (put! (mut (.out c)) " c_vararg_")
+                          (str/sb-push-i64! (mut (.out c)) (load i))
+                          (put! (mut (.out c)) ")")
+                          (store! i (+ (load i) 1))))))
+            (let [(mut i) 0]
+              (loop (if (>= (load i) (al/al-len (.va-counter-names c)))
+                        (break)
+                        (do
+                          (put! (mut (.out c)) " (primitive/alias-store! ")
+                          (put! (mut (.out c)) (al/al-get (.va-counter-names c) (load i)))
+                          (put! (mut (.out c)) " (primitive/cast i64 0))")
+                          (store! i (+ (load i) 1))))))
+            (let [(mut i) 0]
+              (loop (if (>= (load i) (al/al-len (.goto-ids c)))
+                        (break)
+                        (let [id (al/al-get (.goto-ids c) (load i))]
+                          (match (hm/hm-get (.goto-flags c) id)
+                            (Some [flag]
+                                  (do
+                                    (put! (mut (.out c)) " (primitive/alias-store! ")
+                                    (put! (mut (.out c)) flag)
+                                    (put! (mut (.out c)) " false)")))
+                            (None [] 0))
+                          (store! i (+ (load i) 1))))))
+            (put! (mut (.out c)) " ")
+            (if (.goto-dispatch c)
+                (do
+                  (open-goto-scopes! c (mut (.out c)))
+                  (stmt! c (mut (.out c)) body)
+                  (close-goto-scopes! c (mut (.out c)))
+                  (emit-goto-dispatch! c (mut (.out c)) body))
+                (stmt! c (mut (.out c)) body))
+            (put! (mut (.out c)) " (primitive/zeroed ")
+            (emit-return-type! c (mut (.out c)) (node-type c node))
+            (put! (mut (.out c)) ")))))\n"))))))
+
+(defn emit-function! [(c (ptr Context)) (node i64)] (-> i64)
+  (let [function-type (node-type c node)
+        name (property c node "name")]
+    (if (not (and (= (ct/type-kind function-type) ct/CTYPE-FUNCTION)
+                  (ct/type-variadic? function-type)))
+        (emit-function-as! c node "" "")
+        0)
+    (if (>= (has-body c node) 0)
+        (let [specs (.variadic-specs (.cfg c))
+              (mut at) 0
+              n (slice/slice-len specs)]
+          (loop (if (>= (load at) n)
+                    (break)
+                    (let [start (load at)
+                          (mut stop) (load at)]
+                      (loop (if (or (>= (load stop) n)
+                                    (= (slice/slice-get specs (load stop))
+                                       (primitive/cast u8 #\newline)))
+                                (break)
+                                (store! stop (+ (load stop) 1))))
+                      (let [line (slice/subslice specs start (load stop))]
+                        (if (text=? (tab-field line 0) (declaration-target c node true))
+                            (emit-function-as! c node (tab-field line 1) line)
+                            0))
+                      (store! at (+ (load stop) 1)))))
+          0)
+        0)))
+
+(defn emit-main-wrapper! [(c (ptr Context))] (-> i64)
+  (if (not (.wrap-main (.cfg c)))
+      0
+      (let [(mut has-main) false
+            (mut i) 0
+            n (al/al-len (.top c))]
+        (loop (if (>= (load i) n)
+                  (break)
+                  (let [node (al/al-get (.top c) (load i))]
+                    (if (and (text=? (kind c node) "FunctionDecl")
+                             (text=? (property c node "name") "main")
+                             (>= (has-body c node) 0))
+                        (store! has-main true)
+                        0)
+                    (store! i (+ (load i) 1)))))
+        (if (load has-main)
+            (do
+              (put! (mut (.out c)) "(defn main [] (-> i32) (do")
+              (set! i 0)
+              (loop (if (>= (load i) (al/al-len (.constructors c)))
+                        (break)
+                        (do
+                          (put! (mut (.out c)) " (")
+                          (put! (mut (.out c)) (al/al-get (.constructors c) (load i)))
+                          (put! (mut (.out c)) ")")
+                          (store! i (+ (load i) 1)))))
+              (put! (mut (.out c)) " (let [c_main_result (c_user_main)]")
+              (set! i (- (al/al-len (.destructors c)) 1))
+              (loop (if (< (load i) 0)
+                        (break)
+                        (do
+                          (put! (mut (.out c)) " (")
+                          (put! (mut (.out c)) (al/al-get (.destructors c) (load i)))
+                          (put! (mut (.out c)) ")")
+                          (store! i (- (load i) 1)))))
+              (put! (mut (.out c)) " c_main_result)))\n"))
+            0))))
+
+(defn generate! [(c (ptr Context))] (-> i64)
+  (collect-top! c)
+  (collect-header-typedefs! c (ast/ast-root (.tree c)))
+  (collect-enums! c (ast/ast-root (.tree c)))
+  (index! c)
+  ;; Register all function-local static objects before emitting global accessors.
+  (let [(mut i) 0
+        n (al/al-len (.top c))]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [node (al/al-get (.top c) (load i))]
+                (if (and (text=? (kind c node) "FunctionDecl")
+                         (>= (has-body c node) 0)
+                         (or (not (present? (.emit-functions (.cfg c))))
+                             (line-member? (.emit-functions (.cfg c))
+                                           (declaration-target c node true))))
+                    (register-function-locals! c node)
+                    0)
+                (store! i (+ (load i) 1))))))
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (al/al-len (.records c)))
+              (break)
+              (do
+                (emit-record! c (al/al-get (.records c) (load i)))
+                (store! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (al/al-len (.top c)))
+              (break)
+              (let [node (al/al-get (.top c) (load i))]
+                (if (text=? (kind c node) "VarDecl") (emit-global! c node) 0)
+                (store! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (al/al-len (.static-locals c)))
+              (break)
+              (do
+                (emit-global! c (al/al-get (.static-locals c) (load i)))
+                (store! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (al/al-len (.top c)))
+              (break)
+              (let [node (al/al-get (.top c) (load i))]
+                (if (text=? (kind c node) "FunctionDecl") (emit-function! c node) 0)
+                (store! i (+ (load i) 1)))))
+    (emit-main-wrapper! c))
+  0)
+
+(defn assemble [(c (ptr Context))] (-> (slice u8))
+  (let [(mut result) (str/sb-new (.a c))]
+    (if (not (.fragment (.cfg c)))
+        (do
+          (put! (mut result) "(module ")
+          (identifier! (mut result) (.module-name (.cfg c)))
+          (put! (mut result) ")\n(import \"coil.primitive\" :as primitive)\n")
+          (put! (mut result) "(import \"coil.alloc\" :as alloc)\n")
+          (put! (mut result) "(import \"coil.mem\" :as mem)\n")
+          (put! (mut result) "(import \"coil.control\" :as control)\n"))
+        0)
+    (put! (mut result) (finish (mut (.externs c))))
+    (put! (mut result) (finish (mut (.out c))))
+    (finish (mut result))))
+
+(defn lower [(a (dyn alloc/Allocator)) (tree ast/Ast) (cfg LowerConfig)] (-> (Result (slice u8) LowerError))
+  (let [c (primitive/alloc-stack Context)]
+    (store! c (primitive/zeroed Context))
+    (set! (.a c) a)
+    (set! (.tree c) tree)
+    (set! (.cfg c) cfg)
+    (set! (.out c) (str/sb-new a))
+    (set! (.externs c) (str/sb-new a))
+    (set! (.types c) (hm/hm-new [(slice u8) (ptr ct/CType)] a (str/str-keyops-borrowed)))
+    (set! (.typedefs c) (hm/hm-new [(slice u8) (ptr ct/CType)] a (str/str-keyops-borrowed)))
+    (set! (.enum-values c) (hm/hm-new [(slice u8) i64] a (str/str-keyops-borrowed)))
+    (set! (.symbols c) (hm/hm-new [(slice u8) Symbol] a (str/str-keyops-borrowed)))
+    (set! (.labels c) (hm/hm-new [(slice u8) (slice u8)] a (str/str-keyops-borrowed)))
+    (set! (.defined-names c) (hm/hm-new [(slice u8) bool] a (str/str-keyops-borrowed)))
+    (set! (.external-names c) (hm/hm-new [(slice u8) bool] a (str/str-keyops-borrowed)))
+    (set! (.emitted-globals c) (hm/hm-new [(slice u8) bool] a (str/str-keyops-borrowed)))
+    (set! (.record-names c) (hm/hm-new [(slice u8) (slice u8)] a (str/str-keyops-borrowed)))
+    (set! (.anonymous-records c)
+          (hm/hm-new [(slice u8) (slice u8)] a (str/str-keyops-borrowed)))
+    (set! (.record-nodes c) (hm/hm-new [(slice u8) i64] a (str/str-keyops-borrowed)))
+    (set! (.expression-places c)
+          (hm/hm-new [(slice u8) (slice u8)] a (str/str-keyops-borrowed)))
+    (set! (.top c) (al/al-new [i64] a))
+    (set! (.top-files c) (al/al-new [(slice u8)] a))
+    (set! (.records c) (al/al-new [i64] a))
+    (set! (.static-locals c) (al/al-new [i64] a))
+    (set! (.constructors c) (al/al-new [(slice u8)] a))
+    (set! (.destructors c) (al/al-new [(slice u8)] a))
+    (set! (.break-labels c) (al/al-new [(slice u8)] a))
+    (set! (.continue-labels c) (al/al-new [(slice u8)] a))
+    (set! (.error-node c) -1)
+    (generate! c)
+    (if (.failed c)
+        (Err (LowerError :node (.error-node c) :message (.error-message c)))
+        (Ok (assemble c)))))
+
+(defn lower-fragment [(a (dyn alloc/Allocator)) (tree ast/Ast) (cfg LowerConfig)] (-> (Result (slice u8) LowerError))
+  (lower a
+         tree
+         (LowerConfig
+           :module-name (.module-name cfg)
+           :source-root (.source-root cfg)
+           :unit (.unit cfg)
+           :fragment true
+           :wrap-main (.wrap-main cfg)
+           :defined-functions (.defined-functions cfg)
+           :defined-globals (.defined-globals cfg)
+           :owned-globals (.owned-globals cfg)
+           :emit-functions (.emit-functions cfg)
+           :variadic-specs (.variadic-specs cfg))))
