@@ -1,101 +1,80 @@
-# Native C reader (experimental)
+# Native C frontend (experimental)
 
-This package is a whole-program C11 reader. At metaprogram time it runs clang's
-preprocessor and semantic analyser (`-fsyntax-only -Xclang -ast-dump=json`) and
-lowers the typed AST to ordinary Coil. It does **not** ask clang to generate code,
-embed/link a C object, or retain an AST interpreter or runtime dispatch loop. The
-Coil output is inspectable and Coil's normal native backend creates the binary.
+This package is a whole-program C11 frontend implemented in ordinary Coil.
+Clang is invoked directly by argv to preprocess and type-check each source and to
+emit its typed JSON AST:
+
+```text
+clang -std=gnu11 -fsyntax-only -Wno-everything \
+      <C flags> -Xclang -ast-dump=json <translation-unit.c>
+```
+
+Clang never emits LLVM IR, assembly, objects, or executables in this build path.
+`experiments.c.ast` parses the output through `coil.json`,
+`experiments.c.build` establishes C linkage over independent translation units,
+and `experiments.c.lower` emits one inspectable ordinary Coil program. Coil's
+normal native backend compiles that generated program and contributes the
+standard library once.
+
+## Building C
+
+`scripts/c-build.py` is only a thin bootstrap/invocation harness for the native
+builder; it contains no frontend logic:
 
 ```sh
-coil run experiments.c.lang tests/c/fib.c       # inspect generated Coil
-coil build tests/c/fib.c --use experiments.c.lang -o /tmp/fib
+python3 scripts/c-build.py --compiler "$(command -v coil)" \
+  tests/c/fib.c -O0 -o /tmp/fib
 /tmp/fib
+
+python3 scripts/c-build.py --compiler "$(command -v coil)" \
+  src/main.c src/render.c -O0 -o /tmp/game \
+  --cflag=-Iinclude --cflag=-DFEATURE=1 --link-flag=-lm
 ```
 
-Multiple C translation units use the linkage-aware build driver:
+Pass `--build-dir DIR` to retain the generated `DIR/program.coil`, or
+`--frontend-only` to stop after writing it. Without a build directory, the
+generated file is removed after a successful full build. The native builder can
+also be compiled and invoked directly:
 
 ```sh
-python3 scripts/c-build.py src/main.c src/render.c src/game.c -o /tmp/game
+coil build src/dialects/c/build.coil -O3 -o build/c-native/c-build
+build/c-native/c-build tests/c/fib.c -O0 -o /tmp/fib --coil "$(command -v coil)"
 ```
 
-Each source is preprocessed and type-checked by clang as an independent C
-translation unit. The driver builds a program-wide symbol index, validates
-external declarations, selects the owner of each tentative global definition,
-gives `static` functions and globals unit-local identities, and then lowers the
-units into one Coil native compilation. Compiling them together preserves Coil's
-whole-program optimization and emits the runtime only once; it does not concatenate
-C source or change preprocessing, tag, `static`, or tentative-definition scope.
-`--cflag=-Iinclude` and `--cflag=-DFEATURE=1` pass preprocessing options, while
-`--link-flag=-lSDL2` passes native libraries to Coil's final linker invocation.
+## Translation units and types
 
-The Python helper is parser glue only and must be run from the workspace root.
-`clang` and `python3` are compile-time dependencies; produced executables need
-neither. Includes and macros work because clang performs preprocessing first.
+Every C source is preprocessed, type-checked, indexed, and lowered as a separate
+translation unit. There is no C source concatenation. The linker index validates
+external function/global declarations, tentative and initialized definitions,
+recursive record layouts, unit-local `static` identities, constructors and
+destructors, and function reachability before lowering. C declarators are lexed
+and parsed into recursive structural types: pointer/array/function precedence is
+not inferred from regular expressions, token counts, or canonicalized strings.
 
-## Implemented surface
+The implemented corpus exercises scalar and aggregate values, enums, typedefs,
+anonymous records, pointers and fixed arrays, direct and indirect calls,
+variadics and `va_list` forwarding, mutable local/global/static storage,
+initializers, arithmetic and casts, lvalues, indexing/member access,
+conditionals, generic selection, compound literals, GNU statement expressions,
+switch/fallthrough, loops, break/continue, goto/labels, and C linkage.
+Unsupported typed-AST forms fail during lowering rather than falling back to
+native C code generation.
 
-The reader lowers integer/floating scalar types with clang's resolved widths,
-typedefs, enums, structs/unions, anonymous records, pointers, fixed arrays,
-function pointers, direct/indirect calls, C/variadic externs, mutable parameters
-and locals, arithmetic/comparisons/casts, lvalues, address and dereference,
-indexing/member access, conditionals, switch/fallthrough, loops, break/continue,
-goto/labels, and return. Static/global storage has native process lifetime and
-zero initialization. Function-local cells are allocated once at function entry,
-matching C's reusable automatic storage and allowing LLVM's normal mem2reg pass.
-Scalar memory operations use Coil's explicit alias-aware load/store primitives to
-carry C's strict-aliasing contract into LLVM TBAA metadata. Union member accesses
-remain untagged so legal C union punning stays conservative.
+This is not a conforming general-purpose C implementation. Bitfields, VLAs,
+atomics, complex numbers, TLS, arbitrary irreducible goto graphs, and all
+packed/over-aligned layouts are not complete.
 
-Whole-program compilation specializes a C-defined variadic forwarding function
-for each statically observed argument signature. This makes clox's
-`runtimeError(...)/vfprintf` path fixed-signature ordinary Coil while preserving
-external C variadics such as `printf` through Coil's C ABI support.
-
-## Explicit limitations
-
-This is not yet a conforming TCC-scale C implementation. Bitfields, VLAs,
-atomics, GNU extensions, complex numbers, TLS, arbitrary irreducible goto graphs,
-and packed/over-aligned layouts are not complete. Unions use
-overlaid member access on storage whose ordinary Coil struct supplies sufficient
-size/alignment for the validated corpus. Diagnostics name the first unsupported
-typed-AST node instead of silently invoking C codegen.
-
-The checked corpus includes three independent real applications: 4,979 lines of
-clox, 3,206 lines of cJSON, and 2,848 lines of LZ4. clox passes all 246 vendored
-Crafting Interpreters tests. cJSON parses, traverses, prints, and frees a document.
-LZ4 repeatedly compresses and decompresses 8 MiB and verifies every byte.
-
-## Language coverage baseline
-
-`scripts/c-conformance.py` fetches immutable TinyCC and c-testsuite revisions into
-the ignored `build/conformance` cache, compiles each applicable test through this
-reader, executes it natively, and compares its ordered stdout/stderr with upstream
-expectations. Unsupported C features count as failures. Explicit skips are limited
-to platform assembly, TCC-only extensions and harnesses, upstream source/expectation
-mismatches, invalid tests that TinyCC itself skips, and linker/multi-translation-unit
-tests outside this single-source harness. Multi-unit behavior is covered separately
-by `scripts/c-multi-unit.py`.
-
-The current [full baseline](../../../tests/c/conformance/BASELINE.md) is 301/325
-(92.6%) overall: 205/219 (93.6%) for portable c-testsuite cases and 96/106
-(90.6%) for TinyCC's broader native regression corpus. These are frozen-corpus pass
-rates, not a claim of ISO C conformance.
+## Validation
 
 ```sh
-python3 scripts/c-conformance.py --suite all \
-  --write-report tests/c/conformance/BASELINE.md
+coil test --suite c
+python3 scripts/c-multi-unit.py --compiler "$(command -v coil)"
+python3 scripts/c-doom.py --compiler "$(command -v coil)"
 ```
 
-## Validation and comparison
-
-```sh
-python3 src/dialects/c/c_ast_to_coil.py tests/c/fib.c > /tmp/fib.coil
-python3 scripts/c-multi-unit.py
-python3 scripts/c-dialect.py
-```
-
-The script builds every case through both `clang -O3` and the Coil reader/native
-backend, checks exact observable output, runs clox's 246-test suite, and measures
-warmed clox and LZ4 application workloads. The current validation run measured
-clox at 1.01× and LZ4 at 0.99× the matching Clang time. The gate rejects either
-Coil-generated program exceeding Clang by more than 15%.
+The multi-unit gate checks positive linkage, incompatible declarations,
+recursive record-layout incompatibility, and cJSON as two real translation
+units. The Doom gate pins Doom Generic revision
+`fc601639494e089702a1ada082eb51aaafc03722`, builds its 81 translation units,
+runs exactly 1,000 frames with the pinned shareware WAD, and requires framebuffer
+hash `734a03fe31906bc3`.

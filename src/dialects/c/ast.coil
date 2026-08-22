@@ -1,0 +1,246 @@
+(module experiments.c.ast)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as arraylist)
+(import "coil.json" :as json)
+(import "coil.slice" :as slice)
+(import "coil.str" :as str)
+
+(export Ast
+        CTypeLexer
+        ast-parse
+        ast-free!
+        ast-root
+        ast-token-count
+        ast-token
+        ast-field
+        ast-field-text
+        ast-field-number-text
+        ast-field-bool
+        ast-kind?
+        ast-children-count
+        ast-first-child
+        ast-next-node
+        ast-child
+        ast-array-field-count
+        ast-array-field-nth
+        c-type-lexer
+        c-type-next)
+
+;; Clang's JSON remains borrowed by `json.Doc`; the owning byte buffer must stay
+;; alive until `ast-free!`. Nodes are token-tape indices, so navigation does not
+;; allocate dictionaries or recursively copy the several-megabyte AST.
+(defstruct Ast [(doc json/Doc) (next (arraylist/ArrayList i64))])
+
+;; `coil.json` intentionally keeps only a compact preorder token tape. Its
+;; general `next-index` operation discovers a subtree's end recursively, which
+;; is appropriate for occasional JSON navigation but repeats that traversal at
+;; every level of a large AST walk. Build the same structural fact once for each
+;; token. Walking Clang's tree is then linear in node count rather than in the
+;; sum of node depths.
+(defn ast-next-table [(a (dyn alloc/Allocator)) (doc json/Doc)] (-> (arraylist/ArrayList i64))
+  (let [(mut result) (arraylist/al-new [i64] a)
+        count (json/token-count doc)
+        (mut i) 0]
+    (loop (if (>= (load i) count)
+              (break)
+              (do
+                (arraylist/al-push! (mut result) 0)
+                (store! i (+ (load i) 1)))))
+    (set! i (- count 1))
+    (loop (if (< (load i) 0)
+              (break)
+              (let [token (json/token doc (load i))
+                    container (or (json/is-array? token) (json/is-object? token))]
+                (if container
+                    (let [(mut at) (+ (load i) 1)
+                          (mut child) 0
+                          children
+                            (* (json/child-count token)
+                               (if (json/is-object? token) 2 1))]
+                      (loop (if (>= (load child) children)
+                                (break)
+                                (do
+                                  (store! at (arraylist/al-get result (load at)))
+                                  (store! child (+ (load child) 1)))))
+                      (arraylist/al-set! (mut result) (load i) (load at)))
+                    (arraylist/al-set! (mut result) (load i) (+ (load i) 1)))
+                (store! i (- (load i) 1)))))
+    (load result)))
+
+(defn ast-parse [(a (dyn alloc/Allocator)) (source (slice u8))] (-> (Result Ast json/Error))
+  (match (json/parse a source)
+    (Err [error] (Err error))
+    (Ok [doc]
+        (let [ast (primitive/alloc-stack Ast)]
+          (store! (field ast doc) doc)
+          (store! (field ast next) (ast-next-table a doc))
+          (Ok (load ast))))))
+
+(defn ast-free! [(ast (mut Ast))] (-> i64)
+  (arraylist/al-free! (mut (field ast next)))
+  (json/doc-free! (mut (field ast doc))))
+
+(defn ast-root [(ast Ast)] (-> i64)
+  0)
+
+(defn ast-token-count [(ast Ast)] (-> i64)
+  (json/token-count (load (field ast doc))))
+
+(defn ast-token [(ast Ast) (node i64)] (-> json/Token)
+  (json/token (load (field ast doc)) node))
+
+;; Return a field's value-token index, or -1 when the node is not an object or
+;; does not contain the field.
+(defn ast-field [(ast Ast) (node i64) (key (slice u8))] (-> i64)
+  (let [token (ast-token ast node)]
+    (if (not (json/is-object? token))
+        -1
+        (let [doc (load (field ast doc))
+              (mut i) 0
+              (mut at) (+ node 1)
+              (mut found) -1]
+          (loop (if (>= (load i) (json/child-count token))
+                    (break)
+                    (let [key-token (json/token doc (load at))
+                          value (+ (load at) 1)]
+                      (if (str/str-eq (json/string-text doc key-token) key)
+                          (do (store! found value) (break))
+                          (do
+                            (store! at (arraylist/al-get (load (field ast next)) value))
+                            (store! i (+ (load i) 1)))))))
+          (load found)))))
+
+(defn ast-field-text [(ast Ast) (node i64) (key (slice u8))] (-> (slice u8))
+  (let [value (ast-field ast node key)]
+    (if (< value 0)
+        ""
+        (let [token (ast-token ast value)]
+          (if (json/is-string? token)
+              (json/string-text (load (field ast doc)) token)
+              "")))))
+
+(defn ast-field-number-text [(ast Ast) (node i64) (key (slice u8))] (-> (slice u8))
+  (let [value (ast-field ast node key)]
+    (if (< value 0)
+        ""
+        (let [token (ast-token ast value)]
+          (if (json/is-number? token)
+              (json/number-text (load (field ast doc)) token)
+              "")))))
+
+(defn ast-field-bool [(ast Ast) (node i64) (key (slice u8))] (-> bool)
+  (let [value (ast-field ast node key)]
+    (and (>= value 0)
+         (let [token (ast-token ast value)]
+           (and (json/is-bool? token) (json/bool token))))))
+
+(defn ast-kind? [(ast Ast) (node i64) (kind (slice u8))] (-> bool)
+  (str/str-eq (ast-field-text ast node "kind") kind))
+
+(defn ast-inner [(ast Ast) (node i64)] (-> i64)
+  (let [inner (ast-field ast node "inner")]
+    (if (and (>= inner 0) (json/is-array? (ast-token ast inner))) inner -1)))
+
+(defn ast-children-count [(ast Ast) (node i64)] (-> i64)
+  (let [inner (ast-inner ast node)]
+    (if (< inner 0) 0 (json/child-count (ast-token ast inner)))))
+
+(defn ast-first-child [(ast Ast) (node i64)] (-> i64)
+  (let [inner (ast-inner ast node)]
+    (if (or (< inner 0) (= (json/child-count (ast-token ast inner)) 0))
+        -1
+        (+ inner 1))))
+
+;; Advance from one node to its next sibling in the enclosing `inner` array.
+;; Callers track the parent's child count; the precomputed subtree boundary makes
+;; this constant-time.
+(defn ast-next-node [(ast Ast) (node i64)] (-> i64)
+  (arraylist/al-get (load (field ast next)) node))
+
+(defn ast-child [(ast Ast) (node i64) (index i64)] (-> i64)
+  (let [inner (ast-inner ast node)]
+    (if (or (< inner 0) (< index 0))
+        -1
+        (let [(mut at) (+ inner 1)
+              (mut i) 0]
+          (loop (if (>= (load i) index)
+                    (break)
+                    (do
+                      (store! at (ast-next-node ast (load at)))
+                      (store! i (+ (load i) 1)))))
+          (load at)))))
+
+(defn ast-array-field-count [(ast Ast) (node i64) (key (slice u8))] (-> i64)
+  (let [array (ast-field ast node key)]
+    (if (and (>= array 0) (json/is-array? (ast-token ast array)))
+        (json/child-count (ast-token ast array))
+        0)))
+
+(defn ast-array-field-nth [(ast Ast) (node i64) (key (slice u8)) (index i64)] (-> i64)
+  (let [array (ast-field ast node key)]
+    (if (or (< array 0)
+            (< index 0)
+            (not (json/is-array? (ast-token ast array))))
+        -1
+        (let [(mut at) (+ array 1)
+              (mut i) 0]
+          (loop (if (>= (load i) index)
+                    (break)
+                    (do
+                      (store! at (ast-next-node ast (load at)))
+                      (store! i (+ (load i) 1)))))
+          (load at)))))
+
+;; A real lexer for Clang's residual C type spellings. Most type facts come from
+;; typed declarations; spelling is needed for declarator structure that Clang's
+;; JSON does not expose consistently. Tokens are borrowed slices, never regex
+;; matches or canonicalized replacement strings.
+(defstruct CTypeLexer [(source (slice u8)) (position i64)])
+
+(defn c-type-lexer [(source (slice u8))] (-> CTypeLexer)
+  (let [lexer (primitive/alloc-stack CTypeLexer)]
+    (store! (field lexer source) source)
+    (store! (field lexer position) 0)
+    (load lexer)))
+
+(defn c-type-space? [(byte u8)] (-> bool)
+  (or (= byte (primitive/cast u8 #\space))
+      (or (= byte (primitive/cast u8 #\tab))
+          (or (= byte (primitive/cast u8 #\newline))
+              (= byte (primitive/cast u8 #\return))))))
+
+(defn c-type-word? [(byte u8)] (-> bool)
+  (or (and (>= byte (primitive/cast u8 #\a)) (<= byte (primitive/cast u8 #\z)))
+      (or (and (>= byte (primitive/cast u8 #\A)) (<= byte (primitive/cast u8 #\Z)))
+          (or (and (>= byte (primitive/cast u8 #\0)) (<= byte (primitive/cast u8 #\9)))
+              (= byte (primitive/cast u8 #\_))))))
+
+;; Empty means end-of-input. Punctuation is one token except `...`, which is one
+;; declarator token. The parser layered above this function owns C grammar.
+(defn c-type-next [(lexer (mut CTypeLexer))] (-> (slice u8))
+  (let [source (load (field lexer source))
+        length (slice/slice-len source)
+        (mut at) (load (field lexer position))]
+    (loop (if (and (< (load at) length) (c-type-space? (slice/slice-get source (load at))))
+              (store! at (+ (load at) 1))
+              (break)))
+    (if (>= (load at) length)
+        (do (store! (field lexer position) length) "")
+        (let [start (load at)
+              first (slice/slice-get source (load at))]
+          (if (c-type-word? first)
+              (do
+                (store! at (+ (load at) 1))
+                (loop (if (and (< (load at) length) (c-type-word? (slice/slice-get source (load at))))
+                          (store! at (+ (load at) 1))
+                          (break))))
+              (if (and (= first (primitive/cast u8 #\.))
+                       (and (< (+ (load at) 2) length)
+                            (and (= (slice/slice-get source (+ (load at) 1)) (primitive/cast u8 #\.))
+                                 (= (slice/slice-get source (+ (load at) 2)) (primitive/cast u8 #\.)))))
+                  (store! at (+ (load at) 3))
+                  (store! at (+ (load at) 1))))
+          (store! (field lexer position) (load at))
+          (slice/subslice source start (load at))))))

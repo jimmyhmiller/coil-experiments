@@ -29,11 +29,18 @@ int from_beta(int value)
 int main(int argc, char **argv)
 {
     struct Pair pair = {3, 5};
+    struct Choice choices[2];
+    choices[0].tag = 1;
+    choices[0].value.number = 20;
+    choices[1].tag = 1;
+    choices[1].value.number = 22;
     int ok = argc > 0 && argv
         && from_alpha(&pair) == 113
         && shared == 8
         && initialized == 7
-        && apply(twice, 9) == 18;
+        && apply(twice, 9) == 18
+        && sum_choices(choices, 2) == 42;
+    report("linked-varargs", ok);
     printf("main=%d\n", ok);
     return !ok;
 }

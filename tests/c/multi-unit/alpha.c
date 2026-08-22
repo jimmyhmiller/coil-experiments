@@ -1,4 +1,5 @@
 #include "api.h"
+#include <stdarg.h>
 #include <stdio.h>
 
 static int counter = 4;
@@ -23,6 +24,14 @@ static int increment(int value)
     return value + counter;
 }
 
+void report(const char *label, ...)
+{
+    va_list arguments;
+    va_start(arguments, label);
+    printf("%s=%d\n", label, va_arg(arguments, int));
+    va_end(arguments);
+}
+
 int from_alpha(struct Pair *pair)
 {
     shared += pair->x;
@@ -32,6 +41,17 @@ int from_alpha(struct Pair *pair)
 int apply(int (*function)(int), int value)
 {
     return function(value);
+}
+
+long sum_choices(struct Choice *choices, int count)
+{
+    long total = 0;
+    int i;
+    for (i = 0; i < count; ++i)
+    {
+        total += choices[i].value.number;
+    }
+    return total;
 }
 
 int call_increment(int value)
