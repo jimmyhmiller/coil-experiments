@@ -77,6 +77,8 @@ def invoke(compiler: str, kind: str, path: str, arg: str) -> tuple[int, str]:
                            capture_output=True, timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
         return 124, f"TIMED OUT after {TIMEOUT}s\n"
+    if kind == "wasm" and p.returncode == 0:
+        return 0, "built wasm\n"
     return p.returncode, p.stdout if p.returncode == 0 else p.stdout + p.stderr
 
 
