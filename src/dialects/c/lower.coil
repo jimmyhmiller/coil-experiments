@@ -89,6 +89,7 @@
    (external-names (hm/HashMap (slice u8) bool))
    (emitted-globals (hm/HashMap (slice u8) bool))
    (record-names (hm/HashMap (slice u8) (slice u8)))
+   (va-list-aliases (hm/HashMap (slice u8) bool))
    (anonymous-records (hm/HashMap (slice u8) (slice u8)))
    (record-nodes (hm/HashMap (slice u8) i64))
    (expression-places (hm/HashMap (slice u8) (slice u8)))
@@ -917,6 +918,17 @@
   (if (text=? (kind c node) "TypedefDecl")
       (let [name (property c node "name")
             spelling (node-type-text c node)]
+        ;; `node-type-text` prefers Clang's desugared spelling, which erases the
+        ;; alias chain a va_list is recognised by. The sugared spelling still
+        ;; names the typedef this one aliases, and C requires it to be declared
+        ;; first, so a single forward pass closes the chain.
+        (let [type-object (ast/ast-field (.tree c) node "type")
+              sugared (if (< type-object 0) "" (property c type-object "qualType"))]
+          (if (and (present? name)
+                   (or (text=? sugared "__builtin_va_list")
+                       (hm/hm-contains? (.va-list-aliases c) sugared)))
+              (hm/hm-put! (mut (.va-list-aliases c)) name true)
+              0))
         (if (and (present? name) (present? spelling) (not (text=? name spelling)))
             (let [parsed (ct/parse-type (.a c) spelling)]
               (if (not (= (ct/type-kind parsed) ct/CTYPE-INVALID))
@@ -1108,12 +1120,22 @@
         (put! (mut b) "i64")
         (type! c (mut b) result))))
 
+;; Only some targets desugar a `va_list` parameter to `__va_list_tag *` in the
+;; spellings Clang reports. Darwin keeps the typedef name and defines it as a
+;; plain `char *`, so there the structural form never appears and structure
+;; alone cannot separate a va_list from any other `char *`. The typedef names
+;; aliasing Clang's universal `__builtin_va_list` are recorded while header
+;; typedefs are collected; recognise those by name.
 (defn va-list-type? [(c (ptr Context)) (value (ptr ct/CType))] (-> bool)
-  (let [resolved (resolved-type c value)]
-    (and (= (ct/type-kind resolved) ct/CTYPE-POINTER)
-         (let [pointee (resolved-type c (ct/type-child resolved))]
-           (and (= (ct/type-kind pointee) ct/CTYPE-RECORD)
-                (text=? (ct/type-name pointee) "__va_list_tag"))))))
+  (if (and (= (ct/type-kind value) ct/CTYPE-NAMED)
+           (or (text=? (ct/type-name value) "__builtin_va_list")
+               (hm/hm-contains? (.va-list-aliases c) (ct/type-name value))))
+      true
+      (let [resolved (resolved-type c value)]
+        (and (= (ct/type-kind resolved) ct/CTYPE-POINTER)
+             (let [pointee (resolved-type c (ct/type-child resolved))]
+               (and (= (ct/type-kind pointee) ct/CTYPE-RECORD)
+                    (text=? (ct/type-name pointee) "__va_list_tag")))))))
 
 (defn function-takes-va-list? [(c (ptr Context)) (value (ptr ct/CType))] (-> bool)
   (and (= (ct/type-kind value) ct/CTYPE-FUNCTION)
@@ -1253,8 +1275,29 @@
         0))
   0)
 
+;; Clang spells the signatures of its own builtins with C++ reference
+;; parameters even in C mode — `__builtin_va_start` is `void (*)(
+;; __builtin_va_list &, ...)`.  Those spellings are not C declarators, and the
+;; calls that carry them are emitted directly rather than through the type
+;; machinery, so the type is never needed.
+(defn reference-spelling? [(spelling (slice u8))] (-> bool)
+  (let [(mut i) 0
+        n (slice/slice-len spelling)
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) n))
+              (break)
+              (do
+                (if (= (primitive/cast i64 (slice/slice-get spelling (load i)))
+                       (primitive/cast i64 38))
+                    (store! found true)
+                    0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
 (defn parseable-node-type? [(c (ptr Context)) (node i64)] (-> bool)
-  (not (str/starts-with (node-type-text c node) "<builtin")))
+  (let [spelling (node-type-text c node)]
+    (and (not (str/starts-with spelling "<builtin"))
+         (not (reference-spelling? spelling)))))
 
 (defn register-function-locals! [(c (ptr Context)) (node i64)] (-> i64)
   (let [k (kind c node)]
@@ -1632,6 +1675,17 @@
                                         (node i64)
                                         (source i64)] (-> i64)
   (let [place (expression-place c node)]
+    ;; A function pointer converted to another function pointer keeps its
+    ;; representation, so the cast is a retype rather than a reinterpretation.
+    ;; Emitting it directly is also the only form available in a constant
+    ;; initializer, where no expression place exists.
+    (if (function-value? c (node-type c source))
+        (do
+          (put! (mut b) "(primitive/cast ")
+          (type! c (mut b) (node-type c node))
+          (put! (mut b) " ")
+          (expr! c (mut b) source)
+          (put! (mut b) ")"))
     (if (not (present? place))
         (do
           (fail! c node "function pointer cast has no reinterpretation storage")
@@ -1659,7 +1713,7 @@
           (type! c (mut b) (node-type c node))
           (put! (mut b) " ")
           (put! (mut b) place)
-          (put! (mut b) "))")))))
+          (put! (mut b) "))"))))))
 
 (defn direct-declaration [(c (ptr Context)) (node i64)] (-> i64)
   (let [k (kind c node)]
@@ -3935,6 +3989,7 @@
     (set! (.external-names c) (hm/hm-new [(slice u8) bool] a (str/str-keyops-borrowed)))
     (set! (.emitted-globals c) (hm/hm-new [(slice u8) bool] a (str/str-keyops-borrowed)))
     (set! (.record-names c) (hm/hm-new [(slice u8) (slice u8)] a (str/str-keyops-borrowed)))
+    (set! (.va-list-aliases c) (hm/hm-new [(slice u8) bool] a (str/str-keyops-borrowed)))
     (set! (.anonymous-records c)
           (hm/hm-new [(slice u8) (slice u8)] a (str/str-keyops-borrowed)))
     (set! (.record-nodes c) (hm/hm-new [(slice u8) i64] a (str/str-keyops-borrowed)))

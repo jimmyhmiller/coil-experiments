@@ -91,7 +91,8 @@
    (typedefs (hm/HashMap (slice u8) (slice u8)))
    (typedef-records (hm/HashMap (slice u8) (slice u8)))
    (records (hm/HashMap (slice u8) i64))
-   (enums (hm/HashMap (slice u8) i64))])
+   (enums (hm/HashMap (slice u8) i64))
+   (va-list-aliases (hm/HashMap (slice u8) bool))])
 
 (defstruct LinkState
   [(a (dyn alloc/Allocator))
@@ -322,7 +323,19 @@
               (if (present? id) (hm/hm-put! (mut (.enums g)) id node) 0)
               (if (present? name) (hm/hm-put! (mut (.enums g)) name node) 0))
           (and (text=? kind "TypedefDecl") (present? name))
-            (let [spelling (node-type-text (.tree g) node)]
+            (let [spelling (node-type-text (.tree g) node)
+                  ;; `node-type-text` prefers Clang's desugared spelling, which
+                  ;; erases the alias chain a va_list is recognised by. The
+                  ;; sugared spelling still names the typedef this one aliases,
+                  ;; and C requires it to be declared first, so a single forward
+                  ;; pass closes the chain.
+                  sugared
+                    (let [object (ast/ast-field (.tree g) node "type")]
+                      (if (< object 0) "" (node-text (.tree g) object "qualType")))]
+              (if (or (text=? sugared "__builtin_va_list")
+                      (hm/hm-contains? (.va-list-aliases g) sugared))
+                  (hm/hm-put! (mut (.va-list-aliases g)) name true)
+                  0)
               (if (not (text=? name spelling))
                   (hm/hm-put! (mut (.typedefs g)) name spelling)
                   (let [(mut i) 0
@@ -400,6 +413,8 @@
           (hm/hm-new [(slice u8) (slice u8)] a (str/str-keyops-borrowed)))
     (set! (.records g) (hm/hm-new [(slice u8) i64] a (str/str-keyops-borrowed)))
     (set! (.enums g) (hm/hm-new [(slice u8) i64] a (str/str-keyops-borrowed)))
+    (set! (.va-list-aliases g)
+          (hm/hm-new [(slice u8) bool] a (str/str-keyops-borrowed)))
     (collect-type-graph! g (ast/ast-root tree))
     (load g)))
 
@@ -956,19 +971,30 @@
                     (break)))))
     (load found)))
 
-(defn va-list-type? [(value (ptr ct/CType))] (-> bool)
-  (and (= (ct/type-kind value) ct/CTYPE-POINTER)
-       (let [pointee (ct/type-child value)]
-         (and (= (ct/type-kind pointee) ct/CTYPE-RECORD)
-              (text=? (ct/type-name pointee) "__va_list_tag")))))
+;; Only some targets desugar a `va_list` parameter to `__va_list_tag *` in the
+;; spellings Clang reports. Darwin keeps the typedef name and defines it as a
+;; plain `char *`, so there the structural form never appears and structure
+;; alone cannot separate a va_list from any other `char *`. The typedef names
+;; that alias Clang's universal `__builtin_va_list` are recorded while the type
+;; graph is collected; recognise those by name.
+(defn va-list-type? [(g (ptr TypeGraph)) (value (ptr ct/CType))] (-> bool)
+  (if (and (= (ct/type-kind value) ct/CTYPE-NAMED)
+           (or (text=? (ct/type-name value) "__builtin_va_list")
+               (hm/hm-contains? (.va-list-aliases g) (ct/type-name value))))
+      true
+      (and (= (ct/type-kind value) ct/CTYPE-POINTER)
+           (let [pointee (ct/type-child value)]
+             (and (= (ct/type-kind pointee) ct/CTYPE-RECORD)
+                  (text=? (ct/type-name pointee) "__va_list_tag"))))))
 
-(defn function-takes-va-list? [(value (ptr ct/CType))] (-> bool)
+(defn function-takes-va-list? [(g (ptr TypeGraph)) (value (ptr ct/CType))] (-> bool)
   (and (= (ct/type-kind value) ct/CTYPE-FUNCTION)
        (let [parameters (ct/type-parameters value)
              count (al/al-len parameters)]
-         (and (> count 0) (va-list-type? (al/al-get parameters (- count 1)))))))
+         (and (> count 0) (va-list-type? g (al/al-get parameters (- count 1)))))))
 
 (defn collect-call! [(s (ptr LinkState))
+                     (g (ptr TypeGraph))
                      (tree ast/Ast)
                      (node i64)
                      (unit i64)
@@ -999,7 +1025,7 @@
                                    (mut (.calls s))
                                    (CallShape :name (copy-text (.a s) target) :types types))))
                   0)
-              (if (and (present? from) (function-takes-va-list? function-type))
+              (if (and (present? from) (function-takes-va-list? g function-type))
                   (al/al-push! (mut (.variadic-forwards s))
                                (VariadicForward :from (copy-text (.a s) from)
                                  :to (copy-text (.a s) target)))
@@ -1012,7 +1038,7 @@
     (loop (if (>= (load i) n)
               (break)
               (do
-                (collect-call! s tree (load current) unit from)
+                (collect-call! s g tree (load current) unit from)
                 (store! current (ast/ast-next-node tree (load current)))
                 (store! i (+ (load i) 1))))))
   0)
@@ -1061,6 +1087,7 @@
                                       true)
                           0)
                       (collect-call! s
+                                     (mut graph)
                                      tree
                                      node
                                      unit
