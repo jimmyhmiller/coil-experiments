@@ -861,19 +861,51 @@
                 (store! i (+ (load i) 1)))))
     0))
 
+;; The tag a typedef introduces is reported two ways. Clang 21 and earlier wrap
+;; the typedef's type in an ElaboratedType carrying `ownedTagDecl`; Clang 22
+;; removed those sugar nodes and instead marks the underlying record or enum
+;; type with `isTagOwned`, naming the declaration through `decl`.
+(defn owned-tag-decl [(c (ptr Context)) (node i64)] (-> i64)
+  (let [elaborated (ast/ast-field (.tree c) node "ownedTagDecl")]
+    (if (>= elaborated 0)
+        elaborated
+        (if (ast/ast-field-bool (.tree c) node "isTagOwned")
+            (ast/ast-field (.tree c) node "decl")
+            -1))))
+
+(defn typedef-owns-tag? [(c (ptr Context)) (node i64)] (-> bool)
+  (let [(mut i) 0
+        n (child-count c node)
+        (mut current) (ast/ast-first-child (.tree c) node)
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) n))
+              (break)
+              (do
+                (if (>= (owned-tag-decl c (load current)) 0) (store! found true) 0)
+                (store! current (ast/ast-next-node (.tree c) (load current)))
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
 (defn collect-typedef! [(c (ptr Context)) (node i64)] (-> i64)
   (if (text=? (kind c node) "TypedefDecl")
       (let [name (property c node "name")
             spelling (node-type-text c node)]
+        ;; Whether this typedef introduces its own tag is a structural fact --
+        ;; the declaration carries an `ownedTagDecl`. Do not infer it from the
+        ;; type spelling: only some Clang releases desugar `typedef struct { …
+        ;; } X;` to a bare `X` that happens to equal the typedef's own name,
+        ;; and the rest report `struct X`, which would take the alias path and
+        ;; name a record that is never defined. Searching for the owned tag
+        ;; first is correct either way, and falls back to the alias when the
+        ;; typedef genuinely names another type.
         (if (present? name)
-            (if (text=? name spelling)
-                (let [(mut i) 0
-                      n (child-count c node)
-                      (mut current) (ast/ast-first-child (.tree c) node)
-                      (mut linked) false]
+            (let [(mut i) 0
+                  n (child-count c node)
+                  (mut current) (ast/ast-first-child (.tree c) node)
+                  (mut linked) false]
                   (loop (if (or (load linked) (>= (load i) n))
                             (break)
-                            (let [owned (ast/ast-field (.tree c) (load current) "ownedTagDecl")]
+                            (let [owned (owned-tag-decl c (load current))]
                               (if (>= owned 0)
                                   (if (text=? (kind c owned) "EnumDecl")
                                       (do
@@ -903,10 +935,9 @@
                                   0)
                               (store! current (ast/ast-next-node (.tree c) (load current)))
                               (store! i (+ (load i) 1)))))
-                  (if (not (load linked))
-                      (hm/hm-put! (mut (.typedefs c)) name (parse-type c node spelling))
-                      0))
-                (hm/hm-put! (mut (.typedefs c)) name (parse-type c node spelling)))
+              (if (not (load linked))
+                  (hm/hm-put! (mut (.typedefs c)) name (parse-type c node spelling))
+                  0))
             0))
       0)
   0)
@@ -929,7 +960,14 @@
                        (hm/hm-contains? (.va-list-aliases c) sugared)))
               (hm/hm-put! (mut (.va-list-aliases c)) name true)
               0))
-        (if (and (present? name) (present? spelling) (not (text=? name spelling)))
+        ;; A typedef that introduces its own tag is linked to that record by
+        ;; collect-typedef!, which runs later with the record table populated.
+        ;; Claiming it here would bind the name to the opaque byte below,
+        ;; because no record is known yet, and that binding wins in `type!`.
+        (if (and (present? name)
+                 (present? spelling)
+                 (not (text=? name spelling))
+                 (not (typedef-owns-tag? c node)))
             (let [parsed (ct/parse-type (.a c) spelling)]
               (if (not (= (ct/type-kind parsed) ct/CTYPE-INVALID))
                   (if (and (or (= (ct/type-kind parsed) ct/CTYPE-RECORD)
