@@ -1,0 +1,123 @@
+(module experiments.csp.lang)
+(import "coil.primitive" :as primitive)
+(import "experiments.coop.scheduler" :use * :reexport)
+
+(extern malloc :cc c [i64] (-> (ptr i8)))
+(extern free :cc c [(ptr i8)] (-> i64))
+(extern abort :cc c [] (-> i64))
+
+;; Channels are scheduler-local.  Consequently their queues need no locks: a
+;; channel operation runs to completion before the next task transition.
+(defstruct Channel
+  [(buffer (ptr i64)) (capacity i64) (head i64) (tail i64) (count i64)
+   (closed bool) (senders WaitQueue) (receivers WaitQueue)
+   (send-parks i64) (receive-parks i64) (wakes i64)])
+
+(defn channel-new [(capacity i64)] (-> (ptr Channel))
+  (if (<= capacity 0) (abort) 0)
+  (let [channel (primitive/cast (ptr Channel) (malloc (primitive/sizeof Channel)))
+        buffer (primitive/cast (ptr i64) (malloc (* capacity (primitive/sizeof i64))))]
+    (if (or (= (primitive/cast i64 channel) 0) (= (primitive/cast i64 buffer) 0)) (abort) 0)
+    (set! (.buffer channel) buffer)
+    (set! (.capacity channel) capacity)
+    (set! (.head channel) 0) (set! (.tail channel) 0) (set! (.count channel) 0)
+    (set! (.closed channel) false)
+    (set! (.send-parks channel) 0) (set! (.receive-parks channel) 0) (set! (.wakes channel) 0)
+    (wait-queue-init! (field channel senders))
+    (wait-queue-init! (field channel receivers))
+    channel))
+
+;; Results are 1 = committed, 0 = parked, -1 = closed.  A generated process
+;; leaves its program counter unchanged on 0 and retries after being woken.
+(defn channel-send-step! [(channel (ptr Channel)) (task (ptr Task)) (value i64)] (-> i64)
+  (if (.closed channel)
+      -1
+      (if (< (.count channel) (.capacity channel))
+          (do
+            (set! (primitive/index (.buffer channel) (.tail channel)) value)
+            (set! (.tail channel) (% (+ (.tail channel) 1) (.capacity channel)))
+            (set! (.count channel) (+ (.count channel) 1))
+            (if (= (primitive/cast i64 (.head (field channel receivers))) 0) 0
+                (do (set! (.wakes channel) (+ (.wakes channel) 1))
+                    (wait-queue-wake-one! (field channel receivers))))
+            1)
+          (do (set! (.send-parks channel) (+ (.send-parks channel) 1))
+              (task-park! (field channel senders) task) 0))))
+
+(defn channel-receive-step! [(channel (ptr Channel)) (task (ptr Task)) (out (ptr i64))] (-> i64)
+  (if (> (.count channel) 0)
+      (do
+        (set! (primitive/index out 0) (load (primitive/index (.buffer channel) (.head channel))))
+        (set! (.head channel) (% (+ (.head channel) 1) (.capacity channel)))
+        (set! (.count channel) (- (.count channel) 1))
+        (if (= (primitive/cast i64 (.head (field channel senders))) 0) 0
+            (do (set! (.wakes channel) (+ (.wakes channel) 1))
+                (wait-queue-wake-one! (field channel senders))))
+        1)
+      (if (.closed channel)
+          -1
+          (do (set! (.receive-parks channel) (+ (.receive-parks channel) 1))
+              (task-park! (field channel receivers) task) 0))))
+
+(defn channel-close! [(channel (ptr Channel))] (-> i64)
+  (if (.closed channel) 0
+      (do (set! (.closed channel) true)
+          (wait-queue-wake-all! (field channel senders))
+          (wait-queue-wake-all! (field channel receivers)) 0)))
+
+(defn channel-destroy! [(channel (ptr Channel))] (-> i64)
+  (free (primitive/cast (ptr i8) (.buffer channel)))
+  (free (primitive/cast (ptr i8) channel)))
+
+;; Compile the deliberately small process DSL into one transition per scheduler
+;; turn.  This is code generation, rather than aliases around blocking calls.
+;; Clauses are: (state N (send ch value next closed)), (receive ch out next closed),
+;; (set place value next), (branch test yes no), (close ch next), and (done).
+(defn compile-operation [(operation Code) (task Code)] (-> Code)
+  (let [kind (primitive/code-nth operation 0)]
+    (if (primitive/code-eq kind `send)
+        `(let [status (channel-send-step! ~(primitive/code-nth operation 1) ~task ~(primitive/code-nth operation 2))]
+           (if (= status 1) (set! (.state ~task) ~(primitive/code-nth operation 3))
+               (if (= status -1) (set! (.state ~task) ~(primitive/code-nth operation 4)) 0)))
+        (if (primitive/code-eq kind `receive)
+            `(let [status (channel-receive-step! ~(primitive/code-nth operation 1) ~task
+                                                  ~(primitive/code-nth operation 2))]
+               (if (= status 1) (set! (.state ~task) ~(primitive/code-nth operation 3))
+                   (if (= status -1) (set! (.state ~task) ~(primitive/code-nth operation 4)) 0)))
+            (if (primitive/code-eq kind `set)
+                `(do (set! ~(primitive/code-nth operation 1) ~(primitive/code-nth operation 2))
+                     (set! (.state ~task) ~(primitive/code-nth operation 3)))
+                (if (primitive/code-eq kind `branch)
+                    `(if ~(primitive/code-nth operation 1)
+                         (set! (.state ~task) ~(primitive/code-nth operation 2))
+                         (set! (.state ~task) ~(primitive/code-nth operation 3)))
+                    (if (primitive/code-eq kind `close)
+                        `(do (channel-close! ~(primitive/code-nth operation 1))
+                             (set! (.state ~task) ~(primitive/code-nth operation 2)))
+                        (if (primitive/code-eq kind `done)
+                            `(task-complete! ~task)
+                            (primitive/error "unknown CSP process operation")))))))))
+
+(defn compile-states [(states Code) (i i64) (task Code)] (-> Code)
+  (if (>= i (primitive/code-count states))
+      `(task-complete! ~task)
+      (let [clause (primitive/code-nth states i)]
+        `(if (= (.state ~task) ~(primitive/code-nth clause 0))
+             ~(compile-operation (primitive/code-nth clause 1) task)
+             ~(compile-states states (+ i 1) task)))))
+
+(defn defprocess [(name Code) (parameter Code) & (states Code)] (-> Code)
+  (let [binding (primitive/code-nth parameter 0)
+        context-name (primitive/code-nth binding 0)
+        context-type (primitive/code-nth binding 1)
+        task (primitive/fresh-identifier "csp_task")]
+    `(defn ~name [(~task (ptr Task))] (-> i64)
+       (let [~context-name (primitive/cast ~context-type (.context ~task))]
+         ~(compile-states states 0 task) 0))))
+
+(defn go [(scheduler Code) (task Code) (process Code) (context Code)] (-> Code)
+  `(task-init! ~task ~scheduler (primitive/fnptr-of ~process)
+                    (primitive/cast (ptr i8) ~context)))
+
+(export Scheduler Task WaitQueue Channel scheduler-init! scheduler-run! channel-new channel-send-step!
+        channel-receive-step! channel-close! channel-destroy! defprocess go)

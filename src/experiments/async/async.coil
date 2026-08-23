@@ -1,0 +1,89 @@
+(module experiments.async.lang)
+(import "coil.primitive" :as primitive)
+(import "experiments.coop.scheduler" :as coop)
+
+(extern malloc :cc c [i64] (-> (ptr i8)))
+(extern free :cc c [(ptr i8)] (-> i64))
+(extern abort :cc c [] (-> i64))
+
+;; Deliberately small async dialect: arguments, saved locals, and results are
+;; i64.  There are no exceptions or cancellation.  A Future owns one heap job;
+;; it may have many waiters, but must be destroyed exactly once, after it is
+;; complete and after the scheduler has stopped touching its embedded Task.
+(defstruct Future
+  [(task coop/Task)
+   (waiters coop/WaitQueue)
+   (result i64)
+   (complete bool)])
+
+(defn future-ready? [(future (ptr Future))] (-> bool) (.complete future))
+(defn future-result [(future (ptr Future))] (-> i64)
+  (if (.complete future) (.result future) (abort)))
+
+;; An await transition is atomic because the scheduler and all async tasks run
+;; on one native thread.  False means the generated machine was parked; its
+;; caller must return from the current step.  Completion enqueues it again.
+(defn future-await! [(future (ptr Future)) (task (ptr coop/Task))
+                     (resume-state i64)] (-> bool)
+  (set! (.state task) resume-state)
+  (if (.complete future)
+      true
+      (do
+        (coop/task-park! (field future waiters) task)
+        false)))
+
+(defn future-complete! [(future (ptr Future)) (value i64)] (-> i64)
+  (if (.complete future)
+      (abort)
+      (do
+        (set! (.result future) value)
+        (set! (.complete future) true)
+        (coop/wait-queue-wake-all! (field future waiters))
+        (coop/task-complete! (field future task)))))
+
+(defn future-destroy! [(future (ptr Future))] (-> i64)
+  (if (not (.complete future)) (abort) 0)
+  ;; Future is intentionally the first field of every generated job.
+  (free (primitive/cast (ptr i8) future)))
+
+;; (defasync-i64 f [(x i64)] [(saved i64) ...] body...) generates a heap
+;; activation record, trampoline, and launcher.  `body` is the transition
+;; function and can inspect/set (.state task), saved job fields, call
+;; future-await!, and finish with future-complete!.  Returning without parking
+;; or completing is a cooperative yield.  This explicit transition DSL keeps
+;; suspension points visible while the metaprogram supplies the lifecycle and
+;; resumable-machine machinery (rather than aliasing await to a blocking call).
+(defn defasync-i64 [(name Code) (params Code) (locals Code) (bindings Code) & (body Code)] (-> Code)
+  (if (or (!= (primitive/code-count params) 1)
+          (!= (primitive/code-count (primitive/code-nth params 0)) 2)
+          (not (primitive/code-eq (primitive/code-nth (primitive/code-nth params 0) 1) `i64)))
+      (primitive/error "defasync-i64 requires exactly one i64 argument")
+      (let [param (primitive/code-nth params 0)
+            arg-name (primitive/code-nth param 0)
+            job-name (primitive/syntax->datum (primitive/code-symbol name "--machine"))
+            step-name (primitive/syntax->datum (primitive/code-symbol name "--step"))
+            raw-task (primitive/fresh-identifier "async_task")
+            task-name (primitive/code-nth bindings 0)
+            job (primitive/code-nth bindings 1)
+            scheduler (primitive/fresh-identifier "async_scheduler")]
+        `(do
+           (defstruct ~job-name [(future Future) (argument i64) ~@locals])
+           (defn ~step-name [(~raw-task (ptr coop/Task))] (-> i64)
+             (block :async-step
+               (let [~job (primitive/cast (ptr ~job-name) (.context ~raw-task))
+                     ~task-name ~raw-task]
+                 ~@body)))
+           (defn ~name [(~scheduler (ptr coop/Scheduler)) ~param] (-> (ptr Future))
+             (let [~job (primitive/cast (ptr ~job-name) (malloc (primitive/sizeof ~job-name)))]
+               (if (= (primitive/cast i64 ~job) 0) (abort) 0)
+               (set! (.argument ~job) ~arg-name)
+               (set! (.result (field ~job future)) 0)
+               (set! (.complete (field ~job future)) false)
+               (coop/wait-queue-init! (field (field ~job future) waiters))
+               (coop/task-init! (field (field ~job future) task) ~scheduler
+                                (primitive/fnptr-of ~step-name)
+                                (primitive/cast (ptr i8) ~job))
+               (field ~job future)))))))
+
+(export Future future-ready? future-result future-await! future-complete!
+        future-destroy! defasync-i64)

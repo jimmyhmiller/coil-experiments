@@ -1,0 +1,251 @@
+(module experiments.dataflow.lang)
+(import "coil.primitive" :as primitive)
+(import "experiments.coop.scheduler" :as coop)
+
+(extern malloc :cc c [i64] (-> (ptr i8)))
+(extern free :cc c [(ptr i8)] (-> i64))
+(extern abort :cc c [] (-> i64))
+
+(defsum BindResult (Bound) (AlreadyBound) (Conflict [(existing i64) (attempted i64)]))
+
+;; Logic variables and dataflow threads are scheduler-local. Reading an unbound
+;; variable parks the current lightweight task; unification wakes every reader.
+(defstruct DataflowVar
+  [(waiters coop/WaitQueue)
+   (value i64)
+   (bound bool)])
+
+(defstruct DataflowRule
+  [(task coop/Task)
+   (left (ptr DataflowVar))
+   (right (ptr DataflowVar))
+   (output (ptr DataflowVar))
+   (left-value i64)
+   (right-value i64)
+   (operation i64)])
+
+(defn dataflow-var-new [] (-> (ptr DataflowVar))
+  (let [variable (primitive/cast (ptr DataflowVar) (malloc (primitive/sizeof DataflowVar)))]
+    (if (= (primitive/cast i64 variable) 0) (abort) 0)
+    (coop/wait-queue-init! (field variable waiters))
+    (set! (.value variable) 0)
+    (set! (.bound variable) false)
+    variable))
+
+(defn dataflow-var-destroy! [(variable (ptr DataflowVar))] (-> i64)
+  (free (primitive/cast (ptr i8) variable)))
+
+(defn dataflow-bind! [(variable (ptr DataflowVar)) (value i64)] (-> BindResult)
+  (if (.bound variable)
+      (if (= (.value variable) value)
+          (AlreadyBound)
+          (Conflict (.value variable) value))
+      (do
+        (set! (.value variable) value)
+        (set! (.bound variable) true)
+        (coop/wait-queue-wake-all! (field variable waiters))
+        (Bound))))
+
+(defn dataflow-read-step! [(variable (ptr DataflowVar))
+                           (task (ptr coop/Task))
+                           (out (ptr i64))] (-> bool)
+  (if (.bound variable)
+      (do (set! (primitive/index out 0) (.value variable)) true)
+      (do (coop/task-park! (field variable waiters) task) false)))
+
+(defn dataflow-rule-step [(task (ptr coop/Task))] (-> i64)
+  (block :rule-step
+    (let [rule (primitive/cast (ptr DataflowRule) (.context task))]
+      (if (= (.state task) 0)
+          (if (dataflow-read-step! (.left rule) task (field rule left-value))
+              (set! (.state task) 1)
+              (return-from :rule-step 0))
+          0)
+      (if (= (.state task) 1)
+          (if (dataflow-read-step! (.right rule) task (field rule right-value))
+              (set! (.state task) 2)
+              (return-from :rule-step 0))
+          0)
+      (if (= (.state task) 2)
+          (let [value (if (= (.operation rule) 1)
+                          (* (.left-value rule) (.right-value rule))
+                          (if (= (.operation rule) 2)
+                              (/ (* (.left-value rule) (.right-value rule)) 100)
+                              (+ (.left-value rule) (.right-value rule))))]
+            (dataflow-bind! (.output rule) value)
+            (coop/task-complete! task))
+          0)
+      0)))
+
+(defn dataflow-rules-new [(count i64)] (-> (ptr DataflowRule))
+  (let [rules (primitive/cast (ptr DataflowRule)
+                              (malloc (* count (primitive/sizeof DataflowRule))))]
+    (if (= (primitive/cast i64 rules) 0) (abort) 0)
+    rules))
+
+(defn dataflow-rule-at [(rules (ptr DataflowRule)) (index i64)] (-> (ptr DataflowRule))
+  (primitive/index rules index))
+
+(defn dataflow-rule-configure! [(rule (ptr DataflowRule))
+                               (scheduler (ptr coop/Scheduler))
+                               (left (ptr DataflowVar))
+                               (right (ptr DataflowVar))
+                               (output (ptr DataflowVar))
+                               (operation i64)] (-> i64)
+  (set! (.left rule) left)
+  (set! (.right rule) right)
+  (set! (.output rule) output)
+  (set! (.left-value rule) 0)
+  (set! (.right-value rule) 0)
+  (set! (.operation rule) operation)
+  (coop/task-init! (field rule task) scheduler
+                   (primitive/fnptr-of dataflow-rule-step)
+                   (primitive/cast (ptr i8) rule)))
+
+(defn dataflow-rules-destroy! [(rules (ptr DataflowRule))] (-> i64)
+  (free (primitive/cast (ptr i8) rules)))
+
+(defn dataflow-scheduler-new [] (-> (ptr coop/Scheduler))
+  (let [scheduler (primitive/cast (ptr coop/Scheduler) (malloc (primitive/sizeof coop/Scheduler)))]
+    (if (= (primitive/cast i64 scheduler) 0) (abort) 0)
+    (coop/scheduler-init! scheduler)
+    scheduler))
+
+(defn dataflow-resolve! [(scheduler (ptr coop/Scheduler))
+                        (variable (ptr DataflowVar))] (-> i64)
+  (if (not (.bound variable)) (coop/scheduler-run! scheduler) true)
+  (if (.bound variable) (.value variable) (abort)))
+
+(defn dataflow-finish! [(scheduler (ptr coop/Scheduler))] (-> i64)
+  (if (coop/scheduler-run! scheduler)
+      (do (free (primitive/cast (ptr i8) scheduler)) 0)
+      (abort)))
+
+;; ---- Oz surface compiler --------------------------------------------------
+(defn oz-name? [(name Code) (names Code) (i i64) (n i64)] (-> bool)
+  (if (>= i n) false
+      (if (primitive/code-eq name (primitive/code-nth names i)) true
+          (oz-name? name names (+ i 1) n))))
+
+(defn oz-thread? [(form Code)] (-> bool)
+  (and (primitive/code-list? form)
+       (and (= (primitive/code-count form) 2)
+            (primitive/code-eq (primitive/code-nth form 0) `thread))))
+
+(defn oz-rule [(form Code)] (-> Code)
+  (let [equation (primitive/code-nth form 1)]
+    (if (or (not (primitive/code-list? equation)) (!= (primitive/code-count equation) 3))
+        (primitive/error "Oz thread must contain (= output expression)")
+        (let [output (primitive/code-nth equation 1)
+              expression (primitive/code-nth equation 2)]
+          (if (or (not (primitive/code-list? expression)) (!= (primitive/code-count expression) 3))
+              (primitive/error "Oz equation currently requires a binary expression")
+              (let [operation (primitive/code-nth expression 0)
+                    left (primitive/code-nth expression 1)
+                    right (primitive/code-nth expression 2)]
+                (if (primitive/code-eq operation `+)
+                    `(sum ~output ~left ~right)
+                    (if (primitive/code-eq operation `*)
+                        `(product ~output ~left ~right)
+                        (if (and (primitive/code-eq operation `/)
+                                 (and (primitive/code-list? left)
+                                      (and (= (primitive/code-count left) 3)
+                                           (and (primitive/code-eq (primitive/code-nth left 0) `*)
+                                                (and (primitive/code-int? right)
+                                                     (= (primitive/code-int right) 100))))))
+                            `(percent ~output ~(primitive/code-nth left 1)
+                                              ~(primitive/code-nth left 2))
+                            (primitive/error "Oz equations support +, *, and (* X Y) / 100"))))))))))
+
+(defn oz-rules [(forms Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `[]
+      (let [form (primitive/code-nth forms i)]
+        (if (oz-thread? form)
+            `[~(oz-rule form) ~@(oz-rules forms (+ i 1) n)]
+            (oz-rules forms (+ i 1) n)))))
+
+(defn oz-bindings [(names Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `[]
+      `[~(primitive/code-nth names i) (dataflow-var-new)
+        ~@(oz-bindings names (+ i 1) n)]))
+
+(defn oz-destroys [(names Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+      `((dataflow-var-destroy! ~(primitive/code-nth names i))
+        ~@(oz-destroys names (+ i 1) n))))
+
+(defn oz-rule-operation [(rule Code)] (-> i64)
+  (let [operation (primitive/code-nth rule 0)]
+    (if (primitive/code-eq operation `sum) 0
+        (if (primitive/code-eq operation `product) 1 2))))
+
+(defn oz-configure [(rules Code) (storage Code) (scheduler Code)
+                    (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+      (let [rule (primitive/code-nth rules i)]
+        `((dataflow-rule-configure!
+            (dataflow-rule-at ~storage ~i) ~scheduler
+            ~(primitive/code-nth rule 2) ~(primitive/code-nth rule 3)
+            ~(primitive/code-nth rule 1) ~(oz-rule-operation rule))
+          ~@(oz-configure rules storage scheduler (+ i 1) n)))))
+
+(defn oz-expression-items [(form Code) (names Code) (scheduler Code)
+                           (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+      `(~(oz-expression (primitive/code-nth form i) names scheduler)
+        ~@(oz-expression-items form names scheduler (+ i 1) n))))
+
+(defn oz-expression [(form Code) (names Code) (scheduler Code)] (-> Code)
+  (if (and (primitive/code-sym? form)
+           (oz-name? form names 0 (primitive/code-count names)))
+      `(dataflow-resolve! ~scheduler ~form)
+      (if (or (primitive/code-list? form) (primitive/code-vector? form))
+          (if (and (primitive/code-list? form)
+                   (and (= (primitive/code-count form) 3)
+                        (and (primitive/code-eq (primitive/code-nth form 0) `=)
+                             (oz-name? (primitive/code-nth form 1)
+                                       names 0 (primitive/code-count names)))))
+              `(dataflow-bind! ~(primitive/code-nth form 1)
+                               ~(oz-expression (primitive/code-nth form 2) names scheduler))
+              (let [items (oz-expression-items form names scheduler 0
+                                               (primitive/code-count form))]
+                (if (primitive/code-vector? form) `[~@items] `(~@items))))
+          form)))
+
+(defn oz-body [(forms Code) (names Code) (scheduler Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+      (let [form (primitive/code-nth forms i)]
+        (if (oz-thread? form)
+            (oz-body forms names scheduler (+ i 1) n)
+            `(~(oz-expression form names scheduler)
+              ~@(oz-body forms names scheduler (+ i 1) n))))))
+
+(defn oz [(names Code) & (forms Code)] (-> Code)
+  (if (not (primitive/code-vector? names))
+      (primitive/error "oz requires a vector of logic-variable names")
+      (let [rules (oz-rules forms 0 (primitive/code-count forms))
+            rule-count (primitive/code-count rules)
+            scheduler (primitive/fresh-identifier "oz_scheduler")
+            storage (primitive/fresh-identifier "oz_rules")
+            result (primitive/fresh-identifier "oz_result")]
+        `(let [~scheduler (dataflow-scheduler-new)
+               ~storage (dataflow-rules-new ~rule-count)
+               ~@(oz-bindings names 0 (primitive/code-count names))]
+           ~@(oz-configure rules storage scheduler 0 rule-count)
+           ;; Give every equation one turn now: unbound inputs genuinely park.
+           (let [initially-finished (coop/scheduler-run! ~scheduler)]
+             (if (and (> ~rule-count 0)
+                      (or initially-finished
+                          (or (!= (.steps ~scheduler) ~rule-count)
+                              (!= (.live ~scheduler) ~rule-count))))
+                 (abort)
+                 0))
+           (let [~result (do ~@(oz-body forms names scheduler 0
+                                        (primitive/code-count forms)))]
+             (dataflow-finish! ~scheduler)
+             (dataflow-rules-destroy! ~storage)
+             ~@(oz-destroys names 0 (primitive/code-count names))
+             ~result)))))
+
+(export BindResult Bound AlreadyBound Conflict DataflowVar DataflowRule
+        dataflow-bind! dataflow-resolve! oz)

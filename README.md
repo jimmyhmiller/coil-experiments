@@ -46,6 +46,14 @@ units and verifies its exact 1,000-frame framebuffer hash. See
 - `gc-dialect/` — explicit-root garbage collection as a dialect
 - `transparent-gc/` — the follow-on transform that inserts the roots
 - `httptap/` — HTTP interception as a whole-program transform, three sinks
+- `coop/` — shared FIFO scheduler for lightweight resumable computations
+- `async/` — generated activation records; `await` parks the current computation
+- `csp/` — Go-style processes with parking, bounded channels, and backpressure
+- `dataflow/` — Oz-style logic variables that suspend and wake dataflow threads
+
+The three concurrency dialects include runnable business-shaped examples and a
+design/tradeoff discussion in
+[`docs/CONCURRENCY_METAPROGRAMS.md`](docs/CONCURRENCY_METAPROGRAMS.md).
 
 ### `tests/` and `scripts/`
 `tests/staged-meta/` holds the staged-metacompilation bridge that computes
