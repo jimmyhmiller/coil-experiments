@@ -92,7 +92,8 @@
    (typedef-records (hm/HashMap (slice u8) (slice u8)))
    (records (hm/HashMap (slice u8) i64))
    (enums (hm/HashMap (slice u8) i64))
-   (va-list-aliases (hm/HashMap (slice u8) bool))])
+   (va-list-aliases (hm/HashMap (slice u8) bool))
+   (expanding (al/ArrayList (slice u8)))])
 
 (defstruct LinkState
   [(a (dyn alloc/Allocator))
@@ -101,6 +102,8 @@
    (globals (hm/HashMap (slice u8) GlobalLink))
    (function-names (al/ArrayList (slice u8)))
    (global-names (al/ArrayList (slice u8)))
+   (record-definitions (hm/HashMap (slice u8) bool))
+   (record-definition-names (al/ArrayList (slice u8)))
    (constructors (al/ArrayList (slice u8)))
    (destructors (al/ArrayList (slice u8)))
    (static-initializers (al/ArrayList (slice u8)))
@@ -427,6 +430,7 @@
     (set! (.enums g) (hm/hm-new [(slice u8) i64] a (str/str-keyops-borrowed)))
     (set! (.va-list-aliases g)
           (hm/hm-new [(slice u8) bool] a (str/str-keyops-borrowed)))
+    (set! (.expanding g) (al/al-new [(slice u8)] a))
     (collect-type-graph! g (ast/ast-root tree))
     (load g)))
 
@@ -537,7 +541,32 @@
               (set! (.bits result) (ct/type-bits value))
               result))))
 
+(defn expanding? [(g (ptr TypeGraph)) (id (slice u8))] (-> bool)
+  (let [(mut i) 0
+        n (al/al-len (.expanding g))
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) n))
+              (break)
+              (do
+                (if (text=? (al/al-get (.expanding g) (load i)) id) (store! found true) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+;; A record reached while it is already being expanded is recorded as a
+;; reference to its tag, the same shape a pointer to it produces. Without this
+;; a structure that reaches itself never terminates: a field holding a function
+;; pointer expands that function's parameters, and a parameter pointing back at
+;; the structure is expanded rather than referenced, so the walk re-enters the
+;; record it started from. SDL's SDL_RWops is exactly that shape -- a record of
+;; function pointers, each taking a pointer to the record.
+(defn link-record-cycle [(g (ptr TypeGraph)) (node i64)] (-> (ptr LinkType))
+  (let [reference (new-link-type g LINK-TAG-REFERENCE)]
+    (set! (.name reference) (copy-text (.a g) (node-text (.tree g) node "name")))
+    reference))
+
 (defn link-record-from [(g (ptr TypeGraph)) (node i64)] (-> (ptr LinkType))
+  (if (expanding? g (node-text (.tree g) node "id"))
+      (link-record-cycle g node)
   (let [tag (node-text (.tree g) node "tagUsed")
         result
           (new-link-type g
@@ -549,6 +578,7 @@
         (mut current) (ast/ast-first-child (.tree g) node)]
     (set! (.name result) (copy-text (.a g) (node-text (.tree g) node "name")))
     (set! (.attributes result) (copy-text (.a g) (layout-attributes g node)))
+    (al/al-push! (mut (.expanding g)) (copy-text (.a g) (node-text (.tree g) node "id")))
     (loop (if (>= (load i) n)
               (break)
               (do
@@ -572,7 +602,8 @@
                     0)
                 (store! current (ast/ast-next-node (.tree g) (load current)))
                 (store! i (+ (load i) 1)))))
-    result))
+    (al/al-pop! [(slice u8)] (mut (.expanding g)))
+    result)))
 
 (defn link-enum-from [(g (ptr TypeGraph)) (node i64)] (-> (ptr LinkType))
   (let [result (new-link-type g ct/CTYPE-ENUM)
@@ -1055,7 +1086,51 @@
                 (store! i (+ (load i) 1))))))
   0)
 
+
+;; Which records the program defines anywhere, so lowering can tell a record it
+;; merely has not seen in this unit from one that is never defined at all. Only
+;; the latter is an opaque handle whose ABI is a byte; the former still needs
+;; the shared name, or units would disagree on the field's type.
+(defn collect-record-definitions! [(s (ptr LinkState)) (tree ast/Ast) (node i64)] (-> i64)
+  (if (and (text=? (node-kind tree node) "RecordDecl")
+           (ast/ast-field-bool tree node "completeDefinition"))
+      (let [name (node-text tree node "name")]
+        (if (and (present? name) (not (hm/hm-contains? (.record-definitions s) name)))
+            (let [owned (copy-text (.a s) name)]
+              (hm/hm-put! (mut (.record-definitions s)) owned true)
+              (al/al-push! (mut (.record-definition-names s)) owned))
+            0))
+      0)
+  (if (or (text=? (node-kind tree node) "TranslationUnitDecl")
+          (or (text=? (node-kind tree node) "RecordDecl")
+              (or (text=? (node-kind tree node) "TypedefDecl")
+                  (text=? (node-kind tree node) "EnumDecl"))))
+      (let [(mut i) 0
+            n (ast/ast-children-count tree node)
+            (mut current) (ast/ast-first-child tree node)]
+        (loop (if (>= (load i) n)
+                  (break)
+                  (do
+                    (collect-record-definitions! s tree (load current))
+                    (store! current (ast/ast-next-node tree (load current)))
+                    (store! i (+ (load i) 1))))))
+      0)
+  0)
+
+(defn record-definition-lines [(s (ptr LinkState))] (-> (slice u8))
+  (let [(mut b) (str/sb-new (.a s))
+        (mut i) 0]
+    (put! (mut b) "\n")
+    (loop (if (>= (load i) (al/al-len (.record-definition-names s)))
+              (break)
+              (do
+                (put! (mut b) (al/al-get (.record-definition-names s) (load i)))
+                (put! (mut b) "\n")
+                (store! i (+ (load i) 1)))))
+    (finish (mut b))))
+
 (defn index-unit! [(s (ptr LinkState)) (tree ast/Ast) (unit i64)] (-> i64)
+  (collect-record-definitions! s tree (ast/ast-root tree))
   (let [(mut graph) (type-graph (.a s) tree)
         root (ast/ast-root tree)
         (mut i) 0
@@ -1126,7 +1201,18 @@
               (break)
               (let [source (al/al-get (.sources o) (load i))]
                 (match (clang/clang-unit (.a s) source (clang-flags o))
-                  (Err [_] (fail-link! s (concat2 (.a s) "Clang rejected " source)))
+                  (Err [problem]
+                       (fail-link! s
+                                   (concat3 (.a s)
+                                            source
+                                            ": "
+                                            (match problem
+                                              (clang/ClangExecuteFailed [] "could not run clang")
+                                              (clang/ClangOutputTooLarge []
+                                                "clang's typed AST exceeded the capture limit")
+                                              (clang/ClangRejected [] "clang rejected this translation unit")
+                                              (clang/ClangInvalidJson []
+                                                "clang's typed AST was not valid JSON")))))
                   (Ok [received]
                       (do
                         (index-unit! s (clang/clang-unit-ast received) (load i))
@@ -1408,6 +1494,7 @@
         (mut declarations) (hm/hm-new [(slice u8) (slice u8)] (.a s) (str/str-keyops-borrowed))
         defined (names-lines s)
         defined-globals (defined-global-lines s)
+        defined-records (record-definition-lines s)
         reachable (reachable-lines s)
         variadic-specs (variadic-spec-lines s)
         (mut i) 0]
@@ -1424,6 +1511,7 @@
                           :wrap-main false
                           :defined-functions defined
                           :defined-globals defined-globals
+                          :defined-records defined-records
                           :owned-globals (owned-global-lines s (load i))
                           :emit-functions reachable
                           :variadic-specs variadic-specs)]
@@ -1503,6 +1591,9 @@
           (store! state (primitive/zeroed LinkState))
           (set! (.a state) a)
           (set! (.roots state) (root-lines a (mut options)))
+          (set! (.record-definitions state)
+                (hm/hm-new [(slice u8) bool] a (str/str-keyops-borrowed)))
+          (set! (.record-definition-names state) (al/al-new [(slice u8)] a))
           (set! (.functions state) (hm/hm-new [(slice u8) FunctionLink] a (str/str-keyops-borrowed)))
           (set! (.globals state) (hm/hm-new [(slice u8) GlobalLink] a (str/str-keyops-borrowed)))
           (set! (.function-names state) (al/al-new [(slice u8)] a))
