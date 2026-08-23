@@ -75,7 +75,11 @@ def main() -> int:
     source_root = prepare_sources()
     prepare_wad()
     sources = source_files(source_root)
-    common = ["-DNORMALUNIX", "-DLINUX", "-DSNDSERV", "-D_DEFAULT_SOURCE", f"-I{source_root}"]
+    # Apple's headers redirect the string and stdio functions to _FORTIFY_SOURCE
+    # builtins (__builtin___memcpy_chk and friends) that the frontend does not
+    # implement. Doom does not depend on the checked variants.
+    common = ["-DNORMALUNIX", "-DLINUX", "-DSNDSERV", "-D_DEFAULT_SOURCE",
+              "-D_FORTIFY_SOURCE=0", f"-I{source_root}"]
     coil = CACHE / "doom-coil"
     command = [sys.executable, str(ROOT / "scripts/c-build.py"),
                "--compiler", args.compiler]
