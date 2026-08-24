@@ -56,5 +56,30 @@ int main(void) {
     for (int j = 0; j < 700; j++) table[j].pad[0] = j;
     small_index = 650;
     printf("big=%d\n", bigs[small_index].pad[0]);
+
+    /* A compound update whose target has its own side effect: the target is
+     * named once, so it steps once. */
+    int acc[6] = {1, 2, 3, 4, 5, 6};
+    int *ap = acc;
+    *ap++ += 10;
+    *ap++ += 20;
+    ++*ap;
+    (*ap)++;
+    printf("acc %d %d %d %d ap=%d\n", acc[0], acc[1], acc[2], acc[3], (int)(ap - acc));
+
+    int idx = 0;
+    acc[idx++] *= 3;
+    acc[idx++] -= 1;
+    printf("acc2 %d %d idx=%d\n", acc[0], acc[1], idx);
+
+    struct bits *cp = k;
+    k[0].a = 1; k[0].b = 2; k[1].a = 3; k[1].b = 4;
+    (cp++)->a += 2;
+    cp->b -= 1;
+    printf("bits2 %d %d %d %d cp=%d\n", k[0].a, k[0].b, k[1].a, k[1].b, (int)(cp - k));
+
+    int post = k[1].b++;
+    int pre = ++k[1].b;
+    printf("bf post=%d pre=%d now=%d\n", post, pre, k[1].b);
     return 0;
 }

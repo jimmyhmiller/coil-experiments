@@ -54,6 +54,9 @@
    ;; program's own writes into, by call site. They are allocated once at the
    ;; top of the function, never inside a loop.
    (va-areas (hm/HashMap (slice u8) (slice u8)))
+   ;; The address of the target of the update being emitted, which the
+   ;; placeholder standing for its value reads from.
+   (target-addrs (al/ArrayList (slice u8)))
    (serial i64)
    (break-labels (al/ArrayList (slice u8)))
    (continue-labels (al/ArrayList (slice u8)))
@@ -307,6 +310,9 @@
                 (put! (mut e) ")")))
       ;; A member is its record's address advanced by the byte offset the
       ;; layout assigned, then reinterpreted.
+      ;; The placeholder for an update's target reaches the address the update
+      ;; already bound.
+      (= k nd/ND-TARGET) (put! (mut e) (top-label (load (field e target-addrs))))
       (= k nd/ND-MEMBER)
         (do
           (put! (mut e) "(primitive/cast (ptr ")
@@ -319,16 +325,19 @@
       :else (fail! (mut e) "expression is not an lvalue" (nd/nd-token n)))))
 
 ;; A bitfield is read by loading its storage unit, shifting the field down, and
-;; masking it; a signed one is then sign-extended by shifting up and back.
-(defn emit-bitfield-load! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
-  (let [width (nd/nd-member-bit-width n)
-        offset (nd/nd-member-bit-offset n)
-        t (nd/nd-type n)
-        bits (* (ct/ty-size t) 8)]
+;; masking it; a signed one is then sign-extended by shifting up and back. The
+;; unit's address is a parameter, because an update reads and writes the same
+;; unit and must reach it once.
+(defn emit-bits-load! [(e (mut Emitter))
+                       (t (ptr ct/Type))
+                       (offset i64)
+                       (width i64)
+                       (at (slice u8))] (-> i64)
+  (let [bits (* (ct/ty-size t) 8)]
     (if (ct/ty-unsigned? t)
         (do
           (put! (mut e) "(primitive/iand (primitive/ishr (primitive/load ")
-          (emit-addr! (mut e) n)
+          (put! (mut e) at)
           (put! (mut e) ") ")
           (put-int! (mut e) offset)
           (put! (mut e) ") ")
@@ -336,7 +345,7 @@
           (put! (mut e) ")"))
         (do
           (put! (mut e) "(primitive/ishr (primitive/ishl (primitive/load ")
-          (emit-addr! (mut e) n)
+          (put! (mut e) at)
           (put! (mut e) ") ")
           (put-int! (mut e) (- bits (+ offset width)))
           (put! (mut e) ") ")
@@ -344,25 +353,32 @@
           (put! (mut e) ")"))))
   0)
 
-;; Writing a bitfield is read-modify-write: clear the field's bits, then place
-;; the new value into them.
-(defn emit-bitfield-store! [(e (mut Emitter)) (n (ptr nd/Node)) (value (ptr nd/Node))] (-> i64)
-  (let [width (nd/nd-member-bit-width n)
-        offset (nd/nd-member-bit-offset n)
-        mask (primitive/ishl (- (primitive/ishl 1 width) 1) offset)
-        ;; Read and write reach the same storage unit, so its address is worked
-        ;; out once.
-        slot (fresh (mut e) "at")]
+(defn emit-bitfield-load! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
+  (let [at (fresh (mut e) "bf")]
     (put! (mut e) "(let [")
-    (put! (mut e) slot)
+    (put! (mut e) at)
     (put! (mut e) " ")
     (emit-addr! (mut e) n)
-    (put! (mut e) "] (primitive/store! ")
-    (put! (mut e) slot)
+    (put! (mut e) "] ")
+    (emit-bits-load! (mut e) (nd/nd-type n) (nd/nd-member-bit-offset n) (nd/nd-member-bit-width n) at)
+    (put! (mut e) ")"))
+  0)
+
+;; Writing a bitfield is read-modify-write: clear the field's bits, then place
+;; the new value into them.
+(defn emit-bits-store! [(e (mut Emitter))
+                        (t (ptr ct/Type))
+                        (offset i64)
+                        (width i64)
+                        (at (slice u8))
+                        (value (ptr nd/Node))] (-> i64)
+  (let [mask (primitive/ishl (- (primitive/ishl 1 width) 1) offset)]
+    (put! (mut e) "(primitive/store! ")
+    (put! (mut e) at)
     (put! (mut e) " (primitive/cast ")
-    (emit-type! (mut e) (nd/nd-type n))
+    (emit-type! (mut e) t)
     (put! (mut e) " (primitive/ior (primitive/iand (primitive/cast i64 (primitive/load ")
-    (put! (mut e) slot)
+    (put! (mut e) at)
     (put! (mut e) ")) ")
     (put-int! (mut e) (primitive/inot mask))
     (put! (mut e) ") (primitive/iand (primitive/ishl (primitive/cast i64 ")
@@ -371,7 +387,79 @@
     (put-int! (mut e) offset)
     (put! (mut e) ") ")
     (put-int! (mut e) mask)
-    (put! (mut e) ")))))"))
+    (put! (mut e) "))))"))
+  0)
+
+(defn emit-bitfield-store! [(e (mut Emitter)) (n (ptr nd/Node)) (value (ptr nd/Node))] (-> i64)
+  (let [at (fresh (mut e) "bf")]
+    (put! (mut e) "(let [")
+    (put! (mut e) at)
+    (put! (mut e) " ")
+    (emit-addr! (mut e) n)
+    (put! (mut e) "] ")
+    (emit-bits-store! (mut e) (nd/nd-type n) (nd/nd-member-bit-offset n) (nd/nd-member-bit-width n) at value)
+    (put! (mut e) ")"))
+  0)
+
+;; Reading and writing an update's target, through the address already bound for
+;; it. A bitfield target reaches its storage unit the same way an ordinary one
+;; reaches its object.
+(defn emit-target-load! [(e (mut Emitter)) (target (ptr nd/Node)) (at (slice u8))] (-> i64)
+  (if (>= (nd/nd-member-bit-width target) 0)
+      (emit-bits-load! (mut e)
+                       (nd/nd-type target)
+                       (nd/nd-member-bit-offset target)
+                       (nd/nd-member-bit-width target)
+                       at)
+      (do (put! (mut e) "(primitive/load ") (put! (mut e) at) (put! (mut e) ")"))))
+
+(defn emit-target-store! [(e (mut Emitter))
+                          (target (ptr nd/Node))
+                          (at (slice u8))
+                          (value (ptr nd/Node))] (-> i64)
+  (if (>= (nd/nd-member-bit-width target) 0)
+      (emit-bits-store! (mut e)
+                        (nd/nd-type target)
+                        (nd/nd-member-bit-offset target)
+                        (nd/nd-member-bit-width target)
+                        at
+                        value)
+      (do (put! (mut e) "(primitive/store! ")
+          (put! (mut e) at)
+          (put! (mut e) " ")
+          (emit-expr! (mut e) value)
+          (put! (mut e) ")"))))
+
+;; `x op= y` and `x++`: the target's address is worked out once, the operation
+;; reads through it, and the result goes back to it. `value` says whether the
+;; expression's own value is what the target held before the update.
+(defn emit-compound! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
+  (let [target (nd/nd-lhs n)
+        value (nd/nd-rhs n)
+        at (fresh (mut e) "at")
+        was (fresh (mut e) "was")]
+    (put! (mut e) "(let [")
+    (put! (mut e) at)
+    (put! (mut e) " ")
+    (emit-addr! (mut e) target)
+    (put! (mut e) "] ")
+    (al/al-push! [(slice u8)] (mut (field e target-addrs)) at)
+    (if (= (nd/nd-value n) 1)
+        (do (put! (mut e) "(let [")
+            (put! (mut e) was)
+            (put! (mut e) " ")
+            (emit-target-load! (mut e) target at)
+            (put! (mut e) "] (do ")
+            (emit-target-store! (mut e) target at value)
+            (put! (mut e) " ")
+            (put! (mut e) was)
+            (put! (mut e) ")))"))
+        (do (put! (mut e) "(do ")
+            (emit-target-store! (mut e) target at value)
+            (put! (mut e) " ")
+            (emit-target-load! (mut e) target at)
+            (put! (mut e) "))")))
+    (al/al-pop! [(slice u8)] (mut (field e target-addrs))))
   0)
 
 ;; ------------------------------------------------------------ expressions
@@ -601,6 +689,9 @@
                 (do (put! (mut e) "(primitive/load ") (emit-addr! (mut e) n) (put! (mut e) ")")))
           (= k nd/ND-ADDR) (emit-addr! (mut e) (nd/nd-lhs n))
           (= k nd/ND-ASSIGN) (emit-assign! (mut e) n)
+          (= k nd/ND-COMPOUND) (emit-compound! (mut e) n)
+          (= k nd/ND-TARGET)
+            (emit-target-load! (mut e) n (top-label (load (field e target-addrs))))
           ;; A record has no cast: the value already has the storage type the
           ;; target wants, and Coil has no conversion between aggregates.
           (and (= k nd/ND-CAST) (ct/record? t)) (emit-expr! (mut e) (nd/nd-lhs n))
@@ -1806,6 +1897,7 @@
                         :storage (hm/hm-new [(slice u8) i64] a (str/str-keyops))
                         :storage-size (hm/hm-new [(slice u8) i64] a (str/str-keyops))
                         :va-areas (hm/hm-new [(slice u8) (slice u8)] a (str/str-keyops))
+                        :target-addrs (al/al-new [(slice u8)] a)
                         :serial 0
                         :break-labels (al/al-new [(slice u8)] a)
                         :continue-labels (al/al-new [(slice u8)] a)
