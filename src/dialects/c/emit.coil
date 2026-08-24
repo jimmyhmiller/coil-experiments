@@ -33,6 +33,7 @@
    (slots (hm/HashMap (slice u8) (slice u8)))
    (defined (hm/HashMap (slice u8) bool))
    (externs (hm/HashMap (slice u8) bool))
+   (emitted (hm/HashMap (slice u8) bool))
    (serial i64)
    (break-labels (al/ArrayList (slice u8)))
    (continue-labels (al/ArrayList (slice u8)))
@@ -401,12 +402,22 @@
                 (do (put! (mut e) "(primitive/load ") (emit-addr! (mut e) n) (put! (mut e) ")")))
           (= k nd/ND-ADDR) (emit-addr! (mut e) (nd/nd-lhs n))
           (= k nd/ND-ASSIGN) (emit-assign! (mut e) n)
+          ;; A record has no cast: the value already has the storage type the
+          ;; target wants, and Coil has no conversion between aggregates.
+          (and (= k nd/ND-CAST) (ct/record? t)) (emit-expr! (mut e) (nd/nd-lhs n))
           (= k nd/ND-CAST)
             (do (put! (mut e) "(primitive/cast ")
                 (emit-param-type! (mut e) t)
                 (put! (mut e) " ")
                 (emit-expr! (mut e) (nd/nd-lhs n))
                 (put! (mut e) ")"))
+          ;; Clearing an object an initialiser only partly fills.
+          (= k nd/ND-MEMZERO)
+            (do (put! (mut e) "(primitive/store! ")
+                (emit-addr! (mut e) (nd/nd-lhs n))
+                (put! (mut e) " (primitive/zeroed ")
+                (emit-type! (mut e) t)
+                (put! (mut e) "))"))
           (= k nd/ND-CALL) (emit-call! (mut e) n)
           (= k nd/ND-NEG)
             (do (put! (mut e) "(")
@@ -837,17 +848,92 @@
 
 ;; A global is a static cell reached through a zero-argument accessor, which
 ;; gives it one address for the whole program.
+;; A string literal's bytes are known at compile time, so it is emitted as
+;; static data rather than written by the initialiser at start-up. Coil's string
+;; escape names a code point rather than a byte, so a literal that is not all
+;; ASCII falls back to a cleared array the initialiser fills byte by byte.
+(defn ascii-string? [(bytes (slice u8))] (-> bool)
+  (let [n (slice-len bytes)
+        (mut i) 0
+        (mut ok) 1]
+    (loop (if (or (>= (load i) n) (= (load ok) 0))
+              (break)
+              (do (if (>= (primitive/cast i64 (slice-get bytes (load i))) 128)
+                      (store! ok 0)
+                      0)
+                  (store! i (+ (load i) 1)))))
+    (!= (load ok) 0)))
+
+(defn put-coil-string! [(e (mut Emitter)) (bytes (slice u8))] (-> i64)
+  (let [n (slice-len bytes)
+        (mut i) 0]
+    (put! (mut e) "\"")
+    (loop (if (>= (load i) n)
+              (break)
+              (let [c (primitive/cast i64 (slice-get bytes (load i)))]
+                (put! (mut e) "\\x")
+                (put-hex! (mut e) c)
+                (put! (mut e) ";")
+                (store! i (+ (load i) 1)))))
+    ;; C strings are terminated; the array type already has room for it.
+    (put! (mut e) "\\x0;\""))
+  0)
+
+(defn put-hex! [(e (mut Emitter)) (v i64)] (-> i64)
+  (let [digits "0123456789abcdef"]
+    (if (>= v 16)
+        (put! (mut e) (subslice digits (primitive/idiv v 16) (+ (primitive/idiv v 16) 1)))
+        0)
+    (put! (mut e) (subslice digits (primitive/irem v 16) (+ (primitive/irem v 16) 1))))
+  0)
+
 (defn emit-global! [(e (mut Emitter)) (o (ptr nd/Obj))] (-> i64)
-  (put! (mut e) "(defn ")
-  (put! (mut e) (ident (mut e) "c_g_" (nd/obj-name o)))
-  (put! (mut e) " [] (-> (ptr ")
-  (emit-type! (mut e) (nd/obj-type o))
-  (put! (mut e) ")) (primitive/alloc-static ")
-  (emit-type! (mut e) (nd/obj-type o))
-  (put! (mut e) "))\n")
+  (if (hm/hm-contains? (load (field e emitted)) (nd/obj-name o))
+      0
+      (do
+        (hm/hm-put! [(slice u8) bool] (mut (field e emitted)) (nd/obj-name o) true)
+        (put! (mut e) "(defn ")
+        (put! (mut e) (ident (mut e) "c_g_" (nd/obj-name o)))
+        (put! (mut e) " [] (-> (ptr ")
+        (emit-type! (mut e) (nd/obj-type o))
+        (put! (mut e) ")) ")
+        (if (and (nd/obj-string? o) (ascii-string? (nd/obj-string-data o)))
+            (do (put! (mut e) "(primitive/cast (ptr ")
+                (emit-type! (mut e) (nd/obj-type o))
+                (put! (mut e) ") (slice/slice-data [u8] ")
+                (put-coil-string! (mut e) (nd/obj-string-data o))
+                (put! (mut e) "))"))
+            (do (put! (mut e) "(primitive/alloc-static ")
+                (emit-type! (mut e) (nd/obj-type o))
+                (put! (mut e) ")")))
+        (put! (mut e) ")\n")
+        0)))
+
+;; A string that is not all ASCII gets its bytes written at start-up instead.
+(defn emit-string-fill! [(e (mut Emitter)) (o (ptr nd/Obj))] (-> i64)
+  (let [bytes (nd/obj-string-data o)
+        n (slice-len bytes)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (put! (mut e) " (primitive/store! (primitive/index (primitive/cast (ptr u8) (")
+                (put! (mut e) (ident (mut e) "c_g_" (nd/obj-name o)))
+                (put! (mut e) ")) ")
+                (put-int! (mut e) (load i))
+                (put! (mut e) ") (primitive/cast u8 ")
+                (put-int! (mut e) (primitive/cast i64 (slice-get bytes (load i))))
+                (put! (mut e) "))")
+                (store! i (+ (load i) 1))))))
   0)
 
 (defn emit-extern! [(e (mut Emitter)) (o (ptr nd/Obj))] (-> i64)
+  (if (hm/hm-contains? (load (field e externs)) (nd/obj-name o))
+      0
+      (do (hm/hm-put! [(slice u8) bool] (mut (field e externs)) (nd/obj-name o) true)
+          (emit-extern-decl! (mut e) o))))
+
+(defn emit-extern-decl! [(e (mut Emitter)) (o (ptr nd/Obj))] (-> i64)
   (let [ty (nd/obj-type o)
         params (ct/ty-params ty)
         count (al/al-len [(ptr ct/Type)] params)
@@ -870,12 +956,14 @@
   0)
 
 (defn emit-program [(a (dyn alloc/Allocator))
-                    (globals (al/ArrayList (ptr nd/Obj)))] (-> EmitResult)
+                    (globals (al/ArrayList (ptr nd/Obj)))
+                    (init (ptr nd/Node))] (-> EmitResult)
   (let [(mut e) (load (Emitter :a a
                         :out (str/sb-new a)
                         :slots (hm/hm-new [(slice u8) (slice u8)] a (str/str-keyops))
                         :defined (hm/hm-new [(slice u8) bool] a (str/str-keyops))
                         :externs (hm/hm-new [(slice u8) bool] a (str/str-keyops))
+                        :emitted (hm/hm-new [(slice u8) bool] a (str/str-keyops))
                         :serial 0
                         :break-labels (al/al-new [(slice u8)] a)
                         :continue-labels (al/al-new [(slice u8)] a)
@@ -897,6 +985,7 @@
     (put! (mut e) "(import \"coil.primitive\" :as primitive)\n")
     (put! (mut e) "(import \"coil.alloc\" :as alloc)\n")
     (put! (mut e) "(import \"coil.control\" :as control)\n")
+    (put! (mut e) "(import \"coil.slice\" :as slice)\n")
     ;; Declarations first, so a call can precede the definition it names.
     (loop (if (>= (load i) count)
               (break)
@@ -914,8 +1003,22 @@
               (let [o (al/al-get [(ptr nd/Obj)] globals (load i))]
                 (if (nd/obj-definition? o) (emit-function! (mut e) o) 0)
                 (store! i (+ (load i) 1)))))
+    ;; Everything with static storage is initialised once, in source order,
+    ;; before the program's own `main` runs.
+    (put! (mut e) "(defn c_init_statics [] (-> i64) (do")
+    (store! i 0)
+    (loop (if (>= (load i) count)
+              (break)
+              (let [o (al/al-get [(ptr nd/Obj)] globals (load i))]
+                (if (and (nd/obj-string? o) (not (ascii-string? (nd/obj-string-data o))))
+                    (emit-string-fill! (mut e) o)
+                    0)
+                (store! i (+ (load i) 1)))))
+    (put! (mut e) " ")
+    (emit-stmt! (mut e) init)
+    (put! (mut e) " 0))\n")
     ;; Coil's entry point calls the program's.
-    (put! (mut e) "(defn main [] (-> i32) (primitive/cast i32 (c_fn_main)))\n")
+    (put! (mut e) "(defn main [] (-> i32) (do (c_init_statics) (primitive/cast i32 (c_fn_main))))\n")
     (EmitResult :text (str/sb-str (load (mut (field e out))))
       :failed (load (field e failed))
       :message (load (field e message))

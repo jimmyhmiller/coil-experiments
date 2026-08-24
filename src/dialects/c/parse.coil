@@ -40,6 +40,9 @@
    (pos i64)
    (scopes (al/ArrayList (ptr Scope)))
    (globals (al/ArrayList (ptr nd/Obj)))
+   ;; Global and static initialisers are statements like any other, collected
+   ;; here and run once before the program's own `main`.
+   (init-block (ptr nd/Node))
    (current-fn (ptr nd/Obj))
    (failed i64)
    (message (slice u8))
@@ -49,6 +52,7 @@
 
 (defstruct ParseResult
   [(globals (al/ArrayList (ptr nd/Obj)))
+   (init (ptr nd/Node))
    (failed i64)
    (message (slice u8))
    (file (slice u8))
@@ -150,6 +154,16 @@
                     :type-def (nil-type)
                     :enum-value 0
                     :is-enum 0))))
+
+(defn declare-obj-as! [(p (mut Parser)) (name (slice u8)) (o (ptr nd/Obj))] (-> i64)
+  (declare! (mut p)
+            name
+            (load (VarScope :name name
+                    :obj o
+                    :type-def (nil-type)
+                    :enum-value 0
+                    :is-enum 0)))
+  0)
 
 (defn declare-typedef! [(p (mut Parser)) (name (slice u8)) (t (ptr ct/Type))] (-> i64)
   (declare! (mut p)
@@ -425,6 +439,7 @@
     (str/sb-push-str! (mut name) ".Lstr.")
     (str/sb-push-i64! (mut name) (al/al-len [(ptr nd/Obj)] (load (field p globals))))
     (let [o (nd/obj-new (load (field p a)) (str/sb-str (load (mut name))) ty false)]
+      (nd/set-obj-string! o bytes)
       (al/al-push! [(ptr nd/Obj)] (mut (field p globals)) o)
       (nd/node-var (load (field p a)) o tok))))
 
@@ -1165,6 +1180,299 @@
       :else
         (do (fail-at! (mut p) "expected an expression" t) (advance! (mut p)) (nd/node-num a 0 t)))))
 
+;; ---------------------------------------------------------- initializers
+
+;; An initialiser mirrors the shape of the type it initialises: one child per
+;; array element or record member, with an expression at the leaves. Building
+;; the whole tree before generating anything is what makes `{1, 2}` and
+;; `{{1}, {2}}` mean the same thing, and what lets the parts no initialiser
+;; mentions be zeroed rather than left holding whatever was there.
+(defstruct Init
+  [(ty (ptr ct/Type))
+   (expr (ptr nd/Node))
+   ;; Byte offset within the parent, and the bit position for a bitfield.
+   (offset i64)
+   (bit-offset i64)
+   (bit-width i64)
+   (children (al/ArrayList (ptr Init)))])
+
+(defn nil-init [] (-> (ptr Init)) (primitive/cast (ptr Init) 0))
+
+(defn init-push-element! [(p (mut Parser)) (n (ptr Init)) (index i64)] (-> (ptr Init))
+  (let [base (ct/ty-base (load (field n ty)))
+        c (init-new (mut p) base)]
+    (store! (field c offset) (* index (ct/ty-size base)))
+    (al/al-push! [(ptr Init)] (mut (field n children)) c)
+    c))
+
+(defn init-new [(p (mut Parser)) (ty (ptr ct/Type))] (-> (ptr Init))
+  (let [a (load (field p a))
+        n (alloc/box! a
+                      Init
+                      (load (Init :ty ty
+                              :expr (nil-node)
+                              :offset 0
+                              :bit-offset 0
+                              :bit-width -1
+                              :children (al/al-new [(ptr Init)] a))))]
+    (cond
+      (= (ct/ty-kind ty) ct/TY-ARRAY)
+        (let [len (ct/ty-array-len ty)
+              (mut i) 0]
+          (loop (if (>= (load i) len)
+                    (break)
+                    (do (init-push-element! (mut p) n (load i))
+                        (store! i (+ (load i) 1))))))
+      ;; A union's members all start at offset zero, so initialising one of
+      ;; them is the same operation as initialising a struct's first.
+      (ct/record? ty)
+        (let [ms (ct/ty-members ty)
+              count (al/al-len [ct/Member] ms)
+              (mut i) 0]
+          (loop (if (>= (load i) count)
+                    (break)
+                    (let [m (al/al-get [ct/Member] ms (load i))
+                          c (init-new (mut p) (ct/member-type m))]
+                      (store! (field c offset) (ct/member-offset m))
+                      (store! (field c bit-offset) (ct/member-bit-offset m))
+                      (store! (field c bit-width) (ct/member-bit-width m))
+                      (al/al-push! [(ptr Init)] (mut (field n children)) c)
+                      (store! i (+ (load i) 1))))))
+      :else 0)
+    n))
+
+;; The part at `index`. An array declared `[]` grows to fit whatever the
+;; initialiser names; an index past the end of a fixed-length one is an error in
+;; C, and is parsed into a throwaway so the tokens are still consumed and
+;; nothing is written out of bounds.
+(defn init-child [(p (mut Parser)) (n (ptr Init)) (index i64)] (-> (ptr Init))
+  (let [kids (load (field n children))
+        len (al/al-len [(ptr Init)] kids)
+        ty (load (field n ty))]
+    (cond
+      (< index len) (al/al-get [(ptr Init)] kids index)
+      (and (= (ct/ty-kind ty) ct/TY-ARRAY) (< (ct/ty-array-len ty) 0))
+        (let [(mut i) len
+              (mut last) (nil-init)]
+          (loop (if (> (load i) index)
+                    (break)
+                    (do (store! last (init-push-element! (mut p) n (load i)))
+                        (store! i (+ (load i) 1)))))
+          (load last))
+      (= (ct/ty-kind ty) ct/TY-ARRAY) (init-new (mut p) (ct/ty-base ty))
+      :else (init-new (mut p) (ty-int-of (mut p))))))
+
+(defn at-init-end? [(p (mut Parser))] (-> bool)
+  (or (punct? (mut p) "}")
+      (and (punct? (mut p) ",") (is-punct-at? (mut p) 1 "}"))))
+
+;; Consumes the `}` that closes a list, allowing the trailing comma C permits.
+(defn eat-init-end! [(p (mut Parser))] (-> bool)
+  (cond
+    (punct? (mut p) "}") (do (advance! (mut p)) true)
+    (and (punct? (mut p) ",") (is-punct-at? (mut p) 1 "}"))
+      (do (advance! (mut p)) (advance! (mut p)) true)
+    :else false))
+
+(defn member-index [(t (ptr ct/Type)) (name (slice u8))] (-> i64)
+  (let [ms (ct/ty-members t)
+        count (al/al-len [ct/Member] ms)
+        (mut i) 0
+        (mut found) -1]
+    (loop (if (or (>= (load i) count) (>= (load found) 0))
+              (break)
+              (let [m (al/al-get [ct/Member] ms (load i))]
+                (if (str/str-eq (ct/member-name m) name) (store! found (load i)) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+;; `char greeting[8] = "hi";` writes the bytes and then the terminator, and
+;; leaves the rest zero.
+(defn string-initializer! [(p (mut Parser)) (n (ptr Init))] (-> i64)
+  (let [tok (advance! (mut p))
+        bytes (decode-escapes (mut p) (lex/token-text tok) 34)
+        declared (ct/ty-array-len (load (field n ty)))
+        limit (if (< declared 0) (+ (slice-len bytes) 1) declared)
+        (mut i) 0]
+    (loop (if (>= (load i) limit)
+              (break)
+              (let [c (init-child (mut p) n (load i))
+                    v (if (< (load i) (slice-len bytes))
+                          (primitive/cast i64 (slice-get bytes (load i)))
+                          0)
+                    e (nd/node-num (load (field p a)) v tok)]
+                (add-type! (mut p) e)
+                (store! (field c expr) e)
+                (store! i (+ (load i) 1))))))
+  0)
+
+(defn array-initializer1! [(p (mut Parser)) (n (ptr Init))] (-> i64)
+  (expect! (mut p) "{")
+  (let [(mut i) 0
+        (mut first) 1
+        (mut done) 0]
+    (if (eat-init-end! (mut p)) (store! done 1) 0)
+    (loop
+      (if (or (!= (load done) 0) (or (at-eof? (mut p)) (!= (load (field p failed)) 0)))
+          (break)
+          (do
+            (if (= (load first) 0) (expect! (mut p) ",") 0)
+            (store! first 0)
+            ;; `[2] = v` moves the cursor.
+            (if (punct? (mut p) "[")
+                (do (advance! (mut p))
+                    (store! i (parse-const-expr (mut p)))
+                    (expect! (mut p) "]")
+                    (expect! (mut p) "="))
+                0)
+            (parse-initializer2! (mut p) (init-child (mut p) n (load i)))
+            (store! i (+ (load i) 1))
+            (if (eat-init-end! (mut p)) (store! done 1) 0)))))
+  0)
+
+;; The inner lists of `int a[2][3] = {1, 2, 3, 4, 5, 6}` have no braces of their
+;; own, so each takes as many elements as its length allows.
+(defn array-initializer2! [(p (mut Parser)) (n (ptr Init))] (-> i64)
+  (let [len (ct/ty-array-len (load (field n ty)))
+        (mut i) 0]
+    (loop
+      (if (or (>= (load i) len)
+              (or (at-init-end? (mut p))
+                  (or (at-eof? (mut p)) (!= (load (field p failed)) 0))))
+          (break)
+          (do
+            (if (> (load i) 0) (expect! (mut p) ",") 0)
+            (parse-initializer2! (mut p) (init-child (mut p) n (load i)))
+            (store! i (+ (load i) 1))))))
+  0)
+
+(defn record-initializer1! [(p (mut Parser)) (n (ptr Init))] (-> i64)
+  (expect! (mut p) "{")
+  (let [ty (load (field n ty))
+        count (al/al-len [ct/Member] (ct/ty-members ty))
+        (mut i) 0
+        (mut first) 1
+        (mut done) 0]
+    (if (eat-init-end! (mut p)) (store! done 1) 0)
+    (loop
+      (if (or (!= (load done) 0) (or (at-eof? (mut p)) (!= (load (field p failed)) 0)))
+          (break)
+          (do
+            (if (= (load first) 0) (expect! (mut p) ",") 0)
+            (store! first 0)
+            ;; `.name = v` moves the cursor.
+            (if (punct? (mut p) ".")
+                (do (advance! (mut p))
+                    (let [found (member-index ty (lex/token-text (advance! (mut p))))]
+                      (if (< found 0)
+                          (fail! (mut p) "no such member")
+                          (store! i found)))
+                    (expect! (mut p) "="))
+                0)
+            (if (>= (load i) count)
+                (fail! (mut p) "too many initialisers for this type")
+                (parse-initializer2! (mut p) (init-child (mut p) n (load i))))
+            (store! i (+ (load i) 1))
+            (if (eat-init-end! (mut p)) (store! done 1) 0)))))
+  0)
+
+(defn record-initializer2! [(p (mut Parser)) (n (ptr Init))] (-> i64)
+  (let [count (al/al-len [ct/Member] (ct/ty-members (load (field n ty))))
+        (mut i) 0]
+    (loop
+      (if (or (>= (load i) count)
+              (or (at-init-end? (mut p))
+                  (or (at-eof? (mut p)) (!= (load (field p failed)) 0))))
+          (break)
+          (do
+            (if (> (load i) 0) (expect! (mut p) ",") 0)
+            (parse-initializer2! (mut p) (init-child (mut p) n (load i)))
+            (store! i (+ (load i) 1))))))
+  0)
+
+(defn parse-initializer2! [(p (mut Parser)) (n (ptr Init))] (-> i64)
+  (let [ty (load (field n ty))
+        k (ct/ty-kind ty)]
+    (cond
+      (and (= k ct/TY-ARRAY) (= (lex/token-kind (peek (mut p))) lex/TK-STRING))
+        (string-initializer! (mut p) n)
+      (= k ct/TY-ARRAY)
+        (if (punct? (mut p) "{")
+            (array-initializer1! (mut p) n)
+            (array-initializer2! (mut p) n))
+      (ct/record? ty)
+        (if (punct? (mut p) "{")
+            (record-initializer1! (mut p) n)
+            ;; `struct S a = b;` copies the whole object. Telling that apart
+            ;; from a brace-less member list takes parsing the expression and
+            ;; looking at its type, so the position is restored if it is not.
+            (let [save (load (field p pos))
+                  e (decay (mut p) (parse-assign (mut p)))]
+              (if (and (not (null-type? (nd/nd-type e))) (ct/record? (nd/nd-type e)))
+                  (do (store! (field n expr) e) 0)
+                  (do (store! (field p pos) save) (record-initializer2! (mut p) n)))))
+      ;; `int x = {1};` is allowed.
+      (punct? (mut p) "{")
+        (do (advance! (mut p))
+            (parse-initializer2! (mut p) n)
+            (if (eat-init-end! (mut p)) 0 (expect! (mut p) "}"))
+            0)
+      :else (do (store! (field n expr) (decay (mut p) (parse-assign (mut p)))) 0))))
+
+;; Each leaf becomes an assignment to a synthetic member at a byte offset --
+;; exactly what `a.b[2].c = v` already lowers to, so the emitter learns nothing
+;; new.
+(defn init-stores! [(p (mut Parser))
+                    (block (ptr nd/Node))
+                    (base (ptr nd/Obj))
+                    (offset i64)
+                    (n (ptr Init))
+                    (tok lex/Token)] (-> i64)
+  (let [a (load (field p a))
+        expr (load (field n expr))]
+    (if (not (null-node? expr))
+        (let [target (nd/node-new a nd/ND-MEMBER tok)
+              assign (nd/node-new a nd/ND-ASSIGN tok)]
+          (nd/set-lhs! target (nd/node-var a base tok))
+          (nd/set-type! target (load (field n ty)))
+          (nd/set-member-at! target offset (load (field n bit-offset)) (load (field n bit-width)))
+          (nd/set-lhs! assign target)
+          (nd/set-rhs! assign (nd/node-cast a expr (load (field n ty))))
+          (nd/set-type! assign (load (field n ty)))
+          (nd/push-body! block (nd/node-unary a nd/ND-EXPR-STMT assign tok))
+          0)
+        (let [kids (load (field n children))
+              count (al/al-len [(ptr Init)] kids)
+              (mut i) 0]
+          (loop (if (>= (load i) count)
+                    (break)
+                    (let [c (al/al-get [(ptr Init)] kids (load i))]
+                      (init-stores! (mut p) block base (+ offset (load (field c offset))) c tok)
+                      (store! i (+ (load i) 1)))))
+          0))))
+
+;; An initialiser is a sequence of statements, not a value: the object is zeroed
+;; and then the parts the initialiser names are written. Objects with static
+;; storage start out zero already, so only automatic ones need the clear.
+(defn parse-init-into! [(p (mut Parser))
+                        (block (ptr nd/Node))
+                        (o (ptr nd/Obj))] (-> i64)
+  (let [a (load (field p a))
+        tok (peek (mut p))
+        n (init-new (mut p) (nd/obj-type o))]
+    (parse-initializer2! (mut p) n)
+    (let [ty (nd/obj-type o)]
+      (if (and (= (ct/ty-kind ty) ct/TY-ARRAY) (< (ct/ty-array-len ty) 0))
+          (ct/set-array-len! ty (al/al-len [(ptr Init)] (load (field n children))))
+          0))
+    (if (nd/obj-local? o)
+        (let [zero (nd/node-unary a nd/ND-MEMZERO (nd/node-var a o tok) tok)]
+          (nd/set-type! zero (nd/obj-type o))
+          (nd/push-body! block (nd/node-unary a nd/ND-EXPR-STMT zero tok)))
+        0)
+    (init-stores! (mut p) block o 0 n tok)
+    0))
+
 ;; ------------------------------------------------------------- statements
 
 (defn new-local! [(p (mut Parser)) (name (slice u8)) (ty (ptr ct/Type))] (-> (ptr nd/Obj))
@@ -1180,6 +1488,21 @@
     (declare-obj! (mut p) o)
     (al/al-push! [(ptr nd/Obj)] (mut (field p globals)) o)
     o))
+
+;; A `static` local has static storage but local scope, so it becomes a global
+;; under a name nothing else can collide with, while the name the source used
+;; stays bound in the block.
+(defn new-static-local! [(p (mut Parser)) (name (slice u8)) (ty (ptr ct/Type))] (-> (ptr nd/Obj))
+  (let [a (load (field p a))
+        (mut b) (str/sb-new a)]
+    (str/sb-push-str! (mut b) name)
+    (str/sb-push-str! (mut b) ".")
+    (str/sb-push-i64! (mut b) (al/al-len [(ptr nd/Obj)] (load (field p globals))))
+    (let [o (nd/obj-new a (str/sb-str (load (mut b))) ty false)]
+      (nd/set-obj-static! o true)
+      (al/al-push! [(ptr nd/Obj)] (mut (field p globals)) o)
+      (declare-obj-as! (mut p) name o)
+      o)))
 
 ;; A declaration statement becomes a block of assignments, one per initialised
 ;; declarator, so the rest of the tree only has to know about expressions.
@@ -1197,16 +1520,16 @@
             (cond
               (!= (.is-typedef spec) 0) (declare-typedef! (mut p) (.name d) (.ty d))
               (!= (.is-extern spec) 0) (do (new-global! (mut p) (.name d) (.ty d)) 0)
+              (!= (.is-static spec) 0)
+                (let [o (new-static-local! (mut p) (.name d) (.ty d))]
+                  (if (punct? (mut p) "=")
+                      (do (advance! (mut p))
+                          (parse-init-into! (mut p) (load (field p init-block)) o))
+                      0))
               :else
                 (let [o (new-local! (mut p) (.name d) (.ty d))]
                   (if (punct? (mut p) "=")
-                      (let [tok (advance! (mut p))
-                            lhs (nd/node-var a o tok)
-                            rhs (decay (mut p) (parse-assign (mut p)))
-                            assign (nd/node-binary a nd/ND-ASSIGN lhs rhs tok)]
-                        (add-type! (mut p) assign)
-                        (nd/push-body! block (nd/node-unary a nd/ND-EXPR-STMT assign tok))
-                        0)
+                      (do (advance! (mut p)) (parse-init-into! (mut p) block o))
                       0)))
             (if (punct? (mut p) ",")
                 (do (advance! (mut p)) 0)
@@ -1401,10 +1724,11 @@
                     (= (ct/ty-kind (.ty d)) ct/TY-FUNC)
                       (do (parse-function! (mut p) spec d) (store! more 0))
                     :else
-                      (do
-                        (new-global! (mut p) (.name d) (.ty d))
+                      (let [g (new-global! (mut p) (.name d) (.ty d))]
+                        (if (!= (.is-static spec) 0) (nd/set-obj-static! g true) 0)
                         (if (punct? (mut p) "=")
-                            (do (advance! (mut p)) (parse-assign (mut p)) 0)
+                            (do (advance! (mut p))
+                                (parse-init-into! (mut p) (load (field p init-block)) g))
                             0)
                         (if (punct? (mut p) ",")
                             (do (advance! (mut p)) 0)
@@ -1417,6 +1741,7 @@
     :pos 0
     :scopes (al/al-new [(ptr Scope)] a)
     :globals (al/al-new [(ptr nd/Obj)] a)
+    :init-block (nd/node-new a nd/ND-BLOCK (lex/token-none))
     :current-fn (primitive/cast (ptr nd/Obj) 0)
     :failed 0
     :message ""
@@ -1432,6 +1757,7 @@
         (parse-toplevel! (mut p))))
   (leave-scope! (mut p))
   (ParseResult :globals (load (field p globals))
+    :init (load (field p init-block))
     :failed (load (field p failed))
     :message (load (field p message))
     :file (load (field p file))
