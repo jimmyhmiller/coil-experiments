@@ -1,0 +1,137 @@
+(module experiments.c.pp-test)
+
+(import "experiments.c.lex" :as lex)
+(import "experiments.c.pp" :as pp)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+(import "coil.assert" :use *)
+
+;; Preprocess `source` and render the result as space-separated spellings, which
+;; is the most direct way to assert on what a macro actually produced.
+(defn expand [(source (slice u8))] (-> (slice u8))
+  (let [a (alloc/malloc-allocator)
+        (mut p) (pp/pp-new a)]
+    (let [result (pp/preprocess (mut p) "t.c" source)
+          (mut b) (str/sb-new a)
+          (mut i) 0
+          n (al/al-len [lex/Token] (.tokens result))]
+      (assert (= (.failed result) 0))
+      (loop (if (>= (load i) n)
+                (break)
+                (let [t (al/al-get [lex/Token] (.tokens result) (load i))]
+                  (if (!= (lex/token-kind t) lex/TK-EOF)
+                      (do
+                        (if (> (slice-len (str/sb-str (load (mut b)))) 0)
+                            (str/sb-push-byte! (mut b) (primitive/cast u8 32))
+                            0)
+                        (str/sb-push-str! (mut b) (lex/token-text t)))
+                      0)
+                  (store! i (+ (load i) 1)))))
+      (str/sb-str (load (mut b))))))
+
+(defn failed? [(source (slice u8))] (-> bool)
+  (let [a (alloc/malloc-allocator)
+        (mut p) (pp/pp-new a)]
+    (let [result (pp/preprocess (mut p) "t.c" source)]
+      (!= (.failed result) 0))))
+
+(deftest object-like-macros-expand
+         (assert (str/str-eq (expand "#define N 42\nint x = N;") "int x = 42 ;")))
+
+(deftest macros-expand-inside-macros
+         (assert (str/str-eq (expand "#define A 1\n#define B A + A\nB") "1 + 1")))
+
+(deftest function-like-macros-take-arguments
+         (assert (str/str-eq (expand "#define ADD(a, b) ((a) + (b))\nADD(1, 2)")
+                             "( ( 1 ) + ( 2 ) )")))
+
+(deftest arguments-are-expanded-before-substitution
+         (assert (str/str-eq (expand "#define N 5\n#define ID(x) x\nID(N)") "5")))
+
+;; The recursion rule is what stops this being an infinite loop.
+(deftest a-macro-does-not-expand-inside-itself
+         (assert (str/str-eq (expand "#define X X\nX") "X"))
+         (assert (str/str-eq (expand "#define A B\n#define B A\nA") "A")))
+
+(deftest a-function-like-macro-without-parens-is-just-a-name
+         (assert (str/str-eq (expand "#define F(x) x\nF") "F"))
+         (assert (str/str-eq (expand "#define F(x) x\nF + 1") "F + 1")))
+
+;; The operand of `#` is stringified as written, without being expanded.
+(deftest stringify-uses-the-argument-as-written
+         (assert (str/str-eq (expand "#define N 7\n#define S(x) #x\nS(N)") "\"N\""))
+         (assert (str/str-eq (expand "#define S(x) #x\nS(a + b)") "\"a + b\"")))
+
+(deftest paste-joins-tokens
+         (assert (str/str-eq (expand "#define CAT(a, b) a##b\nCAT(foo, bar)") "foobar"))
+         (assert (str/str-eq (expand "#define CAT(a, b) a##b\nCAT(1, 2)") "12")))
+
+(deftest variadic-macros-collect-the-rest
+         (assert (str/str-eq (expand "#define P(f, ...) g(f, __VA_ARGS__)\nP(1, 2, 3)")
+                             "g ( 1 , 2 , 3 )")))
+
+;; The GNU comma swallow: with no variadic arguments the comma before
+;; `__VA_ARGS__` disappears rather than leaving `g(1,)`.
+(deftest an-empty-variadic-tail-drops-the-comma
+         (assert (str/str-eq (expand "#define P(f, ...) g(f, ##__VA_ARGS__)\nP(1)")
+                             "g ( 1 )")))
+
+(deftest undef-removes-a-macro
+         (assert (str/str-eq (expand "#define N 1\n#undef N\nN") "N")))
+
+(deftest conditionals-select-a-branch
+         (assert (str/str-eq (expand "#if 1\nyes\n#else\nno\n#endif") "yes"))
+         (assert (str/str-eq (expand "#if 0\nyes\n#else\nno\n#endif") "no")))
+
+(deftest ifdef-and-ifndef-test-definedness
+         (assert (str/str-eq (expand "#define N 1\n#ifdef N\nyes\n#endif") "yes"))
+         (assert (str/str-eq (expand "#ifndef N\nyes\n#endif") "yes"))
+         (assert (str/str-eq (expand "#define N 1\n#ifndef N\nyes\n#endif") "")))
+
+(deftest defined-works-with-and-without-parentheses
+         (assert (str/str-eq (expand "#define N 1\n#if defined N\nyes\n#endif") "yes"))
+         (assert (str/str-eq (expand "#define N 1\n#if defined(N)\nyes\n#endif") "yes"))
+         (assert (str/str-eq (expand "#if defined(NOPE)\nyes\n#else\nno\n#endif") "no")))
+
+(deftest elif-chains-take-the-first-true-branch
+         (assert (str/str-eq (expand "#if 0\na\n#elif 1\nb\n#elif 1\nc\n#else\nd\n#endif") "b")))
+
+;; An undefined identifier in `#if` is 0, so this must take the else branch.
+(deftest unknown-identifiers-are-zero-in-conditionals
+         (assert (str/str-eq (expand "#if SOMETHING_UNSET\nyes\n#else\nno\n#endif") "no")))
+
+(deftest conditional-arithmetic-respects-precedence
+         (assert (str/str-eq (expand "#if 2 + 3 * 4 == 14\nyes\n#endif") "yes"))
+         (assert (str/str-eq (expand "#if (1 << 4) == 16\nyes\n#endif") "yes"))
+         (assert (str/str-eq (expand "#if 0x10 == 16 && 010 == 8\nyes\n#endif") "yes"))
+         (assert (str/str-eq (expand "#if 1 ? 0 : 1\nyes\n#else\nno\n#endif") "no")))
+
+(deftest macros-are-expanded-in-conditionals
+         (assert (str/str-eq (expand "#define V 3\n#if V > 2\nyes\n#endif") "yes")))
+
+;; A nested conditional inside a dead branch must stay dead, and its #endif
+;; must not close the outer one.
+(deftest nested-conditionals-inside-a-dead-branch-stay-dead
+         (assert (str/str-eq (expand "#if 0\n#if 1\na\n#endif\nb\n#else\nc\n#endif") "c")))
+
+(deftest builtin-line-and-file-are-available
+         (assert (str/str-eq (expand "#define L __LINE__\nL") "2"))
+         (assert (str/str-eq (expand "__FILE__") "\"t.c\"")))
+
+;; A replacement is rescanned on its own, so an expansion ending in a
+;; function-like macro name does not reach past itself for the following `(`.
+;; See the note on `expand-call!`: this is the price of guaranteeing that
+;; expansion terminates without hide sets.
+(deftest an-expansion-ending-in-a-macro-name-stops-there
+         (assert (str/str-eq (expand "#define F(x) [x]\n#define G F\nG(1)") "F ( 1 )")))
+
+(deftest unbalanced-conditionals-are-reported
+         (assert (failed? "#if 1\nyes"))
+         (assert (failed? "#endif"))
+         (assert (failed? "#else")))
+
+(deftest an-unknown-directive-is-reported
+         (assert (failed? "#nonsense")))
