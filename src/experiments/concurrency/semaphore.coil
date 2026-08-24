@@ -1,0 +1,151 @@
+(module experiments.concurrency.semaphore)
+(import "coil.primitive" :as primitive)
+(import "coil.sync" :as sync)
+(import "coil.time" :as time)
+(import "coil.alloc" :as alloc)
+
+; A counting semaphore over the stdlib's Mutex + Condition pair. Permits cap
+; how many holders may be inside the guarded region at once; acquire blocks or
+; times out while no permit is available, release hands the permit to one
+; waiter. This is the classic resource-throttling tool the stdlib lacks:
+; bounded concurrency for connections, buffers, or worker fan-out.
+(export Semaphore SemaphoreError NoPermits Broken semaphore-init!
+        semaphore-init-with-allocator! semaphore-acquire!
+        semaphore-try-acquire! semaphore-acquire-for! semaphore-release!
+        semaphore-available! semaphore-destroy!)
+
+(defsum SemaphoreError
+  (NoPermits)
+  (Broken [(code i64)]))
+
+(defstruct Semaphore
+  [(mutex sync/Mutex)
+   (condition sync/Condition)
+   (permits i64)
+   (initialized bool)])
+
+(defn semaphore-init-with-allocator! [(sem (mut Semaphore)) (a (dyn alloc/Allocator))] (-> (Result i64 SemaphoreError))
+  (match (sync/mutex-init-with-allocator (.mutex sem) a)
+    (Err [e] (Err (Broken (sync-error-code e))))
+    (Ok [_]
+        (match (sync/condition-init-with-allocator (.condition sem) a)
+          (Err [e]
+               (do
+                 (sync/mutex-destroy! (.mutex sem))
+                 (Err (Broken (sync-error-code e)))))
+          (Ok [_]
+              (do
+                (set! (.initialized sem) true)
+                (Ok 0)))))))
+
+;; Helper: collapse a SyncError to its platform code so callers see one error
+;; shape from this module.
+(defn sync-error-code [(e sync/SyncError)] (-> i64)
+  (match e
+    (sync/InitFailed [code] code)
+    (sync/LockFailed [code] code)
+    (sync/UnlockFailed [code] code)
+    (sync/WaitFailed [code] code)
+    (sync/NotifyFailed [code] code)
+    (sync/DestroyFailed [code] code)))
+
+;; Initialize caller-owned storage with `initial` permits.
+(defn semaphore-init! [(sem (ptr Semaphore)) (initial i64)] (-> (Result i64 SemaphoreError))
+  (match (semaphore-init-with-allocator! sem (alloc/malloc-allocator))
+    (Err [e] (Err e))
+    (Ok [_]
+        (do
+          (set! (.permits sem) initial)
+          (Ok 0)))))
+
+;; Acquire one permit, sleeping until one is released if none are free.
+(defn semaphore-acquire! [(sem (ptr Semaphore))] (-> (Result i64 SemaphoreError))
+  (match (sync/mutex-lock! (.mutex sem))
+    (Err [e] (Err (Broken (sync-error-code e))))
+    (Ok [_]
+        (block :done
+          (loop
+            (if (> (.permits sem) 0)
+                (do
+                  (set! (.permits sem) (- (.permits sem) 1))
+                  (sync/mutex-unlock! (.mutex sem))
+                  (return-from :done (Ok 0)))
+                (match (sync/condition-wait! (.condition sem) (.mutex sem))
+                  (Err [e]
+                       (do
+                         (sync/mutex-unlock! (.mutex sem))
+                         (return-from :done (Err (Broken (sync-error-code e))))))
+                  (Ok [_] 0))))))))
+
+;; Take a permit only if one is free right now. Ok(true) = acquired.
+(defn semaphore-try-acquire! [(sem (ptr Semaphore))] (-> (Result bool SemaphoreError))
+  (match (sync/mutex-lock! (.mutex sem))
+    (Err [e] (Err (Broken (sync-error-code e))))
+    (Ok [_]
+        (let [got (> (.permits sem) 0)]
+          (when got (set! (.permits sem) (- (.permits sem) 1)))
+          (sync/mutex-unlock! (.mutex sem))
+          (Ok got)))))
+
+;; Acquire with a deadline. Returns Ok(false) on timeout without a permit.
+(defn semaphore-acquire-for! [(sem (mut Semaphore)) (duration time/Duration)] (-> (Result bool SemaphoreError))
+  (match (time/deadline-after duration)
+    (Err [e] (Err (Broken (time/time-error-code e))))
+    (Ok [deadline]
+        (match (sync/mutex-lock! (.mutex sem))
+          (Err [e] (Err (Broken (sync-error-code e))))
+          (Ok [_]
+              (block :done
+                (loop
+                  (if (> (.permits sem) 0)
+                      (do
+                        (set! (.permits sem) (- (.permits sem) 1))
+                        (sync/mutex-unlock! (.mutex sem))
+                        (return-from :done (Ok true)))
+                      (match (time/deadline-remaining deadline)
+                        (Err [e]
+                             (do
+                               (sync/mutex-unlock! (.mutex sem))
+                               (return-from :done (Err (Broken (time/time-error-code e))))))
+                        (Ok [remaining]
+                            (if (not (time/duration-valid? remaining))
+                                (do
+                                  (sync/mutex-unlock! (.mutex sem))
+                                  (return-from :done (Ok false)))
+                                (match (sync/condition-wait-for! (.condition sem) (.mutex sem) remaining)
+                                  (Err [e]
+                                       (do
+                                         (sync/mutex-unlock! (.mutex sem))
+                                         (return-from :done (Err (Broken (sync-error-code e))))))
+                                  (Ok [_] 0)))))))))))))
+
+;; Return one permit, waking a single waiter if any are parked.
+(defn semaphore-release! [(sem (ptr Semaphore))] (-> (Result i64 SemaphoreError))
+  (match (sync/mutex-lock! (.mutex sem))
+    (Err [e] (Err (Broken (sync-error-code e))))
+    (Ok [_]
+        (do
+          (set! (.permits sem) (+ (.permits sem) 1))
+          (let [woken (sync/condition-notify-one! (.condition sem))]
+            (match (sync/mutex-unlock! (.mutex sem))
+              (Err [e] (Err (Broken (sync-error-code e))))
+              (Ok [_] woken)))))))
+
+;; Current free-permit count (snapshot under the lock).
+(defn semaphore-available! [(sem (ptr Semaphore))] (-> (Result i64 SemaphoreError))
+  (match (sync/mutex-lock! (.mutex sem))
+    (Err [e] (Err (Broken (sync-error-code e))))
+    (Ok [_]
+        (let [available (.permits sem)]
+          (sync/mutex-unlock! (.mutex sem))
+          (Ok available)))))
+
+(defn semaphore-destroy! [(sem (ptr Semaphore))] (-> (Result i64 SemaphoreError))
+  (if (not (.initialized sem))
+      (Ok 0)
+      (match (sync/condition-destroy! (.condition sem))
+        (Err [e] (Err (Broken (sync-error-code e))))
+        (Ok [_]
+            (match (sync/mutex-destroy! (.mutex sem))
+              (Err [e] (Err (Broken (sync-error-code e))))
+              (Ok [_] (do (set! (.initialized sem) false) (Ok 0))))))))
