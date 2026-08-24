@@ -16,6 +16,10 @@
 (import "experiments.c.ctype" :as ct)
 (import "experiments.c.node" :as nd)
 
+;; Decimal-to-binary rounding is the platform's job; getting it wrong by a
+;; digit would silently change what a program computes.
+(extern strtod :cc c [(ptr i8) (ptr (ptr i8))] (-> f64))
+
 (export Parser
         ParseResult
         parse
@@ -403,6 +407,62 @@
                   (str/sb-push-byte! (mut b) (primitive/cast u8 v))
                   (store! i (+ (load i) 2)))))))
     (str/sb-str (load (mut b)))))
+
+;; Whether a preprocessing number spells a floating constant. A hexadecimal
+;; one needs a point or a binary exponent; a decimal one a point or an exponent.
+;; Testing for `e` unconditionally would misread `0x1e5`.
+(defn float-literal? [(text (slice u8))] (-> bool)
+  (let [n (slice-len text)
+        hex (and (>= n 2)
+                 (and (= (primitive/cast i64 (slice-get text 0)) 48)
+                      (or (= (primitive/cast i64 (slice-get text 1)) 120)
+                          (= (primitive/cast i64 (slice-get text 1)) 88))))
+        (mut i) 0
+        (mut found) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [c (primitive/cast i64 (slice-get text (load i)))]
+                (if (or (= c 46)
+                        (if hex
+                            (or (= c 112) (= c 80))
+                            (or (= c 101) (= c 69))))
+                    (store! found 1)
+                    0)
+                (store! i (+ (load i) 1)))))
+    (!= (load found) 0)))
+
+;; An `f` suffix makes a floating constant single precision; `l` would make it
+;; long double, which is double here.
+(defn number-float-type [(p (mut Parser)) (text (slice u8))] (-> (ptr ct/Type))
+  (let [n (slice-len text)
+        last (if (= n 0) 0 (primitive/cast i64 (slice-get text (- n 1))))]
+    (if (or (= last 102) (= last 70))
+        (ct/ty-float (load (field p a)))
+        (ty-double-of (mut p)))))
+
+;; `u` and `l` decide an integer constant's type; without them its magnitude
+;; does. Neither letter can appear in a hexadecimal digit, so scanning the whole
+;; spelling is safe.
+(defn number-int-type [(p (mut Parser)) (text (slice u8)) (value i64)] (-> (ptr ct/Type))
+  (let [n (slice-len text)
+        (mut i) 0
+        (mut unsigned) 0
+        (mut longs) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [c (primitive/cast i64 (slice-get text (load i)))]
+                (cond
+                  (or (= c 117) (= c 85)) (store! unsigned 1)
+                  (or (= c 108) (= c 76)) (store! longs (+ (load longs) 1))
+                  :else 0)
+                (store! i (+ (load i) 1)))))
+    (let [wide (or (> (load longs) 0)
+                   (if (!= (load unsigned) 0)
+                       (> value 4294967295)
+                       (or (> value 2147483647) (< value -2147483648))))]
+      (if (!= (load unsigned) 0)
+          (if wide (ty-ulong-of (mut p)) (ct/ty-uint (load (field p a))))
+          (if wide (ty-long-of (mut p)) (ty-int-of (mut p)))))))
 
 (defn parse-number-text [(text (slice u8))] (-> i64)
   (let [n (slice-len text)
@@ -1155,8 +1215,16 @@
                 n)))
       (= (lex/token-kind t) lex/TK-NUMBER)
         (let [tok (advance! (mut p))
-              n (nd/node-num a (parse-number-text (lex/token-text tok)) tok)]
-          (add-type! (mut p) n) n)
+              text (lex/token-text tok)]
+          (if (float-literal? text)
+              (let [v (strtod (str/str->cstr a text) (primitive/cast (ptr (ptr i8)) 0))
+                    n (nd/node-float a v tok)]
+                (nd/set-type! n (number-float-type (mut p) text))
+                n)
+              (let [v (parse-number-text text)
+                    n (nd/node-num a v tok)]
+                (nd/set-type! n (number-int-type (mut p) text v))
+                n)))
       (= (lex/token-kind t) lex/TK-CHARACTER)
         (let [tok (advance! (mut p))
               bytes (decode-escapes (mut p) (lex/token-text tok) 39)
