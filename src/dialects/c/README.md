@@ -68,6 +68,23 @@ functions use Coil's native `...` and the platform convention.
 constructors after the static initialisers, destructors through `atexit`, so that
 they still run when the program calls `exit`.
 
+## Records do not cross a foreign call boundary by value
+
+A record is lowered as a blob with C's size and alignment, and passed between
+this program's own functions as that blob. Both sides agree, so struct arguments
+and struct returns work -- `tests/c/native/structs.c` matches Clang.
+
+They do not agree with anybody else. The platform's own convention classifies a
+record by what is in it: on arm64 a struct of four `double`s is a homogeneous
+floating aggregate and travels in `v0..v3`, a small integer struct travels in
+`x` registers, and a large one travels behind a hidden pointer. None of that is
+implemented, so passing a record by value to a function this compiler did not
+build is wrong, and passing one to a variadic foreign function crashes.
+
+`src/apps/doom/cocoa.c` is the only place in this repo that would do it -- a
+`CGRect` to `objc_msgSend` -- and it sends the four doubles as four arguments
+instead, which this target puts in exactly the same registers.
+
 ## What is not implemented
 
 `_Float16` and `__int128` exist so that a system header declaring one lays out

@@ -47,7 +47,6 @@ extern id objc_msgSend(id self, SEL op);
 
 /* --- CoreGraphics ------------------------------------------------------- */
 
-typedef struct { double x, y, w, h; } CGRect_t;
 
 extern void *CGColorSpaceCreateDeviceRGB(void);
 extern void CGColorSpaceRelease(void *space);
@@ -276,7 +275,6 @@ static void post_mouse(void)
 
 void DG_Init(void)
 {
-    CGRect_t frame;
     id view;
     id nearest;
 
@@ -287,15 +285,16 @@ void DG_Init(void)
     /* NSApplicationActivationPolicyRegular: a real windowed app. */
     SEND1(id, app, SEL_("setActivationPolicy:"), long, 0);
 
-    frame.x = 200.0;
-    frame.y = 200.0;
-    frame.w = (double) DOOMGENERIC_RESX;
-    frame.h = (double) DOOMGENERIC_RESY;
-
+    /* The content rect is four doubles, which this target passes in v0..v3 --
+       the same registers four separate double arguments go in. Sending them
+       one by one is the same call, and keeps a record from crossing a foreign
+       boundary, which is a thing the C frontend cannot yet do correctly. */
     window = SEND0(id, CLS("NSWindow"), SEL_("alloc"));
-    window = ((id (*)(id, SEL, CGRect_t, unsigned long, unsigned long, long))objc_msgSend)(
+    window = ((id (*)(id, SEL, double, double, double, double,
+                      unsigned long, unsigned long, long))objc_msgSend)(
                  window, SEL_("initWithContentRect:styleMask:backing:defer:"),
-                 frame, NS_TITLED | NS_CLOSABLE | NS_MINIATURIZABLE, NS_BACKING_BUFFERED, 0);
+                 200.0, 200.0, (double) DOOMGENERIC_RESX, (double) DOOMGENERIC_RESY,
+                 NS_TITLED | NS_CLOSABLE | NS_MINIATURIZABLE, NS_BACKING_BUFFERED, 0);
     if (window == 0)
     {
         printf("doom: could not create a window\n");
