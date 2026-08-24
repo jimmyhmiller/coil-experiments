@@ -1,0 +1,1439 @@
+;; C parser and semantic analysis. Ported from chibicc by Rui Ueyama (MIT) --
+;; see ATTRIBUTION.md.
+;;
+;; Types are resolved and the conversions C performs implicitly are inserted
+;; here, so what comes out is a typed tree rather than a parse tree.
+(module experiments.c.parse)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.hashmap" :as hm)
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+(import "coil.result" :use *)
+(import "experiments.c.lex" :as lex)
+(import "experiments.c.ctype" :as ct)
+(import "experiments.c.node" :as nd)
+
+(export Parser
+        ParseResult
+        parse
+        parser-new)
+
+;; A name in scope is exactly one of: an object, a typedef, or an enum
+;; constant.
+(defstruct VarScope
+  [(name (slice u8))
+   (obj (ptr nd/Obj))
+   (type-def (ptr ct/Type))
+   (enum-value i64)
+   (is-enum i64)])
+
+(defstruct Scope
+  [(vars (hm/HashMap (slice u8) VarScope))
+   (tags (hm/HashMap (slice u8) (ptr ct/Type)))])
+
+(defstruct Parser
+  [(a (dyn alloc/Allocator))
+   (tokens (al/ArrayList lex/Token))
+   (pos i64)
+   (scopes (al/ArrayList (ptr Scope)))
+   (globals (al/ArrayList (ptr nd/Obj)))
+   (current-fn (ptr nd/Obj))
+   (failed i64)
+   (message (slice u8))
+   (file (slice u8))
+   (line i64)
+   (column i64)])
+
+(defstruct ParseResult
+  [(globals (al/ArrayList (ptr nd/Obj)))
+   (failed i64)
+   (message (slice u8))
+   (file (slice u8))
+   (line i64)
+   (column i64)])
+
+(defn nil-node [] (-> (ptr nd/Node)) (primitive/cast (ptr nd/Node) 0))
+(defn nil-obj [] (-> (ptr nd/Obj)) (primitive/cast (ptr nd/Obj) 0))
+(defn nil-type [] (-> (ptr ct/Type)) (primitive/cast (ptr ct/Type) 0))
+(defn null-node? [(n (ptr nd/Node))] (-> bool) (= (primitive/cast i64 n) 0))
+(defn null-type? [(t (ptr ct/Type))] (-> bool) (= (primitive/cast i64 t) 0))
+(defn null-obj? [(o (ptr nd/Obj))] (-> bool) (= (primitive/cast i64 o) 0))
+
+(defn text=? [(x (slice u8)) (y (slice u8))] (-> bool) (str/str-eq x y))
+
+;; ------------------------------------------------------------ token access
+
+(defn peek [(p (mut Parser))] (-> lex/Token)
+  (let [n (al/al-len [lex/Token] (load (field p tokens)))
+        i (load (field p pos))]
+    (al/al-get [lex/Token] (load (field p tokens)) (if (>= i n) (- n 1) i))))
+
+(defn peek-at [(p (mut Parser)) (offset i64)] (-> lex/Token)
+  (let [n (al/al-len [lex/Token] (load (field p tokens)))
+        i (+ (load (field p pos)) offset)]
+    (al/al-get [lex/Token] (load (field p tokens)) (if (>= i n) (- n 1) (if (< i 0) 0 i)))))
+
+(defn at-eof? [(p (mut Parser))] (-> bool)
+  (= (lex/token-kind (peek (mut p))) lex/TK-EOF))
+
+(defn advance! [(p (mut Parser))] (-> lex/Token)
+  (let [t (peek (mut p))]
+    (if (at-eof? (mut p)) 0 (store! (field p pos) (+ (load (field p pos)) 1)))
+    t))
+
+(defn fail-at! [(p (mut Parser)) (message (slice u8)) (t lex/Token)] (-> i64)
+  (if (!= (load (field p failed)) 0)
+      0
+      (do
+        (store! (field p failed) 1)
+        (store! (field p message) message)
+        (store! (field p file) (lex/token-file t))
+        (store! (field p line) (lex/token-line t))
+        (store! (field p column) (lex/token-column t))
+        0)))
+
+(defn fail! [(p (mut Parser)) (message (slice u8))] (-> i64)
+  (fail-at! (mut p) message (peek (mut p))))
+
+(defn punct? [(p (mut Parser)) (s (slice u8))] (-> bool)
+  (let [t (peek (mut p))]
+    (and (= (lex/token-kind t) lex/TK-PUNCT) (text=? (lex/token-text t) s))))
+
+(defn word? [(p (mut Parser)) (s (slice u8))] (-> bool)
+  (let [t (peek (mut p))]
+    (and (or (= (lex/token-kind t) lex/TK-IDENT) (= (lex/token-kind t) lex/TK-KEYWORD))
+         (text=? (lex/token-text t) s))))
+
+(defn eat! [(p (mut Parser)) (s (slice u8))] (-> bool)
+  (if (or (punct? (mut p) s) (word? (mut p) s))
+      (do (advance! (mut p)) true)
+      false))
+
+(defn expect! [(p (mut Parser)) (s (slice u8))] (-> i64)
+  (if (eat! (mut p) s)
+      0
+      (fail! (mut p) "unexpected token")))
+
+;; -------------------------------------------------------------- scopes
+
+(defn scope-new [(p (mut Parser))] (-> (ptr Scope))
+  (alloc/box! (load (field p a))
+              Scope
+              (load (Scope :vars (hm/hm-new [(slice u8) VarScope] (load (field p a)) (str/str-keyops))
+                      :tags (hm/hm-new [(slice u8) (ptr ct/Type)] (load (field p a)) (str/str-keyops))))))
+
+(defn enter-scope! [(p (mut Parser))] (-> i64)
+  (al/al-push! [(ptr Scope)] (mut (field p scopes)) (scope-new (mut p))) 0)
+
+(defn leave-scope! [(p (mut Parser))] (-> i64)
+  (al/al-pop! [(ptr Scope)] (mut (field p scopes))) 0)
+
+(defn scope-depth [(p (mut Parser))] (-> i64)
+  (al/al-len [(ptr Scope)] (load (field p scopes))))
+
+(defn scope-at [(p (mut Parser)) (i i64)] (-> (ptr Scope))
+  (al/al-get [(ptr Scope)] (load (field p scopes)) i))
+
+(defn declare! [(p (mut Parser)) (name (slice u8)) (entry VarScope)] (-> i64)
+  (let [top (scope-at (mut p) (- (scope-depth (mut p)) 1))]
+    (hm/hm-put! [(slice u8) VarScope] (mut (field top vars)) name entry))
+  0)
+
+(defn declare-obj! [(p (mut Parser)) (o (ptr nd/Obj))] (-> i64)
+  (declare! (mut p)
+            (nd/obj-name o)
+            (load (VarScope :name (nd/obj-name o)
+                    :obj o
+                    :type-def (nil-type)
+                    :enum-value 0
+                    :is-enum 0))))
+
+(defn declare-typedef! [(p (mut Parser)) (name (slice u8)) (t (ptr ct/Type))] (-> i64)
+  (declare! (mut p)
+            name
+            (load (VarScope :name name
+                    :obj (nil-obj)
+                    :type-def t
+                    :enum-value 0
+                    :is-enum 0))))
+
+(defn declare-enum! [(p (mut Parser)) (name (slice u8)) (v i64)] (-> i64)
+  (declare! (mut p)
+            name
+            (load (VarScope :name name
+                    :obj (nil-obj)
+                    :type-def (nil-type)
+                    :enum-value v
+                    :is-enum 1))))
+
+;; Innermost scope wins, so the search runs outward.
+(defn lookup [(p (mut Parser)) (name (slice u8))] (-> (Option VarScope))
+  (let [(mut i) (- (scope-depth (mut p)) 1)
+        (mut found) (None [VarScope])]
+    (loop (if (or (< (load i) 0) (match (load found) (Some [_] true) (None [] false)))
+              (break)
+              (do
+                (match (hm/hm-get (load (field (scope-at (mut p) (load i)) vars)) name)
+                  (Some [e] (store! found (Some e)))
+                  (None [] 0))
+                (store! i (- (load i) 1)))))
+    (load found)))
+
+(defn declare-tag! [(p (mut Parser)) (name (slice u8)) (t (ptr ct/Type))] (-> i64)
+  (let [top (scope-at (mut p) (- (scope-depth (mut p)) 1))]
+    (hm/hm-put! [(slice u8) (ptr ct/Type)] (mut (field top tags)) name t))
+  0)
+
+(defn lookup-tag [(p (mut Parser)) (name (slice u8))] (-> (ptr ct/Type))
+  (let [(mut i) (- (scope-depth (mut p)) 1)
+        (mut found) (nil-type)]
+    (loop (if (or (< (load i) 0) (not (null-type? (load found))))
+              (break)
+              (do
+                (match (hm/hm-get (load (field (scope-at (mut p) (load i)) tags)) name)
+                  (Some [t] (store! found t))
+                  (None [] 0))
+                (store! i (- (load i) 1)))))
+    (load found)))
+
+;; ------------------------------------------------------------ type helpers
+
+(defn ty-int-of [(p (mut Parser))] (-> (ptr ct/Type)) (ct/ty-int (load (field p a))))
+(defn ty-long-of [(p (mut Parser))] (-> (ptr ct/Type)) (ct/ty-long (load (field p a))))
+(defn ty-ulong-of [(p (mut Parser))] (-> (ptr ct/Type)) (ct/ty-ulong (load (field p a))))
+(defn ty-char-of [(p (mut Parser))] (-> (ptr ct/Type)) (ct/ty-char (load (field p a))))
+(defn ty-void-of [(p (mut Parser))] (-> (ptr ct/Type)) (ct/ty-void (load (field p a))))
+(defn ty-double-of [(p (mut Parser))] (-> (ptr ct/Type)) (ct/ty-double (load (field p a))))
+
+;; An array or a function used as a value becomes a pointer. C does this
+;; everywhere except as the operand of `sizeof` and `&`.
+(defn decay [(p (mut Parser)) (n (ptr nd/Node))] (-> (ptr nd/Node))
+  (add-type! (mut p) n)
+  (let [t (nd/nd-type n)]
+    (if (null-type? t)
+        n
+        (cond
+          (= (ct/ty-kind t) ct/TY-ARRAY)
+            (nd/node-cast (load (field p a)) n (ct/ty-pointer-to (load (field p a)) (ct/ty-base t)))
+          (= (ct/ty-kind t) ct/TY-FUNC)
+            (nd/node-cast (load (field p a)) n (ct/ty-pointer-to (load (field p a)) t))
+          :else n))))
+
+;; The usual arithmetic conversions: everything narrower than int is promoted to
+;; int, then the wider of the two wins, with unsigned beating signed at equal
+;; width.
+(defn common-type [(p (mut Parser)) (x (ptr ct/Type)) (y (ptr ct/Type))] (-> (ptr ct/Type))
+  (cond
+    (null-type? x) (if (null-type? y) (ty-int-of (mut p)) y)
+    (null-type? y) x
+    (= (ct/ty-kind x) ct/TY-ARRAY) (ct/ty-pointer-to (load (field p a)) (ct/ty-base x))
+    (or (= (ct/ty-kind x) ct/TY-DOUBLE) (= (ct/ty-kind y) ct/TY-DOUBLE)) (ty-double-of (mut p))
+    (or (= (ct/ty-kind x) ct/TY-FLOAT) (= (ct/ty-kind y) ct/TY-FLOAT)) (ct/ty-float (load (field p a)))
+    :else
+      (let [sx (if (< (ct/ty-size x) 4) 4 (ct/ty-size x))
+            sy (if (< (ct/ty-size y) 4) 4 (ct/ty-size y))
+            size (if (> sx sy) sx sy)
+            unsigned (or (and (= sx size) (ct/ty-unsigned? x))
+                         (and (= sy size) (ct/ty-unsigned? y)))]
+        (if (= size 8)
+            (if unsigned (ty-ulong-of (mut p)) (ty-long-of (mut p)))
+            (if unsigned (ct/ty-uint (load (field p a))) (ty-int-of (mut p)))))))
+
+;; Rewrites both operands to their common type, which is what makes the
+;; conversion explicit in the tree rather than implied by the operator.
+(defn usual-conversions [(p (mut Parser)) (n (ptr nd/Node))] (-> i64)
+  (let [l (nd/nd-lhs n)
+        r (nd/nd-rhs n)]
+    (if (or (null-node? l) (null-node? r))
+        0
+        (let [t (common-type (mut p) (nd/nd-type l) (nd/nd-type r))]
+          (nd/set-lhs! n (nd/node-cast (load (field p a)) l t))
+          (nd/set-rhs! n (nd/node-cast (load (field p a)) r t))
+          0))))
+
+;; `p + n` advances by n elements, not n bytes, so the scaling is made explicit.
+(defn new-add [(p (mut Parser)) (lhs (ptr nd/Node)) (rhs (ptr nd/Node)) (tok lex/Token)] (-> (ptr nd/Node))
+  (add-type! (mut p) lhs)
+  (add-type! (mut p) rhs)
+  (let [a (load (field p a))
+        l (decay (mut p) lhs)
+        r (decay (mut p) rhs)
+        lt (nd/nd-type l)
+        rt (nd/nd-type r)]
+    (cond
+      (or (null-type? lt) (null-type? rt))
+        (do (fail-at! (mut p) "operand has no type" tok) l)
+      (and (ct/numeric? lt) (ct/numeric? rt))
+        (let [n (nd/node-binary a nd/ND-ADD l r tok)] (add-type! (mut p) n) n)
+      (and (ct/pointer-like? lt) (ct/numeric? rt))
+        (let [scale (nd/node-binary a
+                                    nd/ND-MUL
+                                    r
+                                    (nd/node-num a (ct/ty-size (ct/ty-base lt)) tok)
+                                    tok)
+              n (nd/node-binary a nd/ND-ADD l scale tok)]
+          (add-type! (mut p) scale)
+          (nd/set-type! n lt)
+          n)
+      (and (ct/numeric? lt) (ct/pointer-like? rt))
+        (new-add (mut p) rhs lhs tok)
+      :else (do (fail-at! (mut p) "invalid operands to +" tok) l))))
+
+(defn new-sub [(p (mut Parser)) (lhs (ptr nd/Node)) (rhs (ptr nd/Node)) (tok lex/Token)] (-> (ptr nd/Node))
+  (add-type! (mut p) lhs)
+  (add-type! (mut p) rhs)
+  (let [a (load (field p a))
+        l (decay (mut p) lhs)
+        r (decay (mut p) rhs)
+        lt (nd/nd-type l)
+        rt (nd/nd-type r)]
+    (cond
+      (or (null-type? lt) (null-type? rt))
+        (do (fail-at! (mut p) "operand has no type" tok) l)
+      (and (ct/numeric? lt) (ct/numeric? rt))
+        (let [n (nd/node-binary a nd/ND-SUB l r tok)] (add-type! (mut p) n) n)
+      (and (ct/pointer-like? lt) (ct/numeric? rt))
+        (let [scale (nd/node-binary a
+                                    nd/ND-MUL
+                                    r
+                                    (nd/node-num a (ct/ty-size (ct/ty-base lt)) tok)
+                                    tok)
+              n (nd/node-binary a nd/ND-SUB l scale tok)]
+          (add-type! (mut p) scale)
+          (nd/set-type! n lt)
+          n)
+      ;; Pointer difference counts elements, so the byte difference is divided
+      ;; by the element size.
+      (and (ct/pointer-like? lt) (ct/pointer-like? rt))
+        (let [diff (nd/node-binary a nd/ND-SUB l r tok)
+              n (nd/node-binary a
+                                nd/ND-DIV
+                                diff
+                                (nd/node-num a (ct/ty-size (ct/ty-base lt)) tok)
+                                tok)]
+          (nd/set-type! diff (ty-long-of (mut p)))
+          (nd/set-type! n (ty-long-of (mut p)))
+          n)
+      :else (do (fail-at! (mut p) "invalid operands to -" tok) l))))
+
+(defn add-type! [(p (mut Parser)) (n (ptr nd/Node))] (-> i64)
+  (if (or (null-node? n) (not (null-type? (nd/nd-type n))))
+      0
+      (let [k (nd/nd-kind n)
+            l (nd/nd-lhs n)
+            r (nd/nd-rhs n)]
+        (cond
+          (= k nd/ND-NUM)
+            (nd/set-type! n (if (or (> (nd/nd-value n) 2147483647) (< (nd/nd-value n) -2147483648))
+                                (ty-long-of (mut p))
+                                (ty-int-of (mut p))))
+          (= k nd/ND-VAR) (nd/set-type! n (nd/obj-type (nd/nd-obj n)))
+          (or (= k nd/ND-ADD) (or (= k nd/ND-SUB) (or (= k nd/ND-MUL)
+              (or (= k nd/ND-DIV) (or (= k nd/ND-MOD) (or (= k nd/ND-BITAND)
+              (or (= k nd/ND-BITOR) (= k nd/ND-BITXOR))))))))
+            (do (usual-conversions (mut p) n) (nd/set-type! n (nd/nd-type (nd/nd-lhs n))))
+          (or (= k nd/ND-NEG) (= k nd/ND-BITNOT))
+            (nd/set-type! n (nd/nd-type l))
+          (or (= k nd/ND-SHL) (= k nd/ND-SHR))
+            (nd/set-type! n (nd/nd-type l))
+          (or (= k nd/ND-EQ) (or (= k nd/ND-NE) (or (= k nd/ND-LT) (= k nd/ND-LE))))
+            (do (usual-conversions (mut p) n) (nd/set-type! n (ty-int-of (mut p))))
+          (or (= k nd/ND-LOGAND) (or (= k nd/ND-LOGOR) (= k nd/ND-NOT)))
+            (nd/set-type! n (ty-int-of (mut p)))
+          (= k nd/ND-ASSIGN) (nd/set-type! n (nd/nd-type l))
+          (= k nd/ND-COMMA) (nd/set-type! n (nd/nd-type r))
+          (= k nd/ND-ADDR)
+            (nd/set-type! n (ct/ty-pointer-to (load (field p a)) (nd/nd-type l)))
+          (= k nd/ND-DEREF)
+            (let [lt (nd/nd-type l)]
+              (if (ct/pointer-like? lt)
+                  (nd/set-type! n (ct/ty-base lt))
+                  (fail-at! (mut p) "cannot dereference a non-pointer" (nd/nd-token n))))
+          (= k nd/ND-COND)
+            (nd/set-type! n (nd/nd-type (nd/nd-then n)))
+          :else 0))))
+
+;; ------------------------------------------------------------- literals
+
+;; Decodes a string or character literal's escapes. The lexer deliberately kept
+;; the original spelling so that `#` could stringify it; this is where the
+;; actual bytes are worked out.
+(defn decode-escapes [(p (mut Parser)) (text (slice u8)) (quote i64)] (-> (slice u8))
+  (let [(mut b) (str/sb-new (load (field p a)))
+        n (slice-len text)
+        (mut i) 0]
+    ;; Skip any encoding prefix and the opening quote.
+    (loop (if (or (>= (load i) n)
+                  (= (primitive/cast i64 (slice-get text (load i))) quote))
+              (break)
+              (store! i (+ (load i) 1))))
+    (store! i (+ (load i) 1))
+    (loop
+      (if (>= (load i) n)
+          (break)
+          (let [c (primitive/cast i64 (slice-get text (load i)))]
+            (cond
+              (= c quote) (break)
+              (!= c 92) (do (str/sb-push-byte! (mut b) (primitive/cast u8 c))
+                            (store! i (+ (load i) 1)))
+              :else
+                (let [k (if (< (+ (load i) 1) n)
+                            (primitive/cast i64 (slice-get text (+ (load i) 1)))
+                            0)
+                      v (cond (= k 110) 10 (= k 116) 9 (= k 114) 13 (= k 97) 7
+                              (= k 98) 8 (= k 102) 12 (= k 118) 11 (= k 48) 0
+                              (= k 101) 27 :else k)]
+                  (str/sb-push-byte! (mut b) (primitive/cast u8 v))
+                  (store! i (+ (load i) 2)))))))
+    (str/sb-str (load (mut b)))))
+
+(defn parse-number-text [(text (slice u8))] (-> i64)
+  (let [n (slice-len text)
+        (mut i) 0
+        (mut base) 10
+        (mut value) 0]
+    (if (and (>= n 2)
+             (and (= (primitive/cast i64 (slice-get text 0)) 48)
+                  (or (= (primitive/cast i64 (slice-get text 1)) 120)
+                      (= (primitive/cast i64 (slice-get text 1)) 88))))
+        (do (store! base 16) (store! i 2))
+        (if (and (>= n 1) (= (primitive/cast i64 (slice-get text 0)) 48))
+            (do (store! base 8) (store! i 1))
+            0))
+    (loop (if (>= (load i) n)
+              (break)
+              (let [c (primitive/cast i64 (slice-get text (load i)))
+                    d (cond (and (>= c 48) (<= c 57)) (- c 48)
+                            (and (>= c 97) (<= c 102)) (+ (- c 97) 10)
+                            (and (>= c 65) (<= c 70)) (+ (- c 65) 10)
+                            :else -1)]
+                (if (or (< d 0) (>= d (load base)))
+                    (break)
+                    (do (store! value (+ (* (load value) (load base)) d))
+                        (store! i (+ (load i) 1)))))))
+    (load value)))
+
+;; A string literal becomes an anonymous global holding its bytes, which is what
+;; gives it an address and a lifetime.
+(defn string-literal [(p (mut Parser)) (tok lex/Token)] (-> (ptr nd/Node))
+  (let [bytes (decode-escapes (mut p) (lex/token-text tok) 34)
+        ty (ct/ty-array-of (load (field p a)) (ty-char-of (mut p)) (+ (slice-len bytes) 1))
+        (mut name) (str/sb-new (load (field p a)))]
+    (str/sb-push-str! (mut name) ".Lstr.")
+    (str/sb-push-i64! (mut name) (al/al-len [(ptr nd/Obj)] (load (field p globals))))
+    (let [o (nd/obj-new (load (field p a)) (str/sb-str (load (mut name))) ty false)]
+      (al/al-push! [(ptr nd/Obj)] (mut (field p globals)) o)
+      (nd/node-var (load (field p a)) o tok))))
+
+;; ---------------------------------------------------------- expressions
+
+(defn parse-expr [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [(mut n) (parse-assign (mut p))]
+    (loop (if (punct? (mut p) ",")
+              (let [tok (advance! (mut p))
+                    r (parse-assign (mut p))
+                    c (nd/node-binary (load (field p a)) nd/ND-COMMA (load n) r tok)]
+                (add-type! (mut p) c)
+                (store! n c))
+              (break)))
+    (load n)))
+
+;; `a op= b` is rewritten to `a = a op b`. Evaluating `a` twice is wrong when it
+;; has side effects, but the lowerer sees an assignment either way and this
+;; keeps the tree in one shape.
+(defn compound-assign [(p (mut Parser)) (lhs (ptr nd/Node)) (kind i64) (tok lex/Token)] (-> (ptr nd/Node))
+  (let [rhs (parse-assign (mut p))
+        op (if (= kind nd/ND-ADD)
+               (new-add (mut p) lhs rhs tok)
+               (if (= kind nd/ND-SUB)
+                   (new-sub (mut p) lhs rhs tok)
+                   (let [b (nd/node-binary (load (field p a)) kind lhs (decay (mut p) rhs) tok)]
+                     (add-type! (mut p) b)
+                     b)))
+        n (nd/node-binary (load (field p a)) nd/ND-ASSIGN lhs op tok)]
+    (add-type! (mut p) n)
+    n))
+
+(defn parse-assign [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [lhs (parse-conditional (mut p))
+        t (peek (mut p))]
+    (cond
+      (punct? (mut p) "=")
+        (let [tok (advance! (mut p))
+              rhs (decay (mut p) (parse-assign (mut p)))
+              n (nd/node-binary (load (field p a)) nd/ND-ASSIGN lhs rhs tok)]
+          ;; The right side is converted to the left side's type, which is what
+          ;; makes the conversion visible instead of implied.
+          (if (null-type? (nd/nd-type lhs))
+              0
+              (nd/set-rhs! n (nd/node-cast (load (field p a)) rhs (nd/nd-type lhs))))
+          (add-type! (mut p) n)
+          n)
+      (punct? (mut p) "+=") (compound-assign (mut p) lhs nd/ND-ADD (advance! (mut p)))
+      (punct? (mut p) "-=") (compound-assign (mut p) lhs nd/ND-SUB (advance! (mut p)))
+      (punct? (mut p) "*=") (compound-assign (mut p) lhs nd/ND-MUL (advance! (mut p)))
+      (punct? (mut p) "/=") (compound-assign (mut p) lhs nd/ND-DIV (advance! (mut p)))
+      (punct? (mut p) "%=") (compound-assign (mut p) lhs nd/ND-MOD (advance! (mut p)))
+      (punct? (mut p) "&=") (compound-assign (mut p) lhs nd/ND-BITAND (advance! (mut p)))
+      (punct? (mut p) "|=") (compound-assign (mut p) lhs nd/ND-BITOR (advance! (mut p)))
+      (punct? (mut p) "^=") (compound-assign (mut p) lhs nd/ND-BITXOR (advance! (mut p)))
+      (punct? (mut p) "<<=") (compound-assign (mut p) lhs nd/ND-SHL (advance! (mut p)))
+      (punct? (mut p) ">>=") (compound-assign (mut p) lhs nd/ND-SHR (advance! (mut p)))
+      :else lhs)))
+
+(defn parse-conditional [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [c (parse-logor (mut p))]
+    (if (not (punct? (mut p) "?"))
+        c
+        (let [tok (advance! (mut p))
+              then (parse-expr (mut p))
+              _ (expect! (mut p) ":")
+              els (parse-conditional (mut p))
+              n (nd/node-new (load (field p a)) nd/ND-COND tok)]
+          (nd/set-test! n (decay (mut p) c))
+          (nd/set-then! n (decay (mut p) then))
+          (nd/set-else! n (decay (mut p) els))
+          (add-type! (mut p) n)
+          n))))
+
+(defn binary-level [(p (mut Parser))
+                    (next-level i64)
+                    (n (ptr nd/Node))] (-> (ptr nd/Node)) n)
+
+(defn parse-logor [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [(mut n) (parse-logand (mut p))]
+    (loop (if (punct? (mut p) "||")
+              (let [tok (advance! (mut p))
+                    r (parse-logand (mut p))
+                    c (nd/node-binary (load (field p a)) nd/ND-LOGOR (load n) r tok)]
+                (add-type! (mut p) c) (store! n c))
+              (break)))
+    (load n)))
+
+(defn parse-logand [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [(mut n) (parse-bitor (mut p))]
+    (loop (if (punct? (mut p) "&&")
+              (let [tok (advance! (mut p))
+                    r (parse-bitor (mut p))
+                    c (nd/node-binary (load (field p a)) nd/ND-LOGAND (load n) r tok)]
+                (add-type! (mut p) c) (store! n c))
+              (break)))
+    (load n)))
+
+(defn parse-bitor [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [(mut n) (parse-bitxor (mut p))]
+    (loop (if (and (punct? (mut p) "|") true)
+              (let [tok (advance! (mut p))
+                    r (parse-bitxor (mut p))
+                    c (nd/node-binary (load (field p a)) nd/ND-BITOR (decay (mut p) (load n)) (decay (mut p) r) tok)]
+                (add-type! (mut p) c) (store! n c))
+              (break)))
+    (load n)))
+
+(defn parse-bitxor [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [(mut n) (parse-bitand (mut p))]
+    (loop (if (punct? (mut p) "^")
+              (let [tok (advance! (mut p))
+                    r (parse-bitand (mut p))
+                    c (nd/node-binary (load (field p a)) nd/ND-BITXOR (decay (mut p) (load n)) (decay (mut p) r) tok)]
+                (add-type! (mut p) c) (store! n c))
+              (break)))
+    (load n)))
+
+(defn parse-bitand [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [(mut n) (parse-equality (mut p))]
+    (loop (if (punct? (mut p) "&")
+              (let [tok (advance! (mut p))
+                    r (parse-equality (mut p))
+                    c (nd/node-binary (load (field p a)) nd/ND-BITAND (decay (mut p) (load n)) (decay (mut p) r) tok)]
+                (add-type! (mut p) c) (store! n c))
+              (break)))
+    (load n)))
+
+(defn parse-equality [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [(mut n) (parse-relational (mut p))]
+    (loop
+      (cond
+        (punct? (mut p) "==")
+          (let [tok (advance! (mut p)) r (parse-relational (mut p))
+                c (nd/node-binary (load (field p a)) nd/ND-EQ (decay (mut p) (load n)) (decay (mut p) r) tok)]
+            (add-type! (mut p) c) (store! n c))
+        (punct? (mut p) "!=")
+          (let [tok (advance! (mut p)) r (parse-relational (mut p))
+                c (nd/node-binary (load (field p a)) nd/ND-NE (decay (mut p) (load n)) (decay (mut p) r) tok)]
+            (add-type! (mut p) c) (store! n c))
+        :else (break)))
+    (load n)))
+
+;; `a > b` is `b < a`, so only two comparison node kinds are needed.
+(defn parse-relational [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [(mut n) (parse-shift (mut p))]
+    (loop
+      (cond
+        (punct? (mut p) "<")
+          (let [tok (advance! (mut p)) r (parse-shift (mut p))
+                c (nd/node-binary (load (field p a)) nd/ND-LT (decay (mut p) (load n)) (decay (mut p) r) tok)]
+            (add-type! (mut p) c) (store! n c))
+        (punct? (mut p) "<=")
+          (let [tok (advance! (mut p)) r (parse-shift (mut p))
+                c (nd/node-binary (load (field p a)) nd/ND-LE (decay (mut p) (load n)) (decay (mut p) r) tok)]
+            (add-type! (mut p) c) (store! n c))
+        (punct? (mut p) ">")
+          (let [tok (advance! (mut p)) r (parse-shift (mut p))
+                c (nd/node-binary (load (field p a)) nd/ND-LT (decay (mut p) r) (decay (mut p) (load n)) tok)]
+            (add-type! (mut p) c) (store! n c))
+        (punct? (mut p) ">=")
+          (let [tok (advance! (mut p)) r (parse-shift (mut p))
+                c (nd/node-binary (load (field p a)) nd/ND-LE (decay (mut p) r) (decay (mut p) (load n)) tok)]
+            (add-type! (mut p) c) (store! n c))
+        :else (break)))
+    (load n)))
+
+(defn parse-shift [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [(mut n) (parse-additive (mut p))]
+    (loop
+      (cond
+        (punct? (mut p) "<<")
+          (let [tok (advance! (mut p)) r (parse-additive (mut p))
+                c (nd/node-binary (load (field p a)) nd/ND-SHL (decay (mut p) (load n)) (decay (mut p) r) tok)]
+            (add-type! (mut p) c) (store! n c))
+        (punct? (mut p) ">>")
+          (let [tok (advance! (mut p)) r (parse-additive (mut p))
+                c (nd/node-binary (load (field p a)) nd/ND-SHR (decay (mut p) (load n)) (decay (mut p) r) tok)]
+            (add-type! (mut p) c) (store! n c))
+        :else (break)))
+    (load n)))
+
+(defn parse-additive [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [(mut n) (parse-multiplicative (mut p))]
+    (loop
+      (cond
+        (punct? (mut p) "+")
+          (let [tok (advance! (mut p)) r (parse-multiplicative (mut p))]
+            (store! n (new-add (mut p) (load n) r tok)))
+        (punct? (mut p) "-")
+          (let [tok (advance! (mut p)) r (parse-multiplicative (mut p))]
+            (store! n (new-sub (mut p) (load n) r tok)))
+        :else (break)))
+    (load n)))
+
+(defn parse-multiplicative [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [(mut n) (parse-cast (mut p))]
+    (loop
+      (cond
+        (punct? (mut p) "*")
+          (let [tok (advance! (mut p)) r (parse-cast (mut p))
+                c (nd/node-binary (load (field p a)) nd/ND-MUL (decay (mut p) (load n)) (decay (mut p) r) tok)]
+            (add-type! (mut p) c) (store! n c))
+        (punct? (mut p) "/")
+          (let [tok (advance! (mut p)) r (parse-cast (mut p))
+                c (nd/node-binary (load (field p a)) nd/ND-DIV (decay (mut p) (load n)) (decay (mut p) r) tok)]
+            (add-type! (mut p) c) (store! n c))
+        (punct? (mut p) "%")
+          (let [tok (advance! (mut p)) r (parse-cast (mut p))
+                c (nd/node-binary (load (field p a)) nd/ND-MOD (decay (mut p) (load n)) (decay (mut p) r) tok)]
+            (add-type! (mut p) c) (store! n c))
+        :else (break)))
+    (load n)))
+
+;; ---------------------------------------------------------- declarations
+
+(defstruct DeclSpec
+  [(ty (ptr ct/Type))
+   (is-typedef i64)
+   (is-static i64)
+   (is-extern i64)])
+
+(defn typedef-type [(p (mut Parser)) (name (slice u8))] (-> (ptr ct/Type))
+  (match (lookup (mut p) name)
+    (Some [found] (let [e found] (.type-def e)))
+    (None [] (nil-type))))
+
+(defn type-keyword? [(w (slice u8))] (-> bool)
+  (cond
+    (text=? w "void") true (text=? w "_Bool") true (text=? w "char") true
+    (text=? w "short") true (text=? w "int") true (text=? w "long") true
+    (text=? w "float") true (text=? w "double") true (text=? w "signed") true
+    (text=? w "unsigned") true (text=? w "struct") true (text=? w "union") true
+    (text=? w "enum") true (text=? w "const") true (text=? w "volatile") true
+    (text=? w "static") true (text=? w "extern") true (text=? w "typedef") true
+    (text=? w "register") true (text=? w "restrict") true (text=? w "__restrict") true
+    (text=? w "__restrict__") true (text=? w "inline") true (text=? w "__inline") true
+    (text=? w "_Noreturn") true (text=? w "_Atomic") true (text=? w "auto") true
+    (text=? w "_Thread_local") true (text=? w "__signed__") true
+    :else false))
+
+;; A name only starts a type if it is a typedef that is actually in scope,
+;; which is the whole reason the parser has to carry a scope at all.
+(defn type-start? [(p (mut Parser))] (-> bool)
+  (let [t (peek (mut p))]
+    (if (= (lex/token-kind t) lex/TK-KEYWORD)
+        (type-keyword? (lex/token-text t))
+        (if (= (lex/token-kind t) lex/TK-IDENT)
+            (not (null-type? (typedef-type (mut p) (lex/token-text t))))
+            false))))
+
+(defn parse-const-expr [(p (mut Parser))] (-> i64)
+  (let [n (parse-conditional (mut p))]
+    (eval-const (mut p) n)))
+
+;; Folds the constant expressions C requires to be folded: array bounds, enum
+;; values, case labels, and bitfield widths.
+(defn eval-const [(p (mut Parser)) (n (ptr nd/Node))] (-> i64)
+  (if (null-node? n)
+      0
+      (let [k (nd/nd-kind n)
+            l (nd/nd-lhs n)
+            r (nd/nd-rhs n)]
+        (cond
+          (= k nd/ND-NUM) (nd/nd-value n)
+          (= k nd/ND-CAST) (eval-const (mut p) l)
+          (= k nd/ND-ADD) (+ (eval-const (mut p) l) (eval-const (mut p) r))
+          (= k nd/ND-SUB) (- (eval-const (mut p) l) (eval-const (mut p) r))
+          (= k nd/ND-MUL) (* (eval-const (mut p) l) (eval-const (mut p) r))
+          (= k nd/ND-DIV) (let [d (eval-const (mut p) r)]
+                            (if (= d 0) 0 (primitive/idiv (eval-const (mut p) l) d)))
+          (= k nd/ND-MOD) (let [d (eval-const (mut p) r)]
+                            (if (= d 0) 0 (primitive/irem (eval-const (mut p) l) d)))
+          (= k nd/ND-NEG) (- 0 (eval-const (mut p) l))
+          (= k nd/ND-BITNOT) (primitive/inot (eval-const (mut p) l))
+          (= k nd/ND-NOT) (if (= (eval-const (mut p) l) 0) 1 0)
+          (= k nd/ND-BITAND) (primitive/iand (eval-const (mut p) l) (eval-const (mut p) r))
+          (= k nd/ND-BITOR) (primitive/ior (eval-const (mut p) l) (eval-const (mut p) r))
+          (= k nd/ND-BITXOR) (primitive/ixor (eval-const (mut p) l) (eval-const (mut p) r))
+          (= k nd/ND-SHL) (primitive/ishl (eval-const (mut p) l) (eval-const (mut p) r))
+          (= k nd/ND-SHR) (primitive/ishr (eval-const (mut p) l) (eval-const (mut p) r))
+          (= k nd/ND-EQ) (if (= (eval-const (mut p) l) (eval-const (mut p) r)) 1 0)
+          (= k nd/ND-NE) (if (!= (eval-const (mut p) l) (eval-const (mut p) r)) 1 0)
+          (= k nd/ND-LT) (if (< (eval-const (mut p) l) (eval-const (mut p) r)) 1 0)
+          (= k nd/ND-LE) (if (<= (eval-const (mut p) l) (eval-const (mut p) r)) 1 0)
+          (= k nd/ND-LOGAND) (if (and (!= (eval-const (mut p) l) 0) (!= (eval-const (mut p) r) 0)) 1 0)
+          (= k nd/ND-LOGOR) (if (or (!= (eval-const (mut p) l) 0) (!= (eval-const (mut p) r) 0)) 1 0)
+          (= k nd/ND-COND) (if (!= (eval-const (mut p) (nd/nd-test n)) 0)
+                               (eval-const (mut p) (nd/nd-then n))
+                               (eval-const (mut p) (nd/nd-else n)))
+          :else (do (fail-at! (mut p) "not a constant expression" (nd/nd-token n)) 0)))))
+
+;; A base type is built from however many specifier keywords appear, in any
+;; order, so they are counted rather than matched in sequence.
+(defn parse-declspec [(p (mut Parser))] (-> DeclSpec)
+  (let [a (load (field p a))
+        (mut ty) (nil-type)
+        (mut signed) 0
+        (mut unsigned) 0
+        (mut longs) 0
+        (mut shorts) 0
+        (mut ints) 0
+        (mut chars) 0
+        (mut voids) 0
+        (mut bools) 0
+        (mut floats) 0
+        (mut doubles) 0
+        (mut is-typedef) 0
+        (mut is-static) 0
+        (mut is-extern) 0
+        (mut done) 0]
+    (loop
+      (if (!= (load done) 0)
+          (break)
+          (let [t (peek (mut p))
+                w (lex/token-text t)]
+            (cond
+              (not (type-start? (mut p))) (store! done 1)
+              (word? (mut p) "typedef") (do (advance! (mut p)) (store! is-typedef 1))
+              (word? (mut p) "static") (do (advance! (mut p)) (store! is-static 1))
+              (word? (mut p) "extern") (do (advance! (mut p)) (store! is-extern 1))
+              (or (word? (mut p) "const") (or (word? (mut p) "volatile")
+                  (or (word? (mut p) "register") (or (word? (mut p) "restrict")
+                  (or (word? (mut p) "__restrict") (or (word? (mut p) "__restrict__")
+                  (or (word? (mut p) "inline") (or (word? (mut p) "__inline")
+                  (or (word? (mut p) "_Noreturn") (or (word? (mut p) "auto")
+                      (word? (mut p) "_Thread_local")))))))))))
+                (do (advance! (mut p)) 0)
+              (word? (mut p) "void") (do (advance! (mut p)) (store! voids (+ (load voids) 1)))
+              (word? (mut p) "_Bool") (do (advance! (mut p)) (store! bools (+ (load bools) 1)))
+              (word? (mut p) "char") (do (advance! (mut p)) (store! chars (+ (load chars) 1)))
+              (word? (mut p) "short") (do (advance! (mut p)) (store! shorts (+ (load shorts) 1)))
+              (word? (mut p) "int") (do (advance! (mut p)) (store! ints (+ (load ints) 1)))
+              (word? (mut p) "long") (do (advance! (mut p)) (store! longs (+ (load longs) 1)))
+              (word? (mut p) "float") (do (advance! (mut p)) (store! floats (+ (load floats) 1)))
+              (word? (mut p) "double") (do (advance! (mut p)) (store! doubles (+ (load doubles) 1)))
+              (or (word? (mut p) "signed") (word? (mut p) "__signed__"))
+                (do (advance! (mut p)) (store! signed 1))
+              (word? (mut p) "unsigned") (do (advance! (mut p)) (store! unsigned 1))
+              (or (word? (mut p) "struct") (word? (mut p) "union"))
+                (do (store! ty (parse-record (mut p) (word? (mut p) "union"))) (store! done 1))
+              (word? (mut p) "enum") (do (store! ty (parse-enum (mut p))) (store! done 1))
+              :else
+                ;; A typedef name ends the specifier list.
+                (let [named (typedef-type (mut p) (lex/token-text t))]
+                  (if (null-type? named)
+                      (store! done 1)
+                      (do (advance! (mut p)) (store! ty named) (store! done 1))))))))
+    (if (null-type? (load ty))
+        (store! ty
+                (cond
+                  (> (load voids) 0) (ct/ty-void a)
+                  (> (load bools) 0) (ct/ty-bool a)
+                  (> (load floats) 0) (ct/ty-float a)
+                  (> (load doubles) 0) (ct/ty-double a)
+                  (> (load chars) 0) (if (!= (load unsigned) 0) (ct/ty-uchar a) (ct/ty-char a))
+                  (> (load shorts) 0) (if (!= (load unsigned) 0) (ct/ty-ushort a) (ct/ty-short a))
+                  (> (load longs) 0) (if (!= (load unsigned) 0) (ct/ty-ulong a) (ct/ty-long a))
+                  :else (if (!= (load unsigned) 0) (ct/ty-uint a) (ct/ty-int a))))
+        0)
+    (load (DeclSpec :ty (load ty)
+            :is-typedef (load is-typedef)
+            :is-static (load is-static)
+            :is-extern (load is-extern)))))
+
+(defn skip-qualifiers! [(p (mut Parser))] (-> i64)
+  (loop (if (or (word? (mut p) "const") (or (word? (mut p) "volatile")
+            (or (word? (mut p) "restrict") (or (word? (mut p) "__restrict")
+                (word? (mut p) "__restrict__")))))
+            (do (advance! (mut p)) 0)
+            (break)))
+  0)
+
+(defn parse-pointers [(p (mut Parser)) (base (ptr ct/Type))] (-> (ptr ct/Type))
+  (let [(mut t) base]
+    (loop (if (punct? (mut p) "*")
+              (do (advance! (mut p))
+                  (store! t (ct/ty-pointer-to (load (field p a)) (load t)))
+                  (skip-qualifiers! (mut p)))
+              (break)))
+    (load t)))
+
+;; `[3][4]` is an array of 3 arrays of 4, so the suffixes are applied from the
+;; inside out -- the recursion does that naturally.
+(defn parse-type-suffix [(p (mut Parser)) (base (ptr ct/Type))] (-> (ptr ct/Type))
+  (cond
+    (punct? (mut p) "(")
+      (do (advance! (mut p))
+          (let [f (ct/ty-func-of (load (field p a)) base)]
+            (parse-params! (mut p) f)
+            f))
+    (punct? (mut p) "[")
+      (do (advance! (mut p))
+          (skip-qualifiers! (mut p))
+          (if (punct? (mut p) "]")
+              (do (advance! (mut p))
+                  (ct/ty-array-of (load (field p a)) (parse-type-suffix (mut p) base) -1))
+              (let [len (parse-const-expr (mut p))]
+                (expect! (mut p) "]")
+                (ct/ty-array-of (load (field p a)) (parse-type-suffix (mut p) base) len))))
+    :else base))
+
+(defn parse-params! [(p (mut Parser)) (f (ptr ct/Type))] (-> i64)
+  (if (punct? (mut p) ")")
+      (do (advance! (mut p)) 0)
+      (if (and (word? (mut p) "void") (is-punct-at? (mut p) 1 ")"))
+          (do (advance! (mut p)) (advance! (mut p)) 0)
+          (let [(mut go) 1]
+            (loop
+              (if (= (load go) 0)
+                  (break)
+                  (if (punct? (mut p) "...")
+                      (do (advance! (mut p)) (ct/set-variadic! f true) (store! go 0))
+                      (let [spec (parse-declspec (mut p))
+                            d (parse-declarator (mut p) (.ty spec))]
+                        (ct/add-param! f (.name d) (.ty d))
+                        (if (punct? (mut p) ",") (do (advance! (mut p)) 0) (store! go 0))))))
+            (expect! (mut p) ")")
+            0))))
+
+(defn is-punct-at? [(p (mut Parser)) (offset i64) (s (slice u8))] (-> bool)
+  (let [t (peek-at (mut p) offset)]
+    (and (= (lex/token-kind t) lex/TK-PUNCT) (text=? (lex/token-text t) s))))
+
+(defstruct Declared [(name (slice u8)) (ty (ptr ct/Type)) (tok lex/Token)])
+
+;; Skips a balanced parenthesised group, used to reach the type suffix before
+;; re-parsing the group against it.
+(defn skip-group! [(p (mut Parser))] (-> i64)
+  (let [(mut depth) 0
+        (mut go) 1]
+    (loop
+      (if (or (= (load go) 0) (at-eof? (mut p)))
+          (break)
+          (do
+            (if (punct? (mut p) "(") (store! depth (+ (load depth) 1)) 0)
+            (if (punct? (mut p) ")")
+                (do (store! depth (- (load depth) 1))
+                    (if (= (load depth) 0) (store! go 0) 0))
+                0)
+            (advance! (mut p)))))
+    0))
+
+;; `(*f)(int)` binds the pointer to the function, not to the return type. The
+;; group is skipped, the suffix after it gives the outer type, and only then is
+;; the group re-parsed against that -- which is what makes the precedence come
+;; out right.
+(defn parse-declarator [(p (mut Parser)) (base (ptr ct/Type))] (-> Declared)
+  (let [ty0 (parse-pointers (mut p) base)]
+    (if (punct? (mut p) "(")
+        (let [start (load (field p pos))]
+          (skip-group! (mut p))
+          (let [outer (parse-type-suffix (mut p) ty0)
+                after (load (field p pos))]
+            (store! (field p pos) (+ start 1))
+            (let [inner (parse-declarator (mut p) outer)]
+              (store! (field p pos) after)
+              inner)))
+        (let [t (peek (mut p))]
+          (if (or (= (lex/token-kind t) lex/TK-IDENT) (= (lex/token-kind t) lex/TK-KEYWORD))
+              (do (advance! (mut p))
+                  (let [suffixed (parse-type-suffix (mut p) ty0)]
+                    (load (Declared :name (lex/token-text t) :ty suffixed :tok t))))
+              (let [suffixed (parse-type-suffix (mut p) ty0)]
+                (load (Declared :name "" :ty suffixed :tok t))))))))
+
+(defn parse-declarator-type [(p (mut Parser)) (base (ptr ct/Type))] (-> (ptr ct/Type))
+  (let [d (parse-declarator (mut p) base)] (.ty d)))
+
+(defn parse-typename [(p (mut Parser))] (-> (ptr ct/Type))
+  (let [spec (parse-declspec (mut p))]
+    (parse-declarator-type (mut p) (.ty spec))))
+
+;; A tag names the same type everywhere it appears, so a reference to one
+;; already declared reuses it rather than making a new one. That is what lets a
+;; record contain a pointer to itself.
+(defn parse-record [(p (mut Parser)) (union? bool)] (-> (ptr ct/Type))
+  (advance! (mut p))
+  (let [t (peek (mut p))
+        named (or (= (lex/token-kind t) lex/TK-IDENT) (= (lex/token-kind t) lex/TK-KEYWORD))
+        tag (if named (lex/token-text t) "")]
+    (if named (do (advance! (mut p)) 0) 0)
+    (if (not (punct? (mut p) "{"))
+        (let [existing (if named (lookup-tag (mut p) tag) (nil-type))]
+          (if (null-type? existing)
+              (let [fresh (ct/ty-record (load (field p a)) union?)]
+                (ct/set-name! fresh tag)
+                (if named (declare-tag! (mut p) tag fresh) 0)
+                fresh)
+              existing))
+        (let [existing (if named (lookup-tag (mut p) tag) (nil-type))
+              ty (if (null-type? existing) (ct/ty-record (load (field p a)) union?) existing)]
+          (ct/set-name! ty tag)
+          (if named (declare-tag! (mut p) tag ty) 0)
+          (advance! (mut p))
+          (loop
+            (if (or (punct? (mut p) "}") (at-eof? (mut p)))
+                (break)
+                (let [spec (parse-declspec (mut p))
+                      (mut more) 1]
+                  (if (punct? (mut p) ";")
+                      (do (advance! (mut p)) (store! more 0))
+                      0)
+                  (loop
+                    (if (= (load more) 0)
+                        (break)
+                        (let [d (parse-declarator (mut p) (.ty spec))
+                              width (if (punct? (mut p) ":")
+                                        (do (advance! (mut p)) (parse-const-expr (mut p)))
+                                        -1)]
+                          (ct/add-member! ty (.name d) (.ty d) width)
+                          (if (punct? (mut p) ",")
+                              (do (advance! (mut p)) 0)
+                              (do (expect! (mut p) ";") (store! more 0)))))))))
+          (expect! (mut p) "}")
+          (ct/layout-record! ty)
+          ty))))
+
+(defn parse-enum [(p (mut Parser))] (-> (ptr ct/Type))
+  (advance! (mut p))
+  (let [t (peek (mut p))
+        named (or (= (lex/token-kind t) lex/TK-IDENT) (= (lex/token-kind t) lex/TK-KEYWORD))
+        tag (if named (lex/token-text t) "")]
+    (if named (do (advance! (mut p)) 0) 0)
+    (if (not (punct? (mut p) "{"))
+        (let [existing (if named (lookup-tag (mut p) tag) (nil-type))]
+          (if (null-type? existing) (ty-int-of (mut p)) existing))
+        (let [ty (ct/ty-new (load (field p a)) ct/TY-ENUM 4 4)
+              (mut next-value) 0]
+          (ct/set-name! ty tag)
+          (if named (declare-tag! (mut p) tag ty) 0)
+          (advance! (mut p))
+          (loop
+            (if (or (punct? (mut p) "}") (at-eof? (mut p)))
+                (break)
+                (let [nt (advance! (mut p))]
+                  (if (punct? (mut p) "=")
+                      (do (advance! (mut p)) (store! next-value (parse-const-expr (mut p))))
+                      0)
+                  (declare-enum! (mut p) (lex/token-text nt) (load next-value))
+                  (store! next-value (+ (load next-value) 1))
+                  (if (punct? (mut p) ",") (do (advance! (mut p)) 0) 0))))
+          (expect! (mut p) "}")
+          ty))))
+
+;; `(int)x` is a cast, `(x)` is a parenthesised expression, and only a type name
+;; after the paren tells them apart.
+(defn parse-cast [(p (mut Parser))] (-> (ptr nd/Node))
+  (if (and (punct? (mut p) "(") (type-start-at? (mut p) 1))
+      (let [tok (advance! (mut p))
+            ty (parse-typename (mut p))]
+        (expect! (mut p) ")")
+        (let [n (nd/node-cast (load (field p a)) (decay (mut p) (parse-cast (mut p))) ty)]
+          n))
+      (parse-unary (mut p))))
+
+(defn type-start-at? [(p (mut Parser)) (offset i64)] (-> bool)
+  (let [saved (load (field p pos))]
+    (store! (field p pos) (+ saved offset))
+    (let [answer (type-start? (mut p))]
+      (store! (field p pos) saved)
+      answer)))
+
+(defn parse-unary [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [a (load (field p a))]
+    (cond
+      (punct? (mut p) "+") (do (advance! (mut p)) (parse-cast (mut p)))
+      (punct? (mut p) "-")
+        (let [tok (advance! (mut p))
+              n (nd/node-unary a nd/ND-NEG (decay (mut p) (parse-cast (mut p))) tok)]
+          (add-type! (mut p) n) n)
+      (punct? (mut p) "!")
+        (let [tok (advance! (mut p))
+              n (nd/node-unary a nd/ND-NOT (decay (mut p) (parse-cast (mut p))) tok)]
+          (add-type! (mut p) n) n)
+      (punct? (mut p) "~")
+        (let [tok (advance! (mut p))
+              n (nd/node-unary a nd/ND-BITNOT (decay (mut p) (parse-cast (mut p))) tok)]
+          (add-type! (mut p) n) n)
+      ;; `&` is one of the two places an array does not decay.
+      (punct? (mut p) "&")
+        (let [tok (advance! (mut p))
+              n (nd/node-unary a nd/ND-ADDR (parse-cast (mut p)) tok)]
+          (add-type! (mut p) n) n)
+      (punct? (mut p) "*")
+        (let [tok (advance! (mut p))
+              n (nd/node-unary a nd/ND-DEREF (decay (mut p) (parse-cast (mut p))) tok)]
+          (add-type! (mut p) n) n)
+      ;; `++x` is `x += 1`, which keeps one assignment shape in the tree.
+      (punct? (mut p) "++")
+        (let [tok (advance! (mut p))] (compound-assign (mut p) (parse-unary (mut p)) nd/ND-ADD tok))
+      (punct? (mut p) "--")
+        (let [tok (advance! (mut p))] (compound-assign (mut p) (parse-unary (mut p)) nd/ND-SUB tok))
+      :else (parse-postfix (mut p)))))
+
+(defn parse-postfix [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [a (load (field p a))
+        (mut n) (parse-primary (mut p))]
+    (loop
+      (cond
+        ;; `x[i]` is `*(x + i)`.
+        (punct? (mut p) "[")
+          (let [tok (advance! (mut p))
+                idx (parse-expr (mut p))]
+            (expect! (mut p) "]")
+            (let [sum (new-add (mut p) (load n) idx tok)
+                  d (nd/node-unary a nd/ND-DEREF sum tok)]
+              (add-type! (mut p) d)
+              (store! n d)))
+        (punct? (mut p) ".")
+          (let [tok (advance! (mut p))]
+            (store! n (member-access (mut p) (load n) (advance! (mut p)) tok)))
+        ;; `x->y` is `(*x).y`.
+        (punct? (mut p) "->")
+          (let [tok (advance! (mut p))
+                d (nd/node-unary a nd/ND-DEREF (decay (mut p) (load n)) tok)]
+            (add-type! (mut p) d)
+            (store! n (member-access (mut p) d (advance! (mut p)) tok)))
+        (punct? (mut p) "(")
+          (store! n (parse-call (mut p) (load n)))
+        (punct? (mut p) "++")
+          (let [tok (advance! (mut p))]
+            (store! n (post-increment (mut p) (load n) nd/ND-ADD tok)))
+        (punct? (mut p) "--")
+          (let [tok (advance! (mut p))]
+            (store! n (post-increment (mut p) (load n) nd/ND-SUB tok)))
+        :else (break)))
+    (load n)))
+
+;; `x++` yields the old value, so it is `(x += 1) - 1` with the arithmetic done
+;; in the value's own type.
+(defn post-increment [(p (mut Parser)) (n (ptr nd/Node)) (kind i64) (tok lex/Token)] (-> (ptr nd/Node))
+  (let [a (load (field p a))
+        one (nd/node-num a 1 tok)
+        bumped (if (= kind nd/ND-ADD)
+                   (new-add (mut p) n one tok)
+                   (new-sub (mut p) n one tok))
+        assigned (nd/node-binary a nd/ND-ASSIGN n bumped tok)]
+    (add-type! (mut p) assigned)
+    (let [back (if (= kind nd/ND-ADD)
+                   (new-sub (mut p) assigned (nd/node-num a 1 tok) tok)
+                   (new-add (mut p) assigned (nd/node-num a 1 tok) tok))]
+      back)))
+
+(defn member-access [(p (mut Parser)) (base (ptr nd/Node)) (name-tok lex/Token) (tok lex/Token)] (-> (ptr nd/Node))
+  (let [ty (nd/nd-type base)]
+    (if (or (null-type? ty) (not (ct/record? ty)))
+        (do (fail-at! (mut p) "member access on a non-record" tok) base)
+        (let [members (ct/ty-members ty)
+              n (al/al-len [ct/Member] members)
+              (mut i) 0
+              (mut found) -1]
+          (loop (if (or (>= (load found) 0) (>= (load i) n))
+                    (break)
+                    (do
+                      (if (text=? (ct/member-name (al/al-get [ct/Member] members (load i)))
+                                  (lex/token-text name-tok))
+                          (store! found (load i))
+                          0)
+                      (store! i (+ (load i) 1)))))
+          (if (< (load found) 0)
+              (do (fail-at! (mut p) "no such member" name-tok) base)
+              (let [node (nd/node-unary (load (field p a)) nd/ND-MEMBER base tok)]
+                (nd/set-member! node (al/al-get [ct/Member] members (load found)))
+                node))))))
+
+(defn parse-call [(p (mut Parser)) (callee (ptr nd/Node))] (-> (ptr nd/Node))
+  (let [a (load (field p a))
+        tok (advance! (mut p))
+        n (nd/node-new a nd/ND-CALL tok)
+        fty (nd/nd-type callee)]
+    (nd/set-lhs! n (decay (mut p) callee))
+    (loop
+      (if (or (punct? (mut p) ")") (at-eof? (mut p)))
+          (break)
+          (do
+            (nd/push-arg! n (decay (mut p) (parse-assign (mut p))))
+            (if (punct? (mut p) ",") (do (advance! (mut p)) 0) (break)))))
+    (expect! (mut p) ")")
+    ;; The call's type is the function's return type, reached through the
+    ;; pointer the callee decayed to.
+    (let [ft (if (and (not (null-type? fty)) (= (ct/ty-kind fty) ct/TY-PTR))
+                 (ct/ty-base fty)
+                 fty)]
+      (nd/set-type! n
+                    (if (and (not (null-type? ft)) (= (ct/ty-kind ft) ct/TY-FUNC))
+                        (ct/ty-base ft)
+                        (ty-int-of (mut p)))))
+    n))
+
+(defn parse-primary [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [a (load (field p a))
+        t (peek (mut p))]
+    (cond
+      (punct? (mut p) "(")
+        (do (advance! (mut p))
+            (let [n (parse-expr (mut p))] (expect! (mut p) ")") n))
+      ;; `sizeof` takes either a type name in parentheses or an expression, and
+      ;; its operand is never evaluated -- so an array does not decay here.
+      (word? (mut p) "sizeof")
+        (let [tok (advance! (mut p))]
+          (if (and (punct? (mut p) "(") (type-start-at? (mut p) 1))
+              (do (advance! (mut p))
+                  (let [ty (parse-typename (mut p))]
+                    (expect! (mut p) ")")
+                    (let [n (nd/node-num a (ct/ty-size ty) tok)]
+                      (nd/set-type! n (ty-ulong-of (mut p)))
+                      n)))
+              (let [operand (parse-unary (mut p))
+                    ty (nd/nd-type operand)
+                    n (nd/node-num a (if (null-type? ty) 0 (ct/ty-size ty)) tok)]
+                (nd/set-type! n (ty-ulong-of (mut p)))
+                n)))
+      (= (lex/token-kind t) lex/TK-NUMBER)
+        (let [tok (advance! (mut p))
+              n (nd/node-num a (parse-number-text (lex/token-text tok)) tok)]
+          (add-type! (mut p) n) n)
+      (= (lex/token-kind t) lex/TK-CHARACTER)
+        (let [tok (advance! (mut p))
+              bytes (decode-escapes (mut p) (lex/token-text tok) 39)
+              v (if (> (slice-len bytes) 0) (primitive/cast i64 (slice-get bytes 0)) 0)
+              n (nd/node-num a v tok)]
+          (add-type! (mut p) n) n)
+      (= (lex/token-kind t) lex/TK-STRING)
+        (let [tok (advance! (mut p))] (string-literal (mut p) tok))
+      (or (= (lex/token-kind t) lex/TK-IDENT) (= (lex/token-kind t) lex/TK-KEYWORD))
+        (let [tok (advance! (mut p))]
+          (match (lookup (mut p) (lex/token-text tok))
+            (Some [found]
+              (let [e found]
+                (if (!= (.is-enum e) 0)
+                    (let [n (nd/node-num a (.enum-value e) tok)] (add-type! (mut p) n) n)
+                    (if (null-obj? (.obj e))
+                        (do (fail-at! (mut p) "not a value" tok) (nd/node-num a 0 tok))
+                        (nd/node-var a (.obj e) tok)))))
+            (None []
+              (do (fail-at! (mut p) "undeclared identifier" tok) (nd/node-num a 0 tok)))))
+      :else
+        (do (fail-at! (mut p) "expected an expression" t) (advance! (mut p)) (nd/node-num a 0 t)))))
+
+;; ------------------------------------------------------------- statements
+
+(defn new-local! [(p (mut Parser)) (name (slice u8)) (ty (ptr ct/Type))] (-> (ptr nd/Obj))
+  (let [o (nd/obj-new (load (field p a)) name ty true)]
+    (declare-obj! (mut p) o)
+    (if (null-obj? (load (field p current-fn)))
+        0
+        (nd/push-local! (load (field p current-fn)) o))
+    o))
+
+(defn new-global! [(p (mut Parser)) (name (slice u8)) (ty (ptr ct/Type))] (-> (ptr nd/Obj))
+  (let [o (nd/obj-new (load (field p a)) name ty false)]
+    (declare-obj! (mut p) o)
+    (al/al-push! [(ptr nd/Obj)] (mut (field p globals)) o)
+    o))
+
+;; A declaration statement becomes a block of assignments, one per initialised
+;; declarator, so the rest of the tree only has to know about expressions.
+(defn parse-declaration [(p (mut Parser)) (spec DeclSpec)] (-> (ptr nd/Node))
+  (let [a (load (field p a))
+        block (nd/node-new a nd/ND-BLOCK (peek (mut p)))
+        (mut more) 1]
+    (if (punct? (mut p) ";")
+        (do (advance! (mut p)) (store! more 0))
+        0)
+    (loop
+      (if (= (load more) 0)
+          (break)
+          (let [d (parse-declarator (mut p) (.ty spec))]
+            (cond
+              (!= (.is-typedef spec) 0) (declare-typedef! (mut p) (.name d) (.ty d))
+              (!= (.is-extern spec) 0) (do (new-global! (mut p) (.name d) (.ty d)) 0)
+              :else
+                (let [o (new-local! (mut p) (.name d) (.ty d))]
+                  (if (punct? (mut p) "=")
+                      (let [tok (advance! (mut p))
+                            lhs (nd/node-var a o tok)
+                            rhs (decay (mut p) (parse-assign (mut p)))
+                            assign (nd/node-binary a nd/ND-ASSIGN lhs rhs tok)]
+                        (add-type! (mut p) assign)
+                        (nd/push-body! block (nd/node-unary a nd/ND-EXPR-STMT assign tok))
+                        0)
+                      0)))
+            (if (punct? (mut p) ",")
+                (do (advance! (mut p)) 0)
+                (do (expect! (mut p) ";") (store! more 0))))))
+    block))
+
+(defn parse-compound [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [a (load (field p a))
+        tok (peek (mut p))
+        block (nd/node-new a nd/ND-BLOCK tok)]
+    (expect! (mut p) "{")
+    (enter-scope! (mut p))
+    (loop
+      (if (or (punct? (mut p) "}") (or (at-eof? (mut p)) (!= (load (field p failed)) 0)))
+          (break)
+          (if (type-start? (mut p))
+              (let [spec (parse-declspec (mut p))]
+                (nd/push-body! block (parse-declaration (mut p) spec)))
+              (nd/push-body! block (parse-stmt (mut p))))))
+    (leave-scope! (mut p))
+    (expect! (mut p) "}")
+    block))
+
+(defn parse-expr-stmt [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [a (load (field p a))
+        tok (peek (mut p))]
+    (if (punct? (mut p) ";")
+        (do (advance! (mut p)) (nd/node-new a nd/ND-NULL tok))
+        (let [e (parse-expr (mut p))]
+          (expect! (mut p) ";")
+          (nd/node-unary a nd/ND-EXPR-STMT e tok)))))
+
+(defn parse-stmt [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [a (load (field p a))]
+    (cond
+      (punct? (mut p) "{") (parse-compound (mut p))
+      (word? (mut p) "return")
+        (let [tok (advance! (mut p))]
+          (if (punct? (mut p) ";")
+              (do (advance! (mut p)) (nd/node-new a nd/ND-RETURN tok))
+              (let [e (decay (mut p) (parse-expr (mut p)))]
+                (expect! (mut p) ";")
+                (nd/node-unary a nd/ND-RETURN e tok))))
+      (word? (mut p) "if")
+        (let [tok (advance! (mut p))
+              n (nd/node-new a nd/ND-IF tok)]
+          (expect! (mut p) "(")
+          (nd/set-test! n (decay (mut p) (parse-expr (mut p))))
+          (expect! (mut p) ")")
+          (nd/set-then! n (parse-stmt (mut p)))
+          (if (word? (mut p) "else")
+              (do (advance! (mut p)) (nd/set-else! n (parse-stmt (mut p))))
+              0)
+          n)
+      (word? (mut p) "while")
+        (let [tok (advance! (mut p))
+              n (nd/node-new a nd/ND-WHILE tok)]
+          (expect! (mut p) "(")
+          (nd/set-test! n (decay (mut p) (parse-expr (mut p))))
+          (expect! (mut p) ")")
+          (nd/set-then! n (parse-stmt (mut p)))
+          n)
+      (word? (mut p) "do")
+        (let [tok (advance! (mut p))
+              n (nd/node-new a nd/ND-DO tok)]
+          (nd/set-then! n (parse-stmt (mut p)))
+          (expect! (mut p) "while")
+          (expect! (mut p) "(")
+          (nd/set-test! n (decay (mut p) (parse-expr (mut p))))
+          (expect! (mut p) ")")
+          (expect! (mut p) ";")
+          n)
+      ;; The initialiser may declare, so a `for` gets its own scope.
+      (word? (mut p) "for")
+        (let [tok (advance! (mut p))
+              n (nd/node-new a nd/ND-FOR tok)]
+          (expect! (mut p) "(")
+          (enter-scope! (mut p))
+          (if (type-start? (mut p))
+              (let [spec (parse-declspec (mut p))]
+                (nd/set-setup! n (parse-declaration (mut p) spec)))
+              (nd/set-setup! n (parse-expr-stmt (mut p))))
+          (if (punct? (mut p) ";")
+              0
+              (nd/set-test! n (decay (mut p) (parse-expr (mut p)))))
+          (expect! (mut p) ";")
+          (if (punct? (mut p) ")")
+              0
+              (nd/set-step! n (nd/node-unary a nd/ND-EXPR-STMT (parse-expr (mut p)) tok)))
+          (expect! (mut p) ")")
+          (nd/set-then! n (parse-stmt (mut p)))
+          (leave-scope! (mut p))
+          n)
+      (word? (mut p) "switch")
+        (let [tok (advance! (mut p))
+              n (nd/node-new a nd/ND-SWITCH tok)]
+          (expect! (mut p) "(")
+          (nd/set-test! n (decay (mut p) (parse-expr (mut p))))
+          (expect! (mut p) ")")
+          (nd/set-then! n (parse-stmt (mut p)))
+          n)
+      (word? (mut p) "case")
+        (let [tok (advance! (mut p))
+              v (parse-const-expr (mut p))
+              n (nd/node-new a nd/ND-CASE tok)]
+          (expect! (mut p) ":")
+          (nd/set-value! n v)
+          (nd/set-then! n (parse-stmt (mut p)))
+          n)
+      (word? (mut p) "default")
+        (let [tok (advance! (mut p))
+              n (nd/node-new a nd/ND-CASE tok)]
+          (expect! (mut p) ":")
+          (nd/set-value! n 0)
+          (nd/set-label! n "default")
+          (nd/set-then! n (parse-stmt (mut p)))
+          n)
+      (word? (mut p) "break")
+        (let [tok (advance! (mut p))] (expect! (mut p) ";") (nd/node-new a nd/ND-BREAK tok))
+      (word? (mut p) "continue")
+        (let [tok (advance! (mut p))] (expect! (mut p) ";") (nd/node-new a nd/ND-CONTINUE tok))
+      (word? (mut p) "goto")
+        (let [tok (advance! (mut p))
+              target (advance! (mut p))
+              n (nd/node-new a nd/ND-GOTO tok)]
+          (expect! (mut p) ";")
+          (nd/set-label! n (lex/token-text target))
+          n)
+      ;; A label is an identifier followed by a colon, which needs two tokens of
+      ;; lookahead to tell from an expression statement.
+      (and (or (= (lex/token-kind (peek (mut p))) lex/TK-IDENT)
+               (= (lex/token-kind (peek (mut p))) lex/TK-KEYWORD))
+           (is-punct-at? (mut p) 1 ":"))
+        (let [tok (advance! (mut p))
+              n (nd/node-new a nd/ND-LABEL tok)]
+          (advance! (mut p))
+          (nd/set-label! n (lex/token-text tok))
+          (nd/set-then! n (parse-stmt (mut p)))
+          n)
+      :else (parse-expr-stmt (mut p)))))
+
+;; ---------------------------------------------------------------- top level
+
+;; Parameter names travel on the function type beside their types, so the
+;; body can refer to them.
+(defn param-name [(p (mut Parser)) (ty (ptr ct/Type)) (index i64)] (-> (slice u8))
+  (let [names (ct/ty-param-names ty)]
+    (if (< index (al/al-len [(slice u8)] names))
+        (al/al-get [(slice u8)] names index)
+        "")))
+
+(defn parse-function! [(p (mut Parser)) (spec DeclSpec) (d Declared)] (-> i64)
+  (let [o (new-global! (mut p) (.name d) (.ty d))]
+    (store! (field p current-fn) o)
+    (nd/set-obj-static! o (!= (.is-static spec) 0))
+    (enter-scope! (mut p))
+    ;; Parameters are declared in the function's own scope before the body is
+    ;; parsed, which is what lets the body refer to them.
+    (let [ptypes (ct/ty-params (.ty d))
+          n (al/al-len [(ptr ct/Type)] ptypes)
+          (mut i) 0]
+      (loop (if (>= (load i) n)
+                (break)
+                (do
+                  (nd/push-param! o
+                                  (new-local! (mut p)
+                                              (param-name (mut p) (.ty d) (load i))
+                                              (al/al-get [(ptr ct/Type)] ptypes (load i))))
+                  (store! i (+ (load i) 1))))))
+    (if (punct? (mut p) "{")
+        (nd/set-obj-body! o (parse-compound (mut p)))
+        (do (advance! (mut p)) 0))
+    (leave-scope! (mut p))
+    (store! (field p current-fn) (nil-obj)))
+  0)
+
+(defn parse-toplevel! [(p (mut Parser))] (-> i64)
+  (let [spec (parse-declspec (mut p))]
+    (if (punct? (mut p) ";")
+        (do (advance! (mut p)) 0)
+        (let [(mut more) 1]
+          (loop
+            (if (or (= (load more) 0) (!= (load (field p failed)) 0))
+                (break)
+                (let [d (parse-declarator (mut p) (.ty spec))]
+                  (cond
+                    (!= (.is-typedef spec) 0)
+                      (do (declare-typedef! (mut p) (.name d) (.ty d))
+                          (if (punct? (mut p) ",")
+                              (do (advance! (mut p)) 0)
+                              (do (expect! (mut p) ";") (store! more 0))))
+                    (= (ct/ty-kind (.ty d)) ct/TY-FUNC)
+                      (do (parse-function! (mut p) spec d) (store! more 0))
+                    :else
+                      (do
+                        (new-global! (mut p) (.name d) (.ty d))
+                        (if (punct? (mut p) "=")
+                            (do (advance! (mut p)) (parse-assign (mut p)) 0)
+                            0)
+                        (if (punct? (mut p) ",")
+                            (do (advance! (mut p)) 0)
+                            (do (expect! (mut p) ";") (store! more 0))))))))
+          0))))
+
+(defn parser-new [(a (dyn alloc/Allocator)) (tokens (al/ArrayList lex/Token))] (-> Parser)
+  (Parser :a a
+    :tokens tokens
+    :pos 0
+    :scopes (al/al-new [(ptr Scope)] a)
+    :globals (al/al-new [(ptr nd/Obj)] a)
+    :current-fn (primitive/cast (ptr nd/Obj) 0)
+    :failed 0
+    :message ""
+    :file ""
+    :line 0
+    :column 0))
+
+(defn parse [(p (mut Parser))] (-> ParseResult)
+  (enter-scope! (mut p))
+  (loop
+    (if (or (at-eof? (mut p)) (!= (load (field p failed)) 0))
+        (break)
+        (parse-toplevel! (mut p))))
+  (leave-scope! (mut p))
+  (ParseResult :globals (load (field p globals))
+    :failed (load (field p failed))
+    :message (load (field p message))
+    :file (load (field p file))
+    :line (load (field p line))
+    :column (load (field p column))))

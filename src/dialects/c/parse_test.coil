@@ -1,0 +1,174 @@
+(module experiments.c.parse-test)
+
+(import "experiments.c.lex" :as lex)
+(import "experiments.c.pp" :as pp)
+(import "experiments.c.ctype" :as ct)
+(import "experiments.c.node" :as nd)
+(import "experiments.c.parse" :as ps)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+(import "coil.assert" :use *)
+
+;; The whole front half of the pipeline: tokenize, preprocess, parse.
+(defn compile-source [(source (slice u8))] (-> ps/ParseResult)
+  (let [a (alloc/malloc-allocator)
+        (mut p) (pp/pp-new a)]
+    (let [pre (pp/preprocess (mut p) "t.c" source)]
+      (assert (= (.failed pre) 0))
+      (let [(mut parser) (ps/parser-new a (.tokens pre))]
+        (ps/parse (mut parser))))))
+
+(defn parse-ok [(source (slice u8))] (-> ps/ParseResult)
+  (let [r (compile-source source)]
+    (assert (= (.failed r) 0))
+    r))
+
+(defn global-count [(r ps/ParseResult)] (-> i64)
+  (al/al-len [(ptr nd/Obj)] (.globals r)))
+
+(defn global-at [(r ps/ParseResult) (i i64)] (-> (ptr nd/Obj))
+  (al/al-get [(ptr nd/Obj)] (.globals r) i))
+
+;; Finds a global by name, so tests do not depend on the order string literals
+;; and functions happen to be appended in.
+(defn find-global [(r ps/ParseResult) (name (slice u8))] (-> (ptr nd/Obj))
+  (let [n (global-count r)
+        (mut i) 0
+        (mut found) (primitive/cast (ptr nd/Obj) 0)]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (if (str/str-eq (nd/obj-name (global-at r (load i))) name)
+                    (store! found (global-at r (load i)))
+                    0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn found? [(o (ptr nd/Obj))] (-> bool) (!= (primitive/cast i64 o) 0))
+
+(deftest a-function-definition-becomes-a-global
+         (let [r (parse-ok "int main(void) { return 0; }")
+               f (find-global r "main")]
+           (assert (found? f))
+           (assert (nd/obj-function? f))
+           (assert (nd/obj-definition? f))
+           (assert-eq (ct/ty-kind (nd/obj-type f)) ct/TY-FUNC)
+           (assert-eq (ct/ty-kind (ct/ty-base (nd/obj-type f))) ct/TY-INT)))
+
+(deftest a-prototype-is-declared-but-not-defined
+         (let [r (parse-ok "int f(int a, int b);")
+               f (find-global r "f")]
+           (assert (found? f))
+           (assert (not (nd/obj-definition? f)))
+           (assert-eq (al/al-len [(ptr ct/Type)] (ct/ty-params (nd/obj-type f))) 2)))
+
+(deftest a-variadic-prototype-is-marked
+         (let [r (parse-ok "int printf(const char *fmt, ...);")
+               f (find-global r "printf")]
+           (assert (ct/ty-variadic? (nd/obj-type f)))))
+
+(deftest locals-are-collected-on-the-function
+         (let [r (parse-ok "int f(void) { int a; int b; char c; return 0; }")
+               f (find-global r "f")]
+           (assert-eq (al/al-len [(ptr nd/Obj)] (nd/obj-locals f)) 3)))
+
+(deftest parameters-are-locals-too
+         (let [r (parse-ok "int f(int x, int y) { return x; }")
+               f (find-global r "f")]
+           (assert-eq (al/al-len [(ptr nd/Obj)] (nd/obj-params f)) 2)))
+
+;; Declarator precedence: the pointer binds to the function, not the return
+;; type, which is the case most hand-written parsers get wrong.
+(deftest declarator-precedence-is-structural
+         (let [r (parse-ok "int *a[3]; int (*b)[3]; int (*c)(char);")
+               a (find-global r "a")
+               b (find-global r "b")
+               c (find-global r "c")]
+           (assert-eq (ct/ty-kind (nd/obj-type a)) ct/TY-ARRAY)
+           (assert-eq (ct/ty-kind (ct/ty-base (nd/obj-type a))) ct/TY-PTR)
+           (assert-eq (ct/ty-kind (nd/obj-type b)) ct/TY-PTR)
+           (assert-eq (ct/ty-kind (ct/ty-base (nd/obj-type b))) ct/TY-ARRAY)
+           (assert-eq (ct/ty-kind (nd/obj-type c)) ct/TY-PTR)
+           (assert-eq (ct/ty-kind (ct/ty-base (nd/obj-type c))) ct/TY-FUNC)))
+
+(deftest array-sizes-come-from-constant-folding
+         (let [r (parse-ok "int a[2 + 3 * 4];")
+               a (find-global r "a")]
+           (assert-eq (ct/ty-array-len (nd/obj-type a)) 14)
+           (assert-eq (ct/ty-size (nd/obj-type a)) 56)))
+
+(deftest typedefs-name-types
+         (let [r (parse-ok "typedef int myint; myint x; typedef struct { int a; } S; S s;")
+               x (find-global r "x")
+               s (find-global r "s")]
+           (assert-eq (ct/ty-kind (nd/obj-type x)) ct/TY-INT)
+           (assert-eq (ct/ty-kind (nd/obj-type s)) ct/TY-STRUCT)
+           (assert-eq (ct/ty-size (nd/obj-type s)) 4)))
+
+;; The layout computed in ctype is what the parser records, so a union really
+;; is the size of its largest member here.
+(deftest record-layout-reaches-the-parser
+         (let [r (parse-ok "union U { char c; double d; }; union U u; struct S { char c; int i; }; struct S s;")
+               u (find-global r "u")
+               s (find-global r "s")]
+           (assert-eq (ct/ty-size (nd/obj-type u)) 8)
+           (assert-eq (ct/ty-size (nd/obj-type s)) 8)))
+
+(deftest bitfields-are-parsed-and-packed
+         (let [r (parse-ok "struct B { unsigned a : 3; unsigned b : 5; }; struct B b;")
+               b (find-global r "b")]
+           (assert-eq (ct/ty-size (nd/obj-type b)) 4)))
+
+;; A record may contain a pointer to itself, which only works because a tag
+;; refers to the same type each time it appears.
+(deftest a-record-can-point-at-itself
+         (let [r (parse-ok "struct N { int v; struct N *next; }; struct N n;")
+               n (find-global r "n")]
+           (assert-eq (ct/ty-size (nd/obj-type n)) 16)))
+
+(deftest enums-declare-constants
+         (let [r (parse-ok "enum E { A, B, C = 10, D }; int x[D];")
+               x (find-global r "x")]
+           (assert-eq (ct/ty-array-len (nd/obj-type x)) 11)))
+
+(deftest sizeof-folds-to-a-constant
+         (let [r (parse-ok "int a[sizeof(int)]; int b[sizeof(char) + sizeof(double)];")
+               a (find-global r "a")
+               b (find-global r "b")]
+           (assert-eq (ct/ty-array-len (nd/obj-type a)) 4)
+           (assert-eq (ct/ty-array-len (nd/obj-type b)) 9)))
+
+(deftest string-literals-become-globals
+         (let [r (parse-ok "char *s = \"hello\";")
+               s (find-global r ".Lstr.1")]
+           (assert (found? s))
+           (assert-eq (ct/ty-kind (nd/obj-type s)) ct/TY-ARRAY)
+           ;; five characters plus the terminator
+           (assert-eq (ct/ty-size (nd/obj-type s)) 6)))
+
+(deftest statements-parse
+         (let [r (parse-ok "int f(int n) { int t = 0; for (int i = 0; i < n; i++) { if (i) t += i; else t -= 1; } while (t) t--; do { t++; } while (0); switch (t) { case 1: break; default: break; } return t; }")
+               f (find-global r "f")]
+           (assert (nd/obj-definition? f))))
+
+;; An undeclared name is an error the parser can point at, which the
+;; Clang-based frontend could never do on its own.
+(deftest errors-carry-a-line-and-column
+         (let [r (compile-source "int f(void) {\n  return nope;\n}")]
+           (assert (!= (.failed r) 0))
+           (assert-eq (.line r) 2)
+           (assert (str/str-eq (.file r) "t.c"))))
+
+(deftest a-missing-semicolon-is-reported
+         (let [r (compile-source "int f(void) { return 0 }")]
+           (assert (!= (.failed r) 0))))
+
+;; The preprocessor and parser really are connected: the macro has to expand
+;; before the array size can fold.
+(deftest macros-reach-the-parser
+         (let [r (parse-ok "#define N 8\nint buf[N];")
+               b (find-global r "buf")]
+           (assert-eq (ct/ty-array-len (nd/obj-type b)) 8)))
