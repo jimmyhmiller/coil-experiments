@@ -9,7 +9,7 @@
  * signature, so the base declaration is retyped at each call site. The same
  * technique as src/apps/chip8/objc.coil, spelled in C.
  *
- *   python3 scripts/doom-play.py --compiler "$(command -v coil)"
+ *   python3 scripts/c-doom-native.py --play --compiler "$(command -v coil)"
  *
  * Move with the arrow keys, fire with ctrl, open with space, strafe with alt,
  * escape for the menu.

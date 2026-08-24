@@ -20,6 +20,14 @@ TARGET = ROOT / "src/dialects/c/target"
 # Whole programs of more than one translation unit, which is where linkage,
 # `static` privacy, and shared headers are actually exercised.
 PROJECTS = [
+    # Two units that share a header and nothing else: cross-unit calls, globals
+    # with one definition and several declarations, same-named `static`s that
+    # must stay apart, a function pointer handed across, a variadic function
+    # defined in one unit and called from the other, and constructors and
+    # destructors around `main`.
+    ("multi-unit", [ROOT / "tests/c/multi-unit/alpha.c",
+                    ROOT / "tests/c/multi-unit/beta.c"],
+     ["-I" + str(ROOT / "tests/c/multi-unit"), "-D_FORTIFY_SOURCE=0"]),
     ("cjson", [ROOT / "tests/c/projects/cjson/cJSON.c",
                ROOT / "tests/c/projects/cjson/separate-program.c"],
      # Apple's headers redirect the string functions to _FORTIFY_SOURCE builtins
@@ -50,7 +58,10 @@ def system_includes() -> list[str]:
 
 def reference(name, sources, flags, work) -> tuple[int, str]:
     binary = work / f"{name}-clang"
-    built = run(["clang", "-std=gnu11", "-O0", "-w", *flags,
+    # -fcommon: `int shared;` in two units is one object, which is what C meant
+    # by a tentative definition and what compiling the whole program at once
+    # gives. Clang defaults to rejecting it; the frontend under test does not.
+    built = run(["clang", "-std=gnu11", "-O0", "-w", "-fcommon", *flags,
                  *map(str, sources), "-o", str(binary), "-lm"])
     if built.returncode:
         raise SystemExit(f"clang could not build {name}:\n{built.stderr}")

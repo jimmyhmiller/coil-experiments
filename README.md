@@ -26,19 +26,19 @@ coil run tests/brainfuck/hello.bf --use experiments.brainfuck.lang
 coil run experiments.brainfuck.lang tests/brainfuck/hello.bf   # print the emitted Coil
 ```
 
-### `src/dialects/c/` — a C frontend written in Coil
+### `src/dialects/c/` — a C compiler written in Coil
 `cc.coil` lexes, preprocesses, parses, type-checks, and lowers C11 with nothing
 but Coil code: no Clang, no JSON, no external tool between the source text and
-the emitted Coil. It compiles a whole program at once into a single Coil module,
-reads the system's own headers, and is ported from
-[chibicc](https://github.com/rui314/chibicc). The pinned gate builds Doom Generic
-as 81 translation units and verifies its exact 1,000-frame framebuffer hash;
-`--play` builds the windowed game with sound. An older Clang-fed path, which has
-Clang dump a typed JSON AST for Coil to link and lower, still lives beside it and
-is held to the same hash. See [`src/dialects/c/README.md`](src/dialects/c/README.md).
+the emitted Coil. It reads the system's own headers, compiles a whole program at
+once into a single Coil module — no object files and no linker of its own — and
+is ported from [chibicc](https://github.com/rui314/chibicc). The pinned gate
+builds Doom Generic as 81 translation units and verifies its exact 1,000-frame
+framebuffer hash; `--play` builds the windowed game with sound. See
+[`src/dialects/c/README.md`](src/dialects/c/README.md) and
+[`MULTI-UNIT.md`](src/dialects/c/MULTI-UNIT.md).
 
 ```sh
-python3 scripts/c-doom-native.py          # Doom, no Clang frontend
+python3 scripts/c-doom-native.py          # Doom, 81 translation units
 python3 scripts/c-doom-native.py --play   # the windowed game, with sound
 ```
 

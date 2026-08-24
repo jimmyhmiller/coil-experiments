@@ -1,22 +1,12 @@
-# C frontends
+# A C compiler written in Coil
 
-Two of them share this directory. Both turn C into ordinary Coil, which Coil's
-own backend then compiles; they differ in who reads the C.
+`cc.coil` lexes, preprocesses, parses, type-checks, and lowers C11 with nothing
+but Coil code. No Clang, no JSON, no external tool of any kind stands between the
+source text and the emitted Coil — the C11 frontend is the program in this
+directory. It is ported from [chibicc](https://github.com/rui314/chibicc) by Rui
+Ueyama; see [ATTRIBUTION.md](ATTRIBUTION.md).
 
-The **native frontend** reads it itself. `cc.coil` lexes, preprocesses, parses,
-type-checks, and lowers C11 with nothing but Coil code — no Clang, no JSON, no
-external tool of any kind between the source text and the emitted Coil. It is
-ported from [chibicc](https://github.com/rui314/chibicc) by Rui Ueyama; see
-[ATTRIBUTION.md](ATTRIBUTION.md).
-
-The **Clang-fed frontend** is the older one. Clang preprocesses and type-checks
-each translation unit and dumps a typed JSON AST, which `ast.coil`, `build.coil`,
-and `lower.coil` link and lower. Clang never emits IR, assembly, or objects
-there either, but it does all the reading.
-
-Both build the same pinned Doom Generic to the same framebuffer hash.
-
-## The native frontend
+The output is ordinary Coil, which Coil's own backend compiles.
 
 ```sh
 coil run src/dialects/c/cc.coil -- -o out.coil a.c b.c \
@@ -39,15 +29,17 @@ coil build out.coil -O2 -o program
 | `cc.coil` | the driver |
 | `target/` | the target's predefined macros, and the builtins the system headers expect |
 
-### Whole-program, one module
+## Many translation units, one module
 
-Every translation unit is preprocessed and parsed on its own — a macro defined in
-one file means nothing in the next — and then all of them are lowered together
-into a single Coil module. A call in one file reaches a definition in another
-without a linker of our own, and a `static` name carries its unit's tag so two
-files may each have their own `static int count`.
+Every `.c` file is preprocessed and parsed on its own — a macro defined in one
+file means nothing in the next, and a `struct` declared in one is a different
+type object from the identically-named one next door. All of them are then
+lowered together into a single Coil module, so a call in one file reaches a
+definition in another without any linker of ours in between. See
+[MULTI-UNIT.md](MULTI-UNIT.md) for what that costs, what it buys, and what the
+commands and intermediate files actually look like.
 
-### How C constructs are represented
+## How C constructs are represented
 
 A record becomes a blob whose size and alignment are C's own: an array whose
 element type carries the required alignment, with members reached by byte offset.
@@ -72,58 +64,36 @@ stack — one eight-byte slot each — so a `va_list` taken from it can be hande
 straight to the C library's `vfprintf`. Calls to the C library's own variadic
 functions use Coil's native `...` and the platform convention.
 
-### What is not implemented
+`__attribute__((constructor))` and `((destructor))` run around `main`:
+constructors after the static initialisers, destructors through `atexit`, so that
+they still run when the program calls `exit`.
+
+## What is not implemented
 
 `_Float16` and `__int128` exist so that a system header declaring one lays out
 correctly; arithmetic on either is reported rather than narrowed. Statement
 expressions, generic selection, compound literals, VLAs, atomics, complex
-numbers, thread-local storage, and inline assembly are not implemented. Each
+numbers, thread-local storage, and inline assembly are not implemented. Implicit
+function declarations are rejected, as C99 and Clang reject them. Each of these
 reports where it appeared instead of quietly producing something else.
-
-## The Clang-fed frontend
-
-```sh
-python3 scripts/c-build.py --compiler "$(command -v coil)" tests/c/fib.c -O0 -o /tmp/fib
-python3 scripts/c-build.py --compiler "$(command -v coil)" \
-  src/main.c src/render.c -O0 -o /tmp/game \
-  --cflag=-Iinclude --cflag=-DFEATURE=1 --link-flag=-lm
-```
-
-`scripts/c-build.py` is a bootstrap harness with no frontend logic in it. Clang
-is invoked by argv:
-
-```text
-clang -std=gnu11 -fsyntax-only -Wno-everything \
-      <C flags> -Xclang -ast-dump=json <translation-unit.c>
-```
-
-Each source is preprocessed, type-checked, indexed, and lowered as a separate
-translation unit; there is no source concatenation. The linker index validates
-external declarations, tentative and initialised definitions, recursive record
-layouts, unit-local `static` identities, constructors and destructors, and
-function reachability before lowering. Bitfields, VLAs, atomics, complex numbers,
-TLS, arbitrary irreducible goto graphs, and packed or over-aligned layouts are
-not complete there.
 
 ## Validation
 
 ```sh
 coil test --suite c                                              # unit tests
 python3 scripts/c-native.py --compiler "$(command -v coil)"      # differential vs clang
-python3 scripts/c-doom-native.py --compiler "$(command -v coil)" # Doom, native frontend
-python3 scripts/c-multi-unit.py --compiler "$(command -v coil)"  # linkage, Clang path
-python3 scripts/c-doom.py --compiler "$(command -v coil)"        # Doom, Clang path
+python3 scripts/c-doom-native.py --compiler "$(command -v coil)" # Doom
 ```
 
-`scripts/c-native.py` compiles every case in `tests/c/native/` twice — once with
-Clang, once with the native frontend — runs both, and requires the exit status
-and output to agree. Clang is the oracle there and nothing else; it is not part
-of the build being tested.
+`scripts/c-native.py` compiles every case in `tests/c/native/` and every project
+in its `PROJECTS` list twice — once with Clang, once with this frontend — runs
+both, and requires the exit status and output to agree. Clang is the oracle there
+and nothing else; it takes no part in the build being tested.
 
-Both Doom gates pin Doom Generic revision
-`fc601639494e089702a1ada082eb51aaafc03722`, build its 81 translation units, run
-exactly 1,000 frames against the pinned shareware WAD, and require framebuffer
-hash `734a03fe31906bc3`.
+The Doom gate pins Doom Generic revision
+`fc601639494e089702a1ada082eb51aaafc03722`, builds its 81 translation units, runs
+exactly 1,000 frames against the pinned shareware WAD, and requires framebuffer
+hash `734a03fe31906bc3` — the same hash a Clang-built Doom produces.
 
-`python3 scripts/c-doom-native.py --play` builds the windowed game instead:
-84 translation units including a Cocoa backend and SDL2 sound.
+`python3 scripts/c-doom-native.py --play` builds the windowed game instead: 84
+translation units including a Cocoa backend and SDL2 sound.
