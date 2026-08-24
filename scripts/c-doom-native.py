@@ -1,42 +1,36 @@
 #!/usr/bin/env python3
 """Build Doom Generic with the native C frontend, with no Clang in the pipeline.
 
-The pinned sources and WAD come from the existing gate. Every translation unit
-is handed to src/dialects/c/cc.coil at once, which lowers the whole program to
-one Coil module; `coil build` turns that into the executable. Clang is not
-invoked for anything but linking the object file `coil build` produces.
+Every translation unit is handed to src/dialects/c/cc.coil at once, which lowers
+the whole program to one Coil module; `coil build` turns that into the
+executable. Clang is not involved in reading a single line of C -- it only links
+the object file `coil build` produces.
 
 Without --play this runs the headless frame hasher and checks it against the
-same expected hash the Clang-path gate uses, so the two frontends are held to
-the same result. With --play it builds the Cocoa backend, sound included.
+pinned hash, which is the same hash a Clang-built Doom produces. With --play it
+builds the windowed game, sound included.
 """
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import os
 import pathlib
 import subprocess
 import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import doom_sources as doom  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 TARGET = ROOT / "src/dialects/c/target"
 BACKEND = ROOT / "src/apps/doom/cocoa.c"
 
 
-def gate_module():
-    """Reuse the gate's pinned source and WAD provisioning verbatim."""
-    spec = importlib.util.spec_from_file_location("c_doom", ROOT / "scripts/c-doom.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def system_includes() -> list[str]:
     """Where this host keeps the C library's headers.
 
     A compiler has to be told; the driver takes -I like any other. The host
-    toolchain is asked rather than guessed so this keeps working when the SDK
+    toolchain is asked rather than guessed, so this keeps working when the SDK
     moves.
     """
     paths = []
@@ -58,11 +52,10 @@ def main() -> int:
     parser.add_argument("-O", dest="optimization", default="-O2")
     args = parser.parse_args()
 
-    gate = gate_module()
-    source_root = gate.prepare_sources()
-    gate.prepare_wad()
+    source_root = doom.prepare_sources()
+    doom.prepare_wad()
 
-    sources = [path for path in gate.source_files(source_root) if path != gate.HEADLESS]
+    sources = doom.source_files(source_root)
     defines = ["-DNORMALUNIX", "-DLINUX", "-DSNDSERV", "-D_DEFAULT_SOURCE",
                # Apple's headers redirect the string and stdio functions to
                # _FORTIFY_SOURCE builtins this frontend does not implement, and
@@ -72,26 +65,26 @@ def main() -> int:
     if args.play:
         # Upstream ships its sound and music modules but never builds them: the
         # pinned configuration leaves FEATURE_SOUND undefined. Both are built
-        # here, against SDL2 and SDL2_mixer.
+        # here, against SDL2 and SDL2_mixer, along with the MUS-to-MIDI
+        # converter the music module needs.
         sources += [source_root / "i_sdlsound.c",
                     source_root / "i_sdlmusic.c",
                     source_root / "mus2mid.c",
                     BACKEND]
         # SDL offers to pull in <arm_neon.h> for its own vector helpers; Doom
-        # uses none of them, and the NEON intrinsic headers are a vector
-        # dialect this frontend does not implement. SDL's own switch turns the
-        # include off.
+        # uses none of them, and the NEON intrinsic headers are a vector dialect
+        # this frontend does not implement. SDL's own switch turns it off.
         defines += ["-DFEATURE_SOUND", "-DSDL_DISABLE_ARM_NEON_H",
                     "-I/opt/homebrew/include/SDL2"]
         link += ["-lobjc", "-L/opt/homebrew/lib", "-lSDL2", "-lSDL2_mixer",
                  "-framework", "AppKit", "-framework", "QuartzCore"]
         name = "doom-native-play"
     else:
-        sources.append(gate.HEADLESS)
+        sources.append(doom.HEADLESS)
         name = "doom-native"
 
-    lowered = gate.CACHE / f"{name}.coil"
-    executable = gate.CACHE / name
+    lowered = doom.CACHE / f"{name}.coil"
+    executable = doom.CACHE / name
 
     frontend = [args.compiler, "run", str(ROOT / "src/dialects/c/cc.coil"), "--",
                 "-o", str(lowered), *map(str, sources),
@@ -111,12 +104,13 @@ def main() -> int:
     if args.build_only:
         return 0
     if args.play:
-        return subprocess.run([str(executable), "-iwad", str(gate.WAD)], cwd=gate.CACHE).returncode
+        return subprocess.run([str(executable), "-iwad", str(doom.WAD)],
+                              cwd=doom.CACHE).returncode
 
-    actual = gate.frame_result(executable)
-    if actual != gate.EXPECTED_FRAME:
+    actual = doom.frame_result(executable)
+    if actual != doom.EXPECTED_FRAME:
         raise SystemExit(f"Doom framebuffer mismatch:\n"
-                         f"expected: {gate.EXPECTED_FRAME}\nactual:   {actual}")
+                         f"expected: {doom.EXPECTED_FRAME}\nactual:   {actual}")
     print(f"Doom Generic ({len(sources)} translation units): {actual}")
     return 0
 

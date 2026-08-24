@@ -8,22 +8,16 @@ frame hasher.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import os
 import pathlib
 import subprocess
 import sys
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import doom_sources as doom  # noqa: E402
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "src/apps/doom/cocoa.c"
-
-
-def gate_module():
-    """Reuse the gate's pinned source and WAD provisioning verbatim."""
-    spec = importlib.util.spec_from_file_location("c_doom", ROOT / "scripts/c-doom.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def main() -> int:
@@ -34,11 +28,10 @@ def main() -> int:
     parser.add_argument("--build-only", action="store_true")
     args = parser.parse_args()
 
-    gate = gate_module()
-    source_root = gate.prepare_sources()
-    gate.prepare_wad()
+    source_root = doom.prepare_sources()
+    doom.prepare_wad()
 
-    sources = [path for path in gate.source_files(source_root) if path != gate.HEADLESS]
+    sources = doom.source_files(source_root)
     # Upstream ships its sound and music modules but never builds them: the
     # pinned configuration leaves FEATURE_SOUND undefined, so sound_modules[]
     # is empty. Both are compiled here, against SDL2 and SDL2_mixer.
@@ -49,7 +42,7 @@ def main() -> int:
     sources.append(source_root / "mus2mid.c")
     sources.append(BACKEND)
 
-    executable = gate.CACHE / "doom-play"
+    executable = doom.CACHE / "doom-play"
     command = [sys.executable, str(ROOT / "scripts/c-build.py"),
                "--compiler", args.compiler,
                *map(str, sources), "-o", str(executable), args.optimization]
@@ -67,7 +60,7 @@ def main() -> int:
     print(f"built {executable} ({len(sources)} translation units)")
     if args.build_only:
         return 0
-    return subprocess.run([str(executable), "-iwad", str(gate.WAD)], cwd=gate.CACHE).returncode
+    return subprocess.run([str(executable), "-iwad", str(doom.WAD)], cwd=doom.CACHE).returncode
 
 
 if __name__ == "__main__":
