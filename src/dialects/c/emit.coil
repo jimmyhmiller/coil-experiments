@@ -916,9 +916,439 @@
           (= k nd/ND-CASE) (emit-stmt! (mut e) (nd/nd-then n))
           ;; Not yet lowered. This reports rather than emitting something that
           ;; would silently run the wrong code.
-          (= k nd/ND-GOTO) (fail! (mut e) "goto is not lowered yet" (nd/nd-token n))
-          (= k nd/ND-LABEL) (fail! (mut e) "labels are not lowered yet" (nd/nd-token n))
+          ;; Only reachable if a label survived into the structured path,
+          ;; which the check in emit-function! rules out.
+          (= k nd/ND-GOTO) (fail! (mut e) "goto outside a flow graph" (nd/nd-token n))
+          (= k nd/ND-LABEL) (fail! (mut e) "label outside a flow graph" (nd/nd-token n))
           :else (do (put! (mut e) "(do ") (emit-expr! (mut e) n) (put! (mut e) " 0)"))))))
+
+;; ------------------------------------------------------- unstructured flow
+
+;; `goto` can leave a loop, enter one, or jump backwards past a declaration, and
+;; no arrangement of Coil's structured forms expresses all of that. A function
+;; containing a label is therefore lowered the way a machine would run it: the
+;; body is cut into straight-line blocks, each ending in a jump, and a loop
+;; around a dispatch runs whichever block a state variable names. Every jump,
+;; including the ones `if` and `while` imply, becomes an assignment to that
+;; variable.
+;;
+;; Functions without a label -- nearly all of them -- keep the structured
+;; lowering above, which is both easier to read and easier for the optimiser.
+(const TERM-JUMP 0)
+(const TERM-BRANCH 1)
+(const TERM-RETURN 2)
+(const TERM-END 3)
+(const TERM-SWITCH 4)
+
+(defstruct Block
+  [(stmts (al/ArrayList (ptr nd/Node)))
+   (term i64)
+   (test (ptr nd/Node))
+   (value (ptr nd/Node))
+   (a i64)
+   (b i64)
+   (cases (al/ArrayList i64))
+   (targets (al/ArrayList i64))])
+
+(defstruct Flow
+  [(alloc (dyn alloc/Allocator))
+   (blocks (al/ArrayList (ptr Block)))
+   (current i64)
+   ;; A label may be jumped to before it is seen, so its block is created by
+   ;; whichever mention comes first.
+   (labels (hm/HashMap (slice u8) i64))
+   (breaks (al/ArrayList i64))
+   (continues (al/ArrayList i64))])
+
+(defn has-label? [(n (ptr nd/Node))] (-> bool)
+  (if (= (primitive/cast i64 n) 0)
+      false
+      (or (= (nd/nd-kind n) nd/ND-LABEL)
+          (or (has-label? (nd/nd-lhs n))
+              (or (has-label? (nd/nd-then n))
+                  (or (has-label? (nd/nd-else n))
+                      (or (has-label? (nd/nd-setup n))
+                          (or (has-label? (nd/nd-step n))
+                              (has-label-list? (nd/nd-body n))))))))))
+
+(defn has-label-list? [(list (al/ArrayList (ptr nd/Node)))] (-> bool)
+  (let [n (al/al-len [(ptr nd/Node)] list)
+        (mut i) 0
+        (mut found) 0]
+    (loop (if (or (>= (load i) n) (!= (load found) 0))
+              (break)
+              (do
+                (if (has-label? (al/al-get [(ptr nd/Node)] list (load i)))
+                    (store! found 1)
+                    0)
+                (store! i (+ (load i) 1)))))
+    (!= (load found) 0)))
+
+(defn flow-new [(a (dyn alloc/Allocator))] (-> Flow)
+  (load (Flow :alloc a
+          :blocks (al/al-new [(ptr Block)] a)
+          :current 0
+          :labels (hm/hm-new [(slice u8) i64] a (str/str-keyops))
+          :breaks (al/al-new [i64] a)
+          :continues (al/al-new [i64] a))))
+
+(defn flow-new-block! [(f (mut Flow))] (-> i64)
+  (let [a (load (field f alloc))
+        b (alloc/box! a
+                      Block
+                      (load (Block :stmts (al/al-new [(ptr nd/Node)] a)
+                              :term TERM-END
+                              :test (primitive/cast (ptr nd/Node) 0)
+                              :value (primitive/cast (ptr nd/Node) 0)
+                              :a 0
+                              :b 0
+                              :cases (al/al-new [i64] a)
+                              :targets (al/al-new [i64] a))))]
+    (al/al-push! [(ptr Block)] (mut (field f blocks)) b)
+    (- (al/al-len [(ptr Block)] (load (field f blocks))) 1)))
+
+(defn flow-block [(f (mut Flow)) (i i64)] (-> (ptr Block))
+  (al/al-get [(ptr Block)] (load (field f blocks)) i))
+
+(defn flow-here [(f (mut Flow))] (-> (ptr Block))
+  (flow-block (mut f) (load (field f current))))
+
+(defn flow-push-stmt! [(f (mut Flow)) (n (ptr nd/Node))] (-> i64)
+  (let [b (flow-here (mut f))]
+    (al/al-push! [(ptr nd/Node)] (mut (field b stmts)) n))
+  0)
+
+(defn flow-jump! [(f (mut Flow)) (target i64)] (-> i64)
+  (let [b (flow-here (mut f))]
+    (store! (field b term) TERM-JUMP)
+    (store! (field b a) target))
+  0)
+
+(defn flow-branch! [(f (mut Flow)) (test (ptr nd/Node)) (yes i64) (no i64)] (-> i64)
+  (let [b (flow-here (mut f))]
+    (store! (field b term) TERM-BRANCH)
+    (store! (field b test) test)
+    (store! (field b a) yes)
+    (store! (field b b) no))
+  0)
+
+(defn flow-label-block! [(f (mut Flow)) (name (slice u8))] (-> i64)
+  (match (hm/hm-get (load (field f labels)) name)
+    (Some [i] i)
+    (None []
+      (let [i (flow-new-block! (mut f))]
+        (hm/hm-put! [(slice u8) i64] (mut (field f labels)) name i)
+        i))))
+
+(defn flow-top [(list (al/ArrayList i64))] (-> i64)
+  (let [n (al/al-len [i64] list)]
+    (if (= n 0) 0 (al/al-get [i64] list (- n 1)))))
+
+;; After a jump, control cannot reach what follows until a label does. A fresh
+;; block collects it: nothing jumps to it, so nothing runs it.
+(defn flow-unreachable! [(f (mut Flow))] (-> i64)
+  (store! (field f current) (flow-new-block! (mut f)))
+  0)
+
+(defn build-flow-list! [(f (mut Flow)) (list (al/ArrayList (ptr nd/Node)))] (-> i64)
+  (let [n (al/al-len [(ptr nd/Node)] list)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do (build-flow! (mut f) (al/al-get [(ptr nd/Node)] list (load i)))
+                  (store! i (+ (load i) 1))))))
+  0)
+
+(defn build-if! [(f (mut Flow)) (n (ptr nd/Node))] (-> i64)
+  (let [yes (flow-new-block! (mut f))
+        no (flow-new-block! (mut f))
+        join (flow-new-block! (mut f))]
+    (flow-branch! (mut f) (nd/nd-test n) yes no)
+    (store! (field f current) yes)
+    (build-flow! (mut f) (nd/nd-then n))
+    (flow-jump! (mut f) join)
+    (store! (field f current) no)
+    (build-flow! (mut f) (nd/nd-else n))
+    (flow-jump! (mut f) join)
+    (store! (field f current) join))
+  0)
+
+(defn build-while! [(f (mut Flow)) (n (ptr nd/Node))] (-> i64)
+  (let [head (flow-new-block! (mut f))
+        body (flow-new-block! (mut f))
+        exit (flow-new-block! (mut f))]
+    (flow-jump! (mut f) head)
+    (store! (field f current) head)
+    (flow-branch! (mut f) (nd/nd-test n) body exit)
+    (al/al-push! [i64] (mut (field f breaks)) exit)
+    (al/al-push! [i64] (mut (field f continues)) head)
+    (store! (field f current) body)
+    (build-flow! (mut f) (nd/nd-then n))
+    (flow-jump! (mut f) head)
+    (al/al-pop! [i64] (mut (field f breaks)))
+    (al/al-pop! [i64] (mut (field f continues)))
+    (store! (field f current) exit))
+  0)
+
+(defn build-do! [(f (mut Flow)) (n (ptr nd/Node))] (-> i64)
+  (let [body (flow-new-block! (mut f))
+        test (flow-new-block! (mut f))
+        exit (flow-new-block! (mut f))]
+    (flow-jump! (mut f) body)
+    (store! (field f current) body)
+    (al/al-push! [i64] (mut (field f breaks)) exit)
+    (al/al-push! [i64] (mut (field f continues)) test)
+    (build-flow! (mut f) (nd/nd-then n))
+    (flow-jump! (mut f) test)
+    (al/al-pop! [i64] (mut (field f breaks)))
+    (al/al-pop! [i64] (mut (field f continues)))
+    (store! (field f current) test)
+    (flow-branch! (mut f) (nd/nd-test n) body exit)
+    (store! (field f current) exit))
+  0)
+
+;; `continue` in a `for` goes to the step, not to the test, so the step gets a
+;; block of its own.
+(defn build-for! [(f (mut Flow)) (n (ptr nd/Node))] (-> i64)
+  (build-flow! (mut f) (nd/nd-setup n))
+  (let [head (flow-new-block! (mut f))
+        body (flow-new-block! (mut f))
+        step (flow-new-block! (mut f))
+        exit (flow-new-block! (mut f))]
+    (flow-jump! (mut f) head)
+    (store! (field f current) head)
+    (if (= (primitive/cast i64 (nd/nd-test n)) 0)
+        (flow-jump! (mut f) body)
+        (flow-branch! (mut f) (nd/nd-test n) body exit))
+    (al/al-push! [i64] (mut (field f breaks)) exit)
+    (al/al-push! [i64] (mut (field f continues)) step)
+    (store! (field f current) body)
+    (build-flow! (mut f) (nd/nd-then n))
+    (flow-jump! (mut f) step)
+    (al/al-pop! [i64] (mut (field f breaks)))
+    (al/al-pop! [i64] (mut (field f continues)))
+    (store! (field f current) step)
+    (build-flow! (mut f) (nd/nd-step n))
+    (flow-jump! (mut f) head)
+    (store! (field f current) exit))
+  0)
+
+(defn build-switch! [(f (mut Flow)) (n (ptr nd/Node))] (-> i64)
+  (let [a (load (field f alloc))
+        (mut flat) (al/al-new [(ptr nd/Node)] a)
+        body (nd/nd-then n)]
+    (if (= (nd/nd-kind body) nd/ND-BLOCK)
+        (let [src (nd/nd-body body)
+              n-src (al/al-len [(ptr nd/Node)] src)
+              (mut i) 0]
+          (loop (if (>= (load i) n-src)
+                    (break)
+                    (do (flatten-case! (mut flat) (al/al-get [(ptr nd/Node)] src (load i)))
+                        (store! i (+ (load i) 1))))))
+        (flatten-case! (mut flat) body))
+    (let [items (load flat)
+          count (al/al-len [(ptr nd/Node)] items)
+          exit (flow-new-block! (mut f))
+          head (flow-here (mut f))
+          (mut i) 0
+          ;; With no `default`, an unmatched value leaves the switch.
+          (mut fallback) exit]
+      (store! (field head term) TERM-SWITCH)
+      (store! (field head test) (nd/nd-test n))
+      ;; One block per group, in order, so that falling off the end of a group
+      ;; enters the next.
+      (loop (if (>= (load i) count)
+                (break)
+                (let [s (al/al-get [(ptr nd/Node)] items (load i))]
+                  (if (= (nd/nd-kind s) nd/ND-CASE)
+                      (let [group (flow-new-block! (mut f))]
+                        (if (str/str-eq (nd/nd-label s) "default")
+                            (store! fallback group)
+                            (do (al/al-push! [i64] (mut (field head cases)) (nd/nd-value s))
+                                (al/al-push! [i64] (mut (field head targets)) group)
+                                0))
+                        0)
+                      0)
+                  (store! i (+ (load i) 1)))))
+      (store! (field head a) (load fallback))
+      (al/al-push! [i64] (mut (field f breaks)) exit)
+      (build-switch-groups! (mut f) items exit)
+      (al/al-pop! [i64] (mut (field f breaks)))
+      (store! (field f current) exit)))
+  0)
+
+;; Walks the flattened body again, this time filling the group blocks the pass
+;; above created. They were created in the same order, so the nth case marker
+;; owns the nth of them.
+(defn build-switch-groups! [(f (mut Flow))
+                            (items (al/ArrayList (ptr nd/Node)))
+                            (exit i64)] (-> i64)
+  (let [count (al/al-len [(ptr nd/Node)] items)
+        head (flow-here (mut f))
+        (mut i) 0
+        (mut group) -1
+        (mut first) -1]
+    ;; The group blocks are the ones allocated between the head and the first
+    ;; statement, so their indices run from just after `exit`.
+    (store! first (+ exit 1))
+    (loop (if (>= (load i) count)
+              (break)
+              (let [s (al/al-get [(ptr nd/Node)] items (load i))]
+                (if (= (nd/nd-kind s) nd/ND-CASE)
+                    (do
+                      (if (>= (load group) 0) (flow-jump! (mut f) (+ (load first) (+ (load group) 1))) 0)
+                      (store! group (+ (load group) 1))
+                      (store! (field f current) (+ (load first) (load group)))
+                      0)
+                    (if (>= (load group) 0) (build-flow! (mut f) s) 0))
+                (store! i (+ (load i) 1)))))
+    (if (>= (load group) 0) (flow-jump! (mut f) exit) 0))
+  0)
+
+(defn build-flow! [(f (mut Flow)) (n (ptr nd/Node))] (-> i64)
+  (if (= (primitive/cast i64 n) 0)
+      0
+      (let [k (nd/nd-kind n)]
+        (cond
+          (= k nd/ND-NULL) 0
+          (= k nd/ND-BLOCK) (build-flow-list! (mut f) (nd/nd-body n))
+          (= k nd/ND-RETURN)
+            (let [b (flow-here (mut f))]
+              (store! (field b term) TERM-RETURN)
+              (store! (field b value) (nd/nd-lhs n))
+              (flow-unreachable! (mut f)))
+          (= k nd/ND-IF) (build-if! (mut f) n)
+          (= k nd/ND-WHILE) (build-while! (mut f) n)
+          (= k nd/ND-DO) (build-do! (mut f) n)
+          (= k nd/ND-FOR) (build-for! (mut f) n)
+          (= k nd/ND-SWITCH) (build-switch! (mut f) n)
+          (= k nd/ND-BREAK)
+            (do (flow-jump! (mut f) (flow-top (load (field f breaks))))
+                (flow-unreachable! (mut f)))
+          (= k nd/ND-CONTINUE)
+            (do (flow-jump! (mut f) (flow-top (load (field f continues))))
+                (flow-unreachable! (mut f)))
+          (= k nd/ND-GOTO)
+            (do (flow-jump! (mut f) (flow-label-block! (mut f) (nd/nd-label n)))
+                (flow-unreachable! (mut f)))
+          (= k nd/ND-LABEL)
+            (let [target (flow-label-block! (mut f) (nd/nd-label n))]
+              (flow-jump! (mut f) target)
+              (store! (field f current) target)
+              (build-flow! (mut f) (nd/nd-then n)))
+          ;; A case outside any switch body block, which the switch builder
+          ;; would otherwise have taken.
+          (= k nd/ND-CASE) (build-flow! (mut f) (nd/nd-then n))
+          :else (flow-push-stmt! (mut f) n)))))
+
+;; ------------------------------------------------- emitting the flow graph
+
+(defn emit-goto! [(e (mut Emitter)) (state (slice u8)) (target i64)] (-> i64)
+  (put! (mut e) "(do (primitive/store! ")
+  (put! (mut e) state)
+  (put! (mut e) " ")
+  (put-int! (mut e) target)
+  (put! (mut e) ") 0)")
+  0)
+
+(defn emit-terminator! [(e (mut Emitter))
+                        (f (mut Flow))
+                        (b (ptr Block))
+                        (state (slice u8))
+                        (result (ptr ct/Type))] (-> i64)
+  (let [term (load (field b term))]
+    (cond
+      (= term TERM-JUMP) (emit-goto! (mut e) state (load (field b a)))
+      (= term TERM-BRANCH)
+        (do (put! (mut e) "(if ")
+            (emit-truth! (mut e) (load (field b test)))
+            (put! (mut e) " ")
+            (emit-goto! (mut e) state (load (field b a)))
+            (put! (mut e) " ")
+            (emit-goto! (mut e) state (load (field b b)))
+            (put! (mut e) ")"))
+      (= term TERM-RETURN)
+        (do (put! (mut e) "(control/return-from :c_return ")
+            (if (= (primitive/cast i64 (load (field b value))) 0)
+                (do (put! (mut e) "(primitive/zeroed ")
+                    (emit-return-type! (mut e) result)
+                    (put! (mut e) ")"))
+                (emit-expr! (mut e) (load (field b value))))
+            (put! (mut e) ")"))
+      (= term TERM-SWITCH) (emit-switch-terminator! (mut e) b state)
+      ;; Nothing follows this block: leave the dispatch loop.
+      :else (put! (mut e) "(break)"))))
+
+(defn emit-switch-terminator! [(e (mut Emitter)) (b (ptr Block)) (state (slice u8))] (-> i64)
+  (let [values (load (field b cases))
+        targets (load (field b targets))
+        count (al/al-len [i64] values)
+        value (fresh (mut e) "sw")
+        (mut i) 0]
+    (put! (mut e) "(let [")
+    (put! (mut e) value)
+    (put! (mut e) " (primitive/cast i64 ")
+    (emit-expr! (mut e) (load (field b test)))
+    (put! (mut e) ")] ")
+    (loop (if (>= (load i) count)
+              (break)
+              (do
+                (put! (mut e) "(if (primitive/icmp-eq ")
+                (put! (mut e) value)
+                (put! (mut e) " ")
+                (put-int! (mut e) (al/al-get [i64] values (load i)))
+                (put! (mut e) ") ")
+                (emit-goto! (mut e) state (al/al-get [i64] targets (load i)))
+                (put! (mut e) " ")
+                (store! i (+ (load i) 1)))))
+    (emit-goto! (mut e) state (load (field b a)))
+    (store! i 0)
+    (loop (if (>= (load i) count)
+              (break)
+              (do (put! (mut e) ")") (store! i (+ (load i) 1)))))
+    (put! (mut e) ")"))
+  0)
+
+(defn emit-flow-block! [(e (mut Emitter))
+                        (f (mut Flow))
+                        (index i64)
+                        (state (slice u8))
+                        (result (ptr ct/Type))] (-> i64)
+  (let [b (flow-block (mut f) index)
+        stmts (load (field b stmts))
+        count (al/al-len [(ptr nd/Node)] stmts)
+        (mut i) 0]
+    (put! (mut e) "(do")
+    (loop (if (>= (load i) count)
+              (break)
+              (do (put! (mut e) " ")
+                  (emit-stmt! (mut e) (al/al-get [(ptr nd/Node)] stmts (load i)))
+                  (store! i (+ (load i) 1)))))
+    (put! (mut e) " ")
+    (emit-terminator! (mut e) (mut f) b state result)
+    (put! (mut e) ")"))
+  0)
+
+;; A binary search rather than a chain, so that reaching a block costs the same
+;; wherever it sits in a long function.
+(defn emit-dispatch! [(e (mut Emitter))
+                      (f (mut Flow))
+                      (lo i64)
+                      (hi i64)
+                      (state (slice u8))
+                      (result (ptr ct/Type))] (-> i64)
+  (if (>= lo hi)
+      (emit-flow-block! (mut e) (mut f) lo state result)
+      (let [mid (primitive/idiv (+ lo hi) 2)]
+        (put! (mut e) "(if (primitive/icmp-le (primitive/load ")
+        (put! (mut e) state)
+        (put! (mut e) ") ")
+        (put-int! (mut e) mid)
+        (put! (mut e) ") ")
+        (emit-dispatch! (mut e) (mut f) lo mid state result)
+        (put! (mut e) " ")
+        (emit-dispatch! (mut e) (mut f) (+ mid 1) hi state result)
+        (put! (mut e) ")"))))
 
 ;; ------------------------------------------------------------- top level
 
@@ -1008,10 +1438,32 @@
                 (store! i (+ (load i) 1))))))
   0)
 
+;; Builds the flow graph for a function that contains a label, and emits the
+;; dispatch loop that runs it.
+(defn emit-flow! [(e (mut Emitter)) (f (ptr nd/Obj)) (state (slice u8))] (-> i64)
+  (let [(mut flow) (flow-new (load (field e a)))
+        entry (flow-new-block! (mut flow))]
+    (store! (field flow current) entry)
+    (build-flow! (mut flow) (nd/obj-body f))
+    (put! (mut e) "(primitive/store! ")
+    (put! (mut e) state)
+    (put! (mut e) " ")
+    (put-int! (mut e) entry)
+    (put! (mut e) ") (loop ")
+    (emit-dispatch! (mut e)
+                    (mut flow)
+                    0
+                    (- (al/al-len [(ptr Block)] (load (field flow blocks))) 1)
+                    state
+                    (ct/ty-base (nd/obj-type f)))
+    (put! (mut e) ")"))
+  0)
+
 (defn emit-function! [(e (mut Emitter)) (f (ptr nd/Obj))] (-> i64)
   (let [ty (nd/obj-type f)
         params (nd/obj-params f)
         count (al/al-len [(ptr nd/Obj)] params)
+        state (fresh (mut e) "st")
         (mut i) 0]
     (put! (mut e) "(defn ")
     (put! (mut e) (ident (mut e) "c_fn_" (nd/obj-name f)))
@@ -1037,10 +1489,15 @@
     (put! (mut e) ")\n  (let [")
     (emit-locals! (mut e) f)
     (emit-va-areas! (mut e) (nd/obj-body f))
+    (if (has-label? (nd/obj-body f))
+        (do (put! (mut e) " ") (put! (mut e) state) (put! (mut e) " (primitive/alloc-stack i64)"))
+        0)
     (put! (mut e) "]\n    (control/scope :c_return (do")
     (emit-param-copies! (mut e) f)
     (put! (mut e) " ")
-    (emit-stmt! (mut e) (nd/obj-body f))
+    (if (has-label? (nd/obj-body f))
+        (emit-flow! (mut e) f state)
+        (emit-stmt! (mut e) (nd/obj-body f)))
     ;; A function that runs off its end still has to yield a value of its
     ;; return type.
     (put! (mut e) " (primitive/zeroed ")
