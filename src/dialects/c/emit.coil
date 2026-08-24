@@ -1,0 +1,197 @@
+;; Lowers the typed C AST to ordinary Coil.
+;;
+;; Two rules shape everything here.
+;;
+;; A C record is emitted as a blob with C's own size and alignment -- an array
+;; whose element type carries the required alignment -- and members are reached
+;; by byte offset. Handing records to Coil's struct layout instead would mean
+;; two independent sets of layout rules had to agree, which they need not; this
+;; way the offsets computed in experiments.c.ctype are the offsets used. It is
+;; also what makes bitfields expressible at all.
+;;
+;; Every expression has two forms: its value, and its address. `emit-addr!`
+;; exists for exactly the constructs C calls lvalues, and reading an lvalue is
+;; a load from its address. Assignment, `&`, and member access all fall out of
+;; that rather than being special-cased.
+(module experiments.c.emit)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.hashmap" :as hm)
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+(import "experiments.c.lex" :as lex)
+(import "experiments.c.ctype" :as ct)
+(import "experiments.c.node" :as nd)
+
+(export Emitter EmitResult emit-program)
+
+(defstruct Emitter
+  [(a (dyn alloc/Allocator))
+   (out str/StrBuf)
+   (slots (hm/HashMap (slice u8) (slice u8)))
+   (defined (hm/HashMap (slice u8) bool))
+   (externs (hm/HashMap (slice u8) bool))
+   (serial i64)
+   (loop-depth i64)
+   (failed i64)
+   (message (slice u8))
+   (file (slice u8))
+   (line i64)])
+
+(defstruct EmitResult
+  [(text (slice u8))
+   (failed i64)
+   (message (slice u8))
+   (file (slice u8))
+   (line i64)])
+
+(defn put! [(e (mut Emitter)) (s (slice u8))] (-> i64)
+  (str/sb-push-str! (mut (field e out)) s) 0)
+
+(defn put-int! [(e (mut Emitter)) (v i64)] (-> i64)
+  (str/sb-push-i64! (mut (field e out)) v) 0)
+
+(defn fail! [(e (mut Emitter)) (message (slice u8)) (tok lex/Token)] (-> i64)
+  (if (!= (load (field e failed)) 0)
+      0
+      (do
+        (store! (field e failed) 1)
+        (store! (field e message) message)
+        (store! (field e file) (lex/token-file tok))
+        (store! (field e line) (lex/token-line tok))
+        0)))
+
+(defn fresh [(e (mut Emitter)) (prefix (slice u8))] (-> (slice u8))
+  (let [(mut b) (str/sb-new (load (field e a)))]
+    (str/sb-push-str! (mut b) prefix)
+    (str/sb-push-i64! (mut b) (load (field e serial)))
+    (store! (field e serial) (+ (load (field e serial)) 1))
+    (str/sb-str (load (mut b)))))
+
+;; C identifiers are a subset of what Coil accepts, except that a leading dot
+;; appears in the names generated for string literals.
+(defn ident [(e (mut Emitter)) (prefix (slice u8)) (name (slice u8))] (-> (slice u8))
+  (let [(mut b) (str/sb-new (load (field e a)))
+        n (slice-len name)
+        (mut i) 0]
+    (str/sb-push-str! (mut b) prefix)
+    (loop (if (>= (load i) n)
+              (break)
+              (let [c (primitive/cast i64 (slice-get name (load i)))]
+                (str/sb-push-byte! (mut b)
+                                   (primitive/cast u8
+                                                   (if (or (and (>= c 48) (<= c 57))
+                                                           (or (and (>= c 65) (<= c 90))
+                                                               (or (and (>= c 97) (<= c 122))
+                                                                   (= c 95))))
+                                                       c
+                                                       95)))
+                (store! i (+ (load i) 1)))))
+    (str/sb-str (load (mut b)))))
+
+;; --------------------------------------------------------------- types
+
+(defn scalar-name [(t (ptr ct/Type))] (-> (slice u8))
+  (let [k (ct/ty-kind t)
+        u (ct/ty-unsigned? t)]
+    (cond
+      (= k ct/TY-VOID) "i8"
+      (= k ct/TY-BOOL) "u8"
+      (= k ct/TY-CHAR) (if u "u8" "i8")
+      (= k ct/TY-SHORT) (if u "u16" "i16")
+      (= k ct/TY-INT) (if u "u32" "i32")
+      (= k ct/TY-ENUM) "i32"
+      (= k ct/TY-LONG) (if u "u64" "i64")
+      (= k ct/TY-FLOAT) "f32"
+      (= k ct/TY-DOUBLE) "f64"
+      (= k ct/TY-LDOUBLE) "f64"
+      :else "")))
+
+;; A record's storage: an array of the widest unit its alignment allows, so the
+;; blob has exactly C's size and alignment. C guarantees the size is a multiple
+;; of the alignment, so the division is exact.
+(defn emit-record-storage! [(e (mut Emitter)) (t (ptr ct/Type))] (-> i64)
+  (let [size (ct/ty-size t)
+        align (ct/ty-align t)]
+    (put! (mut e) "(array ")
+    (cond
+      (>= align 8) (do (put! (mut e) "i64 ") (put-int! (mut e) (primitive/idiv size 8)))
+      (= align 4) (do (put! (mut e) "i32 ") (put-int! (mut e) (primitive/idiv size 4)))
+      (= align 2) (do (put! (mut e) "i16 ") (put-int! (mut e) (primitive/idiv size 2)))
+      :else (do (put! (mut e) "u8 ") (put-int! (mut e) (if (= size 0) 1 size))))
+    (put! (mut e) ")"))
+  0)
+
+(defn emit-type! [(e (mut Emitter)) (t (ptr ct/Type))] (-> i64)
+  (if (= (primitive/cast i64 t) 0)
+      (put! (mut e) "i64")
+      (let [k (ct/ty-kind t)]
+        (cond
+          (ct/record? t) (emit-record-storage! (mut e) t)
+          (= k ct/TY-PTR)
+            (do (put! (mut e) "(ptr ")
+                (emit-pointee! (mut e) (ct/ty-base t))
+                (put! (mut e) ")"))
+          ;; An array parameter or value is only ever handled through its
+          ;; address, so its element type is what matters.
+          (= k ct/TY-ARRAY)
+            (do (put! (mut e) "(array ")
+                (emit-type! (mut e) (ct/ty-base t))
+                (put! (mut e) " ")
+                (put-int! (mut e) (if (< (ct/ty-array-len t) 0) 0 (ct/ty-array-len t)))
+                (put! (mut e) ")"))
+          (= k ct/TY-FUNC) (emit-fnptr! (mut e) t)
+          :else (put! (mut e) (scalar-name t))))))
+
+;; `void *` and a pointer to an incomplete record both become `(ptr i8)`: the
+;; pointee's layout is never needed through them.
+(defn emit-pointee! [(e (mut Emitter)) (t (ptr ct/Type))] (-> i64)
+  (if (= (primitive/cast i64 t) 0)
+      (put! (mut e) "i8")
+      (let [k (ct/ty-kind t)]
+        (cond
+          (= k ct/TY-VOID) (put! (mut e) "i8")
+          (= k ct/TY-FUNC) (emit-fnptr! (mut e) t)
+          (and (ct/record? t) (not (ct/ty-complete? t))) (put! (mut e) "i8")
+          :else (emit-type! (mut e) t)))))
+
+(defn emit-fnptr! [(e (mut Emitter)) (t (ptr ct/Type))] (-> i64)
+  (let [params (ct/ty-params t)
+        n (al/al-len [(ptr ct/Type)] params)
+        (mut i) 0]
+    (put! (mut e) "(fnptr c [")
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (if (> (load i) 0) (put! (mut e) " ") 0)
+                (emit-param-type! (mut e) (al/al-get [(ptr ct/Type)] params (load i)))
+                (store! i (+ (load i) 1)))))
+    (if (ct/ty-variadic? t)
+        (do (if (> n 0) (put! (mut e) " ") 0) (put! (mut e) "..."))
+        0)
+    (put! (mut e) "] ")
+    (emit-return-type! (mut e) (ct/ty-base t))
+    (put! (mut e) ")"))
+  0)
+
+;; An array parameter is a pointer, and a record parameter is passed by
+;; reference here rather than by value.
+(defn emit-param-type! [(e (mut Emitter)) (t (ptr ct/Type))] (-> i64)
+  (if (= (primitive/cast i64 t) 0)
+      (put! (mut e) "i64")
+      (let [k (ct/ty-kind t)]
+        (cond
+          (= k ct/TY-ARRAY)
+            (do (put! (mut e) "(ptr ") (emit-pointee! (mut e) (ct/ty-base t)) (put! (mut e) ")"))
+          (= k ct/TY-FUNC)
+            (do (put! (mut e) "(ptr ") (emit-fnptr! (mut e) t) (put! (mut e) ")"))
+          :else (emit-type! (mut e) t)))))
+
+(defn emit-return-type! [(e (mut Emitter)) (t (ptr ct/Type))] (-> i64)
+  (if (= (primitive/cast i64 t) 0)
+      (put! (mut e) "i64")
+      (if (= (ct/ty-kind t) ct/TY-VOID)
+          (put! (mut e) "i64")
+          (emit-param-type! (mut e) t))))
