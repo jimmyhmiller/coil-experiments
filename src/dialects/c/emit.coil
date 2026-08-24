@@ -313,6 +313,17 @@
       ;; The placeholder for an update's target reaches the address the update
       ;; already bound.
       (= k nd/ND-TARGET) (put! (mut e) (top-label (load (field e target-addrs))))
+      ;; A member is its record's address advanced by the byte offset the
+      ;; layout assigned, then reinterpreted. The first member is not advanced
+      ;; at all -- it starts where the record does -- and most members are the
+      ;; first of something.
+      (and (= k nd/ND-MEMBER) (= (nd/nd-member-offset n) 0))
+        (do
+          (put! (mut e) "(primitive/cast (ptr ")
+          (emit-type! (mut e) (nd/nd-type n))
+          (put! (mut e) ") ")
+          (emit-addr! (mut e) (nd/nd-lhs n))
+          (put! (mut e) ")"))
       (= k nd/ND-MEMBER)
         (do
           (put! (mut e) "(primitive/cast (ptr ")
@@ -475,20 +486,40 @@
            (and (= (ct/ty-kind t) ct/TY-PTR)
                 (= (ct/ty-kind (ct/ty-base t)) ct/TY-FUNC)))))
 
+;; Two C types that are written the same way in Coil.
+(defn same-scalar? [(a (ptr ct/Type)) (b (ptr ct/Type))] (-> bool)
+  (and (!= (primitive/cast i64 a) 0)
+       (and (!= (primitive/cast i64 b) 0)
+            (let [na (scalar-name a)]
+              (and (> (slice-len na) 0) (str/str-eq na (scalar-name b)))))))
+
+;; A cast whose operand is already a cast to the same Coil type: the inner one
+;; produced that type, so it adds nothing. They stack up because the parser
+;; materialises every conversion C performs and the lowering then names the type
+;; again. The outer cast is kept -- it may be the one doing real work -- and the
+;; redundant inner ones are dropped.
+(defn without-redundant-casts [(n (ptr nd/Node)) (target (ptr ct/Type))] (-> (ptr nd/Node))
+  (let [(mut operand) n]
+    (loop (if (and (= (nd/nd-kind (load operand)) nd/ND-CAST)
+                   (same-scalar? (nd/nd-type (load operand)) target))
+              (store! operand (nd/nd-lhs (load operand)))
+              (break)))
+    (load operand)))
+
 ;; The operand of a cast, with the hop inserted when one side is a function
 ;; pointer and the other is not.
-(defn emit-cast-operand! [(e (mut Emitter)) (n (ptr nd/Node)) (target (ptr ct/Type))] (-> i64)
-  (let [from (nd/nd-type (nd/nd-lhs n))]
+(defn emit-cast-operand! [(e (mut Emitter)) (operand (ptr nd/Node)) (target (ptr ct/Type))] (-> i64)
+  (let [from (nd/nd-type operand)]
     (cond
       (and (fnptr-type? target) (not (fnptr-type? from)))
         (do (put! (mut e) "(primitive/cast (ptr i8) (primitive/cast i64 ")
-            (emit-expr! (mut e) (nd/nd-lhs n))
+            (emit-expr! (mut e) operand)
             (put! (mut e) "))"))
       (and (fnptr-type? from) (not (fnptr-type? target)))
         (do (put! (mut e) "(primitive/cast i64 (primitive/cast (ptr i8) ")
-            (emit-expr! (mut e) (nd/nd-lhs n))
+            (emit-expr! (mut e) operand)
             (put! (mut e) "))"))
-      :else (emit-expr! (mut e) (nd/nd-lhs n)))))
+      :else (emit-expr! (mut e) operand))))
 
 (defn emit-truth! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
   (let [t (nd/nd-type n)]
@@ -640,6 +671,46 @@
           (put! (mut e) ")))"))))
   0)
 
+;; An assignment or an update evaluated for its effect. Producing the value as
+;; well costs a bound address and a reload at every one, and a program is mostly
+;; assignments whose value nobody reads -- a static initialiser especially, where
+;; every element of every table is one of these.
+(defn emit-assign-only! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
+  (let [target (nd/nd-lhs n)
+        value (nd/nd-rhs n)]
+    (put! (mut e) "(do ")
+    (if (>= (nd/nd-member-bit-width target) 0)
+        (emit-bitfield-store! (mut e) target value)
+        (do (put! (mut e) "(primitive/store! ")
+            (emit-addr! (mut e) target)
+            (put! (mut e) " ")
+            (emit-expr! (mut e) value)
+            (put! (mut e) ")")))
+    (put! (mut e) " 0)"))
+  0)
+
+(defn emit-compound-only! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
+  (let [target (nd/nd-lhs n)
+        value (nd/nd-rhs n)
+        at (fresh (mut e) "at")]
+    (put! (mut e) "(let [")
+    (put! (mut e) at)
+    (put! (mut e) " ")
+    (emit-addr! (mut e) target)
+    (put! (mut e) "] (do ")
+    (al/al-push! [(slice u8)] (mut (field e target-addrs)) at)
+    (emit-target-store! (mut e) target at value)
+    (al/al-pop! [(slice u8)] (mut (field e target-addrs)))
+    (put! (mut e) " 0))"))
+  0)
+
+(defn emit-discarded! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
+  (let [k (nd/nd-kind n)]
+    (cond
+      (= k nd/ND-ASSIGN) (emit-assign-only! (mut e) n)
+      (= k nd/ND-COMPOUND) (emit-compound-only! (mut e) n)
+      :else (do (put! (mut e) "(do ") (emit-expr! (mut e) n) (put! (mut e) " 0)")))))
+
 (defn callee-name [(e (mut Emitter)) (o (ptr nd/Obj))] (-> (slice u8))
   (if (hm/hm-contains? (load (field e defined)) (nd/obj-name o))
       (ident (mut e) "c_fn_" (nd/obj-name o))
@@ -699,7 +770,7 @@
             (do (put! (mut e) "(primitive/cast ")
                 (emit-param-type! (mut e) t)
                 (put! (mut e) " ")
-                (emit-cast-operand! (mut e) n t)
+                (emit-cast-operand! (mut e) (without-redundant-casts (nd/nd-lhs n) t) t)
                 (put! (mut e) ")"))
           ;; Clearing an object an initialiser only partly fills.
           (= k nd/ND-MEMZERO)
@@ -985,11 +1056,8 @@
                           (emit-stmt! (mut e) (al/al-get [(ptr nd/Node)] body (load i)))
                           (store! i (+ (load i) 1)))))
               (put! (mut e) " 0)"))
-          ;; The value is discarded, so it is sequenced and then dropped.
-          (= k nd/ND-EXPR-STMT)
-            (do (put! (mut e) "(do ")
-                (emit-expr! (mut e) (nd/nd-lhs n))
-                (put! (mut e) " 0)"))
+          ;; The value is discarded, so it is never produced.
+          (= k nd/ND-EXPR-STMT) (emit-discarded! (mut e) (nd/nd-lhs n))
           (= k nd/ND-RETURN)
             (do (put! (mut e) "(control/return-from :c_return ")
                 (if (= (primitive/cast i64 (nd/nd-lhs n)) 0)
@@ -1084,7 +1152,7 @@
           ;; which the check in emit-function! rules out.
           (= k nd/ND-GOTO) (fail! (mut e) "goto outside a flow graph" (nd/nd-token n))
           (= k nd/ND-LABEL) (fail! (mut e) "label outside a flow graph" (nd/nd-token n))
-          :else (do (put! (mut e) "(do ") (emit-expr! (mut e) n) (put! (mut e) " 0)"))))))
+          :else (emit-discarded! (mut e) n)))))
 
 ;; ------------------------------------------------------- unstructured flow
 
@@ -1672,28 +1740,13 @@
 
 ;; A global is a static cell reached through a zero-argument accessor, which
 ;; gives it one address for the whole program.
-;; A string literal's bytes are known at compile time, so it is emitted as
-;; static data rather than written by the initialiser at start-up. Coil's string
-;; escape names a code point rather than a byte, so a literal that is not all
-;; ASCII falls back to a cleared array the initialiser fills byte by byte.
-(defn ascii-string? [(bytes (slice u8))] (-> bool)
-  (let [n (slice-len bytes)
-        (mut i) 0
-        (mut ok) 1]
-    (loop (if (or (>= (load i) n) (= (load ok) 0))
-              (break)
-              (do (if (>= (primitive/cast i64 (slice-get bytes (load i))) 128)
-                      (store! ok 0)
-                      0)
-                  (store! i (+ (load i) 1)))))
-    (!= (load ok) 0)))
-
 (defn put-byte! [(e (mut Emitter)) (c i64)] (-> i64)
   (str/sb-push-byte! (mut (field e out)) (primitive/cast u8 c)) 0)
 
 ;; A byte that reads as itself is written as itself: the generated module is
-;; meant to be read, and `"WIMINUS\0"` says what a run of hex escapes only
-;; encodes. The escape is kept for the bytes with no printable spelling.
+;; meant to be read, and `c"WIMINUS"` says what a run of escapes only encodes.
+;; The escape is kept for the bytes with no printable spelling; in a `c"..."`
+;; literal it names the byte itself, so every value is expressible.
 (defn put-string-byte! [(e (mut Emitter)) (c i64)] (-> i64)
   (cond
     (= c 34) (put! (mut e) "\\\"")
@@ -1705,16 +1758,17 @@
     (and (>= c 32) (<= c 126)) (put-byte! (mut e) c)
     :else (do (put! (mut e) "\\x") (put-hex! (mut e) c) (put! (mut e) ";"))))
 
+;; A C string literal is a C string literal: `c"..."` is byte-exact and already
+;; terminated, which is exactly what the object's type says it holds.
 (defn put-coil-string! [(e (mut Emitter)) (bytes (slice u8))] (-> i64)
   (let [n (slice-len bytes)
         (mut i) 0]
-    (put! (mut e) "\"")
+    (put! (mut e) "c\"")
     (loop (if (>= (load i) n)
               (break)
               (do (put-string-byte! (mut e) (primitive/cast i64 (slice-get bytes (load i))))
                   (store! i (+ (load i) 1)))))
-    ;; C strings are terminated; the array type already has room for it.
-    (put! (mut e) "\\0\""))
+    (put! (mut e) "\""))
   0)
 
 (defn put-hex! [(e (mut Emitter)) (v i64)] (-> i64)
@@ -1735,35 +1789,17 @@
         (put! (mut e) " [] (-> (ptr ")
         (emit-type! (mut e) (nd/obj-type o))
         (put! (mut e) ")) ")
-        (if (and (nd/obj-string? o) (ascii-string? (nd/obj-string-data o)))
+        (if (nd/obj-string? o)
             (do (put! (mut e) "(primitive/cast (ptr ")
                 (emit-type! (mut e) (nd/obj-type o))
-                (put! (mut e) ") (slice/slice-data [u8] ")
+                (put! (mut e) ") ")
                 (put-coil-string! (mut e) (nd/obj-string-data o))
-                (put! (mut e) "))"))
+                (put! (mut e) ")"))
             (do (put! (mut e) "(primitive/alloc-static ")
                 (emit-type! (mut e) (nd/obj-type o))
                 (put! (mut e) ")")))
         (put! (mut e) ")\n")
         0)))
-
-;; A string that is not all ASCII gets its bytes written at start-up instead.
-(defn emit-string-fill! [(e (mut Emitter)) (o (ptr nd/Obj))] (-> i64)
-  (let [bytes (nd/obj-string-data o)
-        n (slice-len bytes)
-        (mut i) 0]
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (put! (mut e) " (primitive/store! (primitive/index (primitive/cast (ptr u8) (")
-                (put! (mut e) (ident (mut e) "c_g_" (nd/obj-name o)))
-                (put! (mut e) ")) ")
-                (put-int! (mut e) (load i))
-                (put! (mut e) ") (primitive/cast u8 ")
-                (put-int! (mut e) (primitive/cast i64 (slice-get bytes (load i))))
-                (put! (mut e) "))")
-                (store! i (+ (load i) 1))))))
-  0)
 
 (defn emit-extern! [(e (mut Emitter)) (o (ptr nd/Obj))] (-> i64)
   (if (hm/hm-contains? (load (field e externs)) (nd/obj-name o))
@@ -2028,7 +2064,6 @@
     (put! (mut e) "(import \"coil.primitive\" :as primitive)\n")
     (put! (mut e) "(import \"coil.alloc\" :as alloc)\n")
     (put! (mut e) "(import \"coil.control\" :as control)\n")
-    (put! (mut e) "(import \"coil.slice\" :as slice)\n")
     ;; `destructor` functions are registered here rather than called from the
     ;; end of `main`, so that they still run when the program calls `exit`.
     (put! (mut e) "(extern atexit :cc c [(fnptr c [] i64)] (-> i32))\n")
@@ -2072,16 +2107,7 @@
                 (store! i (+ (load i) 1)))))
     ;; Everything with static storage is initialised once, in source order,
     ;; before the program's own `main` runs.
-    (put! (mut e) "(defn c_init_statics [] (-> i64) (do")
-    (store! i 0)
-    (loop (if (>= (load i) count)
-              (break)
-              (let [o (al/al-get [(ptr nd/Obj)] globals (load i))]
-                (if (and (nd/obj-string? o) (not (ascii-string? (nd/obj-string-data o))))
-                    (emit-string-fill! (mut e) o)
-                    0)
-                (store! i (+ (load i) 1)))))
-    (put! (mut e) " ")
+    (put! (mut e) "(defn c_init_statics [] (-> i64) (do ")
     (emit-stmt! (mut e) init)
     (emit-at-start! (mut e) globals)
     (put! (mut e) " 0))\n")
