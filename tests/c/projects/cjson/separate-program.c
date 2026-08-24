@@ -1,6 +1,8 @@
 #include "cJSON.h"
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 int main(void) {
   const char *text = "{\"name\":\"coil\",\"values\":[1,2,3,4],\"ok\":true}";

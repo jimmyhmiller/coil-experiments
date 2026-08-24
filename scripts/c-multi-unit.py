@@ -23,7 +23,10 @@ def native_command(compiler: str, builder: pathlib.Path | None,
                "--compiler", compiler]
     if builder is not None:
         command.extend(["--builder", str(builder)])
-    return [*command, *arguments, "-O0"]
+    # Apple's headers redirect the string functions to _FORTIFY_SOURCE builtins
+    # (__builtin___strcpy_chk and friends) that this frontend does not
+    # implement, and nothing here depends on the checked variants.
+    return [*command, *arguments, "-O0", "--cflag=-D_FORTIFY_SOURCE=0"]
 
 
 def main() -> int:
