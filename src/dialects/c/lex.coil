@@ -1,0 +1,392 @@
+;; C tokenizer. Ported from chibicc by Rui Ueyama (MIT) -- see ATTRIBUTION.md.
+;;
+;; Produces the token stream the preprocessor consumes, so it keeps everything
+;; the preprocessor needs and decides nothing it does not have to: a numeric
+;; literal stays a preprocessing number until after macro expansion, and a
+;; string keeps its original spelling so `#` can stringify it. Every token
+;; carries a file, line, and column, which is what makes real diagnostics
+;; possible.
+(module experiments.c.lex)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+
+(export Token
+        TK-EOF
+        TK-IDENT
+        TK-PUNCT
+        TK-KEYWORD
+        TK-NUMBER
+        TK-STRING
+        TK-CHARACTER
+        LexResult
+        lex
+        token-kind
+        token-text
+        token-file
+        token-line
+        token-column
+        token-at-line-start?
+        token-preceded-by-space?
+        keyword?)
+
+(const TK-EOF 0)
+(const TK-IDENT 1)
+(const TK-PUNCT 2)
+(const TK-KEYWORD 3)
+;; A preprocessing number, not yet a value: `0x1p-3` and `1.2e+5` are single
+;; tokens here and are only interpreted once macro expansion is finished.
+(const TK-NUMBER 4)
+(const TK-STRING 5)
+(const TK-CHARACTER 6)
+
+;; `text` is the exact source spelling, which `#` needs in order to stringify a
+;; macro argument as written. `at-line-start` and `preceded-by-space` are what
+;; a directive parser and `#` respectively depend on.
+(defstruct Token
+  [(kind i64)
+   (text (slice u8))
+   (file (slice u8))
+   (line i64)
+   (column i64)
+   (at-line-start bool)
+   (preceded-by-space bool)])
+
+(defstruct LexResult
+  [(tokens (al/ArrayList Token))
+   (failed bool)
+   (message (slice u8))
+   (file (slice u8))
+   (line i64)
+   (column i64)])
+
+(defn token-kind [(t Token)] (-> i64) (.kind t))
+(defn token-text [(t Token)] (-> (slice u8)) (.text t))
+(defn token-file [(t Token)] (-> (slice u8)) (.file t))
+(defn token-line [(t Token)] (-> i64) (.line t))
+(defn token-column [(t Token)] (-> i64) (.column t))
+(defn token-at-line-start? [(t Token)] (-> bool) (.at-line-start t))
+(defn token-preceded-by-space? [(t Token)] (-> bool) (.preceded-by-space t))
+
+(defstruct Lexer
+  [(a (dyn alloc/Allocator))
+   (src (slice u8))
+   (file (slice u8))
+   (pos i64)
+   (line i64)
+   (column i64)
+   (at-line-start bool)
+   (preceded-by-space bool)
+   (tokens (al/ArrayList Token))
+   (failed bool)
+   (message (slice u8))
+   (error-line i64)
+   (error-column i64)])
+
+(defn byte-at [(x (ptr Lexer)) (offset i64)] (-> i64)
+  (let [at (+ (load (field x pos)) offset)]
+    (if (or (< at 0) (>= at (slice-len (load (field x src)))))
+        0
+        (primitive/cast i64 (slice-get (load (field x src)) at)))))
+
+(defn at-end? [(x (ptr Lexer))] (-> bool)
+  (>= (load (field x pos)) (slice-len (load (field x src)))))
+
+(defn fail! [(x (ptr Lexer)) (message (slice u8))] (-> i64)
+  (if (load (field x failed))
+      0
+      (do
+        (store! (field x failed) true)
+        (store! (field x message) message)
+        (store! (field x error-line) (load (field x line)))
+        (store! (field x error-column) (load (field x column)))
+        0)))
+
+;; A newline resets the column and marks the next token as starting a line,
+;; which is the only signal a directive is allowed to begin here.
+(defn advance! [(x (ptr Lexer)) (count i64)] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) count)
+              (break)
+              (do
+                (if (= (byte-at x 0) 10)
+                    (do
+                      (store! (field x line) (+ (load (field x line)) 1))
+                      (store! (field x column) 1)
+                      (store! (field x at-line-start) true))
+                    (store! (field x column) (+ (load (field x column)) 1)))
+                (store! (field x pos) (+ (load (field x pos)) 1))
+                (store! i (+ (load i) 1))))))
+  0)
+
+(defn digit? [(c i64)] (-> bool)
+  (and (>= c 48) (<= c 57)))
+
+(defn hex-digit? [(c i64)] (-> bool)
+  (or (digit? c)
+      (or (and (>= c 97) (<= c 102))
+          (and (>= c 65) (<= c 70)))))
+
+(defn ident-start? [(c i64)] (-> bool)
+  (or (and (>= c 97) (<= c 122))
+      (or (and (>= c 65) (<= c 90))
+          (= c 95))))
+
+(defn ident-rest? [(c i64)] (-> bool)
+  (or (ident-start? c) (digit? c)))
+
+(defn horizontal-space? [(c i64)] (-> bool)
+  (or (= c 32) (or (= c 9) (or (= c 11) (= c 12) (= c 13)))))
+
+;; C11 keywords, plus the GNU spellings that appear throughout real headers.
+;; Whether a word is a keyword is decided after preprocessing in chibicc; doing
+;; it here is safe because a macro name that shadows a keyword is not legal C.
+(defn keyword? [(word (slice u8))] (-> bool)
+  (cond
+    (str/str-eq word "auto") true
+    (str/str-eq word "break") true
+    (str/str-eq word "case") true
+    (str/str-eq word "char") true
+    (str/str-eq word "const") true
+    (str/str-eq word "continue") true
+    (str/str-eq word "default") true
+    (str/str-eq word "do") true
+    (str/str-eq word "double") true
+    (str/str-eq word "else") true
+    (str/str-eq word "enum") true
+    (str/str-eq word "extern") true
+    (str/str-eq word "float") true
+    (str/str-eq word "for") true
+    (str/str-eq word "goto") true
+    (str/str-eq word "if") true
+    (str/str-eq word "inline") true
+    (str/str-eq word "int") true
+    (str/str-eq word "long") true
+    (str/str-eq word "register") true
+    (str/str-eq word "restrict") true
+    (str/str-eq word "return") true
+    (str/str-eq word "short") true
+    (str/str-eq word "signed") true
+    (str/str-eq word "sizeof") true
+    (str/str-eq word "static") true
+    (str/str-eq word "struct") true
+    (str/str-eq word "switch") true
+    (str/str-eq word "typedef") true
+    (str/str-eq word "union") true
+    (str/str-eq word "unsigned") true
+    (str/str-eq word "void") true
+    (str/str-eq word "volatile") true
+    (str/str-eq word "while") true
+    (str/str-eq word "_Alignas") true
+    (str/str-eq word "_Alignof") true
+    (str/str-eq word "_Atomic") true
+    (str/str-eq word "_Bool") true
+    (str/str-eq word "_Complex") true
+    (str/str-eq word "_Generic") true
+    (str/str-eq word "_Noreturn") true
+    (str/str-eq word "_Static_assert") true
+    (str/str-eq word "_Thread_local") true
+    (str/str-eq word "__attribute__") true
+    (str/str-eq word "__restrict") true
+    (str/str-eq word "__restrict__") true
+    (str/str-eq word "__inline") true
+    (str/str-eq word "__inline__") true
+    (str/str-eq word "__signed__") true
+    (str/str-eq word "__typeof__") true
+    (str/str-eq word "typeof") true
+    :else false))
+
+;; Longest match wins, so three-character operators are tried first.
+(defn punct-length [(x (ptr Lexer))] (-> i64)
+  (let [c0 (byte-at x 0)
+        c1 (byte-at x 1)
+        c2 (byte-at x 2)]
+    (cond
+      (and (= c0 60) (and (= c1 60) (= c2 61))) 3   ; <<=
+      (and (= c0 62) (and (= c1 62) (= c2 61))) 3   ; >>=
+      (and (= c0 46) (and (= c1 46) (= c2 46))) 3   ; ...
+      (and (= c0 61) (= c1 61)) 2                   ; ==
+      (and (= c0 33) (= c1 61)) 2                   ; !=
+      (and (= c0 60) (= c1 61)) 2                   ; <=
+      (and (= c0 62) (= c1 61)) 2                   ; >=
+      (and (= c0 45) (= c1 62)) 2                   ; ->
+      (and (= c0 43) (= c1 61)) 2                   ; +=
+      (and (= c0 45) (= c1 61)) 2                   ; -=
+      (and (= c0 42) (= c1 61)) 2                   ; *=
+      (and (= c0 47) (= c1 61)) 2                   ; /=
+      (and (= c0 37) (= c1 61)) 2                   ; %=
+      (and (= c0 38) (= c1 61)) 2                   ; &=
+      (and (= c0 124) (= c1 61)) 2                  ; |=
+      (and (= c0 94) (= c1 61)) 2                   ; ^=
+      (and (= c0 43) (= c1 43)) 2                   ; ++
+      (and (= c0 45) (= c1 45)) 2                   ; --
+      (and (= c0 38) (= c1 38)) 2                   ; &&
+      (and (= c0 124) (= c1 124)) 2                 ; ||
+      (and (= c0 60) (= c1 60)) 2                   ; <<
+      (and (= c0 62) (= c1 62)) 2                   ; >>
+      (and (= c0 35) (= c1 35)) 2                   ; ##
+      :else 1)))
+
+(defn punct-start? [(c i64)] (-> bool)
+  (or (and (>= c 33) (<= c 47))
+      (or (and (>= c 58) (<= c 64))
+          (or (and (>= c 91) (<= c 96))
+              (and (>= c 123) (<= c 126))))))
+
+(defn push! [(x (ptr Lexer))
+             (kind i64)
+             (start i64)
+             (line i64)
+             (column i64)] (-> i64)
+  (al/al-push! [Token]
+               (mut (field x tokens))
+               (Token :kind kind
+                 :text (subslice (load (field x src)) start (load (field x pos)))
+                 :file (load (field x file))
+                 :line line
+                 :column column
+                 :at-line-start (load (field x at-line-start))
+                 :preceded-by-space (load (field x preceded-by-space))))
+  (store! (field x at-line-start) false)
+  (store! (field x preceded-by-space) false)
+  0)
+
+;; A preprocessing number is deliberately looser than any real numeric literal:
+;; it swallows a sign only directly after an exponent marker, which is what
+;; makes `1e-5` one token and `a-5` three.
+(defn read-number! [(x (ptr Lexer))] (-> i64)
+  (loop (let [c (byte-at x 0)
+              previous (byte-at x -1)]
+          (if (or (ident-rest? c) (= c 46))
+              (if (and (or (= c 43) (= c 45))
+                       (not (or (= previous 101) (or (= previous 69)
+                                (or (= previous 112) (= previous 80))))))
+                  (break)
+                  (advance! x 1))
+              (if (and (or (= c 43) (= c 45))
+                       (or (= previous 101) (or (= previous 69)
+                           (or (= previous 112) (= previous 80)))))
+                  (advance! x 1)
+                  (break)))))
+  0)
+
+;; Consumes through the closing quote. Escapes are not decoded here -- the
+;; spelling is kept so `#` can reproduce it -- but a backslash still has to be
+;; honoured so an escaped quote does not end the literal early.
+(defn read-quoted! [(x (ptr Lexer)) (quote i64) (what (slice u8))] (-> i64)
+  (advance! x 1)
+  (loop (let [c (byte-at x 0)]
+          (cond (at-end? x) (do (fail! x what) (break))
+                (= c 10) (do (fail! x what) (break))
+                (= c 92) (advance! x 2)
+                (= c quote) (do (advance! x 1) (break))
+                :else (advance! x 1))))
+  0)
+
+(defn skip-block-comment! [(x (ptr Lexer))] (-> i64)
+  (advance! x 2)
+  (loop (cond (at-end? x) (do (fail! x "unterminated block comment") (break))
+              (and (= (byte-at x 0) 42) (= (byte-at x 1) 47)) (do (advance! x 2) (break))
+              :else (advance! x 1)))
+  0)
+
+(defn skip-line-comment! [(x (ptr Lexer))] (-> i64)
+  (loop (if (or (at-end? x) (= (byte-at x 0) 10)) (break) (advance! x 1)))
+  0)
+
+;; A backslash immediately before a newline splices the lines together before
+;; anything else looks at them, so it is handled as whitespace rather than as a
+;; token.
+(defn line-splice? [(x (ptr Lexer))] (-> bool)
+  (and (= (byte-at x 0) 92) (= (byte-at x 1) 10)))
+
+(defn skip-space! [(x (ptr Lexer))] (-> i64)
+  (loop (let [c (byte-at x 0)]
+          (cond (at-end? x) (break)
+                (horizontal-space? c)
+                  (do (advance! x 1) (store! (field x preceded-by-space) true))
+                (= c 10) (advance! x 1)
+                (line-splice? x)
+                  (do (advance! x 2) (store! (field x preceded-by-space) true))
+                (and (= c 47) (= (byte-at x 1) 47))
+                  (do (skip-line-comment! x) (store! (field x preceded-by-space) true))
+                (and (= c 47) (= (byte-at x 1) 42))
+                  (do (skip-block-comment! x) (store! (field x preceded-by-space) true))
+                :else (break))))
+  0)
+
+;; A string or character literal may carry an encoding prefix (L, u, U, u8).
+;; Returns the quote byte if one begins here, 0 otherwise.
+(defn quote-after-prefix [(x (ptr Lexer))] (-> i64)
+  (let [c0 (byte-at x 0)
+        c1 (byte-at x 1)
+        c2 (byte-at x 2)]
+    (cond (or (= c0 34) (= c0 39)) c0
+          (and (or (= c0 76) (or (= c0 117) (= c0 85)))
+               (or (= c1 34) (= c1 39)))
+            c1
+          (and (and (= c0 117) (= c1 56)) (or (= c2 34) (= c2 39))) c2
+          :else 0)))
+
+(defn prefix-length [(x (ptr Lexer))] (-> i64)
+  (let [c0 (byte-at x 0)]
+    (cond (or (= c0 34) (= c0 39)) 0
+          (and (= c0 117) (= (byte-at x 1) 56)) 2
+          :else 1)))
+
+(defn lex-one! [(x (ptr Lexer))] (-> i64)
+  (let [line (load (field x line))
+        column (load (field x column))
+        start (load (field x pos))
+        c (byte-at x 0)
+        quote (quote-after-prefix x)]
+    (cond
+      (!= quote 0)
+        (do
+          (advance! x (prefix-length x))
+          (read-quoted! x
+                        quote
+                        (if (= quote 34) "unterminated string literal" "unterminated character literal"))
+          (push! x (if (= quote 34) TK-STRING TK-CHARACTER) start line column))
+      (ident-start? c)
+        (do
+          (loop (if (ident-rest? (byte-at x 0)) (advance! x 1) (break)))
+          (let [text (subslice (load (field x src)) start (load (field x pos)))]
+            (push! x (if (keyword? text) TK-KEYWORD TK-IDENT) start line column)))
+      (or (digit? c) (and (= c 46) (digit? (byte-at x 1))))
+        (do (read-number! x) (push! x TK-NUMBER start line column))
+      (punct-start? c)
+        (do (advance! x (punct-length x)) (push! x TK-PUNCT start line column))
+      :else
+        (do (fail! x "stray character in program") (advance! x 1) 0))))
+
+(defn lex [(a (dyn alloc/Allocator))
+           (file (slice u8))
+           (src (slice u8))] (-> LexResult)
+  (let [x (primitive/alloc-stack Lexer)]
+    (store! x (primitive/zeroed Lexer))
+    (store! (field x a) a)
+    (store! (field x src) src)
+    (store! (field x file) file)
+    (store! (field x pos) 0)
+    (store! (field x line) 1)
+    (store! (field x column) 1)
+    (store! (field x at-line-start) true)
+    (store! (field x preceded-by-space) false)
+    (store! (field x tokens) (al/al-new [Token] a))
+    (store! (field x failed) false)
+    (loop (do
+            (skip-space! x)
+            (if (or (load (field x failed)) (at-end? x))
+                (break)
+                (lex-one! x))))
+    (push! x TK-EOF (load (field x pos)) (load (field x line)) (load (field x column)))
+    (LexResult :tokens (load (field x tokens))
+      :failed (load (field x failed))
+      :message (load (field x message))
+      :file file
+      :line (load (field x error-line))
+      :column (load (field x error-column)))))

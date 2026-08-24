@@ -1,0 +1,134 @@
+(module experiments.c.lex-test)
+
+(import "experiments.c.lex" :as lex)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+(import "coil.assert" :use *)
+
+;; Tokenize `source` and return the token list, asserting the lexer succeeded.
+(defn tokens-of [(source (slice u8))] (-> (al/ArrayList lex/Token))
+  (let [a (alloc/malloc-allocator)
+        result (lex/lex a "t.c" source)]
+    (assert (not (.failed result)))
+    (.tokens result)))
+
+(defn nth-token [(list (al/ArrayList lex/Token)) (index i64)] (-> lex/Token)
+  (al/al-get [lex/Token] list index))
+
+(defn text-at [(list (al/ArrayList lex/Token)) (index i64)] (-> (slice u8))
+  (lex/token-text (nth-token list index)))
+
+(defn kind-at [(list (al/ArrayList lex/Token)) (index i64)] (-> i64)
+  (lex/token-kind (nth-token list index)))
+
+(deftest keywords-are-separated-from-identifiers
+         (let [list (tokens-of "int counter;")]
+           (assert-eq (al/al-len [lex/Token] list) 4)
+           (assert-eq (kind-at list 0) lex/TK-KEYWORD)
+           (assert (str/str-eq (text-at list 0) "int"))
+           (assert-eq (kind-at list 1) lex/TK-IDENT)
+           (assert (str/str-eq (text-at list 1) "counter"))
+           (assert-eq (kind-at list 2) lex/TK-PUNCT)
+           (assert-eq (kind-at list 3) lex/TK-EOF)))
+
+(deftest punctuators-take-the-longest-match
+         (let [list (tokens-of "a <<= b << c < d")]
+           (assert (str/str-eq (text-at list 1) "<<="))
+           (assert (str/str-eq (text-at list 3) "<<"))
+           (assert (str/str-eq (text-at list 5) "<"))))
+
+(deftest ellipsis-is-one-token-and-member-access-is-not
+         (let [list (tokens-of "f(a, ...); p->q; r.s")]
+           (assert (str/str-eq (text-at list 4) "..."))
+           (assert (str/str-eq (text-at list 8) "->"))
+           (assert (str/str-eq (text-at list 12) "."))))
+
+;; A preprocessing number absorbs a sign only directly after an exponent
+;; marker, which is the whole reason `1e-5` and `a-5` tokenize differently.
+(deftest exponent-signs-belong-to-the-number
+         (let [list (tokens-of "1e-5")]
+           (assert-eq (kind-at list 0) lex/TK-NUMBER)
+           (assert (str/str-eq (text-at list 0) "1e-5"))
+           (assert-eq (kind-at list 1) lex/TK-EOF)))
+
+(deftest a-minus-after-an-identifier-is-an-operator
+         (let [list (tokens-of "a-5")]
+           (assert-eq (kind-at list 0) lex/TK-IDENT)
+           (assert (str/str-eq (text-at list 1) "-"))
+           (assert-eq (kind-at list 2) lex/TK-NUMBER)))
+
+(deftest hex-float-exponents-stay-in-one-token
+         (let [list (tokens-of "0x1p-3")]
+           (assert-eq (kind-at list 0) lex/TK-NUMBER)
+           (assert (str/str-eq (text-at list 0) "0x1p-3"))))
+
+(deftest a-leading-dot-still-starts-a-number
+         (let [list (tokens-of ".5f")]
+           (assert-eq (kind-at list 0) lex/TK-NUMBER)
+           (assert (str/str-eq (text-at list 0) ".5f"))))
+
+;; The spelling is kept intact so `#` can stringify a macro argument exactly as
+;; it was written, escapes and all.
+(deftest string-literals-keep-their-spelling
+         (let [list (tokens-of "\"a\\\"b\"")]
+           (assert-eq (kind-at list 0) lex/TK-STRING)
+           (assert (str/str-eq (text-at list 0) "\"a\\\"b\""))))
+
+(deftest encoding-prefixes-belong-to-the-literal
+         (let [list (tokens-of "L\"wide\" u8\"utf\"")]
+           (assert-eq (kind-at list 0) lex/TK-STRING)
+           (assert (str/str-eq (text-at list 0) "L\"wide\""))
+           (assert-eq (kind-at list 1) lex/TK-STRING)
+           (assert (str/str-eq (text-at list 1) "u8\"utf\""))))
+
+(deftest character-literals-are-their-own-kind
+         (let [list (tokens-of "'x' '\\n'")]
+           (assert-eq (kind-at list 0) lex/TK-CHARACTER)
+           (assert-eq (kind-at list 1) lex/TK-CHARACTER)
+           (assert (str/str-eq (text-at list 1) "'\\n'"))))
+
+(deftest comments-are-whitespace
+         (let [list (tokens-of "a /* one\ntwo */ b // three\nc")]
+           (assert-eq (al/al-len [lex/Token] list) 4)
+           (assert (str/str-eq (text-at list 0) "a"))
+           (assert (str/str-eq (text-at list 1) "b"))
+           (assert (str/str-eq (text-at list 2) "c"))))
+
+;; A backslash-newline splices lines before anything else sees them, so the
+;; identifier below is a single token.
+(deftest line-continuations-splice
+         (let [list (tokens-of "ab\\\ncd")]
+           (assert-eq (al/al-len [lex/Token] list) 3)
+           (assert (str/str-eq (text-at list 0) "ab"))
+           (assert (str/str-eq (text-at list 1) "cd"))))
+
+;; Real source positions are what the current frontend cannot report at all.
+(deftest tokens-carry-file-line-and-column
+         (let [list (tokens-of "int x;\n  long y;")
+               y (nth-token list 4)]
+           (assert (str/str-eq (lex/token-file y) "t.c"))
+           (assert-eq (lex/token-line y) 2)
+           (assert-eq (lex/token-column y) 8)))
+
+;; The preprocessor needs both of these: `at-line-start` to know a directive
+;; may begin, `preceded-by-space` to reproduce spacing under `#`.
+(deftest line-start-and-spacing-are-recorded
+         (let [list (tokens-of "a b\n#define X")]
+           (assert (lex/token-at-line-start? (nth-token list 0)))
+           (assert (not (lex/token-at-line-start? (nth-token list 1))))
+           (assert (lex/token-preceded-by-space? (nth-token list 1)))
+           (assert (lex/token-at-line-start? (nth-token list 2)))
+           (assert (str/str-eq (text-at list 2) "#"))))
+
+(deftest an-unterminated-string-is-reported-with-a-position
+         (let [a (alloc/malloc-allocator)
+               result (lex/lex a "t.c" "int x = \"oops;")]
+           (assert (.failed result))
+           (assert-eq (.line result) 1)))
+
+(deftest an-unterminated-block-comment-is-reported
+         (let [a (alloc/malloc-allocator)
+               result (lex/lex a "t.c" "a /* forever")]
+           (assert (.failed result))))
