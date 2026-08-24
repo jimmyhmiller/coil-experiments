@@ -77,7 +77,12 @@ def main() -> int:
                     source_root / "i_sdlmusic.c",
                     source_root / "mus2mid.c",
                     BACKEND]
-        defines += ["-DFEATURE_SOUND", "-I/opt/homebrew/include/SDL2"]
+        # SDL offers to pull in <arm_neon.h> for its own vector helpers; Doom
+        # uses none of them, and the NEON intrinsic headers are a vector
+        # dialect this frontend does not implement. SDL's own switch turns the
+        # include off.
+        defines += ["-DFEATURE_SOUND", "-DSDL_DISABLE_ARM_NEON_H",
+                    "-I/opt/homebrew/include/SDL2"]
         link += ["-lobjc", "-L/opt/homebrew/lib", "-lSDL2", "-lSDL2_mixer",
                  "-framework", "AppKit", "-framework", "QuartzCore"]
         name = "doom-native-play"
