@@ -252,6 +252,15 @@
 ;; The usual arithmetic conversions: everything narrower than int is promoted to
 ;; int, then the wider of the two wins, with unsigned beating signed at equal
 ;; width.
+;; The integer promotions: anything narrower than `int` is computed as an
+;; `int`. A shift and the unary operators promote their operand this way on its
+;; own, rather than against another operand as the binary operators do.
+(defn integer-promote [(p (mut Parser)) (n (ptr nd/Node))] (-> (ptr nd/Node))
+  (let [t (nd/nd-type n)]
+    (if (and (not (null-type? t)) (and (ct/integer? t) (< (ct/ty-size t) 4)))
+        (nd/node-cast (load (field p a)) n (ty-int-of (mut p)))
+        n)))
+
 (defn common-type [(p (mut Parser)) (x (ptr ct/Type)) (y (ptr ct/Type))] (-> (ptr ct/Type))
   (cond
     (null-type? x) (if (null-type? y) (ty-int-of (mut p)) y)
@@ -271,15 +280,23 @@
 
 ;; Rewrites both operands to their common type, which is what makes the
 ;; conversion explicit in the tree rather than implied by the operator.
+;;
+;; Both operands are typed first. An operand whose type is still unknown looks
+;; to `common-type` like no constraint at all, and the other operand's type wins
+;; outright -- which is how `firstline * 56` came to be computed in the 16 bits
+;; `firstline` was declared with.
 (defn usual-conversions [(p (mut Parser)) (n (ptr nd/Node))] (-> i64)
   (let [l (nd/nd-lhs n)
         r (nd/nd-rhs n)]
     (if (or (null-node? l) (null-node? r))
         0
-        (let [t (common-type (mut p) (nd/nd-type l) (nd/nd-type r))]
-          (nd/set-lhs! n (nd/node-cast (load (field p a)) l t))
-          (nd/set-rhs! n (nd/node-cast (load (field p a)) r t))
-          0))))
+        (do
+          (add-type! (mut p) l)
+          (add-type! (mut p) r)
+          (let [t (common-type (mut p) (nd/nd-type l) (nd/nd-type r))]
+            (nd/set-lhs! n (nd/node-cast (load (field p a)) l t))
+            (nd/set-rhs! n (nd/node-cast (load (field p a)) r t))
+            0)))))
 
 ;; `p + n` advances by n elements, not n bytes, so the scaling is made explicit.
 (defn new-add [(p (mut Parser)) (lhs (ptr nd/Node)) (rhs (ptr nd/Node)) (tok lex/Token)] (-> (ptr nd/Node))
@@ -363,9 +380,15 @@
               (or (= k nd/ND-BITOR) (= k nd/ND-BITXOR))))))))
             (do (usual-conversions (mut p) n) (nd/set-type! n (nd/nd-type (nd/nd-lhs n))))
           (or (= k nd/ND-NEG) (= k nd/ND-BITNOT))
-            (nd/set-type! n (nd/nd-type l))
+            (do (nd/set-lhs! n (integer-promote (mut p) l))
+                (nd/set-type! n (nd/nd-type (nd/nd-lhs n))))
+          ;; A shift's value has the type of its promoted left operand; the
+          ;; count is converted to it too, because the operation it lowers to
+          ;; takes one type.
           (or (= k nd/ND-SHL) (= k nd/ND-SHR))
-            (nd/set-type! n (nd/nd-type l))
+            (do (nd/set-lhs! n (integer-promote (mut p) l))
+                (nd/set-rhs! n (convert-to (mut p) r (nd/nd-type (nd/nd-lhs n))))
+                (nd/set-type! n (nd/nd-type (nd/nd-lhs n))))
           (or (= k nd/ND-EQ) (or (= k nd/ND-NE) (or (= k nd/ND-LT) (= k nd/ND-LE))))
             (do (usual-conversions (mut p) n) (nd/set-type! n (ty-int-of (mut p))))
           (or (= k nd/ND-LOGAND) (or (= k nd/ND-LOGOR) (= k nd/ND-NOT)))
@@ -379,8 +402,22 @@
               (if (ct/pointer-like? lt)
                   (nd/set-type! n (ct/ty-base lt))
                   (fail-at! (mut p) "cannot dereference a non-pointer" (nd/nd-token n))))
+          ;; Both arms of `?:` produce the one value the expression has, so they
+          ;; are brought to a common type the way a binary operator's operands
+          ;; are.
           (= k nd/ND-COND)
-            (nd/set-type! n (nd/nd-type (nd/nd-then n)))
+            (let [then (nd/nd-then n)
+                  els (nd/nd-else n)
+                  yes (nd/nd-type then)
+                  no (nd/nd-type els)]
+              (if (and (not (null-type? yes))
+                       (and (not (null-type? no))
+                            (and (ct/numeric? yes) (ct/numeric? no))))
+                  (let [common (common-type (mut p) yes no)]
+                    (nd/set-then! n (convert-to (mut p) then common))
+                    (nd/set-else! n (convert-to (mut p) els common))
+                    (nd/set-type! n common))
+                  (nd/set-type! n yes)))
           :else 0))))
 
 ;; ------------------------------------------------------------- literals
@@ -502,7 +539,10 @@
 ;; A string literal becomes an anonymous global holding its bytes, which is what
 ;; gives it an address and a lifetime. Literals written next to each other are
 ;; one literal, which is how C lets a long message be split across lines.
-(defn string-literal [(p (mut Parser)) (tok lex/Token)] (-> (ptr nd/Node))
+;; The bytes of a string literal, and of any literal written next to it: C joins
+;; adjacent literals into one, which is how a long message is split across lines
+;; and how the system headers build a symbol name out of pieces.
+(defn read-string-bytes! [(p (mut Parser)) (tok lex/Token)] (-> (slice u8))
   (let [(mut text) (str/sb-new (load (field p a)))]
     (str/sb-push-str! (mut text) (decode-escapes (mut p) (lex/token-text tok) 34))
     (loop
@@ -511,13 +551,21 @@
           (let [next (advance! (mut p))]
             (str/sb-push-str! (mut text) (decode-escapes (mut p) (lex/token-text next) 34))
             0)))
-    (string-object (mut p) (str/sb-str (load (mut text))) tok)))
+    (str/sb-str (load (mut text)))))
+
+(defn string-literal [(p (mut Parser)) (tok lex/Token)] (-> (ptr nd/Node))
+  (string-object (mut p) (read-string-bytes! (mut p) tok) tok))
 
 (defn string-object [(p (mut Parser)) (bytes (slice u8)) (tok lex/Token)] (-> (ptr nd/Node))
   (let [ty (ct/ty-array-of (load (field p a)) (ty-char-of (mut p)) (+ (slice-len bytes) 1))
         (mut name) (str/sb-new (load (field p a)))]
+    ;; The unit's tag is part of the name: two files' twelfth string literals
+    ;; are two different objects, and the whole program is emitted as one
+    ;; module.
     (str/sb-push-str! (mut name) ".Lstr.")
     (str/sb-push-i64! (mut name) (al/al-len [(ptr nd/Obj)] (load (field p globals))))
+    (str/sb-push-str! (mut name) "$")
+    (str/sb-push-str! (mut name) (load (field p unit)))
     (let [o (nd/obj-new (load (field p a)) (str/sb-str (load (mut name))) ty false)]
       (nd/set-obj-string! o bytes)
       (nd/set-obj-definition! o true)
@@ -1065,7 +1113,10 @@
                       (do (advance! (mut p)) (ct/set-variadic! f true) (store! go 0))
                       (let [spec (parse-declspec (mut p))
                             d (parse-declarator (mut p) (.ty spec))]
-                        (ct/add-param! f (.name d) (.ty d))
+                        ;; A parameter declared as an array or a function is a
+                        ;; pointer, and is one here too: the caller passes an
+                        ;; address and the body reads one.
+                        (ct/add-param! f (.name d) (param-target-type (mut p) (.ty d)))
                         (if (punct? (mut p) ",") (do (advance! (mut p)) 0) (store! go 0))))))
             (expect! (mut p) ")")
             0))))
@@ -1116,8 +1167,7 @@
               (let [t (peek (mut p))]
                 (if (!= (lex/token-kind t) lex/TK-STRING)
                     (do (skip-to-close! (mut p)) "")
-                    (let [text (decode-escapes (mut p) (lex/token-text t) 34)]
-                      (advance! (mut p))
+                    (let [text (read-string-bytes! (mut p) (advance! (mut p)))]
                       (skip-to-close! (mut p))
                       (if (and (> (slice-len text) 1)
                                (= (primitive/cast i64 (slice-get text 0)) 95))
@@ -1357,7 +1407,9 @@
         bumped (if (= kind nd/ND-ADD)
                    (new-add (mut p) n one tok)
                    (new-sub (mut p) n one tok))
-        assigned (nd/node-binary a nd/ND-ASSIGN n bumped tok)]
+        ;; The step happens in the promoted type and is stored back narrowed,
+        ;; the same as any other compound assignment.
+        assigned (nd/node-binary a nd/ND-ASSIGN n (convert-to (mut p) bumped (nd/nd-type n)) tok)]
     (add-type! (mut p) assigned)
     (let [back (if (= kind nd/ND-ADD)
                    (new-sub (mut p) assigned (nd/node-num a 1 tok) tok)

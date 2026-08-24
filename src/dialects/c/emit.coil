@@ -44,6 +44,12 @@
    ;; Names with a definition somewhere in the program, which decides whether a
    ;; global is storage of ours or a symbol somebody else's object file has.
    (defined-data (hm/HashMap (slice u8) bool))
+   ;; Which of a name's several declarations is the one to emit storage for.
+   ;; A header's `extern char *names[];` and the file that defines
+   ;; `char *names[NUM] = {...}` are two objects with one name and two sizes,
+   ;; and only the complete one describes the storage.
+   (storage (hm/HashMap (slice u8) i64))
+   (storage-size (hm/HashMap (slice u8) i64))
    ;; The outgoing argument area each call to a variadic function of this
    ;; program's own writes into, by call site. They are allocated once at the
    ;; top of the function, never inside a loop.
@@ -164,17 +170,24 @@
           ;; Storage only. Anything that computes with one is refused below.
           (= k ct/TY-INT128) (put! (mut e) "(array i64 2)")
           (= k ct/TY-FLOAT16) (put! (mut e) "(array u8 2)")
+          ;; A pointer to a function is a function pointer, not a pointer to
+          ;; one: Coil's `fnptr` is already the address.
+          (and (= k ct/TY-PTR) (= (ct/ty-kind (ct/ty-base t)) ct/TY-FUNC))
+            (emit-fnptr! (mut e) (ct/ty-base t))
           (= k ct/TY-PTR)
             (do (put! (mut e) "(ptr ")
                 (emit-pointee! (mut e) (ct/ty-base t))
                 (put! (mut e) ")"))
           ;; An array parameter or value is only ever handled through its
           ;; address, so its element type is what matters.
+          ;; An array of no stated length is only ever reached through a
+          ;; pointer, so one element stands for its storage. Coil has no
+          ;; zero-length array type to spell the alternative with.
           (= k ct/TY-ARRAY)
             (do (put! (mut e) "(array ")
                 (emit-type! (mut e) (ct/ty-base t))
                 (put! (mut e) " ")
-                (put-int! (mut e) (if (< (ct/ty-array-len t) 0) 0 (ct/ty-array-len t)))
+                (put-int! (mut e) (if (< (ct/ty-array-len t) 1) 1 (ct/ty-array-len t)))
                 (put! (mut e) ")"))
           (= k ct/TY-FUNC) (emit-fnptr! (mut e) t)
           :else (put! (mut e) (scalar-name t))))))
@@ -187,7 +200,6 @@
       (let [k (ct/ty-kind t)]
         (cond
           (= k ct/TY-VOID) (put! (mut e) "i8")
-          (= k ct/TY-FUNC) (emit-fnptr! (mut e) t)
           (and (ct/record? t) (not (ct/ty-complete? t))) (put! (mut e) "i8")
           :else (emit-type! (mut e) t)))))
 
@@ -219,8 +231,7 @@
         (cond
           (= k ct/TY-ARRAY)
             (do (put! (mut e) "(ptr ") (emit-pointee! (mut e) (ct/ty-base t)) (put! (mut e) ")"))
-          (= k ct/TY-FUNC)
-            (do (put! (mut e) "(ptr ") (emit-fnptr! (mut e) t) (put! (mut e) ")"))
+          (= k ct/TY-FUNC) (emit-fnptr! (mut e) t)
           :else (emit-type! (mut e) t)))))
 
 (defn emit-return-type! [(e (mut Emitter)) (t (ptr ct/Type))] (-> i64)
@@ -267,6 +278,12 @@
 (defn emit-addr! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
   (let [k (nd/nd-kind n)]
     (cond
+      ;; A function has no storage to take the address of: its name already
+      ;; denotes its address.
+      (and (= k nd/ND-VAR) (= (ct/ty-kind (nd/obj-type (nd/nd-obj n))) ct/TY-FUNC))
+        (do (put! (mut e) "(primitive/fnptr-of ")
+            (put! (mut e) (callee-name (mut e) (nd/nd-obj n)))
+            (put! (mut e) ")"))
       (= k nd/ND-VAR)
         (let [o (nd/nd-obj n)]
           (if (nd/obj-local? o)
@@ -317,13 +334,20 @@
 (defn emit-bitfield-store! [(e (mut Emitter)) (n (ptr nd/Node)) (value (ptr nd/Node))] (-> i64)
   (let [width (nd/nd-member-bit-width n)
         offset (nd/nd-member-bit-offset n)
-        mask (primitive/ishl (- (primitive/ishl 1 width) 1) offset)]
-    (put! (mut e) "(primitive/store! ")
+        mask (primitive/ishl (- (primitive/ishl 1 width) 1) offset)
+        ;; Read and write reach the same storage unit, so its address is worked
+        ;; out once.
+        slot (fresh (mut e) "at")]
+    (put! (mut e) "(let [")
+    (put! (mut e) slot)
+    (put! (mut e) " ")
     (emit-addr! (mut e) n)
+    (put! (mut e) "] (primitive/store! ")
+    (put! (mut e) slot)
     (put! (mut e) " (primitive/cast ")
     (emit-type! (mut e) (nd/nd-type n))
     (put! (mut e) " (primitive/ior (primitive/iand (primitive/cast i64 (primitive/load ")
-    (emit-addr! (mut e) n)
+    (put! (mut e) slot)
     (put! (mut e) ")) ")
     (put-int! (mut e) (primitive/inot mask))
     (put! (mut e) ") (primitive/iand (primitive/ishl (primitive/cast i64 ")
@@ -332,13 +356,37 @@
     (put-int! (mut e) offset)
     (put! (mut e) ") ")
     (put-int! (mut e) mask)
-    (put! (mut e) "))))"))
+    (put! (mut e) ")))))"))
   0)
 
 ;; ------------------------------------------------------------ expressions
 
 ;; A floating value is true when it differs from zero, which converting it to
 ;; an integer first would not preserve: 0.5 would round to false.
+;; Coil converts a function pointer to a data pointer and back, but not to an
+;; integer, which C does convert one to. The conversion therefore goes through a
+;; data pointer.
+(defn fnptr-type? [(t (ptr ct/Type))] (-> bool)
+  (and (!= (primitive/cast i64 t) 0)
+       (or (= (ct/ty-kind t) ct/TY-FUNC)
+           (and (= (ct/ty-kind t) ct/TY-PTR)
+                (= (ct/ty-kind (ct/ty-base t)) ct/TY-FUNC)))))
+
+;; The operand of a cast, with the hop inserted when one side is a function
+;; pointer and the other is not.
+(defn emit-cast-operand! [(e (mut Emitter)) (n (ptr nd/Node)) (target (ptr ct/Type))] (-> i64)
+  (let [from (nd/nd-type (nd/nd-lhs n))]
+    (cond
+      (and (fnptr-type? target) (not (fnptr-type? from)))
+        (do (put! (mut e) "(primitive/cast (ptr i8) (primitive/cast i64 ")
+            (emit-expr! (mut e) (nd/nd-lhs n))
+            (put! (mut e) "))"))
+      (and (fnptr-type? from) (not (fnptr-type? target)))
+        (do (put! (mut e) "(primitive/cast i64 (primitive/cast (ptr i8) ")
+            (emit-expr! (mut e) (nd/nd-lhs n))
+            (put! (mut e) "))"))
+      :else (emit-expr! (mut e) (nd/nd-lhs n)))))
+
 (defn emit-truth! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
   (let [t (nd/nd-type n)]
     (if (and (!= (primitive/cast i64 t) 0) (ct/floating? t))
@@ -347,9 +395,13 @@
             (put! (mut e) " (primitive/cast ")
             (emit-type! (mut e) t)
             (put! (mut e) " 0.0))"))
-        (do (put! (mut e) "(primitive/icmp-ne (primitive/cast i64 ")
-            (emit-expr! (mut e) n)
-            (put! (mut e) ") 0)"))))
+        (if (fnptr-type? t)
+            (do (put! (mut e) "(primitive/icmp-ne (primitive/cast i64 (primitive/cast (ptr i8) ")
+                (emit-expr! (mut e) n)
+                (put! (mut e) ")) 0)"))
+            (do (put! (mut e) "(primitive/icmp-ne (primitive/cast i64 ")
+                (emit-expr! (mut e) n)
+                (put! (mut e) ") 0)")))))
   0)
 
 (defn emit-binary! [(e (mut Emitter)) (n (ptr nd/Node)) (op (slice u8))] (-> i64)
@@ -467,16 +519,22 @@
         value (nd/nd-rhs n)]
     (if (and (= (nd/nd-kind target) nd/ND-MEMBER) (>= (nd/nd-member-bit-width target) 0))
         (emit-bitfield-store! (mut e) target value)
-        (do
-          ;; The assignment yields the stored value, so the store is sequenced
-          ;; before a reload of the target.
-          (put! (mut e) "(do (primitive/store! ")
+        ;; The address is worked out once and bound. An assignment yields the
+        ;; value stored, which means reading the target back, and computing its
+        ;; address a second time would run the target's own side effects twice:
+        ;; `*++p = v` would step the pointer twice.
+        (let [slot (fresh (mut e) "at")]
+          (put! (mut e) "(let [")
+          (put! (mut e) slot)
+          (put! (mut e) " ")
           (emit-addr! (mut e) target)
+          (put! (mut e) "] (do (primitive/store! ")
+          (put! (mut e) slot)
           (put! (mut e) " ")
           (emit-expr! (mut e) value)
           (put! (mut e) ") (primitive/load ")
-          (emit-addr! (mut e) target)
-          (put! (mut e) "))"))))
+          (put! (mut e) slot)
+          (put! (mut e) ")))"))))
   0)
 
 (defn callee-name [(e (mut Emitter)) (o (ptr nd/Obj))] (-> (slice u8))
@@ -535,7 +593,7 @@
             (do (put! (mut e) "(primitive/cast ")
                 (emit-param-type! (mut e) t)
                 (put! (mut e) " ")
-                (emit-expr! (mut e) (nd/nd-lhs n))
+                (emit-cast-operand! (mut e) n t)
                 (put! (mut e) ")"))
           ;; Clearing an object an initialiser only partly fills.
           (= k nd/ND-MEMZERO)
@@ -1623,8 +1681,11 @@
 
 ;; Records every name the program mentions, so that only the declarations it
 ;; needs become externs.
+;; Only objects with static storage are recorded. A parameter or a block-scoped
+;; variable may share a name with a global the program never touches, and
+;; counting it would declare that global as an external symbol nothing defines.
 (defn note-use! [(e (mut Emitter)) (o (ptr nd/Obj))] (-> i64)
-  (if (= (primitive/cast i64 o) 0)
+  (if (or (= (primitive/cast i64 o) 0) (nd/obj-local? o))
       0
       (do (hm/hm-put! [(slice u8) bool] (mut (field e used)) (nd/obj-name o) true) 0)))
 
@@ -1674,6 +1735,48 @@
   (put! (mut e) ")))\n")
   0)
 
+;; Remembers the largest declaration of a name as the one whose type describes
+;; its storage.
+(defn choose-storage! [(e (mut Emitter)) (o (ptr nd/Obj)) (index i64)] (-> i64)
+  (let [name (nd/obj-name o)
+        size (ct/ty-size (nd/obj-type o))
+        best (match (hm/hm-get (load (field e storage-size)) name)
+               (Some [s] s)
+               (None [] -1))]
+    (if (> size best)
+        (do (hm/hm-put! [(slice u8) i64] (mut (field e storage)) name index)
+            (hm/hm-put! [(slice u8) i64] (mut (field e storage-size)) name size)
+            0)
+        0)))
+
+(defn storage-index [(e (mut Emitter)) (name (slice u8))] (-> i64)
+  (match (hm/hm-get (load (field e storage)) name)
+    (Some [i] i)
+    (None [] -1)))
+
+;; `main` may be declared with no parameters or with the argument count and
+;; vector, and the entry point has to match whichever it was.
+(defn main-arity [(globals (al/ArrayList (ptr nd/Obj)))] (-> i64)
+  (let [count (al/al-len [(ptr nd/Obj)] globals)
+        (mut i) 0
+        (mut arity) 0]
+    (loop (if (>= (load i) count)
+              (break)
+              (let [o (al/al-get [(ptr nd/Obj)] globals (load i))]
+                (if (and (nd/obj-definition? o)
+                         (and (nd/obj-function? o) (str/str-eq (nd/obj-name o) "main")))
+                    (store! arity (al/al-len [(ptr nd/Obj)] (nd/obj-params o)))
+                    0)
+                (store! i (+ (load i) 1)))))
+    (load arity)))
+
+(defn emit-entry! [(e (mut Emitter)) (globals (al/ArrayList (ptr nd/Obj)))] (-> i64)
+  (if (>= (main-arity globals) 2)
+      (do (put! (mut e) "(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i32)")
+          (put! (mut e) " (do (c_init_statics) (primitive/cast i32 (c_fn_main argc argv))))\n"))
+      (put! (mut e)
+            "(defn main [] (-> i32) (do (c_init_statics) (primitive/cast i32 (c_fn_main))))\n")))
+
 (defn emit-program [(a (dyn alloc/Allocator))
                     (globals (al/ArrayList (ptr nd/Obj)))
                     (init (ptr nd/Node))] (-> EmitResult)
@@ -1685,6 +1788,8 @@
                         :emitted (hm/hm-new [(slice u8) bool] a (str/str-keyops))
                         :used (hm/hm-new [(slice u8) bool] a (str/str-keyops))
                         :defined-data (hm/hm-new [(slice u8) bool] a (str/str-keyops))
+                        :storage (hm/hm-new [(slice u8) i64] a (str/str-keyops))
+                        :storage-size (hm/hm-new [(slice u8) i64] a (str/str-keyops))
                         :va-areas (hm/hm-new [(slice u8) (slice u8)] a (str/str-keyops))
                         :serial 0
                         :break-labels (al/al-new [(slice u8)] a)
@@ -1710,6 +1815,7 @@
                                         (mut (field e defined-data))
                                         (nd/obj-name o)
                                         true)
+                            (choose-storage! (mut e) o (load i))
                             0))
                     0)
                 ;; A string literal has no reference to find it by; its bytes
@@ -1747,7 +1853,9 @@
                         (emit-extern! (mut e) o)
                         0)
                   (hm/hm-contains? (load (field e defined-data)) (nd/obj-name o))
-                    (emit-global! (mut e) o)
+                    (if (= (storage-index (mut e) (nd/obj-name o)) (load i))
+                        (emit-global! (mut e) o)
+                        0)
                   (used? (mut e) o)
                     (if (hm/hm-contains? (load (field e emitted)) (nd/obj-name o))
                         0
@@ -1780,8 +1888,8 @@
     (put! (mut e) " ")
     (emit-stmt! (mut e) init)
     (put! (mut e) " 0))\n")
-    ;; Coil's entry point calls the program's.
-    (put! (mut e) "(defn main [] (-> i32) (do (c_init_statics) (primitive/cast i32 (c_fn_main))))\n")
+    ;; Coil's entry point calls the program's, with the arguments it asked for.
+    (emit-entry! (mut e) globals)
     (EmitResult :text (str/sb-str (load (mut (field e out))))
       :failed (load (field e failed))
       :message (load (field e message))
