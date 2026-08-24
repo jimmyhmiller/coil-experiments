@@ -1,0 +1,671 @@
+(module experiments.forth.reader)
+
+; The Forth dialect compiler. Runs as a `:phase read` whole-file transform:
+; it parses raw Forth source and emits one ordinary Coil module in which every
+; Forth word is a real native function over two static stacks. There is no
+; interpreter anywhere downstream -- control structures become Coil's own
+; `if`/`loop`, calls are direct, and LLVM does the rest.
+
+(import "coil.primitive" :as primitive)
+(import "coil.arraylist" :use *)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.str" :as str)
+
+; ------------------------------------------------------------------ limits --
+
+(const DATA-STACK-CELLS 16384)
+(const RETURN-STACK-CELLS 4096)
+(const MEMORY-BYTES 1048576)
+
+; ------------------------------------------------------------------ tokens --
+
+(defstruct Tok [(start i64) (end i64)])
+
+(defn tok-bytes [(src (slice u8)) (t Tok)] (-> (slice u8))
+  (subslice [u8] src (.start t) (.end t)))
+
+(defn is-space [(b u8)] (-> bool)
+  (or (= b #\space)
+      (or (= b #\newline) (or (= b #\tab) (= b #\return)))))
+
+(defn to-lower [(b u8)] (-> u8)
+  (if (and (>= b #\A) (<= b #\Z))
+      (primitive/cast u8 (+ (primitive/cast i64 b) 32))
+      b))
+
+; Whitespace tokens with `\ ... <newline>` and `( ... )` comments removed;
+; every token remembers its byte offset for diagnostics.
+(defn tokenize [(src (slice u8))] (-> (ptr (ArrayList Tok)))
+  (let [a (malloc-allocator)
+        toks (box! a Tok (al-new [Tok] a))
+        n (slice-len [u8] src)
+        (mut i) 0]
+    (loop
+      (while (< (load i) n)
+        (let [b (slice-get [u8] src (load i))]
+          (cond
+            ; comment to end of line
+            (= b #\\)
+              (do
+                (store! i (+ (load i) 1))
+                (loop (while (and (< (load i) n)
+                                  (!= (slice-get [u8] src (load i)) #\newline))
+                        (store! i (+ (load i) 1))))
+                0)
+            ; comment to closing paren (non-nesting, classic Forth)
+            (= b #\()
+              (do
+                (store! i (+ (load i) 1))
+                (loop (while (and (< (load i) n)
+                                  (!= (slice-get [u8] src (load i)) #\)))
+                        (store! i (+ (load i) 1))))
+                (if (< (load i) n)
+                    (store! i (+ (load i) 1))
+                    0)
+                0)
+            (is-space b)
+              (do (store! i (+ (load i) 1)) 0)
+            :else
+              (do
+                (let [(mut j) (load i)]
+                  (loop (while (and (< j n) (not (is-space (slice-get [u8] src j))))
+                          (store! j (+ j 1))))
+                  (al-push! (mut toks) (Tok (load i) j))
+                  (store! i j)
+                  0)))))))
+    toks))
+
+; ------------------------------------------------------------------ errors --
+
+(defn forth-error [(path (slice u8)) (src (slice u8)) (at i64) (problem (slice u8))] (-> Code)
+  (let [sb (str/sb-new (malloc-allocator))]
+    (str/sb-push-str! sb "forth: ")
+    (str/sb-push-str! sb problem)
+    (str/sb-push-str! sb " at byte ")
+    (str/sb-push-i64! sb at)
+    (if (> (slice-len [u8] path) 0)
+        (do (str/sb-push-str! sb " in ") (str/sb-push-str! sb path))
+        0)
+    (primitive/error (str/sb-finish! sb))))
+
+; ------------------------------------------------------------- identifiers --
+
+; Keep [a-z0-9], spell everything else ~XX. Deterministic and readable enough
+; that generated modules still read like the Forth they came from.
+(defn sanitize-into [(sb (mut str/StrBuf)) (name (slice u8))] (-> i64)
+  (let [n (slice-len [u8] name)]
+    (loop
+      (for [k 0 n]
+        (let [b (to-lower (slice-get [u8] name k))]
+          (if (or (and (>= b #\a) (<= b #\z))
+                  (and (>= b #\0) (<= b #\9))
+                  (= b #-))
+              (str/sb-push-byte! (mut sb) b)
+              (do
+                (str/sb-push-byte! (mut sb) #\~)
+                (let [hi (primitive/udiv (primitive/cast i64 b) 16)
+                      lo (% (primitive/cast i64 b) 16)]
+                  (str/sb-push-byte! (mut sb)
+                                     (primitive/cast u8
+                                       (if (< hi 10) (+ hi 48) (+ hi 87))))
+                  (str/sb-push-byte! (mut sb)
+                                     (primitive/cast u8
+                                       (if (< lo 10) (+ lo 48) (+ lo 87))))))))))
+    0))
+
+; A word's Coil name: f-<sanitized>, deduplicated with -2/-3/... suffixes so
+; distinct Forth names never collide even after sanitization.
+(defn mangle [(taken (ptr (ArrayList (slice u8)))) (name (slice u8))] (-> (slice u8))
+  (let [a (malloc-allocator)
+        sb (str/sb-new a)]
+    (str/sb-push-str! sb "f-")
+    (sanitize-into (mut sb) name)
+    (let [base (str/sb-finish! sb)
+          (mut candidate) base
+          (mut k) 1]
+      (loop (while (bytes-taken? taken (load candidate))
+              (let [sb2 (str/sb-new a)]
+                (str/sb-push-str! sb2 base)
+                (str/sb-push-i64! sb2 (load k))
+                (store! candidate (str/sb-finish! sb2))
+                (store! k (+ (load k) 1))
+                0))
+            0)
+      (al-push! (mut taken) (load candidate))
+      (load candidate))))
+
+(defn bytes-taken? [(taken (ptr (ArrayList (slice u8)))) (s (slice u8))] (-> bool)
+  (let [(mut hit) false]
+    (loop
+      (for [d 0 (al-len [(slice u8)] (load taken))]
+        (when (bytes-eq? (al-get [(slice u8)] (load taken) d) s)
+          (store! hit true)))
+      (break))
+    (load hit)))
+
+; Slice equality on u8.
+(defn bytes-eq? [(a (slice u8)) (b (slice u8))] (-> bool)
+  (let [la (slice-len [u8] a)
+        lb (slice-len [u8] b)]
+    (if (!= la lb)
+        false
+        (let [(mut ok) true]
+          (loop
+            (for [k 0 la]
+              (when (!= (slice-get [u8] a k) (slice-get [u8] b k))
+                (store! ok false)
+                (break)))
+            (break))
+          ok))))
+      (al-push! (mut taken) base)
+      base)))
+
+; --------------------------------------------------------------- dictionary --
+
+(defstruct Entry [(name (slice u8)) (id Code)])
+
+(defn dict-add [(dict (ptr (ArrayList Entry))) (name (slice u8)) (id Code)] (-> i64)
+  (al-push! (mut dict) (Entry name id))
+  0)
+
+; Newest entry wins, so user redefinitions shadow builtins like real Forth.
+(defn dict-find [(dict (ptr (ArrayList Entry))) (word (slice u8))] (-> Code)
+  (let [(mut i) (- (al-len [Entry] (load dict)) 1)
+        (mut hit) (primitive/cast Code 0)]
+    (loop (while (and (>= (load i) 0) (= (primitive/cast i64 (load hit)) 0))
+            (let [e (al-get [Entry] (load dict) (load i))]
+              (if (bytes-eq? (.name e) word)
+                  (store! hit (.id e))
+                  0))
+            (store! i (- (load i) 1))))
+    (load hit)))
+
+; ------------------------------------------------------- numbers & strings --
+
+(defn digit-val [(b u8)] (-> i64)
+  (cond
+    (and (>= b #\0) (<= b #\9)) (- (primitive/cast i64 b) 48)
+    (and (>= b #\a) (<= b #\f)) (+ (- (primitive/cast i64 b) 97) 10)
+    :else -1))
+
+; Decimal, $hex, %binary; optional leading minus for decimal.
+(defn parse-number [(w (slice u8))] (-> (Option i64))
+  (let [n (slice-len [u8] w)]
+    (if (= n 0)
+        (None [])
+        (if (bytes-eq? w "-")
+            (None [])
+            (let [b0 (to-lower (slice-get [u8] w 0))]
+              (cond
+                (= b0 #\$)
+                  (hex-body w 1 16)
+                (= b0 #\%)
+                  (hex-body w 1 2)
+                :else
+                  (let [(mut neg) false
+                        (mut start) 0]
+                    (when (= b0 #-)
+                      (store! neg true)
+                      (store! start 1))
+                    (match (hex-body w (load start) 10)
+                      (Some [v]) (Some (if (load neg) (- 0 v) v))
+                      (None []) (None [])))))))))
+
+(defn hex-body [(w (slice u8)) (from i64) (base i64)] (-> (Option i64))
+  (let [n (slice-len [u8] w)
+        (mut acc) 0
+        (mut k) from
+        (mut any) false
+        (mut bad) false]
+    (loop (while (< (load k) n)
+            (let [d (digit-val (slice-get [u8] w (load k)))]
+              (if (and (>= d 0) (< d base))
+                  (do (store! acc (+ (* (load acc) base) d))
+                      (store! any true)
+                      (store! k (+ (load k) 1)))
+                  (do (store! bad true) (store! k n)))
+              0))
+          0)
+    (if (and (load any) (not (load bad)))
+        (Some (load acc))
+        (None []))))
+
+; Escape raw bytes as the body of a Coil string literal (quotes included).
+(defn escape-into [(sb (mut str/StrBuf)) (bytes (slice u8))] (-> i64)
+  (let [n (slice-len [u8] bytes)]
+    (str/sb-push-byte! (mut sb) #\")
+    (loop
+      (for [k 0 n]
+        (let [b (slice-get [u8] bytes k)]
+          (cond
+            (= b #\newline) (do (str/sb-push-byte! (mut sb) #\\)
+                                (str/sb-push-byte! (mut sb) #\n))
+            (= b #\tab)     (do (str/sb-push-byte! (mut sb) #\\)
+                                (str/sb-push-byte! (mut sb) #\t))
+            (= b #\")      (do (str/sb-push-byte! (mut sb) #\\)
+                                (str/sb-push-byte! (mut sb) #\"))
+            (= b #\\)       (do (str/sb-push-byte! (mut sb) #\\)
+                                (str/sb-push-byte! (mut sb) #\\))
+            :else
+              (if (and (>= b #\space) (<= b #\~))
+                  (str/sb-push-byte! (mut sb) b)
+                  (do (str/sb-push-byte! (mut sb) #\\)
+                      (str/sb-push-byte! (mut sb) #\x)
+                      (let [hi (primitive/udiv (primitive/cast i64 b) 16)
+                            lo (% (primitive/cast i64 b) 16)]
+                        (str/sb-push-byte! (mut sb)
+                                           (primitive/cast u8
+                                             (if (< hi 10) (+ hi 48) (+ hi 87))))
+                        (str/sb-push-byte! (mut sb)
+                                           (primitive/cast u8
+                                             (if (< lo 10) (+ lo 48) (+ lo 87))))
+                        (str/sb-push-byte! (mut sb) #\;))))))))
+    (str/sb-push-byte! (mut sb) #\"))
+  0)
+
+; Parse SOURCE TEXT through the built-in reader; the result arrives wrapped in
+; a `(do …)`, so the real form sits at index 1.
+(defn read-node [(text (slice u8))] (-> Code)
+  (primitive/code-nth
+    (primitive/code-read text `(reader-config :unquote #\~ :splice #\@))
+    1))
+
+(defn string-literal-node [(bytes (slice u8))] (-> Code)
+  (let [sb (str/sb-new (malloc-allocator))]
+    (escape-into (mut sb) bytes)
+    (read-node (str/sb-finish! sb))))
+
+; ------------------------------------------------------------ compiler state --
+
+(defstruct DoFrame [(ix Code) (lim Code) (label Code)])
+
+(defstruct Ctx
+  [(path (slice u8))
+   (src (slice u8))
+   (toks (ptr (ArrayList Tok)))
+   (dict (ptr (ArrayList Entry)))
+   (taken (ptr (ArrayList (slice u8))))
+   (defs Code)
+   (forms Code)
+   (pool-len i64)
+   (var-base i64)
+   (do-stack (ptr (ArrayList DoFrame)))
+   (last-number (Option i64))
+   (word-label Code)
+   (word-id Code)
+   (ids Ids)])
+
+(defstruct Ids
+  [(context Code)
+   (main Code) (putchar Code) (getchar Code) (exitc Code) (printf Code)
+   (sp Code) (ds Code) (rp Code) (rs Code) (mem Code) (here Code) (strdata Code)
+   (push Code) (pop Code) (top Code) (nth Code)
+   (rpush Code) (rpop Code) (rpeek Code)
+   (fatal Code) (ptype Code) (pdot Code) (pudot Code) (pdots Code)
+   (sprint Code)])
+
+
+(defn sid [(context Code) (name (slice u8))] (-> Code)
+  (primitive/datum->syntax context name))
+
+(defn gid [(ctx (ptr Ctx)) (name (slice u8))] (-> Code)
+  (sid (.context (.ids ctx)) name))
+
+(defstruct DoFrame [(ix Code) (lim Code) (label Code)])
+
+(defstruct Ctx
+  [(path (slice u8))
+   (src (slice u8))
+   (toks (ptr (ArrayList Tok)))
+   (dict (ptr (ArrayList Entry)))
+   (taken (ptr (ArrayList (slice u8))))
+   (defs Code)
+   (forms Code)
+   (pool-len i64)
+   (var-base i64)
+   (do-stack (ptr (ArrayList DoFrame)))
+   (last-number (Option i64))
+   (word-label Code)
+   (word-id Code)
+   (ids Ids)])
+
+; ------------------------------------------------------------------ errors --
+
+(defn fail [(ctx (ptr Ctx)) (t Tok) (problem (slice u8))] (-> Code)
+  (forth-error (.path ctx) (.src ctx) (.start t) problem))
+
+(defn tok-at [(ctx (ptr Ctx)) (i i64)] (-> Tok)
+  (al-get [Tok] (.toks ctx) i))
+
+(defn tok-count [(ctx (ptr Ctx))] (-> i64)
+  (al-len [Tok] (.toks ctx)))
+
+; The lowercase source text of a token.
+(defn word-of [(ctx (ptr Ctx)) (t Tok)] (-> (slice u8))
+  (let [raw (tok-bytes (.src ctx) t)
+        sb (str/sb-new (malloc-allocator))]
+    (sanitize-lower (mut sb) raw)
+    (str/sb-finish! sb)))
+
+(defn sanitize-lower [(sb (mut str/StrBuf)) (name (slice u8))] (-> i64)
+  (let [n (slice-len [u8] name)]
+    (loop
+      (for [k 0 n]
+        (str/sb-push-byte! (mut sb) (to-lower (slice-get [u8] name k)))))
+    0))
+
+(defn make-ids [(context Code)] (-> Ids)
+  (Ids
+    context
+    (sid context "main")
+    (sid context "f-putchar") (sid context "f-getchar")
+    (sid context "f-exit")   (sid context "f-printf")
+    (sid context "f-sp") (sid context "f-ds")
+    (sid context "f-rp") (sid context "f-rs")
+    (sid context "f-mem") (sid context "f-here") (sid context "f-strdata")
+    (sid context "f-push") (sid context "f-pop")
+    (sid context "f-top") (sid context "f-nth")
+    (sid context "f-rpush") (sid context "f-rpop") (sid context "f-rpeek")
+    (sid context "f-fatal") (sid context "f-type") (sid context "f-dot")
+    (sid context "f-udot") (sid context "f-dots")
+    (sid context "f-sprint")))
+
+
+; --------------------------------------------------- generated module pieces --
+
+; The shared runtime every generated program carries: two checked stacks, the
+; linear data space, and the printing words. All of it compiles to a handful of
+; loads, stores and libc calls.
+(defn emit-helpers [(ctx (ptr Ctx)) (strlit Code)] (-> Code)
+  (let [ids (.ids ctx)
+        p (.putchar ids)
+        g (.getchar ids)
+        x (.exitc ids)
+        pr (.printf ids)]
+    `(do
+       (extern ~p :cc c [i32] (-> i32))
+       (extern ~g :cc c [] (-> i32))
+       (extern ~x :cc c [i32] (-> i32))
+       (extern ~pr :cc c [(ptr i8) ...] (-> i32))
+       (defn ~(.sp ids) [] (-> (ptr i64)) (primitive/alloc-static i64))
+       (defn ~(.ds ids) [] (-> (ptr (array i64 DATA-STACK-CELLS)))
+         (primitive/alloc-static (array i64 DATA-STACK-CELLS)))
+       (defn ~(.rp ids) [] (-> (ptr i64)) (primitive/alloc-static i64))
+       (defn ~(.rs ids) [] (-> (ptr (array i64 RETURN-STACK-CELLS)))
+         (primitive/alloc-static (array i64 RETURN-STACK-CELLS)))
+       (defn ~(.mem ids) [] (-> (ptr (array u8 MEMORY-BYTES)))
+         (primitive/alloc-static (array u8 MEMORY-BYTES)))
+       (defn ~(.here ids) [] (-> (ptr i64)) (primitive/alloc-static i64))
+       (defn ~(.strdata ids) [] (-> (slice u8)) ~strlit)
+       (defn ~(.fatal ids) [(msg (slice u8))] (-> i64)
+         (do
+           (loop (for [k 0 (slice-len [u8] msg)]
+                   (~p (primitive/cast i32 (slice-get [u8] msg k)))))
+           (~p 10)
+           (~x 1)
+           0))
+       (defn ~(.push ids) [(v i64)] (-> i64)
+         (if (>= (load (~(.sp ids))) DATA-STACK-CELLS)
+             (~(.fatal ids) "forth: data stack overflow")
+             (do (store! (primitive/index (~(.ds ids)) (load (~(.sp ids)))) v)
+                 (store! (~(.sp ids)) (+ (load (~(.sp ids))) 1))
+                 0)))
+       (defn ~(.pop ids) [] (-> i64)
+         (if (<= (load (~(.sp ids))) 0)
+             (~(.fatal ids) "forth: data stack underflow")
+             (do (store! (~(.sp ids)) (- (load (~(.sp ids))) 1))
+                 (load (primitive/index (~(.ds ids)) (load (~(.sp ids))))))))
+       (defn ~(.top ids) [] (-> i64)
+         (if (<= (load (~(.sp ids))) 0)
+             (~(.fatal ids) "forth: data stack underflow")
+             (load (primitive/index (~(.ds ids)) (- (load (~(.sp ids))) 1)))))
+       (defn ~(.nth ids) [(k i64)] (-> i64)
+         (if (or (< k 0) (>= k (load (~(.sp ids)))))
+             (~(.fatal ids) "forth: stack pick out of range")
+             (load (primitive/index (~(.ds ids))
+                                    (- (- (load (~(.sp ids))) 1) k)))))
+       (defn ~(.rpush ids) [(v i64)] (-> i64)
+         (if (>= (load (~(.rp ids))) RETURN-STACK-CELLS)
+             (~(.fatal ids) "forth: return stack overflow")
+             (do (store! (primitive/index (~(.rs ids)) (load (~(.rp ids)))) v)
+                 (store! (~(.rp ids)) (+ (load (~(.rp ids))) 1))
+                 0)))
+       (defn ~(.rpop ids) [] (-> i64)
+         (if (<= (load (~(.rp ids))) 0)
+             (~(.fatal ids) "forth: return stack underflow")
+             (do (store! (~(.rp ids)) (- (load (~(.rp ids))) 1))
+                 (load (primitive/index (~(.rs ids)) (load (~(.rp ids))))))))
+       (defn ~(.rpeek ids) [] (-> i64)
+         (if (<= (load (~(.rp ids))) 0)
+             (~(.fatal ids) "forth: return stack underflow")
+             (load (primitive/index (~(.rs ids)) (- (load (~(.rp ids))) 1)))))
+       (defn ~(.ptype ids) [(addr i64) (n i64)] (-> i64)
+         (do
+           (loop (for [k 0 n]
+                   (~p (primitive/cast i32
+                         (primitive/index (~(.mem ids)) (+ addr k))))))
+           0))
+       (defn ~(.pdot ids) [(v i64)] (-> i64) (~pr c"%ld " v))
+       (defn ~(.pudot ids) [(v i64)] (-> i64)
+         (~pr c"%lu " (primitive/cast u64 v)))
+       (defn ~(.pdots ids) [] (-> i64)
+         (do
+           (~pr c"<%ld> " (load (~(.sp ids))))
+           (loop (for [k 0 (load (~(.sp ids)))]
+                   (~pr c"%ld " (primitive/index (~(.ds ids)) k))))
+           0))
+       (defn ~(.sprint ids) [(off i64) (n i64)] (-> i64)
+         (do
+           (loop (for [k 0 n]
+                   (~p (primitive/cast i32
+                         (slice-get [u8] (~(.strdata ids)) (+ off k))))))
+           0))))
+
+; ------------------------------------------------------------ builtin words --
+
+; Every builtin is an ordinary zero-argument function over the shared stacks,
+; exactly like a compiled colon definition -- which is what makes ' and
+; execute uniform for builtins and user words alike.
+(defn builtin-defn [(ctx (ptr Ctx)) (word (slice u8)) (id Code)] (-> Code)
+  (let [ids (.ids ctx)
+        p (lambda-void ids)]
+    (cond
+      (bytes-eq? word "dup")
+        `(defn ~id [] (-> i64) (let [v (~(.pop ids))] (do (~(.push ids) v) (~(.push ids) v) 0)))
+      (bytes-eq? word "drop")
+        `(defn ~id [] (-> i64) (do (~(.pop ids)) 0))
+      (bytes-eq? word "swap")
+        `(defn ~id [] (-> i64)
+           (let [b (~(.pop ids)) a (~(.pop ids))] (do (~(.push ids) a) (~(.push ids) b) 0)))
+      (bytes-eq? word "over")
+        `(defn ~id [] (-> i64) (~(.push ids) (~(.nth ids) 1)))
+      (bytes-eq? word "rot")
+        `(defn ~id [] (-> i64)
+           (let [c (~(.pop ids)) b (~(.pop ids)) a (~(.pop ids))]
+             (do (~(.push ids) b) (~(.push ids) c) (~(.push ids) a) 0)))
+      (bytes-eq? word "-rot")
+        `(defn ~id [] (-> i64)
+           (let [c (~(.pop ids)) b (~(.pop ids)) a (~(.pop ids))]
+             (do (~(.push ids) c) (~(.push ids) a) (~(.push ids) b) 0)))
+      (bytes-eq? word "nip")
+        `(defn ~id [] (-> i64)
+           (let [b (~(.pop ids))] (do (~(.pop ids)) (~(.push ids) b) 0)))
+      (bytes-eq? word "tuck")
+        `(defn ~id [] (-> i64)
+           (let [b (~(.pop ids)) a (~(.pop ids))]
+             (do (~(.push ids) b) (~(.push ids) a) (~(.push ids) b) 0)))
+      (bytes-eq? word "?dup")
+        `(defn ~id [] (-> i64)
+           (if (!= (~(.top ids)) 0) (~(.push ids) (~(.top ids))) 0))
+      (bytes-eq? word "depth")
+        `(defn ~id [] (-> i64) (~(.push ids) (load (~(.sp ids)))))
+      (bytes-eq? word "pick")
+        `(defn ~id [] (-> i64) (let [k (~(.pop ids))] (~(.push ids) (~(.nth ids) k))))
+      (bytes-eq? word "2dup")
+        `(defn ~id [] (-> i64)
+           (do (~(.push ids) (~(.nth ids) 1)) (~(.push ids) (~(.nth ids) 1)) 0))
+      (bytes-eq? word "2drop")
+        `(defn ~id [] (-> i64) (do (~(.pop ids)) (~(.pop ids)) 0))
+      (bytes-eq? word "2over")
+        `(defn ~id [] (-> i64)
+           (do (~(.push ids) (~(.nth ids) 3)) (~(.push ids) (~(.nth ids) 3)) 0))
+      :else (binop-or-rest ctx word id))))
+
+(defn lambda-void [(ids Ids)] (-> Code) `0)
+
+(defn binop-or-rest [(ctx (ptr Ctx)) (word (slice u8)) (id Code)] (-> Code)
+  (let [ids (.ids ctx)]
+    (cond
+      (bytes-eq? word "+")
+        `(defn ~id [] (-> i64) (let [b (~(.pop ids)) a (~(.pop ids))] (~(.push ids) (+ a b))))
+      (bytes-eq? word "-")
+        `(defn ~id [] (-> i64) (let [b (~(.pop ids)) a (~(.pop ids))] (~(.push ids) (- a b))))
+      (bytes-eq? word "*")
+        `(defn ~id [] (-> i64) (let [b (~(.pop ids)) a (~(.pop ids))] (~(.push ids) (* a b))))
+      (bytes-eq? word "/")
+        `(defn ~id [] (-> i64)
+           (let [b (~(.pop ids)) a (~(.pop ids))]
+             (if (= b 0) (~(.fatal ids) "forth: division by zero") (~(.push ids) (/ a b)))))
+      (bytes-eq? word "mod")
+        `(defn ~id [] (-> i64)
+           (let [b (~(.pop ids)) a (~(.pop ids))]
+             (if (= b 0) (~(.fatal ids) "forth: division by zero") (~(.push ids) (% a b)))))
+      (bytes-eq? word "/mod")
+        `(defn ~id [] (-> i64)
+           (let [b (~(.pop ids)) a (~(.pop ids))]
+             (if (= b 0)
+                 (~(.fatal ids) "forth: division by zero")
+                 (do (~(.push ids) (% a b)) (~(.push ids) (/ a b)) 0))))
+      (bytes-eq? word "negate")
+        `(defn ~id [] (-> i64) (~(.push ids) (- 0 (~(.pop ids)))))
+      (bytes-eq? word "abs")
+        `(defn ~id [] (-> i64) (let [v (~(.pop ids))] (~(.push ids) (if (< v 0) (- 0 v) v))))
+      (bytes-eq? word "min")
+        `(defn ~id [] (-> i64) (let [b (~(.pop ids)) a (~(.pop ids))] (~(.push ids) (if (< a b) a b))))
+      (bytes-eq? word "max")
+        `(defn ~id [] (-> i64) (let [b (~(.pop ids)) a (~(.pop ids))] (~(.push ids) (if (> a b) a b))))
+      (bytes-eq? word "1+")
+        `(defn ~id [] (-> i64) (~(.push ids) (+ 1 (~(.pop ids)))))
+      (bytes-eq? word "1-")
+        `(defn ~id [] (-> i64) (~(.push ids) (- (~(.pop ids)) 1)))
+      (bytes-eq? word "2*")
+        `(defn ~id [] (-> i64) (~(.push ids) (* 2 (~(.pop ids)))))
+      (bytes-eq? word "2/")
+        `(defn ~id [] (-> i64) (~(.push ids) (/ (~(.pop ids)) 2)))
+      :else (cmp-or-bit ctx word id))))
+
+(defn flag [] (-> Code) `-1)
+
+(defn cmp-or-bit [(ctx (ptr Ctx)) (word (slice u8)) (id Code)] (-> Code)
+  (let [ids (.ids ctx)]
+    (cond
+      (bytes-eq? word "=")
+        `(defn ~id [] (-> i64) (let [b (~(.pop ids)) a (~(.pop ids))] (~(.push ids) (if (= a b) -1 0))))
+      (bytes-eq? word "<>")
+        `(defn ~id [] (-> i64) (let [b (~(.pop ids)) a (~(.pop ids))] (~(.push ids) (if (!= a b) -1 0))))
+      (bytes-eq? word "<")
+        `(defn ~id [] (-> i64) (let [b (~(.pop ids)) a (~(.pop ids))] (~(.push ids) (if (< a b) -1 0))))
+      (bytes-eq? word ">")
+        `(defn ~id [] (-> i64) (let [b (~(.pop ids)) a (~(.pop ids))] (~(.push ids) (if (> a b) -1 0))))
+      (bytes-eq? word "<=")
+        `(defn ~id [] (-> i64) (let [b (~(.pop ids)) a (~(.pop ids))] (~(.push ids) (if (<= a b) -1 0))))
+      (bytes-eq? word ">=")
+        `(defn ~id [] (-> i64) (let [b (~(.pop ids)) a (~(.pop ids))] (~(.push ids) (if (>= a b) -1 0))))
+      (bytes-eq? word "0=")
+        `(defn ~id [] (-> i64) (~(.push ids) (if (= (~(.pop ids)) 0) -1 0)))
+      (bytes-eq? word "0<")
+        `(defn ~id [] (-> i64) (~(.push ids) (if (< (~(.pop ids)) 0) -1 0)))
+      (bytes-eq? word "0>")
+        `(defn ~id [] (-> i64) (~(.push ids) (if (> (~(.pop ids)) 0) -1 0)))
+      (bytes-eq? word "0<>")
+        `(defn ~id [] (-> i64) (~(.push ids) (if (!= (~(.pop ids)) 0) -1 0)))
+      (bytes-eq? word "true")
+        `(defn ~id [] (-> i64) (~(.push ids) -1))
+      (bytes-eq? word "false")
+        `(defn ~id [] (-> i64) (~(.push ids) 0))
+      (bytes-eq? word "and")
+        `(defn ~id [] (-> i64) (let [b (~(.pop ids)) a (~(.pop ids))] (~(.push ids) (primitive/iand a b))))
+      (bytes-eq? word "or")
+        `(defn ~id [] (-> i64) (let [b (~(.pop ids)) a (~(.pop ids))] (~(.push ids) (primitive/ior a b))))
+      (bytes-eq? word "xor")
+        `(defn ~id [] (-> i64) (let [b (~(.pop ids)) a (~(.pop ids))] (~(.push ids) (primitive/ixor a b))))
+      (bytes-eq? word "invert")
+        `(defn ~id [] (-> i64) (~(.push ids) (primitive/inot (~(.pop ids)))))
+      (bytes-eq? word "lshift")
+        `(defn ~id [] (-> i64) (let [n (~(.pop ids)) a (~(.pop ids))] (~(.push ids) (primitive/ishl a n))))
+      (bytes-eq? word "rshift")
+        `(defn ~id [] (-> i64) (let [n (~(.pop ids)) a (~(.pop ids))] (~(.push ids) (primitive/ishr a n))))
+      (bytes-eq? word ">r")
+        `(defn ~id [] (-> i64) (~(.rpush ids) (~(.pop ids))))
+      (bytes-eq? word "r>")
+        `(defn ~id [] (-> i64) (~(.push ids) (~(.rpop ids))))
+      (bytes-eq? word "r@")
+        `(defn ~id [] (-> i64) (~(.push ids) (~(.rpeek ids))))
+      :else (mem-or-io ctx word id))))
+
+(defn mem-or-io [(ctx (ptr Ctx)) (word (slice u8)) (id Code)] (-> Code)
+  (let [ids (.ids ctx)]
+    (cond
+      (bytes-eq? word "@")
+        `(defn ~id [] (-> i64)
+           (let [a (~(.pop ids))] (~(.push ids) (load (cell-at ids a)))))
+      (bytes-eq? word "!")
+        `(defn ~id [] (-> i64)
+           (let [a (~(.pop ids)) v (~(.pop ids))] (do (store! (cell-at ids a) v) 0)))
+      (bytes-eq? word "+!")
+        `(defn ~id [] (-> i64)
+           (let [a (~(.pop ids)) v (~(.pop ids))]
+             (do (store! (cell-at ids a) (+ (load (cell-at ids a)) v)) 0)))
+      (bytes-eq? word "c@")
+        `(defn ~id [] (-> i64)
+           (let [a (~(.pop ids))]
+             (~(.push ids) (primitive/cast i64 (primitive/index (~(.mem ids)) a)))))
+      (bytes-eq? word "c!")
+        `(defn ~id [] (-> i64)
+           (let [a (~(.pop ids)) v (~(.pop ids))]
+             (do (store! (primitive/index (~(.mem ids)) a) (primitive/cast u8 v)) 0)))
+      (bytes-eq? word "here")
+        `(defn ~id [] (-> i64) (~(.push ids) (load (~(.here ids)))))
+      (bytes-eq? word "allot")
+        `(defn ~id [] (-> i64)
+           (let [n (~(.pop ids))] (do (store! (~(.here ids)) (+ (load (~(.here ids))) n)) 0)))
+      (bytes-eq? word "cells")
+        `(defn ~id [] (-> i64) (~(.push ids) (* 8 (~(.pop ids)))))
+      (bytes-eq? word "cell+")
+        `(defn ~id [] (-> i64) (~(.push ids) (+ 8 (~(.pop ids)))))
+      (bytes-eq? word ",")
+        `(defn ~id [] (-> i64)
+           (let [v (~(.pop ids)) a (align8 (load (~(.here ids))))]
+             (do (store! (~(.here ids)) (+ a 8)) (store! (cell-at ids a) v) 0)))
+      (bytes-eq? word ".")
+        `(defn ~id [] (-> i64) (~(.pdot ids) (~(.pop ids))))
+      (bytes-eq? word "u.")
+        `(defn ~id [] (-> i64) (~(.pudot ids) (~(.pop ids))))
+      (bytes-eq? word ".s")
+        `(defn ~id [] (-> i64) (~(.pdots ids)))
+      (bytes-eq? word "emit")
+        `(defn ~id [] (-> i64) (~(.putchar ids) (primitive/cast i32 (~(.pop ids)))))
+      (bytes-eq? word "cr")
+        `(defn ~id [] (-> i64) (~(.putchar ids) 10))
+      (bytes-eq? word "space")
+        `(defn ~id [] (-> i64) (~(.putchar ids) 32))
+      (bytes-eq? word "spaces")
+        `(defn ~id [] (-> i64)
+           (loop (for [k 0 (~(.pop ids))] (~(.putchar ids) 32)))
+           0)
+      (bytes-eq? word "type")
+        `(defn ~id [] (-> i64)
+           (let [n (~(.pop ids)) addr (~(.pop ids))] (~(.ptype ids) addr n)))
+      (bytes-eq? word "key")
+        `(defn ~id [] (-> i64)
+           (let [c (~(.getchar ids))] (~(.push ids) (if (< c 0) -1 (primitive/cast i64 c)))))
+      (bytes-eq? word "execute")
+        `(defn ~id [] (-> i64)
+           (let [xt (~(.pop ids))]
+             (primitive/call-ptr (primitive/cast (fnptr c [] i64) xt))))
+      :else (primitive/error "forth reader: internal: unknown builtin"))))
+
+(defn cell-at [(ids Ids) (a i64)] (-> (ptr i64))
+  (primitive/cast (ptr i64) (primitive/index (.mem ids) a)))
+
+(defn align8 [(a i64)] (-> i64) (* 8 (/ (+ a 7) 8)))
