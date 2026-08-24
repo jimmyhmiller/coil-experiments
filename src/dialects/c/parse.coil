@@ -92,12 +92,18 @@
     (if (at-eof? (mut p)) 0 (store! (field p pos) (+ (load (field p pos)) 1)))
     t))
 
+;; The spelling of the offending token goes into the message: a bare "unexpected
+;; token" leaves nothing to search a header for.
 (defn fail-at! [(p (mut Parser)) (message (slice u8)) (t lex/Token)] (-> i64)
   (if (!= (load (field p failed)) 0)
       0
-      (do
+      (let [(mut b) (str/sb-new (load (field p a)))]
+        (str/sb-push-str! (mut b) message)
+        (str/sb-push-str! (mut b) " near `")
+        (str/sb-push-str! (mut b) (lex/token-text t))
+        (str/sb-push-str! (mut b) "`")
         (store! (field p failed) 1)
-        (store! (field p message) message)
+        (store! (field p message) (str/sb-str (load (mut b))))
         (store! (field p file) (lex/token-file t))
         (store! (field p line) (lex/token-line t))
         (store! (field p column) (lex/token-column t))
@@ -739,17 +745,67 @@
     (text=? w "__restrict__") true (text=? w "inline") true (text=? w "__inline") true
     (text=? w "_Noreturn") true (text=? w "_Atomic") true (text=? w "auto") true
     (text=? w "_Thread_local") true (text=? w "__signed__") true
+    (text=? w "__builtin_va_list") true (text=? w "_Complex") true
+    (text=? w "__int128_t") true (text=? w "__uint128_t") true
+    (text=? w "__int128") true
     :else false))
 
-;; A name only starts a type if it is a typedef that is actually in scope,
-;; which is the whole reason the parser has to carry a scope at all.
+;; A name only starts a type if it is a type keyword or a typedef that is
+;; actually in scope, which is the whole reason the parser has to carry a scope
+;; at all. Whether the lexer classified the word as a keyword does not matter:
+;; the reserved spellings a compiler adds, `__builtin_va_list` among them, are
+;; ordinary identifiers to it.
 (defn type-start? [(p (mut Parser))] (-> bool)
-  (let [t (peek (mut p))]
-    (if (= (lex/token-kind t) lex/TK-KEYWORD)
-        (type-keyword? (lex/token-text t))
-        (if (= (lex/token-kind t) lex/TK-IDENT)
-            (not (null-type? (typedef-type (mut p) (lex/token-text t))))
-            false))))
+  (let [t (peek (mut p))
+        k (lex/token-kind t)]
+    (if (or (= k lex/TK-KEYWORD) (= k lex/TK-IDENT))
+        (or (type-keyword? (lex/token-text t))
+            (not (null-type? (typedef-type (mut p) (lex/token-text t)))))
+        false)))
+
+;; A GNU attribute, a Microsoft one, and the nullability qualifiers may appear
+;; almost anywhere a declaration may, and none of them changes the program this
+;; compiler generates. They are consumed wherever a declaration can start or
+;; end, rather than being rejected as stray tokens.
+(defn attribute-start? [(p (mut Parser))] (-> bool)
+  (cond
+    (word? (mut p) "__attribute__") true
+    (word? (mut p) "__attribute") true
+    (word? (mut p) "__declspec") true
+    (word? (mut p) "_Nullable") true
+    (word? (mut p) "_Nonnull") true
+    (word? (mut p) "_Null_unspecified") true
+    (word? (mut p) "__nullable") true
+    (word? (mut p) "__nonnull") true
+    (word? (mut p) "__null_unspecified") true
+    (word? (mut p) "__unsafe_unretained") true
+    (word? (mut p) "__kindof") true
+    (word? (mut p) "__extension__") true
+    :else false))
+
+;; Consumes a parenthesised group with its nesting, from the `(` to its `)`.
+(defn skip-balanced! [(p (mut Parser))] (-> i64)
+  (if (not (punct? (mut p) "("))
+      0
+      (let [(mut depth) 0
+            (mut done) 0]
+        (loop
+          (if (or (!= (load done) 0) (or (at-eof? (mut p)) (!= (load (field p failed)) 0)))
+              (break)
+              (do
+                (if (punct? (mut p) "(") (store! depth (+ (load depth) 1)) 0)
+                (if (punct? (mut p) ")")
+                    (do (store! depth (- (load depth) 1))
+                        (if (= (load depth) 0) (store! done 1) 0))
+                    0)
+                (advance! (mut p)))))
+        0)))
+
+(defn skip-attributes! [(p (mut Parser))] (-> i64)
+  (loop (if (attribute-start? (mut p))
+            (do (advance! (mut p)) (skip-balanced! (mut p)) 0)
+            (break)))
+  0)
 
 (defn parse-const-expr [(p (mut Parser))] (-> i64)
   (let [n (parse-conditional (mut p))]
@@ -817,6 +873,7 @@
           (let [t (peek (mut p))
                 w (lex/token-text t)]
             (cond
+              (attribute-start? (mut p)) (skip-attributes! (mut p))
               (not (type-start? (mut p))) (store! done 1)
               (word? (mut p) "typedef") (do (advance! (mut p)) (store! is-typedef 1))
               (word? (mut p) "static") (do (advance! (mut p)) (store! is-static 1))
@@ -828,6 +885,20 @@
                   (or (word? (mut p) "_Noreturn") (or (word? (mut p) "auto")
                       (word? (mut p) "_Thread_local")))))))))))
                 (do (advance! (mut p)) 0)
+              ;; On this target a `va_list` is a plain `char *`; the calling
+              ;; convention puts the variadic arguments in a contiguous area and
+              ;; the pointer walks it.
+              (word? (mut p) "__builtin_va_list")
+                (do (advance! (mut p))
+                    (store! ty (ct/ty-pointer-to a (ct/ty-char a)))
+                    (store! done 1))
+              (word? (mut p) "_Complex") (do (advance! (mut p)) 0)
+              (or (word? (mut p) "__int128_t") (word? (mut p) "__int128"))
+                (do (advance! (mut p))
+                    (store! ty (ct/ty-int128 a (!= (load unsigned) 0)))
+                    (store! done 1))
+              (word? (mut p) "__uint128_t")
+                (do (advance! (mut p)) (store! ty (ct/ty-int128 a true)) (store! done 1))
               (word? (mut p) "void") (do (advance! (mut p)) (store! voids (+ (load voids) 1)))
               (word? (mut p) "_Bool") (do (advance! (mut p)) (store! bools (+ (load bools) 1)))
               (word? (mut p) "char") (do (advance! (mut p)) (store! chars (+ (load chars) 1)))
@@ -866,11 +937,13 @@
             :is-extern (load is-extern)))))
 
 (defn skip-qualifiers! [(p (mut Parser))] (-> i64)
-  (loop (if (or (word? (mut p) "const") (or (word? (mut p) "volatile")
-            (or (word? (mut p) "restrict") (or (word? (mut p) "__restrict")
-                (word? (mut p) "__restrict__")))))
-            (do (advance! (mut p)) 0)
-            (break)))
+  (loop (do
+          (skip-attributes! (mut p))
+          (if (or (word? (mut p) "const") (or (word? (mut p) "volatile")
+                (or (word? (mut p) "restrict") (or (word? (mut p) "__restrict")
+                    (or (word? (mut p) "__restrict__") (word? (mut p) "_Atomic"))))))
+              (do (advance! (mut p)) 0)
+              (break))))
   0)
 
 (defn parse-pointers [(p (mut Parser)) (base (ptr ct/Type))] (-> (ptr ct/Type))
@@ -924,7 +997,14 @@
   (let [t (peek-at (mut p) offset)]
     (and (= (lex/token-kind t) lex/TK-PUNCT) (text=? (lex/token-text t) s))))
 
-(defstruct Declared [(name (slice u8)) (ty (ptr ct/Type)) (tok lex/Token)])
+;; `asm-name` is the symbol a declaration is really called, from
+;; `__asm("_name")`. Ignoring it would emit a call to a name the linker does not
+;; have.
+(defstruct Declared
+  [(name (slice u8))
+   (ty (ptr ct/Type))
+   (asm-name (slice u8))
+   (tok lex/Token)])
 
 ;; Skips a balanced parenthesised group, used to reach the type suffix before
 ;; re-parsing the group against it.
@@ -940,6 +1020,42 @@
                 (do (store! depth (- (load depth) 1))
                     (if (= (load depth) 0) (store! go 0) 0))
                 0)
+            (advance! (mut p)))))
+    0))
+
+;; `__asm("_name")` after a declarator renames the symbol. The spelling is a
+;; string literal whose quotes and any leading underscore the assembler adds are
+;; stripped here, so what comes out is the name as C would have written it.
+(defn parse-asm-name! [(p (mut Parser))] (-> (slice u8))
+  (skip-attributes! (mut p))
+  (if (not (or (word? (mut p) "__asm") (or (word? (mut p) "__asm__") (word? (mut p) "asm"))))
+      ""
+      (do
+        (advance! (mut p))
+        (if (not (punct? (mut p) "("))
+            ""
+            (do
+              (advance! (mut p))
+              (let [t (peek (mut p))]
+                (if (!= (lex/token-kind t) lex/TK-STRING)
+                    (do (skip-to-close! (mut p)) "")
+                    (let [text (decode-escapes (mut p) (lex/token-text t) 34)]
+                      (advance! (mut p))
+                      (skip-to-close! (mut p))
+                      (if (and (> (slice-len text) 1)
+                               (= (primitive/cast i64 (slice-get text 0)) 95))
+                          (subslice text 1 (slice-len text))
+                          text)))))))))
+
+;; Consumes the rest of a group whose `(` has already been taken.
+(defn skip-to-close! [(p (mut Parser))] (-> i64)
+  (let [(mut depth) 1]
+    (loop
+      (if (or (= (load depth) 0) (or (at-eof? (mut p)) (!= (load (field p failed)) 0)))
+          (break)
+          (do
+            (if (punct? (mut p) "(") (store! depth (+ (load depth) 1)) 0)
+            (if (punct? (mut p) ")") (store! depth (- (load depth) 1)) 0)
             (advance! (mut p)))))
     0))
 
@@ -959,12 +1075,20 @@
               (store! (field p pos) after)
               inner)))
         (let [t (peek (mut p))]
-          (if (or (= (lex/token-kind t) lex/TK-IDENT) (= (lex/token-kind t) lex/TK-KEYWORD))
+          (if (and (or (= (lex/token-kind t) lex/TK-IDENT) (= (lex/token-kind t) lex/TK-KEYWORD))
+                   (not (attribute-start? (mut p))))
               (do (advance! (mut p))
-                  (let [suffixed (parse-type-suffix (mut p) ty0)]
-                    (load (Declared :name (lex/token-text t) :ty suffixed :tok t))))
-              (let [suffixed (parse-type-suffix (mut p) ty0)]
-                (load (Declared :name "" :ty suffixed :tok t))))))))
+                  (let [suffixed (parse-type-suffix (mut p) ty0)
+                        asm-name (parse-asm-name! (mut p))]
+                    (skip-attributes! (mut p))
+                    (load (Declared :name (lex/token-text t)
+                            :ty suffixed
+                            :asm-name asm-name
+                            :tok t))))
+              (let [suffixed (parse-type-suffix (mut p) ty0)
+                    asm-name (parse-asm-name! (mut p))]
+                (skip-attributes! (mut p))
+                (load (Declared :name "" :ty suffixed :asm-name asm-name :tok t))))))))
 
 (defn parse-declarator-type [(p (mut Parser)) (base (ptr ct/Type))] (-> (ptr ct/Type))
   (let [d (parse-declarator (mut p) base)] (.ty d)))

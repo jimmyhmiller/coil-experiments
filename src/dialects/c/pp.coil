@@ -24,6 +24,7 @@
         preprocess
         pp-new
         pp-define-text
+        pp-read-prefix
         pp-add-include-path)
 
 (defstruct Macro
@@ -35,8 +36,12 @@
    (params (al/ArrayList (slice u8)))
    (body (al/ArrayList lex/Token))])
 
+;; `outer` is whether the group containing this `#if` is itself being emitted.
+;; Without it a later `#else` or `#elif` would judge its branch on its own
+;; condition alone and switch a skipped region back on.
 (defstruct Conditional
   [(active i64)       ; this branch is being emitted
+   (outer i64)        ; the enclosing group is being emitted
    (taken i64)        ; some branch of this #if has already been taken
    (seen-else i64)])
 
@@ -639,17 +644,38 @@
                 (None [Macro])
                 (Some m)))))))
 
+;; `_Pragma("...")` is a directive written as an expression, so that a macro can
+;; contain one. Every pragma this compiler understands is a `#pragma`, and the
+;; rest are ignored, so the operator and its argument are simply consumed --
+;; leaving them in the stream would put them in front of the parser.
+(defn drop-pragma! [(p (mut PP)) (r (mut Reader))] (-> i64)
+  (if (or (r-done? (mut r)) (not (is-punct? (r-peek (mut r)) "(")))
+      0
+      (let [(mut depth) 0
+            (mut done) 0]
+        (loop (if (or (!= (load done) 0) (r-done? (mut r)))
+                  (break)
+                  (let [t (r-next (mut r))]
+                    (cond
+                      (is-punct? t "(") (store! depth (+ (load depth) 1))
+                      (is-punct? t ")") (do (store! depth (- (load depth) 1))
+                                            (if (= (load depth) 0) (store! done 1) 0))
+                      :else 0))))
+        0)))
+
 (defn expand-into! [(p (mut PP)) (r (mut Reader)) (out (mut (al/ArrayList lex/Token)))] (-> i64)
   (loop
     (if (or (!= (load (field p failed)) 0) (r-done? (mut r)))
         (break)
         (let [t (r-next (mut r))]
-          (match (builtin-value (mut p) t)
-            (Some [v] (al/al-push! [lex/Token] (mut out) v))
-            (None []
-              (match (expandable (mut p) (mut r) t)
-                (Some [found] (let [m found] (expand-call! (mut p) (mut r) t m (mut out))))
-                (None [] (al/al-push! [lex/Token] (mut out) t))))))))
+          (if (or (is-word? t "_Pragma") (is-word? t "__pragma"))
+              (drop-pragma! (mut p) (mut r))
+              (match (builtin-value (mut p) t)
+                (Some [v] (al/al-push! [lex/Token] (mut out) v))
+                (None []
+                  (match (expandable (mut p) (mut r) t)
+                    (Some [found] (let [m found] (expand-call! (mut p) (mut r) t m (mut out))))
+                    (None [] (al/al-push! [lex/Token] (mut out) t)))))))))
   0)
 
 (defn expand-run [(p (mut PP)) (in (al/ArrayList lex/Token))] (-> (al/ArrayList lex/Token))
@@ -743,7 +769,10 @@
 (defn push-conditional! [(p (mut PP)) (taken bool)] (-> i64)
   (let [outer (active? (mut p))
         live (if (and outer taken) 1 0)
-        entry (Conditional :active live :taken live :seen-else 0)]
+        entry (Conditional :active live
+                :outer (if outer 1 0)
+                :taken live
+                :seen-else 0)]
     (al/al-push! [Conditional] (mut (field p conditionals)) entry))
   0)
 
@@ -832,8 +861,68 @@
           fixed)))
   0)
 
-;; `defined X` and `defined(X)` are resolved before expansion, because the
-;; operand must not itself be expanded.
+;; The `__has_*` family looks like a function-like macro but is answered by the
+;; preprocessor itself, so `defined(__has_include)` has to be true even though
+;; none of them is in the macro table.
+(defn builtin-test? [(name (slice u8))] (-> bool)
+  (or (text=? name "__has_include")
+      (or (text=? name "__has_include_next")
+          (or (text=? name "__has_feature")
+              (or (text=? name "__has_extension")
+                  (or (text=? name "__has_attribute")
+                      (or (text=? name "__has_declspec_attribute")
+                          (or (text=? name "__has_builtin")
+                              (or (text=? name "__has_warning")
+                                  (or (text=? name "__has_c_attribute")
+                                      (or (text=? name "__has_cpp_attribute")
+                                          (or (text=? name "__is_identifier")
+                                              (text=? name "__building_module")))))))))))))
+
+;; The index just past the `)` that closes the argument list starting at `open`.
+(defn skip-parens [(in (al/ArrayList lex/Token)) (open i64)] (-> i64)
+  (let [n (tok-count in)
+        (mut i) open
+        (mut depth) 0
+        (mut done) 0]
+    (loop (if (or (!= (load done) 0) (>= (load i) n))
+              (break)
+              (let [t (tok-at in (load i))]
+                (cond
+                  (is-punct? t "(") (store! depth (+ (load depth) 1))
+                  (is-punct? t ")") (do (store! depth (- (load depth) 1))
+                                        (if (= (load depth) 0) (store! done 1) 0))
+                  :else 0)
+                (store! i (+ (load i) 1)))))
+    (load i)))
+
+;; Answers `__has_include(<a/b.h>)` by running the same search a real `#include`
+;; would. Every other member of the family answers zero: a header that asks
+;; whether an extension exists gets told it does not, and takes the portable
+;; path, which is the one this compiler implements.
+(defn builtin-test-value [(p (mut PP))
+                          (in (al/ArrayList lex/Token))
+                          (name (slice u8))
+                          (open i64)
+                          (close i64)
+                          (at lex/Token)] (-> i64)
+  (if (text=? name "__is_identifier")
+      1
+      (if (not (or (text=? name "__has_include") (text=? name "__has_include_next")))
+          0
+          (let [head (tok-at in (+ open 1))
+                angled (is-punct? head "<")
+                header (if angled
+                           (header-name (mut p) in (+ open 2) (- close 1))
+                           (unquote-header (lex/token-text head)))
+                found (search-include (mut p)
+                                      header
+                                      angled
+                                      (dirname (lex/token-file at))
+                                      (if angled 0 -1))]
+            (.ok found)))))
+
+;; `defined X`, `defined(X)`, and the `__has_*` tests are resolved before
+;; expansion, because their operands must not themselves be expanded.
 (defn resolve-defined [(p (mut PP)) (in (al/ArrayList lex/Token))] (-> (al/ArrayList lex/Token))
   (let [(mut out) (al/al-new [lex/Token] (load (field p a)))
         n (tok-count in)
@@ -841,14 +930,24 @@
     (loop (if (>= (load i) n)
               (break)
               (let [t (tok-at in (load i))]
-                (if (not (is-word? t "defined"))
+                (cond
+                  (builtin-test? (lex/token-text t))
+                    (if (or (>= (+ (load i) 1) n) (not (is-punct? (tok-at in (+ (load i) 1)) "(")))
+                        (do (fail! (mut p) "this test needs an argument list" t) (store! i n))
+                        (let [close (- (skip-parens in (+ (load i) 1)) 1)
+                              v (builtin-test-value (mut p) in (lex/token-text t) (+ (load i) 1) close t)]
+                          (al/al-push! [lex/Token] (mut out) (number-token t v (mut p)))
+                          (store! i (+ close 1))))
+                  (not (is-word? t "defined"))
                     (do (al/al-push! [lex/Token] (mut out) t) (store! i (+ (load i) 1)))
+                  :else
                     (let [paren (and (< (+ (load i) 1) n) (is-punct? (tok-at in (+ (load i) 1)) "("))
                           at (+ (load i) (if paren 2 1))]
                       (if (>= at n)
                           (do (fail! (mut p) "#if defined needs a name" t) (store! i n))
-                          (let [known (hm/hm-contains? (load (field p macros))
-                                                       (lex/token-text (tok-at in at)))]
+                          (let [word (lex/token-text (tok-at in at))
+                                known (or (hm/hm-contains? (load (field p macros)) word)
+                                          (builtin-test? word))]
                             (al/al-push! [lex/Token] (mut out) (number-token t (if known 1 0) (mut p)))
                             (store! i (+ at (if paren 2 1))))))))))
     (load (mut out))))
@@ -917,15 +1016,21 @@
             live (active? (mut p))
             depth (al/al-len [Conditional] (load (field p conditionals)))]
         (cond
+          ;; A conditional inside a skipped group is still tracked, so that its
+          ;; `#endif` closes the right one, but its condition is never
+          ;; evaluated: the tokens there may not even be a valid expression.
           (text=? name "ifdef")
-            (let [nm (tok-at tokens body)
-                  known (and (< body until)
-                             (hm/hm-contains? (load (field p macros)) (lex/token-text nm)))]
-              (push-conditional! (mut p) known))
+            (push-conditional! (mut p)
+                               (and live
+                                    (and (< body until)
+                                         (hm/hm-contains? (load (field p macros))
+                                                          (lex/token-text (tok-at tokens body))))))
           (text=? name "ifndef")
-            (push-conditional! (mut p) (and (< body until)
-                                      (not (hm/hm-contains? (load (field p macros))
-                                                            (lex/token-text (tok-at tokens body))))))
+            (push-conditional! (mut p)
+                               (and live
+                                    (and (< body until)
+                                         (not (hm/hm-contains? (load (field p macros))
+                                                               (lex/token-text (tok-at tokens body)))))))
           (text=? name "if")
             (push-conditional! (mut p) (and live (condition-value (mut p) tokens body until)))
           (text=? name "elif")
@@ -934,7 +1039,7 @@
                 (let [top (al/al-elem [Conditional] (mut (field p conditionals)) (- depth 1))]
                   (if (!= (load (field top seen-else)) 0)
                       (fail! (mut p) "#elif after #else" head)
-                      (if (!= (load (field top taken)) 0)
+                      (if (or (= (load (field top outer)) 0) (!= (load (field top taken)) 0))
                           (store! (field top active) 0)
                           (let [now (if (condition-value (mut p) tokens body until) 1 0)]
                             (store! (field top active) now)
@@ -945,7 +1050,8 @@
                 (fail! (mut p) "#else outside a conditional" head)
                 (let [top (al/al-elem [Conditional] (mut (field p conditionals)) (- depth 1))]
                   (store! (field top seen-else) 1)
-                  (store! (field top active) (if (= (load (field top taken)) 0) 1 0))
+                  (store! (field top active)
+                          (if (and (!= (load (field top outer)) 0) (= (load (field top taken)) 0)) 1 0))
                   (store! (field top taken) 1)
                   0))
           (text=? name "endif")
@@ -1046,7 +1152,15 @@
           (define! (mut p) (.tokens result) 0 (- (tok-count (.tokens result)) 1)))))
   0)
 
-(defn preprocess [(p (mut PP)) (file (slice u8)) (source (slice u8))] (-> PPResult)
+(defn pp-result [(p (mut PP))] (-> PPResult)
+  (PPResult :tokens (load (field p out))
+    :failed (load (field p failed))
+    :message (load (field p message))
+    :file (load (field p file))
+    :line (load (field p line))))
+
+;; Reads one source file into the token stream, leaving the stream open.
+(defn pp-read [(p (mut PP)) (file (slice u8)) (source (slice u8))] (-> PPResult)
   (let [result (lex/lex (load (field p a)) file source)]
     (if (lex/lex-failed? result)
         (PPResult :tokens (load (field p out))
@@ -1060,6 +1174,20 @@
                    (> (al/al-len [Conditional] (load (field p conditionals))) 0))
               (fail! (mut p) "unterminated #if" (tok-at (.tokens result) 0))
               0)
+          (pp-result (mut p))))))
+
+;; A header read ahead of the translation unit, as `-include` does. The end
+;; marker is deliberately not appended: the stream is not finished until the
+;; program itself has been read, and an early one would stop the parser at the
+;; end of the prefix.
+(defn pp-read-prefix [(p (mut PP)) (file (slice u8)) (source (slice u8))] (-> PPResult)
+  (pp-read (mut p) file source))
+
+(defn preprocess [(p (mut PP)) (file (slice u8)) (source (slice u8))] (-> PPResult)
+  (let [r (pp-read (mut p) file source)]
+    (if (!= (.failed r) 0)
+        r
+        (do
           (al/al-push! [lex/Token]
                        (mut (field p out))
                        (lex/Token :kind lex/TK-EOF
@@ -1069,8 +1197,4 @@
                          :column 1
                          :at-line-start 1
                          :preceded-by-space 0))
-          (PPResult :tokens (load (field p out))
-            :failed (load (field p failed))
-            :message (load (field p message))
-            :file (load (field p file))
-            :line (load (field p line)))))))
+          (pp-result (mut p))))))
