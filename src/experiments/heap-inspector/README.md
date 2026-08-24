@@ -1,69 +1,152 @@
-# Heap inspector
+# Coil heap inspector
 
-A whole-program transform inspired by `lang-with-inspector`. It recognizes the
-*checked declaration* `coil.alloc/create [T]` (not its spelling) when `T` is a
-concrete struct. `box` expands through `create`, so it is included naturally.
-Successful `Option` results are registered without changing payload layout;
-failure remains `None`. Arguments are evaluated once. The matching checked
-`coil.alloc/destroy` unregisters immediately before destruction.
+An opt-in whole-program metaprogram that adds a live allocation inspector to an
+ordinary Coil program. It borrows the product shape of `lang-with-inspector`—a
+viewer attached to a running process—but follows Coil's allocator-oriented memory
+model rather than adding managed objects, per-type arenas, or garbage collection.
 
 ```sh
-cd /path/to/coil-experiments
-coil build src/experiments/heap-inspector/demo.coil \
-  -o /tmp/heap-inspector-demo --use experiments.heap-inspector.transform
-/tmp/heap-inspector-demo
-# or: src/experiments/heap-inspector/scripts/demo.sh
+coil build app.coil -o app --use experiments.heap-inspector.transform
+./app
+# heap inspector: http://127.0.0.1:7391
 ```
 
-The JIT demo submits inspector queries at runtime. The host exports the inspector
-functions so submitted forms can resolve them. On Linux x86-64 it must also link
-LLVM because `coil.jit` uses Coil's LLVM MCJIT backend:
+The application source, Coil compiler, and standard library are unchanged. Removing
+`--use` removes the census, generated metadata, server, and viewer.
 
-```sh
-coil build src/experiments/heap-inspector/jit_demo.coil \
-  -o /tmp/heap-inspector-jit \
-  --use experiments.heap-inspector.transform \
-  --link-flag "-L$(llvm-config --libdir)" \
-  --link-flag -lLLVM --link-flag -lm \
-  --link-flag -Wl,--export-dynamic
-/tmp/heap-inspector-jit
-```
+## Contract
 
-On macOS arm64, omit the LLVM flags and use
-`--link-flag -Wl,-export_dynamic`. The ordinary demo deliberately does not
-import `coil.jit`: source-linking the compiler into a binary is expensive when
-runtime query submission is not being demonstrated.
+The inspector sees every successful operation made through the checked
+`coil.alloc` protocol boundary: `raw-alloc`, `raw-resize`, `raw-remap`, and
+`raw-free`.
 
-The side registry assigns monotonically increasing instance IDs and records the
-pointer, type ID, and live bit. Generated metadata contains compile-time type
-text, `sizeof`, `alignof`, field count/names/types, plus a type-specific callback.
-Field metadata is queryable at runtime and includes each field's index, name,
-type text, and byte offset. Coil's current field reflection preserves concrete
-type arguments for fields of a generic instantiation, but reports only the base
-name for an ordinary field such as `(slice u8)` or `(ptr Point)`. The callback
-safely prints i64, bool, f64, and pointer fields; slices and other unsupported
-field kinds are explicitly shown as unsupported rather than reinterpreted.
-Nested structs by value are not recursively formatted; pointers to nested
-structs are shown as addresses. The fixed registry supports 256 type
-records and 4096 instances and is single-threaded.
+The transform recognizes checked declarations, not names or import spellings. It
+rewrites the boundary calls inside the checked `coil.alloc` module for this build,
+so `alloc`, `alloc-bytes`, `create`, `box`, `free`, `resize`, `remap`, `reallocate`,
+collection backing storage, and custom `Allocator` implementations flowing through
+those APIs are covered without enumerating convenience functions.
 
-Stable non-generic output APIs are `inspector-list-types`,
-`inspector-list-instances`, and `inspector-inspect`. The JIT demo keeps one
-`JitSession`, submits complete forms calling these APIs when `jit-supported?`,
-and clearly reports the unsupported path. The query forms declare `extern` C
-symbols and call back into the host registry; importing the runtime into the JIT
-would incorrectly create a second set of static cells. The host must therefore
-export those symbols dynamically. Executing Coil's JIT currently supports
-macOS arm64 and Linux x86-64.
+Each user module also receives a lazily initialized catalog for its concrete struct
+declarations. This lets runtime type IDs from generic collection storage—such as
+`(ArrayList Project)` allocating inside the standard library—resolve back to qualified
+names and field layouts even though the concrete allocation call is not written in the
+user module.
 
-## Exact surface and limitations
+This is deliberately not a global hook in Coil and does not modify `coil.alloc` on
+disk. It is an orthogonal compilation transform.
 
-Only typed `create [concrete-struct]` is tracked: not `alloc-slice`, arrays,
-primitives, stack/static, `raw-alloc`, direct malloc/casts, or primitive heap
-allocation. Concrete generic struct instantiations are eligible when exposed by
-the checked type model. Calls bypassing `destroy` (`raw-free`, direct `free`) are
-not observable, nor is arena bulk reset; arena `destroy` itself is a no-op but
-still removes the logical registry entry. Escaped pointers can therefore outlive
-or underlive registry information. There is no concurrency synchronization.
-This is precise instrumentation of the supported API surface, not universal
-liveness tracking.
+> Every live allocation made through the transformed program's `coil.alloc`
+> protocol is enumerable. Memory obtained directly from libc, a foreign library,
+> `primitive` allocation, stack/static storage, or another bypass is not.
+
+## Viewer and query model
+
+The transform injects a localhost HTTP server into `main`. The viewer polls a
+structured snapshot containing:
+
+- live allocation ID and address;
+- process-local typed allocation ID;
+- element count, byte size, and alignment;
+- concrete struct name, size, alignment, and field layout when statically known;
+- generated values for i64, bool, f64, and pointer fields;
+- raw allocation records even when structured type metadata is unavailable;
+- total live allocation count and bytes.
+
+The JSON endpoint is `GET /api/snapshot`. The HTML viewer is `GET /`. The UI is
+ordinary, separately maintained `index.html`, `app.js`, and `style.css` under
+`viewer/`; Coil only serves those files. Set `COIL_HEAP_INSPECTOR_VIEWER` to that
+directory when the program runs from somewhere other than the repository root.
+
+The viewer provides a live allocation/byte history, searchable type navigation,
+a size-weighted address map, sortable allocation census, type-layout memory map,
+raw-byte display, and a focused value inspector. Polling pauses while the tab is
+hidden and can also be paused explicitly from the toolbar.
+
+### Byte buffers and slice references
+
+Selecting any live allocation opens a paged hex and ASCII memory explorer. The
+viewer reads at most 256 bytes per request, so large `u8` buffers can be explored
+without copying their entire contents into every snapshot. Addresses and offsets
+are read while the registry lock proves the allocation is still live.
+
+The snapshot also derives slice references from direct `slice` fields in reflected
+live heap objects. For each reference it reports the target allocation, interior
+offset, length, source allocation, source type, source slot, and field name. The
+viewer highlights covered bytes and lets a reference jump directly to its target
+offset. Multiple slices may overlap or point into the same allocation.
+
+This reference list is intentionally described as **discovered slices**, not all
+slices. Allocator interception provides a complete census of allocations made
+through the transformed `coil.alloc` boundary, but it cannot enumerate slice
+descriptors that exist only on a stack or in registers. Direct fields in known
+heap layouts are discoverable; slices hidden in foreign, unreflected, or nested
+container layouts require additional reflected traversal rules before they can be
+reported. The underlying byte-buffer allocation remains authoritative even when
+no slice reference is discoverable.
+
+Allocation IDs are monotonically increasing and never reused. A successful free
+retires the record before the underlying allocator can reclaim or reuse its address.
+Resize updates the existing record. Remap preserves its allocation ID while changing
+the address and request metadata.
+
+## Consistency and threading
+
+Registry changes and snapshots use a static-storage spin mutex implemented with
+`coil.atomic`. Census bookkeeping remains in static storage. The serialized response
+uses a reusable geometrically growing buffer owned by the inspector runtime, which
+the transform excludes from observation, so it cannot recursively enter the census.
+Free cannot race a snapshot into dereferencing reclaimed
+storage: it must retire the entry under the same lock before delegating.
+
+The snapshot currently has **weak field consistency**. Ordinary program writes do
+not take the registry lock, so fields from a concurrently-mutating allocation may
+come from slightly different instants. The allocation itself remains valid for the
+duration of serialization. This is appropriate for an observational Coil tool and
+does not impose a stop-the-world protocol on programs. A later opt-in quiescence
+policy can strengthen field consistency without changing the allocator census.
+
+The registry is intentionally bounded at 4,096 allocation events, 256 reflected
+types, and 4,096 fields. Capacity exhaustion drops new census records rather than
+writing out of bounds. The JSON response buffer grows as needed and has no fixed
+snapshot-size ceiling.
+
+## Coil-specific semantics
+
+This is an allocation inspector, not a language object browser:
+
+- Typed slices are one allocation with `count > 1`, not many objects.
+- `alloc-bytes` has type ID zero and is shown as raw bytes.
+- Pointer fields are edges/addresses; ownership is not inferred.
+- Struct metadata is generated where the checked program exposes a concrete struct
+  allocation type.
+- A bump arena may accept logical frees while retaining physical storage. The census
+  records protocol liveness: after `raw-free`, the allocation is no longer live even
+  if that allocator retains its backing bytes.
+- Arena bulk reset performed outside the allocator protocol cannot be observed.
+
+There is no garbage collector, reachability analysis, tracing root set, moving
+objects, or hidden ownership model.
+
+## Current files
+
+- `transform.coil` — semantic discovery, allocator-boundary rewriting, metadata
+  generation, and viewer boot injection.
+- `runtime.coil` — census, synchronization, structured serialization, and legacy
+  stdout/JIT query functions.
+- `viewer.coil` — background localhost HTTP server and asset/API routing.
+- `viewer/` — separate HTML, JavaScript, and CSS viewer assets.
+- `demo.coil` — typed allocations, inspection, snapshot, and free behavior.
+- `jit_demo.coil` — runtime query submission through Coil JIT.
+
+## Remaining production work
+
+- Dynamic/segmented registry storage with recursion-safe bootstrap allocation.
+- Rendering for all Coil scalar widths, slices, arrays, sums, nested values, and
+  concrete generic field types.
+- Allocator-instance identity and grouping in the viewer.
+- Observable arena lifecycle/reset where an existing checked API provides it.
+- Configurable bind address/port and authentication before non-loopback binding.
+- Browser and concurrency stress tests.
+
+The architectural constraint remains fixed: this stays an opt-in transparent
+metaprogram; none of it belongs in Coil core or `coil.alloc`.

@@ -1,18 +1,33 @@
 (module experiments.heap-inspector.runtime)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
+(import "coil.atomic" :as atomic)
+(import "coil.arraylist" :as arraylist)
 (import "coil.slice" :use *)
 (import "coil.result" :use *)
 
 (extern printf :cc c [(ptr i8) ...] (-> i32))
+(extern realloc :cc c [(ptr i8) i64] (-> (ptr i8)))
 
 (defstruct Entry
   [(id i64)
    (p (ptr i8))
    (type-id i64)
+   (count i64)
+   (initialized i64)
+   (container-kind i64)
+   (bytes i64)
+   (align i64)
    (live bool)
    (show (fnptr c [(ptr i8)] i64))])
-(defstruct TypeInfo [(name (slice u8)) (size i64) (align i64) (fields i64)])
+(defstruct TypeInfo
+  [(name (slice u8))
+   (runtime-id i64)
+   (size i64)
+   (align i64)
+   (fields i64)
+   (show (fnptr c [(ptr i8)] i64))
+   (json (fnptr c [(ptr i8)] i64))])
 (defstruct FieldInfo
   [(type-id i64)
    (index i64)
@@ -36,85 +51,446 @@
   (primitive/alloc-static i64))
 (defn next-id [] (-> (ptr i64))
   (primitive/alloc-static i64))
+(defn registry-lock [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+(defn json-buffer-cell [] (-> (ptr (ptr u8)))
+  (primitive/alloc-static (ptr u8)))
+(defn json-buffer [] (-> (ptr u8))
+  (load (json-buffer-cell)))
+(defn json-capacity [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+(defn json-length [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+(defn json-failed [] (-> (ptr bool))
+  (primitive/alloc-static bool))
+
+; The registry cannot allocate through `coil.alloc`: doing so would recursively
+; inspect its own bookkeeping. A tiny spin mutex over static storage is sufficient
+; for this bounded experiment and makes allocation/free updates atomic with queries.
+(defn lock! [] (-> i64)
+  (loop (if (= (atomic/atomic-cas (registry-lock) 0 1) 0) (break) 0))
+  0)
+(defn unlock! [] (-> i64) (atomic/atomic-store (registry-lock) 0))
+
+; The response buffer belongs to the excluded inspector runtime, grows geometrically,
+; and is reused between requests. It never crosses the transformed allocator boundary,
+; so serializing the census cannot recursively add itself to the census.
+(defn json-ensure! [(needed i64)] (-> bool)
+  (if (<= needed (load (json-capacity)))
+      true
+      (let [(mut capacity) (if (> (load (json-capacity)) 0) (load (json-capacity)) 65536)]
+        (loop (if (>= (load capacity) needed)
+                  (break)
+                  (set! capacity (* (load capacity) 2))))
+        (let [p (realloc (primitive/cast (ptr i8) (json-buffer)) (load capacity))]
+          (if (= (primitive/cast i64 p) 0)
+              (do (set! (json-failed) true) false)
+              (do (set! (json-buffer-cell) (primitive/cast (ptr u8) p))
+                  (set! (json-capacity) (load capacity))
+                  true))))))
+(defn json-reset! [] (-> i64) (set! (json-length) 0) (set! (json-failed) false))
+(defn json-byte! [(c u8)] (-> i64)
+  (let [n (load (json-length))]
+    (if (and (not (load (json-failed))) (json-ensure! (+ n 1)))
+        (do (set! (primitive/index (json-buffer) n) c)
+            (set! (json-length) (+ n 1)))
+        0)))
+(defn json-text! [(s (slice u8))] (-> i64)
+  (for [i 0 (slice-len s)] (json-byte! (slice-get s i)))
+  0)
+(defn json-quoted! [(s (slice u8))] (-> i64)
+  (json-byte! (primitive/cast u8 #\"))
+  (for [i 0 (slice-len s)]
+    (let [c (slice-get s i)]
+      (if (or (= (primitive/cast i64 c) 34) (= (primitive/cast i64 c) 92))
+          (do (json-byte! (primitive/cast u8 #\\)) (json-byte! c))
+          (if (< (primitive/cast i64 c) 32) (json-byte! (primitive/cast u8 32)) (json-byte! c)))))
+  (json-byte! (primitive/cast u8 #\"))
+  0)
+(defn json-slice-value! [T] [(s (slice T))] (-> i64)
+  (if (= (primitive/sizeof T) 1)
+      (do
+        (json-text! "{\"sliceAddress\":")
+        (json-int! (primitive/cast i64 (slice-data s)))
+        (json-text! ",\"length\":")
+        (json-int! (slice-len s))
+        (json-text! ",\"text\":")
+        (json-quoted! (slice-new (primitive/cast (ptr u8) (slice-data s)) (slice-len s)))
+        (json-byte! (primitive/cast u8 #\})))
+      (do
+        (json-text! "{\"address\":")
+        (json-int! (primitive/cast i64 (slice-data s)))
+        (json-text! ",\"length\":")
+        (json-int! (slice-len s))
+        (json-byte! (primitive/cast u8 #\})))))
+(defn json-nat! [(v i64)] (-> i64)
+  (let [digits (primitive/alloc-stack (array u8 24))
+        (mut n) 0
+        (mut x) v]
+    (if (= (load x) 0)
+        (json-byte! (primitive/cast u8 #\0))
+        (do
+          (loop (if (<= (load x) 0)
+                    (break)
+                    (do
+                      (set! (primitive/index digits (load n)) (primitive/cast u8 (+ 48 (% (load x) 10))))
+                      (set! n (+ (load n) 1))
+                      (set! x (/ (load x) 10)))))
+          (loop (if (<= (load n) 0)
+                    (break)
+                    (do (set! n (- (load n) 1)) (json-byte! (load (primitive/index digits (load n)))))))))
+    0))
+(defn json-int! [(v i64)] (-> i64)
+  (if (< v 0) (do (json-byte! (primitive/cast u8 #\-)) (json-nat! (- 0 v))) (json-nat! v)))
+(extern snprintf :cc c [(ptr i8) i64 (ptr i8) ...] (-> i32))
+(defn json-f64! [(v f64)] (-> i64)
+  (let [buf (primitive/alloc-stack (array i8 64))
+        n (snprintf (primitive/index buf 0) 64 c"%.17g" v)]
+    (if (> n 0)
+        (json-text! (slice-new (primitive/cast (ptr u8) (primitive/index buf 0)) (primitive/cast i64 n)))
+        (json-text! "null"))))
+(defn json-pointer! [(p (ptr i8))] (-> i64)
+  (if (= (primitive/cast i64 p) 0)
+      (json-text! "null")
+      (do (json-text! "{\"pointer\":") (json-int! (primitive/cast i64 p)) (json-byte! (primitive/cast u8 #\})))))
+
+(defn type-index-for-runtime-id [(runtime-id i64)] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
+    (loop (if (>= (load i) (load (type-n)))
+              (break)
+              (if (= (.runtime-id (primitive/index (types) (load i))) runtime-id)
+                  (do (set! found (load i)) (break))
+                  (set! i (+ (load i) 1)))))
+    (load found)))
+
+(defn entry-containing [(address i64)] (-> (ptr Entry))
+  (let [(mut i) 0 (mut found) (primitive/cast (ptr Entry) 0)]
+    (loop (if (>= (load i) (load (entry-n)))
+              (break)
+              (let [e (primitive/index (entries) (load i))
+                    start (primitive/cast i64 (.p e))]
+                (if (and (.live e) (>= address start) (< address (+ start (.bytes e))))
+                    (do (set! found e) (break))
+                    (set! i (+ (load i) 1))))))
+    (load found)))
+
+(defn json-slice-references-to! [(target (ptr Entry))] (-> i64)
+  (json-text! ",\"sliceRefs\":[")
+  (let [(mut first) true
+        target-start (primitive/cast i64 (.p target))
+        target-end (+ (primitive/cast i64 (.p target)) (.bytes target))]
+    (for [i 0 (load (entry-n))]
+      (let [source (primitive/index (entries) i)
+            ti (type-index-for-runtime-id (.type-id source))]
+        (if (and (.live source) (>= ti 0))
+            (let [t (primitive/index (types) ti)
+                  visible (if (>= (.initialized source) 0) (.initialized source) (.count source))]
+              (for [slot 0 visible]
+                (for [j 0 (load (field-n))]
+                  (let [f (primitive/index (fields) j)]
+                    (if (and (= (.type-id f) ti) (= (.type-name f) "slice"))
+                        (let [base (primitive/index (.p source) (+ (* slot (.size t)) (.offset f)))
+                              address (primitive/cast i64 (load (primitive/cast (ptr (ptr i8)) base)))
+                              length (load (primitive/cast (ptr i64) (primitive/index base 8)))
+                              in-target (and (>= address target-start) (< address target-end))]
+                          (if (and (!= address 0) (>= length 0) in-target)
+                              (do
+                                (if (load first) (set! first false) (json-byte! (primitive/cast u8 #\,)))
+                                (json-text! "{\"allocationId\":") (json-int! (.id target))
+                                (json-text! ",\"offset\":") (json-int! (- address target-start))
+                                (json-text! ",\"length\":") (json-int! length)
+                                (json-text! ",\"sourceAllocationId\":") (json-int! (.id source))
+                                (json-text! ",\"sourceType\":") (json-quoted! (.name t))
+                                (json-text! ",\"slot\":") (json-int! slot)
+                                (json-text! ",\"field\":") (json-quoted! (.name f))
+                                (json-byte! (primitive/cast u8 #\})))
+                              0))
+                        0)))))
+            0)))
+  (json-byte! (primitive/cast u8 #\]))
+  0))
+
+(defn json-entry-value! [(e (ptr Entry))] (-> i64)
+  (let [ti (type-index-for-runtime-id (.type-id e))]
+    (json-text! "\"value\":")
+    (if (>= ti 0)
+        (let [t (primitive/index (types) ti)]
+          (if (= (if (>= (.initialized e) 0) (.initialized e) (.count e)) 1)
+              (primitive/call-ptr (.json t) (.p e))
+              (do
+                (json-byte! (primitive/cast u8 #\[))
+                (let [visible (if (>= (.initialized e) 0) (.initialized e) (.count e))
+                      limit (if (< visible 64) visible 64)]
+                  (for [item 0 limit]
+                    (do
+                      (if (> item 0) (json-byte! (primitive/cast u8 #\,)) 0)
+                      (primitive/call-ptr (.json t) (primitive/index (.p e) (* item (.size t)))))))
+                (json-byte! (primitive/cast u8 #\])))))
+        (do
+          (json-text! "{\"bytes\":[")
+          (let [limit (if (< (.bytes e) 64) (.bytes e) 64)]
+            (for [byte 0 limit]
+              (do (if (> byte 0) (json-byte! (primitive/cast u8 #\,)) 0)
+                  (json-int! (primitive/cast i64 (load (primitive/index (.p e) byte))))))
+            (json-text! "],\"shown\":") (json-int! limit)
+            (json-text! ",\"total\":") (json-int! (.bytes e))
+            (json-byte! (primitive/cast u8 #\})))))
+  0))
+
+(defn inspector-memory [(id i64) (offset i64)] (-> (slice u8))
+  (lock!)
+  (json-reset!)
+  (let [(mut i) 0 (mut found) false]
+    (loop (if (>= (load i) (load (entry-n)))
+              (break)
+              (let [e (primitive/index (entries) (load i))]
+                (if (and (.live e) (= (.id e) id))
+                    (let [start (if (< offset 0) 0 (if (> offset (.bytes e)) (.bytes e) offset))
+                          remaining (- (.bytes e) start)
+                          length (if (< remaining 256) remaining 256)]
+                      (json-text! "{\"id\":") (json-int! id)
+                      (json-text! ",\"offset\":") (json-int! start)
+                      (json-text! ",\"length\":") (json-int! length)
+                      (json-text! ",\"total\":") (json-int! (.bytes e))
+                      (json-text! ",\"bytes\":[")
+                      (for [byte 0 length]
+                        (do (if (> byte 0) (json-byte! (primitive/cast u8 #\,)) 0)
+                            (json-int! (primitive/cast i64 (load (primitive/index (.p e) (+ start byte)))))))
+                      (json-text! "]}")
+                      (set! found true)
+                      (break))
+                    (set! i (+ (load i) 1))))))
+    (if (not (load found)) (json-text! "{\"error\":\"allocation is not live\"}") 0))
+  (unlock!)
+  (slice-new (json-buffer) (load (json-length))))
+
+(defn inspector-allocation-snapshot [(id i64)] (-> (slice u8))
+  (lock!)
+  (json-reset!)
+  (let [(mut i) 0 (mut found) false]
+    (loop (if (>= (load i) (load (entry-n)))
+              (break)
+              (let [e (primitive/index (entries) (load i))]
+                (if (and (.live e) (= (.id e) id))
+                    (do (json-text! "{\"id\":") (json-int! id) (json-byte! (primitive/cast u8 #\,))
+                        (json-entry-value! e)
+                        (let [ti (type-index-for-runtime-id (.type-id e))]
+                          (if (or (< ti 0) (= (.size (primitive/index (types) ti)) 1))
+                              (json-slice-references-to! e)
+                              (json-text! ",\"sliceRefs\":[]")))
+                        (json-byte! (primitive/cast u8 #\}))
+                        (set! found true)
+                        (break))
+                    (set! i (+ (load i) 1))))))
+    (if (not (load found)) (json-text! "{\"error\":\"allocation is not live\"}") 0))
+  (unlock!)
+  (slice-new (json-buffer) (load (json-length))))
+
+(defn inspector-snapshot [] (-> (slice u8))
+  (lock!)
+  (json-reset!)
+  (json-text! "{\"types\":[")
+  (for [i 0 (load (type-n))]
+    (let [t (primitive/index (types) i) (mut live) 0 (mut slots) 0]
+      (if (> i 0) (json-byte! (primitive/cast u8 #\,)) 0)
+      (for [j 0 (load (entry-n))]
+        (let [e (primitive/index (entries) j)]
+          (if (and (.live e) (= (.type-id e) (.runtime-id t)))
+              (do (set! live (+ (load live) 1))
+                  (set! slots (+ (load slots) (.count e))))
+              0)))
+      (json-text! "{\"id\":") (json-int! i)
+      (json-text! ",\"runtimeId\":") (json-int! (.runtime-id t))
+      (json-text! ",\"name\":") (json-quoted! (.name t))
+      (json-text! ",\"size\":") (json-int! (.size t))
+      (json-text! ",\"align\":") (json-int! (.align t))
+      (json-text! ",\"live\":") (json-int! (load live))
+      (json-text! ",\"regions\":") (json-int! (load live))
+      (json-text! ",\"slots\":") (json-int! (load slots))
+      (json-text! ",\"fields\":[")
+      (let [(mut first) true]
+        (for [j 0 (load (field-n))]
+          (let [f (primitive/index (fields) j)]
+            (if (= (.type-id f) i)
+                (do
+                  (if (load first) (set! first false) (json-byte! (primitive/cast u8 #\,)))
+                  (json-text! "{\"index\":") (json-int! (.index f))
+                  (json-text! ",\"name\":") (json-quoted! (.name f))
+                  (json-text! ",\"type\":") (json-quoted! (.type-name f))
+                  (json-text! ",\"offset\":") (json-int! (.offset f))
+                  (json-byte! (primitive/cast u8 #\})))
+                0))))
+      (json-text! "]}")))
+  (json-text! "],\"allocations\":[")
+  (let [(mut first) true (mut total-bytes) 0 (mut live-count) 0]
+    (for [i 0 (load (entry-n))]
+      (let [e (primitive/index (entries) i)]
+        (if (.live e)
+            (do
+              (if (load first) (set! first false) (json-byte! (primitive/cast u8 #\,)))
+              (set! total-bytes (+ (load total-bytes) (.bytes e)))
+              (set! live-count (+ (load live-count) 1))
+              (json-text! "{\"id\":") (json-int! (.id e))
+              (json-text! ",\"address\":") (json-int! (primitive/cast i64 (.p e)))
+              (json-text! ",\"typeId\":") (json-int! (.type-id e))
+              (let [ti (type-index-for-runtime-id (.type-id e))]
+              (json-text! ",\"type\":")
+                (if (>= ti 0) (json-quoted! (.name (primitive/index (types) ti))) (json-text! "null")))
+              (json-text! ",\"count\":") (json-int! (.count e))
+              (json-text! ",\"initialized\":")
+              (if (>= (.initialized e) 0) (json-int! (.initialized e)) (json-text! "null"))
+              (json-text! ",\"container\":")
+              (if (= (.container-kind e) 1) (json-quoted! "ArrayList") (json-text! "null"))
+              (json-text! ",\"bytes\":") (json-int! (.bytes e))
+              (json-text! ",\"align\":") (json-int! (.align e))
+              (json-byte! (primitive/cast u8 #\})))
+            0)))
+    (json-byte! (primitive/cast u8 #\]))
+    (json-text! ",\"summary\":{\"allocations\":") (json-int! (load live-count))
+    (json-text! ",\"bytes\":") (json-int! (load total-bytes)) (json-text! "}}"))
+  (unlock!)
+  (slice-new (json-buffer) (load (json-length))))
 
 (defn print-text [(s (slice u8))] (-> i64)
   (printf c"%.*s" (slice-len s) (slice-data s))
   0)
 
-(defn register-type [(name (slice u8)) (size i64) (align i64) (fields i64)] (-> i64)
+(defn show-raw [(p (ptr i8))] (-> i64)
+  (printf c"raw allocation at 0x%lx\n" (primitive/cast i64 p))
+  0)
+
+(defn register-type [(name (slice u8))
+                     (runtime-id i64)
+                     (size i64)
+                     (align i64)
+                     (fields i64)
+                     (show (fnptr c [(ptr i8)] i64))
+                     (json (fnptr c [(ptr i8)] i64))] (-> i64)
+  (lock!)
   (let [(mut i) 0
         (mut found) -1]
     (loop (if (>= (load i) (load (type-n)))
               (break)
               (let [t (primitive/index (types) (load i))]
-                (if (and (= (.name t) name)
-                         (and (= (.size t) size) (= (.align t) align)))
+                (if (= (.runtime-id t) runtime-id)
                     (do (set! found (load i)) (break))
                     (set! i (+ (load i) 1))))))
     (if (>= (load found) 0)
-        (load found)
+        (do (unlock!) (load found))
         (let [id (load (type-n))
-              t (primitive/index (types) id)]
-          (set! (.name t) name)
-          (set! (.size t) size)
-          (set! (.align t) align)
-          (set! (.fields t) fields)
-          (set! (type-n) (+ id 1))
-          id))))
+              t (if (< id 256) (primitive/index (types) id) (primitive/cast (ptr TypeInfo) 0))]
+          (if (>= id 256)
+              (do (unlock!) -1)
+              (do
+                (set! (.name t) name)
+                (set! (.runtime-id t) runtime-id)
+                (set! (.size t) size)
+                (set! (.align t) align)
+                (set! (.fields t) fields)
+                (set! (.show t) show)
+                (set! (.json t) json)
+                (set! (type-n) (+ id 1))
+                (unlock!)
+                id))))))
 
 (defn register-field [(tid i64)
                       (index i64)
                       (name (slice u8))
                       (type-name (slice u8))
                       (offset i64)] (-> i64)
-  (let [(mut i) 0
-        (mut found) false]
-    (loop (if (>= (load i) (load (field-n)))
-              (break)
-              (let [f (primitive/index (fields) (load i))]
-                (if (and (= (.type-id f) tid) (= (.index f) index))
-                    (do (set! found true) (break))
-                    (set! i (+ (load i) 1))))))
-    (if (load found)
-        0
-        (let [at (load (field-n))
-              f (primitive/index (fields) at)]
-          (set! (.type-id f) tid)
-          (set! (.index f) index)
-          (set! (.name f) name)
-          (set! (.type-name f) type-name)
-          (set! (.offset f) offset)
-          (set! (field-n) (+ at 1))
-          0))))
+  (if (< tid 0)
+      0
+      (do
+        (lock!)
+        (let [(mut i) 0
+              (mut found) false]
+          (loop (if (>= (load i) (load (field-n)))
+                    (break)
+                    (let [f (primitive/index (fields) (load i))]
+                      (if (and (= (.type-id f) tid) (= (.index f) index))
+                          (do (set! found true) (break))
+                          (set! i (+ (load i) 1))))))
+          (if (load found)
+              (do (unlock!) 0)
+              (let [at (load (field-n))]
+                (if (>= at 4096)
+                    (do (unlock!) -1)
+                    (let [f (primitive/index (fields) at)]
+                      (set! (.type-id f) tid)
+                      (set! (.index f) index)
+                      (set! (.name f) name)
+                      (set! (.type-name f) type-name)
+                      (set! (.offset f) offset)
+                      (set! (field-n) (+ at 1))
+                      (unlock!)
+                      0))))))))
 
 ;; Generated allocation sites call this marker. Keeping the original `create`
 ;; beneath a semantically recognizable runtime call makes the transform fixpoint-safe.
 (defn track-create [T] [(o (Option (ptr T)))
                         (tid i64)
                         (show (fnptr c [(ptr i8)] i64))] (-> (Option (ptr T)))
-  (match o
-    (None [] (None))
-    (Some [p]
-          (do (register-instance (primitive/cast (ptr i8) p) tid show) (Some p)))))
+  o)
+(defn track-alloc [T] [(o (Option (slice T)))
+                       (tid i64)
+                       (show (fnptr c [(ptr i8)] i64))] (-> (Option (slice T)))
+  o)
+(defn track-arraylist-push [T] [(result i64)
+                                (list (mut (arraylist/ArrayList T)))
+                                (tid i64)] (-> i64)
+  (if (< tid 0)
+      result
+      (do
+        (lock!)
+        (let [p (primitive/cast (ptr i8) (load (field list data)))
+              e (find-live-entry p)
+              t (primitive/index (types) tid)]
+          (if (= (primitive/cast i64 e) 0)
+              0
+              (do (set! (.type-id e) (.runtime-id t))
+                  (set! (.container-kind e) 1)
+                  (set! (.initialized e) (load (field list len))))))
+        (unlock!)
+        result)))
 
 (defn track-destroy [T] [(a (dyn alloc/Allocator)) (p (ptr T))] (-> i64)
-  (unregister-instance (primitive/cast (ptr i8) p))
   (alloc/destroy [T] a p))
 
 (defn register-instance [(p (ptr i8)) (tid i64) (show (fnptr c [(ptr i8)] i64))] (-> i64)
-  (let [i (load (entry-n))
-        e (primitive/index (entries) i)
+  (register-allocation p (alloc/AllocRequest :type-id tid :count 1 :bytes 0 :align 0) show))
+
+(defn register-allocation [(p (ptr i8))
+                           (request alloc/AllocRequest)
+                           (show (fnptr c [(ptr i8)] i64))] (-> i64)
+  (lock!)
+  (let [(mut scan) 0 (mut reusable) -1
         id (+ (load (next-id)) 1)]
-    (set! (next-id) id)
-    (set! (.id e) id)
-    (set! (.p e) p)
-    (set! (.type-id e) tid)
-    (set! (.live e) true)
-    (set! (.show e) show)
-    (set! (entry-n) (+ i 1))
-    id))
+    (loop (if (>= (load scan) (load (entry-n)))
+              (break)
+              (if (not (.live (primitive/index (entries) (load scan))))
+                  (do (set! reusable (load scan)) (break))
+                  (set! scan (+ (load scan) 1)))))
+    (let [i (if (>= (load reusable) 0) (load reusable) (load (entry-n)))]
+    (if (>= i 4096)
+        (do (unlock!) -1)
+        (let [e (primitive/index (entries) i)]
+          (set! (next-id) id)
+          (set! (.id e) id)
+          (set! (.p e) p)
+          (set! (.type-id e) (.type-id request))
+          (set! (.count e) (.count request))
+          (set! (.initialized e) -1)
+          (set! (.container-kind e) 0)
+          (set! (.bytes e) (.bytes request))
+          (set! (.align e) (.align request))
+          (set! (.live e) true)
+          (set! (.show e) show)
+          (if (< (load reusable) 0) (set! (entry-n) (+ i 1)) 0)
+          (unlock!)
+          id)))))
 
 (defn unregister-instance [(p (ptr i8))] (-> i64)
+  (lock!)
   (let [(mut i) 0]
     (loop (if (>= (load i) (load (entry-n)))
               (break)
@@ -123,7 +499,72 @@
                     (set! (.live e) false)
                     0)
                 (set! i (+ (load i) 1)))))
+    (unlock!)
     0))
+
+(defn find-live-entry [(p (ptr i8))] (-> (ptr Entry))
+  (let [(mut i) 0
+        (mut found) (primitive/cast (ptr Entry) 0)]
+    (loop (if (>= (load i) (load (entry-n)))
+              (break)
+              (let [e (primitive/index (entries) (load i))]
+                (if (and (.live e) (= (primitive/cast i64 (.p e)) (primitive/cast i64 p)))
+                    (do (set! found e) (break))
+                    (set! i (+ (load i) 1))))))
+    (load found)))
+
+; These four functions are the transform's runtime markers. The original checked
+; raw operation remains underneath, making the transform fixpoint-safe.
+(defn inspect-raw-alloc [(a (dyn alloc/Allocator)) (request alloc/AllocRequest)] (-> (Option (ptr i8)))
+  (let [result (alloc/raw-alloc a request)]
+    (match result
+      (None [] result)
+      (Some [p] (do (register-allocation p request (primitive/fnptr-of show-raw)) result)))))
+
+(defn inspect-raw-resize [(a (dyn alloc/Allocator))
+                          (memory (ptr i8))
+                          (old alloc/AllocRequest)
+                          (new alloc/AllocRequest)] (-> bool)
+  (let [ok (alloc/raw-resize a memory old new)]
+    (if ok
+        (do (lock!)
+            (let [e (find-live-entry memory)]
+              (if (= (primitive/cast i64 e) 0) 0
+                  (do (set! (.type-id e) (.type-id new))
+                      (set! (.count e) (.count new))
+                      (set! (.bytes e) (.bytes new))
+                      (set! (.align e) (.align new)))))
+            (unlock!) 0)
+        0)
+    ok))
+
+(defn inspect-raw-remap [(a (dyn alloc/Allocator))
+                         (memory (ptr i8))
+                         (old alloc/AllocRequest)
+                         (new alloc/AllocRequest)] (-> (Option (ptr i8)))
+  (let [result (alloc/raw-remap a memory old new)]
+    (match result
+      (None [] result)
+      (Some [p]
+        (do (lock!)
+            (let [e (find-live-entry memory)]
+              (if (= (primitive/cast i64 e) 0)
+                  0
+                  (do (set! (.p e) p)
+                      (set! (.type-id e) (.type-id new))
+                      (set! (.count e) (.count new))
+                      (set! (.bytes e) (.bytes new))
+                      (set! (.align e) (.align new)))))
+            (unlock!)
+            result)))))
+
+(defn inspect-raw-free [(a (dyn alloc/Allocator))
+                        (memory (ptr i8))
+                        (request alloc/AllocRequest)] (-> i64)
+  ; Retire before delegating, so no inspector query can acquire a live entry after
+  ; the underlying allocator is allowed to reclaim or reuse the address.
+  (unregister-instance memory)
+  (alloc/raw-free a memory request))
 
 ;; Stable, non-generic query API. These print to stdout so they are directly callable
 ;; from submitted JIT forms without sharing allocator-owned result memory.
@@ -134,7 +575,7 @@
           (mut live) 0]
       (for [j 0 (load (entry-n))]
         (let [e (primitive/index (entries) j)]
-          (if (and (.live e) (= (.type-id e) i)) (set! live (+ (load live) 1)) 0)))
+          (if (and (.live e) (= (.type-id e) (.runtime-id t))) (set! live (+ (load live) 1)) 0)))
       (printf c"  type=%ld name=" i)
       (print-text (.name t))
       (printf c" size=%ld align=%ld fields=%ld live=%ld\n"
@@ -157,7 +598,9 @@
   (printf c"instances:\n")
   (for [i 0 (load (entry-n))]
     (let [e (primitive/index (entries) i)]
-      (if (.live e) (printf c"  id=%ld type=%ld ptr=0x%lx\n" (.id e) (.type-id e) (primitive/cast i64 (.p e))) 0)))
+      (if (.live e) (printf c"  id=%ld type=%ld ptr=0x%lx count=%ld bytes=%ld align=%ld\n"
+                            (.id e) (.type-id e) (primitive/cast i64 (.p e))
+                            (.count e) (.bytes e) (.align e)) 0)))
   0)
 (defn inspector-inspect [(id i64)] (-> i64)
   (let [(mut i) 0
@@ -168,7 +611,16 @@
                 (if (and (.live e) (= (.id e) id))
                     (do
                       (printf c"id=%ld type=%ld ptr=0x%lx " id (.type-id e) (primitive/cast i64 (.p e)))
-                      (primitive/call-ptr (.show e) (.p e))
+                      (let [(mut j) 0 (mut shown) false]
+                        (loop (if (>= (load j) (load (type-n)))
+                                  (break)
+                                  (let [t (primitive/index (types) (load j))]
+                                    (if (= (.runtime-id t) (.type-id e))
+                                        (do (primitive/call-ptr (.show t) (.p e))
+                                            (set! shown true)
+                                            (break))
+                                        (set! j (+ (load j) 1))))))
+                        (if (load shown) 0 (primitive/call-ptr (.show e) (.p e))))
                       (set! found true)
                       (break))
                     0)
