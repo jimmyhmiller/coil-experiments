@@ -34,8 +34,11 @@ def reference(source: pathlib.Path, work: pathlib.Path) -> tuple[int, str]:
 def native(coil: str, source: pathlib.Path, work: pathlib.Path) -> tuple[int, str, str]:
     generated = work / (source.stem + ".coil")
     binary = work / (source.stem + "-coil")
+    target = ROOT / "src/dialects/c/target"
     lowered = run([coil, "run", str(ROOT / "src/dialects/c/cc.coil"), "--",
-                   str(source), str(generated)])
+                   "-o", str(generated), str(source),
+                   "-include", str(target / "darwin-arm64.h"),
+                   "-include", str(target / "builtins.h")])
     if lowered.returncode or not generated.exists():
         return -1, "", (lowered.stdout + lowered.stderr).strip()
     built = run([coil, "build", str(generated), "-O0", "-o", str(binary)])

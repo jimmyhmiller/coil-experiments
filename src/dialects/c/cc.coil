@@ -1,7 +1,14 @@
 ;; The native C compiler driver: tokenize, preprocess, parse, lower.
 ;;
-;;   coil run src/dialects/c/cc.coil -- input.c output.coil \
+;;   coil run src/dialects/c/cc.coil -- -o out.coil a.c b.c ... \
 ;;     [-Ipath ...] [-Dname[=value] ...] [-include path ...]
+;;
+;; Every translation unit is preprocessed and parsed on its own -- a macro
+;; defined in one file means nothing in the next -- and then all of them are
+;; lowered together into a single Coil module. That is what lets a call in one
+;; file reach a definition in another without a linker of our own: the whole
+;; program is one module, and a `static` name carries its unit's tag so that two
+;; files may each have their own.
 ;;
 ;; The target's predefined macros live in a header of their own
 ;; (src/dialects/c/target/), which the caller force-includes with -include.
@@ -19,11 +26,20 @@
 (import "coil.io" :as io)
 (import "coil.os" :as os)
 (import "coil.result" :use *)
+(import "experiments.c.lex" :as lex)
+(import "experiments.c.node" :as nd)
 (import "experiments.c.pp" :as pp)
 (import "experiments.c.parse" :as ps)
 (import "experiments.c.emit" :as em)
 
-(extern strlen :cc c [(ptr i8)] (-> i64))
+(defstruct Options
+  [(inputs (al/ArrayList (slice u8)))
+   (output (slice u8))
+   (includes (al/ArrayList (slice u8)))
+   (defines (al/ArrayList (slice u8)))
+   ;; Headers read ahead of every translation unit, as `-include` does. This is
+   ;; how the target description reaches the preprocessor.
+   (prefixes (al/ArrayList (slice u8)))])
 
 (defn report [(stage (slice u8))
               (message (slice u8))
@@ -32,17 +48,30 @@
   (println "{s}:{d}: {s}: {s}" file line stage message)
   0)
 
-(defstruct Options
-  [(input (slice u8))
-   (output (slice u8))
-   (includes (al/ArrayList (slice u8)))
-   (defines (al/ArrayList (slice u8)))
-   ;; Headers read ahead of the translation unit, as `-include` does. This is
-   ;; how the target description reaches the preprocessor.
-   (prefixes (al/ArrayList (slice u8)))])
+;; The part of a path that names the file, without directories or extension.
+;; This becomes the tag on the unit's `static` names, so it has to be the same
+;; every time the same file is compiled and different for different files.
+(defn unit-tag [(path (slice u8))] (-> (slice u8))
+  (let [n (slice-len path)
+        (mut start) 0
+        (mut end) n
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (if (= (primitive/cast i64 (slice-get path (load i))) 47)
+                    (store! start (+ (load i) 1))
+                    0)
+                (if (= (primitive/cast i64 (slice-get path (load i))) 46)
+                    (store! end (load i))
+                    0)
+                (store! i (+ (load i) 1)))))
+    (if (<= (load end) (load start))
+        (subslice path (load start) n)
+        (subslice path (load start) (load end)))))
 
-;; Reads each prefix header through the same preprocessor the program will use,
-;; so its definitions are in scope by the time the first real line is read.
+;; Reads each prefix header through the same preprocessor the unit will use, so
+;; its definitions are in scope by the time the first real line is read.
 (defn read-prefixes! [(p (mut pp/PP))
                       (a (dyn alloc/Allocator))
                       (prefixes (al/ArrayList (slice u8)))] (-> i64)
@@ -63,45 +92,81 @@
                 (store! i (+ (load i) 1)))))
     (load bad)))
 
-(defn compile-file [(a (dyn alloc/Allocator)) (opts Options)] (-> i64)
-  (let [input (.input opts)
-        output (.output opts)
-        includes (.includes opts)]
-   (match (fs/read-file a input)
-    (Err [_] (do (println "cannot read {s}" input) 1))
-    (Ok [source]
-        (let [(mut p) (pp/pp-new a)
-              (mut i) 0
-              n (al/al-len [(slice u8)] includes)
-              dn (al/al-len [(slice u8)] (.defines opts))]
-          (loop (if (>= (load i) n)
-                    (break)
-                    (do
-                      (pp/pp-add-include-path (mut p) (al/al-get [(slice u8)] includes (load i)))
-                      (store! i (+ (load i) 1)))))
-          (store! i 0)
-          (loop (if (>= (load i) dn)
-                    (break)
-                    (do
-                      (pp/pp-define-text (mut p) (al/al-get [(slice u8)] (.defines opts) (load i)))
-                      (store! i (+ (load i) 1)))))
-          (read-prefixes! (mut p) a (.prefixes opts))
-          (let [pre (pp/preprocess (mut p) input source)]
-            (if (!= (.failed pre) 0)
-                (do (report "preprocessor" (.message pre) (.file pre) (.line pre)) 1)
-                (let [(mut parser) (ps/parser-new a (.tokens pre))
-                      parsed (ps/parse (mut parser))]
-                  (if (!= (.failed parsed) 0)
-                      (do (report "error" (.message parsed) (.file parsed) (.line parsed)) 1)
-                      (let [emitted (em/emit-program a (.globals parsed) (.init parsed))]
-                        (if (!= (.failed emitted) 0)
-                            (do (report "error" (.message emitted) (.file emitted) (.line emitted)) 1)
-                            (match (fs/write-file a output (.text emitted))
-                              (Err [_] (do (println "cannot write {s}" output) 1))
-                              (Ok [_] 0)))))))))))))
+(defn setup-pp! [(p (mut pp/PP)) (a (dyn alloc/Allocator)) (opts Options)] (-> i64)
+  (let [includes (.includes opts)
+        defines (.defines opts)
+        n (al/al-len [(slice u8)] includes)
+        dn (al/al-len [(slice u8)] defines)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do (pp/pp-add-include-path (mut p) (al/al-get [(slice u8)] includes (load i)))
+                  (store! i (+ (load i) 1)))))
+    (store! i 0)
+    (loop (if (>= (load i) dn)
+              (break)
+              (do (pp/pp-define-text (mut p) (al/al-get [(slice u8)] defines (load i)))
+                  (store! i (+ (load i) 1)))))
+    (read-prefixes! (mut p) a (.prefixes opts))))
 
-;; True when `arg` begins with the one-letter flag `letter`, which is how the
-;; C compiler flags that take an attached value are spelled.
+;; Parses one unit and appends what it declared to the whole program.
+(defn compile-unit! [(a (dyn alloc/Allocator))
+                     (opts Options)
+                     (path (slice u8))
+                     (globals (mut (al/ArrayList (ptr nd/Obj))))
+                     (init (ptr nd/Node))] (-> i64)
+  (match (fs/read-file a path)
+    (Err [_] (do (println "cannot read {s}" path) 1))
+    (Ok [source]
+        (let [(mut p) (pp/pp-new a)]
+          (if (!= (setup-pp! (mut p) a opts) 0)
+              1
+              (let [pre (pp/preprocess (mut p) path source)]
+                (if (!= (.failed pre) 0)
+                    (do (report "preprocessor" (.message pre) (.file pre) (.line pre)) 1)
+                    (let [(mut parser) (ps/parser-new a (.tokens pre) (unit-tag path))
+                          parsed (ps/parse (mut parser))]
+                      (if (!= (.failed parsed) 0)
+                          (do (report "error" (.message parsed) (.file parsed) (.line parsed)) 1)
+                          (let [own (.globals parsed)
+                                n (al/al-len [(ptr nd/Obj)] own)
+                                (mut i) 0]
+                            (loop (if (>= (load i) n)
+                                      (break)
+                                      (do (al/al-push! [(ptr nd/Obj)]
+                                                       (mut globals)
+                                                       (al/al-get [(ptr nd/Obj)] own (load i)))
+                                          (store! i (+ (load i) 1)))))
+                            (nd/push-body! init (.init parsed))
+                            0))))))))))
+
+(defn compile [(a (dyn alloc/Allocator)) (opts Options)] (-> i64)
+  (let [(mut globals) (al/al-new [(ptr nd/Obj)] a)
+        init (nd/node-new a nd/ND-BLOCK (lex/token-none))
+        inputs (.inputs opts)
+        n (al/al-len [(slice u8)] inputs)
+        (mut i) 0
+        (mut bad) 0]
+    (loop (if (or (>= (load i) n) (!= (load bad) 0))
+              (break)
+              (do
+                (store! bad (compile-unit! a
+                                           opts
+                                           (al/al-get [(slice u8)] inputs (load i))
+                                           (mut globals)
+                                           init))
+                (store! i (+ (load i) 1)))))
+    (if (!= (load bad) 0)
+        1
+        (let [emitted (em/emit-program a (load (mut globals)) init)]
+          (if (!= (.failed emitted) 0)
+              (do (report "error" (.message emitted) (.file emitted) (.line emitted)) 1)
+              (match (fs/write-file a (.output opts) (.text emitted))
+                (Err [_] (do (println "cannot write {s}" (.output opts)) 1))
+                (Ok [_] 0)))))))
+
+;; True when `arg` begins with the one-letter flag `letter`, which is how the C
+;; compiler flags that take an attached value are spelled.
 (defn flag? [(arg (slice u8)) (letter i64)] (-> bool)
   (and (>= (slice-len arg) 2)
        (and (= (primitive/cast i64 (slice-get arg 0)) 45)
@@ -110,37 +175,41 @@
 (defn flag-value [(arg (slice u8))] (-> (slice u8))
   (subslice arg 2 (slice-len arg)))
 
+(defn arg-at [(argv (ptr (ptr i8))) (i i64)] (-> (slice u8))
+  (str/cstr->str (load (primitive/index argv i))))
+
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
   (let [a (alloc/malloc-allocator)
+        (mut inputs) (al/al-new [(slice u8)] a)
         (mut includes) (al/al-new [(slice u8)] a)
         (mut defines) (al/al-new [(slice u8)] a)
         (mut prefixes) (al/al-new [(slice u8)] a)
-        (mut input) ""
         (mut output) ""
         (mut i) 1
         n (primitive/cast i64 argc)]
     (loop
       (if (>= (load i) n)
           (break)
-          (let [arg (str/cstr->str (load (primitive/index argv (load i))))]
+          (let [arg (arg-at argv (load i))]
             (cond
               (str/str-eq arg "-include")
                 (do (store! i (+ (load i) 1))
                     (if (< (load i) n)
-                        (al/al-push! [(slice u8)]
-                                     (mut prefixes)
-                                     (str/cstr->str (load (primitive/index argv (load i)))))
+                        (al/al-push! [(slice u8)] (mut prefixes) (arg-at argv (load i)))
                         0))
+              (str/str-eq arg "-o")
+                (do (store! i (+ (load i) 1))
+                    (if (< (load i) n) (store! output (arg-at argv (load i))) 0))
               (flag? arg 73) (al/al-push! [(slice u8)] (mut includes) (flag-value arg))
               (flag? arg 68) (al/al-push! [(slice u8)] (mut defines) (flag-value arg))
-              (= (slice-len (load input)) 0) (store! input arg)
-              :else (store! output arg))
+              :else (al/al-push! [(slice u8)] (mut inputs) arg))
             (store! i (+ (load i) 1)))))
-    (if (or (= (slice-len (load input)) 0) (= (slice-len (load output)) 0))
-        (do (println "usage: cc INPUT.c OUTPUT.coil [-Ipath] [-Dname=value] [-include path]") 2)
-        (compile-file a
-                      (load (Options :input (load input)
-                              :output (load output)
-                              :includes (load (mut includes))
-                              :defines (load (mut defines))
-                              :prefixes (load (mut prefixes))))))))
+    (if (or (= (al/al-len [(slice u8)] (load (mut inputs))) 0)
+            (= (slice-len (load output)) 0))
+        (do (println "usage: cc -o OUT.coil IN.c... [-Ipath] [-Dname=value] [-include path]") 2)
+        (compile a
+                 (load (Options :inputs (load (mut inputs))
+                         :output (load output)
+                         :includes (load (mut includes))
+                         :defines (load (mut defines))
+                         :prefixes (load (mut prefixes))))))))

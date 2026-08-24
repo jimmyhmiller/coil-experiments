@@ -36,6 +36,14 @@
    (defined (hm/HashMap (slice u8) bool))
    (externs (hm/HashMap (slice u8) bool))
    (emitted (hm/HashMap (slice u8) bool))
+   ;; Names the program actually mentions. A header declares far more than any
+   ;; one program uses, and a declaration that is never referred to must not
+   ;; become an `extern`: some of them name types this compiler has no
+   ;; arithmetic for, and all of them would be dead weight.
+   (used (hm/HashMap (slice u8) bool))
+   ;; Names with a definition somewhere in the program, which decides whether a
+   ;; global is storage of ours or a symbol somebody else's object file has.
+   (defined-data (hm/HashMap (slice u8) bool))
    (serial i64)
    (break-labels (al/ArrayList (slice u8)))
    (continue-labels (al/ArrayList (slice u8)))
@@ -151,6 +159,7 @@
           (ct/record? t) (emit-record-storage! (mut e) t)
           ;; Storage only. Anything that computes with one is refused below.
           (= k ct/TY-INT128) (put! (mut e) "(array i64 2)")
+          (= k ct/TY-FLOAT16) (put! (mut e) "(array u8 2)")
           (= k ct/TY-PTR)
             (do (put! (mut e) "(ptr ")
                 (emit-pointee! (mut e) (ct/ty-base t))
@@ -392,7 +401,7 @@
 (defn callee-name [(e (mut Emitter)) (o (ptr nd/Obj))] (-> (slice u8))
   (if (hm/hm-contains? (load (field e defined)) (nd/obj-name o))
       (ident (mut e) "c_fn_" (nd/obj-name o))
-      (nd/obj-name o)))
+      (link-name o)))
 
 (defn emit-expr! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
   (if (= (primitive/cast i64 n) 0)
@@ -404,6 +413,8 @@
           ;; 64 bits would be wrong in a way nothing downstream could catch.
           (and (!= (primitive/cast i64 t) 0) (= (ct/ty-kind t) ct/TY-INT128))
             (fail! (mut e) "128-bit integer arithmetic is not supported" (nd/nd-token n))
+          (and (!= (primitive/cast i64 t) 0) (= (ct/ty-kind t) ct/TY-FLOAT16))
+            (fail! (mut e) "half-precision arithmetic is not supported" (nd/nd-token n))
           (= k nd/ND-NUM)
             (do (put! (mut e) "(primitive/cast ")
                 (emit-type! (mut e) t)
@@ -967,13 +978,19 @@
       (do (hm/hm-put! [(slice u8) bool] (mut (field e externs)) (nd/obj-name o) true)
           (emit-extern-decl! (mut e) o))))
 
+;; The name the linker knows an object by: its own, unless `__asm` gave it
+;; another.
+(defn link-name [(o (ptr nd/Obj))] (-> (slice u8))
+  (let [asm (nd/obj-asm-name o)]
+    (if (> (slice-len asm) 0) asm (nd/obj-name o))))
+
 (defn emit-extern-decl! [(e (mut Emitter)) (o (ptr nd/Obj))] (-> i64)
   (let [ty (nd/obj-type o)
         params (ct/ty-params ty)
         count (al/al-len [(ptr ct/Type)] params)
         (mut i) 0]
     (put! (mut e) "(extern ")
-    (put! (mut e) (nd/obj-name o))
+    (put! (mut e) (link-name o))
     (put! (mut e) " :cc c [")
     (loop (if (>= (load i) count)
               (break)
@@ -989,6 +1006,59 @@
     (put! (mut e) "))\n"))
   0)
 
+;; Records every name the program mentions, so that only the declarations it
+;; needs become externs.
+(defn note-use! [(e (mut Emitter)) (o (ptr nd/Obj))] (-> i64)
+  (if (= (primitive/cast i64 o) 0)
+      0
+      (do (hm/hm-put! [(slice u8) bool] (mut (field e used)) (nd/obj-name o) true) 0)))
+
+(defn collect-uses! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
+  (if (= (primitive/cast i64 n) 0)
+      0
+      (do
+        (if (= (nd/nd-kind n) nd/ND-VAR) (note-use! (mut e) (nd/nd-obj n)) 0)
+        (collect-uses! (mut e) (nd/nd-lhs n))
+        (collect-uses! (mut e) (nd/nd-rhs n))
+        (collect-uses! (mut e) (nd/nd-test n))
+        (collect-uses! (mut e) (nd/nd-then n))
+        (collect-uses! (mut e) (nd/nd-else n))
+        (collect-uses! (mut e) (nd/nd-setup n))
+        (collect-uses! (mut e) (nd/nd-step n))
+        (collect-uses-list! (mut e) (nd/nd-body n))
+        (collect-uses-list! (mut e) (nd/nd-args n))
+        0)))
+
+(defn collect-uses-list! [(e (mut Emitter)) (list (al/ArrayList (ptr nd/Node)))] (-> i64)
+  (let [n (al/al-len [(ptr nd/Node)] list)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do (collect-uses! (mut e) (al/al-get [(ptr nd/Node)] list (load i)))
+                  (store! i (+ (load i) 1))))))
+  0)
+
+(defn used? [(e (mut Emitter)) (o (ptr nd/Obj))] (-> bool)
+  (hm/hm-contains? (load (field e used)) (nd/obj-name o)))
+
+;; A global with no definition anywhere in the program is somebody else's
+;; symbol. Coil has no separate spelling for external data, so the symbol is
+;; declared as a nullary function and its address taken: that is exactly what
+;; the name means to the linker either way.
+(defn emit-extern-global! [(e (mut Emitter)) (o (ptr nd/Obj))] (-> i64)
+  (put! (mut e) "(extern ")
+  (put! (mut e) (link-name o))
+  (put! (mut e) " :cc c [] (-> i8))\n(defn ")
+  (put! (mut e) (ident (mut e) "c_g_" (nd/obj-name o)))
+  (put! (mut e) " [] (-> (ptr ")
+  (emit-type! (mut e) (nd/obj-type o))
+  (put! (mut e) ")) (primitive/cast (ptr ")
+  (emit-type! (mut e) (nd/obj-type o))
+  (put! (mut e) ") (primitive/fnptr-of ")
+  (put! (mut e) (link-name o))
+  (put! (mut e) ")))\n")
+  0)
+
 (defn emit-program [(a (dyn alloc/Allocator))
                     (globals (al/ArrayList (ptr nd/Obj)))
                     (init (ptr nd/Node))] (-> EmitResult)
@@ -998,6 +1068,8 @@
                         :defined (hm/hm-new [(slice u8) bool] a (str/str-keyops))
                         :externs (hm/hm-new [(slice u8) bool] a (str/str-keyops))
                         :emitted (hm/hm-new [(slice u8) bool] a (str/str-keyops))
+                        :used (hm/hm-new [(slice u8) bool] a (str/str-keyops))
+                        :defined-data (hm/hm-new [(slice u8) bool] a (str/str-keyops))
                         :serial 0
                         :break-labels (al/al-new [(slice u8)] a)
                         :continue-labels (al/al-new [(slice u8)] a)
@@ -1007,35 +1079,76 @@
                         :line 0))
         count (al/al-len [(ptr nd/Obj)] globals)
         (mut i) 0]
+    ;; What has a definition, and under which of the two kinds.
     (loop (if (>= (load i) count)
               (break)
               (let [o (al/al-get [(ptr nd/Obj)] globals (load i))]
                 (if (nd/obj-definition? o)
-                    (hm/hm-put! [(slice u8) bool] (mut (field e defined)) (nd/obj-name o) true)
+                    (if (nd/obj-function? o)
+                        (do (hm/hm-put! [(slice u8) bool]
+                                        (mut (field e defined))
+                                        (nd/obj-name o)
+                                        true)
+                            0)
+                        (do (hm/hm-put! [(slice u8) bool]
+                                        (mut (field e defined-data))
+                                        (nd/obj-name o)
+                                        true)
+                            0))
                     0)
+                ;; A string literal has no reference to find it by; its bytes
+                ;; are the reason it exists.
+                (if (nd/obj-string? o) (note-use! (mut e) o) 0)
                 (store! i (+ (load i) 1)))))
+    ;; What the program mentions.
     (store! i 0)
+    (loop (if (>= (load i) count)
+              (break)
+              (let [o (al/al-get [(ptr nd/Obj)] globals (load i))]
+                (if (nd/obj-definition? o) (collect-uses! (mut e) (nd/obj-body o)) 0)
+                (store! i (+ (load i) 1)))))
+    (collect-uses! (mut e) init)
+
     (put! (mut e) "(module c_program)\n")
     (put! (mut e) "(import \"coil.primitive\" :as primitive)\n")
     (put! (mut e) "(import \"coil.alloc\" :as alloc)\n")
     (put! (mut e) "(import \"coil.control\" :as control)\n")
     (put! (mut e) "(import \"coil.slice\" :as slice)\n")
     ;; Declarations first, so a call can precede the definition it names.
+    (store! i 0)
     (loop (if (>= (load i) count)
               (break)
               (let [o (al/al-get [(ptr nd/Obj)] globals (load i))]
-                (if (and (nd/obj-function? o) (not (nd/obj-definition? o)))
-                    (emit-extern! (mut e) o)
-                    0)
-                (if (= (ct/ty-kind (nd/obj-type o)) ct/TY-FUNC)
-                    0
-                    (emit-global! (mut e) o))
+                (cond
+                  (nd/obj-function? o)
+                    (if (and (not (hm/hm-contains? (load (field e defined)) (nd/obj-name o)))
+                             (used? (mut e) o))
+                        (emit-extern! (mut e) o)
+                        0)
+                  (= (ct/ty-kind (nd/obj-type o)) ct/TY-FUNC)
+                    (if (and (not (hm/hm-contains? (load (field e defined)) (nd/obj-name o)))
+                             (used? (mut e) o))
+                        (emit-extern! (mut e) o)
+                        0)
+                  (hm/hm-contains? (load (field e defined-data)) (nd/obj-name o))
+                    (emit-global! (mut e) o)
+                  (used? (mut e) o)
+                    (if (hm/hm-contains? (load (field e emitted)) (nd/obj-name o))
+                        0
+                        (do (hm/hm-put! [(slice u8) bool]
+                                        (mut (field e emitted))
+                                        (nd/obj-name o)
+                                        true)
+                            (emit-extern-global! (mut e) o)))
+                  :else 0)
                 (store! i (+ (load i) 1)))))
     (store! i 0)
     (loop (if (>= (load i) count)
               (break)
               (let [o (al/al-get [(ptr nd/Obj)] globals (load i))]
-                (if (nd/obj-definition? o) (emit-function! (mut e) o) 0)
+                (if (and (nd/obj-function? o) (nd/obj-definition? o))
+                    (emit-function! (mut e) o)
+                    0)
                 (store! i (+ (load i) 1)))))
     ;; Everything with static storage is initialised once, in source order,
     ;; before the program's own `main` runs.

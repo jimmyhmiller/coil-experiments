@@ -47,6 +47,9 @@
    ;; Global and static initialisers are statements like any other, collected
    ;; here and run once before the program's own `main`.
    (init-block (ptr nd/Node))
+   ;; The translation unit's tag, which makes its `static` names its own once
+   ;; every unit has been emitted into one module.
+   (unit (slice u8))
    (current-fn (ptr nd/Obj))
    (failed i64)
    (message (slice u8))
@@ -497,15 +500,27 @@
     (load value)))
 
 ;; A string literal becomes an anonymous global holding its bytes, which is what
-;; gives it an address and a lifetime.
+;; gives it an address and a lifetime. Literals written next to each other are
+;; one literal, which is how C lets a long message be split across lines.
 (defn string-literal [(p (mut Parser)) (tok lex/Token)] (-> (ptr nd/Node))
-  (let [bytes (decode-escapes (mut p) (lex/token-text tok) 34)
-        ty (ct/ty-array-of (load (field p a)) (ty-char-of (mut p)) (+ (slice-len bytes) 1))
+  (let [(mut text) (str/sb-new (load (field p a)))]
+    (str/sb-push-str! (mut text) (decode-escapes (mut p) (lex/token-text tok) 34))
+    (loop
+      (if (!= (lex/token-kind (peek (mut p))) lex/TK-STRING)
+          (break)
+          (let [next (advance! (mut p))]
+            (str/sb-push-str! (mut text) (decode-escapes (mut p) (lex/token-text next) 34))
+            0)))
+    (string-object (mut p) (str/sb-str (load (mut text))) tok)))
+
+(defn string-object [(p (mut Parser)) (bytes (slice u8)) (tok lex/Token)] (-> (ptr nd/Node))
+  (let [ty (ct/ty-array-of (load (field p a)) (ty-char-of (mut p)) (+ (slice-len bytes) 1))
         (mut name) (str/sb-new (load (field p a)))]
     (str/sb-push-str! (mut name) ".Lstr.")
     (str/sb-push-i64! (mut name) (al/al-len [(ptr nd/Obj)] (load (field p globals))))
     (let [o (nd/obj-new (load (field p a)) (str/sb-str (load (mut name))) ty false)]
       (nd/set-obj-string! o bytes)
+      (nd/set-obj-definition! o true)
       (al/al-push! [(ptr nd/Obj)] (mut (field p globals)) o)
       (nd/node-var (load (field p a)) o tok))))
 
@@ -525,9 +540,15 @@
 ;; `a op= b` is rewritten to `a = a op b`. Evaluating `a` twice is wrong when it
 ;; has side effects, but the lowerer sees an assignment either way and this
 ;; keeps the tree in one shape.
-(defn compound-assign [(p (mut Parser)) (lhs (ptr nd/Node)) (kind i64) (tok lex/Token)] (-> (ptr nd/Node))
-  (let [rhs (parse-assign (mut p))
-        op (if (= kind nd/ND-ADD)
+;; `x op= y` with the right side already in hand. Prefix `++x` is this with a
+;; literal one, which is why the right side is a parameter rather than something
+;; read from the token stream.
+(defn compound-assign-with [(p (mut Parser))
+                            (lhs (ptr nd/Node))
+                            (kind i64)
+                            (rhs (ptr nd/Node))
+                            (tok lex/Token)] (-> (ptr nd/Node))
+  (let [op (if (= kind nd/ND-ADD)
                (new-add (mut p) lhs rhs tok)
                (if (= kind nd/ND-SUB)
                    (new-sub (mut p) lhs rhs tok)
@@ -537,6 +558,9 @@
         n (nd/node-binary (load (field p a)) nd/ND-ASSIGN lhs op tok)]
     (add-type! (mut p) n)
     n))
+
+(defn compound-assign [(p (mut Parser)) (lhs (ptr nd/Node)) (kind i64) (tok lex/Token)] (-> (ptr nd/Node))
+  (compound-assign-with (mut p) lhs kind (parse-assign (mut p)) tok))
 
 (defn parse-assign [(p (mut Parser))] (-> (ptr nd/Node))
   (let [lhs (parse-conditional (mut p))
@@ -747,7 +771,7 @@
     (text=? w "_Thread_local") true (text=? w "__signed__") true
     (text=? w "__builtin_va_list") true (text=? w "_Complex") true
     (text=? w "__int128_t") true (text=? w "__uint128_t") true
-    (text=? w "__int128") true
+    (text=? w "__int128") true (text=? w "_Float16") true
     :else false))
 
 ;; A name only starts a type if it is a type keyword or a typedef that is
@@ -783,6 +807,52 @@
     (word? (mut p) "__extension__") true
     :else false))
 
+;; The two attributes that change what the program means. Everything else an
+;; attribute list can say is advisory here and is consumed without effect.
+(defstruct Attrs [(packed i64) (aligned i64)])
+
+(defn no-attrs [] (-> Attrs) (load (Attrs :packed 0 :aligned 0)))
+
+;; Reads the contents of one `__attribute__((...))` list, which is a
+;; comma-separated sequence of names, each optionally with its own argument
+;; list. Only `packed` and `aligned(n)` are acted on.
+(defn read-attribute-list! [(p (mut Parser)) (out (mut Attrs))] (-> i64)
+  (expect! (mut p) "(")
+  (expect! (mut p) "(")
+  (let [(mut depth) 2]
+    (loop
+      (if (or (= (load depth) 0) (or (at-eof? (mut p)) (!= (load (field p failed)) 0)))
+          (break)
+          (cond
+            (punct? (mut p) "(") (do (store! depth (+ (load depth) 1)) (advance! (mut p)) 0)
+            (punct? (mut p) ")") (do (store! depth (- (load depth) 1)) (advance! (mut p)) 0)
+            (and (= (load depth) 2)
+                 (or (word? (mut p) "packed") (word? (mut p) "__packed__")))
+              (do (advance! (mut p)) (store! (field out packed) 1) 0)
+            (and (= (load depth) 2)
+                 (or (word? (mut p) "aligned") (word? (mut p) "__aligned__")))
+              (do (advance! (mut p))
+                  (if (punct? (mut p) "(")
+                      (do (advance! (mut p))
+                          (store! (field out aligned) (parse-const-expr (mut p)))
+                          (expect! (mut p) ")"))
+                      0)
+                  0)
+            :else (do (advance! (mut p)) 0)))))
+  0)
+
+;; Consumes every attribute at this position, returning what the ones that
+;; matter said.
+(defn parse-attributes! [(p (mut Parser))] (-> Attrs)
+  (let [(mut out) (no-attrs)]
+    (loop
+      (if (not (attribute-start? (mut p)))
+          (break)
+          (if (or (word? (mut p) "__attribute__") (word? (mut p) "__attribute"))
+              (do (advance! (mut p)) (read-attribute-list! (mut p) (mut out)) 0)
+              (do (advance! (mut p)) (skip-balanced! (mut p)) 0))))
+    (load (mut out))))
+
 ;; Consumes a parenthesised group with its nesting, from the `(` to its `)`.
 (defn skip-balanced! [(p (mut Parser))] (-> i64)
   (if (not (punct? (mut p) "("))
@@ -802,9 +872,7 @@
         0)))
 
 (defn skip-attributes! [(p (mut Parser))] (-> i64)
-  (loop (if (attribute-start? (mut p))
-            (do (advance! (mut p)) (skip-balanced! (mut p)) 0)
-            (break)))
+  (parse-attributes! (mut p))
   0)
 
 (defn parse-const-expr [(p (mut Parser))] (-> i64)
@@ -893,6 +961,8 @@
                     (store! ty (ct/ty-pointer-to a (ct/ty-char a)))
                     (store! done 1))
               (word? (mut p) "_Complex") (do (advance! (mut p)) 0)
+              (word? (mut p) "_Float16")
+                (do (advance! (mut p)) (store! ty (ct/ty-float16 a)) (store! done 1))
               (or (word? (mut p) "__int128_t") (word? (mut p) "__int128"))
                 (do (advance! (mut p))
                     (store! ty (ct/ty-int128 a (!= (load unsigned) 0)))
@@ -1064,6 +1134,7 @@
 ;; the group re-parsed against that -- which is what makes the precedence come
 ;; out right.
 (defn parse-declarator [(p (mut Parser)) (base (ptr ct/Type))] (-> Declared)
+  (skip-attributes! (mut p))
   (let [ty0 (parse-pointers (mut p) base)]
     (if (punct? (mut p) "(")
         (let [start (load (field p pos))]
@@ -1102,7 +1173,9 @@
 ;; record contain a pointer to itself.
 (defn parse-record [(p (mut Parser)) (union? bool)] (-> (ptr ct/Type))
   (advance! (mut p))
-  (let [t (peek (mut p))
+  ;; `struct __attribute__((packed)) s { ... }` puts the attribute here.
+  (let [leading (parse-attributes! (mut p))
+        t (peek (mut p))
         named (or (= (lex/token-kind t) lex/TK-IDENT) (= (lex/token-kind t) lex/TK-KEYWORD))
         tag (if named (lex/token-text t) "")]
     (if named (do (advance! (mut p)) 0) 0)
@@ -1139,6 +1212,14 @@
                               (do (advance! (mut p)) 0)
                               (do (expect! (mut p) ";") (store! more 0)))))))))
           (expect! (mut p) "}")
+          ;; `struct { ... } __attribute__((packed)) name;` puts it here
+          ;; instead, so both positions are collected before the layout runs.
+          (let [trailing (parse-attributes! (mut p))]
+            (if (or (!= (.packed leading) 0) (!= (.packed trailing) 0))
+                (ct/set-packed! ty)
+                0)
+            (if (> (.aligned leading) 0) (ct/set-align-override! ty (.aligned leading)) 0)
+            (if (> (.aligned trailing) 0) (ct/set-align-override! ty (.aligned trailing)) 0))
           (ct/layout-record! ty)
           ty))))
 
@@ -1214,9 +1295,17 @@
           (add-type! (mut p) n) n)
       ;; `++x` is `x += 1`, which keeps one assignment shape in the tree.
       (punct? (mut p) "++")
-        (let [tok (advance! (mut p))] (compound-assign (mut p) (parse-unary (mut p)) nd/ND-ADD tok))
+        (let [tok (advance! (mut p))
+              target (parse-unary (mut p))
+              one (nd/node-num a 1 tok)]
+          (add-type! (mut p) one)
+          (compound-assign-with (mut p) target nd/ND-ADD one tok))
       (punct? (mut p) "--")
-        (let [tok (advance! (mut p))] (compound-assign (mut p) (parse-unary (mut p)) nd/ND-SUB tok))
+        (let [tok (advance! (mut p))
+              target (parse-unary (mut p))
+              one (nd/node-num a 1 tok)]
+          (add-type! (mut p) one)
+          (compound-assign-with (mut p) target nd/ND-SUB one tok))
       :else (parse-postfix (mut p)))))
 
 (defn parse-postfix [(p (mut Parser))] (-> (ptr nd/Node))
@@ -1675,11 +1764,33 @@
         (nd/push-local! (load (field p current-fn)) o))
     o))
 
+;; A `static` name belongs to one translation unit. The whole program is
+;; emitted into a single module, so the unit's tag is appended to keep two
+;; files' `static int count` apart, while the source name stays bound in scope.
+(defn unit-name [(p (mut Parser)) (name (slice u8))] (-> (slice u8))
+  (let [(mut b) (str/sb-new (load (field p a)))]
+    (str/sb-push-str! (mut b) name)
+    (str/sb-push-str! (mut b) "$")
+    (str/sb-push-str! (mut b) (load (field p unit)))
+    (str/sb-str (load (mut b)))))
+
 (defn new-global! [(p (mut Parser)) (name (slice u8)) (ty (ptr ct/Type))] (-> (ptr nd/Obj))
   (let [o (nd/obj-new (load (field p a)) name ty false)]
     (declare-obj! (mut p) o)
     (al/al-push! [(ptr nd/Obj)] (mut (field p globals)) o)
     o))
+
+(defn new-global-of! [(p (mut Parser))
+                      (name (slice u8))
+                      (ty (ptr ct/Type))
+                      (static? bool)] (-> (ptr nd/Obj))
+  (if (not static?)
+      (new-global! (mut p) name ty)
+      (let [o (nd/obj-new (load (field p a)) (unit-name (mut p) name) ty false)]
+        (nd/set-obj-static! o true)
+        (declare-obj-as! (mut p) name o)
+        (al/al-push! [(ptr nd/Obj)] (mut (field p globals)) o)
+        o)))
 
 ;; A `static` local has static storage but local scope, so it becomes a global
 ;; under a name nothing else can collide with, while the name the source used
@@ -1690,8 +1801,11 @@
     (str/sb-push-str! (mut b) name)
     (str/sb-push-str! (mut b) ".")
     (str/sb-push-i64! (mut b) (al/al-len [(ptr nd/Obj)] (load (field p globals))))
+    (str/sb-push-str! (mut b) "$")
+    (str/sb-push-str! (mut b) (load (field p unit)))
     (let [o (nd/obj-new a (str/sb-str (load (mut b))) ty false)]
       (nd/set-obj-static! o true)
+      (nd/set-obj-definition! o true)
       (al/al-push! [(ptr nd/Obj)] (mut (field p globals)) o)
       (declare-obj-as! (mut p) name o)
       o)))
@@ -1874,9 +1988,9 @@
         "")))
 
 (defn parse-function! [(p (mut Parser)) (spec DeclSpec) (d Declared)] (-> i64)
-  (let [o (new-global! (mut p) (.name d) (.ty d))]
+  (let [o (new-global-of! (mut p) (.name d) (.ty d) (!= (.is-static spec) 0))]
     (store! (field p current-fn) o)
-    (nd/set-obj-static! o (!= (.is-static spec) 0))
+    (nd/set-obj-asm-name! o (.asm-name d))
     (enter-scope! (mut p))
     ;; Parameters are declared in the function's own scope before the body is
     ;; parsed, which is what lets the body refer to them.
@@ -1916,8 +2030,11 @@
                     (= (ct/ty-kind (.ty d)) ct/TY-FUNC)
                       (do (parse-function! (mut p) spec d) (store! more 0))
                     :else
-                      (let [g (new-global! (mut p) (.name d) (.ty d))]
-                        (if (!= (.is-static spec) 0) (nd/set-obj-static! g true) 0)
+                      (let [g (new-global-of! (mut p) (.name d) (.ty d) (!= (.is-static spec) 0))]
+                        (nd/set-obj-asm-name! g (.asm-name d))
+                        ;; `extern T x;` names an object defined elsewhere; every
+                        ;; other file-scope declaration defines one here.
+                        (nd/set-obj-definition! g (= (.is-extern spec) 0))
                         (if (punct? (mut p) "=")
                             (do (advance! (mut p))
                                 (parse-init-into! (mut p) (load (field p init-block)) g))
@@ -1927,13 +2044,16 @@
                             (do (expect! (mut p) ";") (store! more 0))))))))
           0))))
 
-(defn parser-new [(a (dyn alloc/Allocator)) (tokens (al/ArrayList lex/Token))] (-> Parser)
+(defn parser-new [(a (dyn alloc/Allocator))
+                  (tokens (al/ArrayList lex/Token))
+                  (unit (slice u8))] (-> Parser)
   (Parser :a a
     :tokens tokens
     :pos 0
     :scopes (al/al-new [(ptr Scope)] a)
     :globals (al/al-new [(ptr nd/Obj)] a)
     :init-block (nd/node-new a nd/ND-BLOCK (lex/token-none))
+    :unit unit
     :current-fn (primitive/cast (ptr nd/Obj) 0)
     :failed 0
     :message ""
