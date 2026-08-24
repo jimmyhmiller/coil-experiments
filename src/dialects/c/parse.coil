@@ -555,7 +555,14 @@
                    (let [b (nd/node-binary (load (field p a)) kind lhs (decay (mut p) rhs) tok)]
                      (add-type! (mut p) b)
                      b)))
-        n (nd/node-binary (load (field p a)) nd/ND-ASSIGN lhs op tok)]
+        ;; The operation happens in the common type of the two operands, and
+        ;; the result is then converted back to what is being assigned to --
+        ;; `int n; n += strlen(s);` computes in `size_t` and stores an `int`.
+        n (nd/node-binary (load (field p a))
+                          nd/ND-ASSIGN
+                          lhs
+                          (convert-to (mut p) op (nd/nd-type lhs))
+                          tok)]
     (add-type! (mut p) n)
     n))
 
@@ -1379,6 +1386,41 @@
                 (nd/set-member! node (al/al-get [ct/Member] members (load found)))
                 node))))))
 
+;; What a parameter of this declared type actually receives. An array or a
+;; function parameter is a pointer, the same way an argument of either type is.
+(defn param-target-type [(p (mut Parser)) (t (ptr ct/Type))] (-> (ptr ct/Type))
+  (if (null-type? t)
+      t
+      (cond
+        (= (ct/ty-kind t) ct/TY-ARRAY)
+          (ct/ty-pointer-to (load (field p a)) (ct/ty-base t))
+        (= (ct/ty-kind t) ct/TY-FUNC)
+          (ct/ty-pointer-to (load (field p a)) t)
+        :else t)))
+
+;; A value is converted to the type it is being handed to. Leaving this out
+;; means the receiver reads a different width than the sender wrote.
+(defn convert-to [(p (mut Parser)) (n (ptr nd/Node)) (target (ptr ct/Type))] (-> (ptr nd/Node))
+  (if (or (null-type? target)
+          (or (null-type? (nd/nd-type n)) (= (ct/ty-kind target) ct/TY-VOID)))
+      n
+      (nd/node-cast (load (field p a)) n target)))
+
+;; The default argument promotions. A variadic argument has no parameter to be
+;; converted to, so C promotes it: anything narrower than `int` becomes one, and
+;; a `float` becomes a `double`. Both sides of the call have to agree, so this is
+;; made explicit here rather than left to whoever reads the argument.
+(defn default-promote [(p (mut Parser)) (n (ptr nd/Node))] (-> (ptr nd/Node))
+  (let [t (nd/nd-type n)]
+    (if (null-type? t)
+        n
+        (cond
+          (= (ct/ty-kind t) ct/TY-FLOAT)
+            (nd/node-cast (load (field p a)) n (ty-double-of (mut p)))
+          (and (ct/integer? t) (< (ct/ty-size t) 4))
+            (nd/node-cast (load (field p a)) n (ty-int-of (mut p)))
+          :else n))))
+
 (defn parse-call [(p (mut Parser)) (callee (ptr nd/Node))] (-> (ptr nd/Node))
   (let [a (load (field p a))
         tok (advance! (mut p))
@@ -1388,8 +1430,18 @@
     (loop
       (if (or (punct? (mut p) ")") (at-eof? (mut p)))
           (break)
-          (do
-            (nd/push-arg! n (decay (mut p) (parse-assign (mut p))))
+          (let [arg (decay (mut p) (parse-assign (mut p)))
+                params (call-params (mut p) fty)
+                named (al/al-len [(ptr ct/Type)] params)
+                at (al/al-len [(ptr nd/Node)] (nd/nd-args n))]
+            (nd/push-arg! n
+                          (if (>= at named)
+                              (default-promote (mut p) arg)
+                              (convert-to (mut p)
+                                          arg
+                                          (param-target-type
+                                            (mut p)
+                                            (al/al-get [(ptr ct/Type)] params at)))))
             (if (punct? (mut p) ",") (do (advance! (mut p)) 0) (break)))))
     (expect! (mut p) ")")
     ;; The call's type is the function's return type, reached through the
@@ -1402,6 +1454,32 @@
                         (ct/ty-base ft)
                         (ty-int-of (mut p)))))
     n))
+
+;; `va_start(ap, last)` points `ap` at the caller's variadic arguments. The
+;; named parameter it is given exists only to say where they begin, which the
+;; lowerer knows from the function it is emitting, so it is parsed and dropped.
+(defn parse-va-start [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [a (load (field p a))
+        tok (advance! (mut p))]
+    (expect! (mut p) "(")
+    (let [ap (parse-assign (mut p))]
+      (loop (if (punct? (mut p) ",")
+                (do (advance! (mut p)) (parse-assign (mut p)) 0)
+                (break)))
+      (expect! (mut p) ")")
+      (let [n (nd/node-unary a nd/ND-VA-START ap tok)]
+        (nd/set-type! n (ty-int-of (mut p)))
+        n))))
+
+;; The parameter list of whatever a call expression names, for deciding which
+;; arguments are the variadic ones.
+(defn call-params [(p (mut Parser)) (fty (ptr ct/Type))] (-> (al/ArrayList (ptr ct/Type)))
+  (let [ft (if (and (not (null-type? fty)) (= (ct/ty-kind fty) ct/TY-PTR))
+               (ct/ty-base fty)
+               fty)]
+    (if (and (not (null-type? ft)) (= (ct/ty-kind ft) ct/TY-FUNC))
+        (ct/ty-params ft)
+        (al/al-new [(ptr ct/Type)] (load (field p a))))))
 
 (defn parse-primary [(p (mut Parser))] (-> (ptr nd/Node))
   (let [a (load (field p a))
@@ -1446,6 +1524,37 @@
           (add-type! (mut p) n) n)
       (= (lex/token-kind t) lex/TK-STRING)
         (let [tok (advance! (mut p))] (string-literal (mut p) tok))
+      ;; The variadic access builtins are forms, not calls: `va_arg` takes a
+      ;; type where an expression would go, and `va_start` needs the callee's
+      ;; own argument area, which no C expression names.
+      (word? (mut p) "__builtin_va_start") (parse-va-start (mut p))
+      (word? (mut p) "__builtin_c23_va_start") (parse-va-start (mut p))
+      (word? (mut p) "__builtin_va_end")
+        (let [tok (advance! (mut p))]
+          (expect! (mut p) "(")
+          (parse-assign (mut p))
+          (expect! (mut p) ")")
+          (let [n (nd/node-num a 0 tok)] (add-type! (mut p) n) n))
+      (word? (mut p) "__builtin_va_copy")
+        (let [tok (advance! (mut p))]
+          (expect! (mut p) "(")
+          (let [dst (parse-assign (mut p))]
+            (expect! (mut p) ",")
+            (let [src (decay (mut p) (parse-assign (mut p)))
+                  n (nd/node-binary a nd/ND-ASSIGN dst src tok)]
+              (expect! (mut p) ")")
+              (add-type! (mut p) n)
+              n)))
+      (word? (mut p) "__builtin_va_arg")
+        (let [tok (advance! (mut p))]
+          (expect! (mut p) "(")
+          (let [ap (parse-assign (mut p))]
+            (expect! (mut p) ",")
+            (let [ty (parse-typename (mut p))
+                  n (nd/node-unary a nd/ND-VA-ARG ap tok)]
+              (expect! (mut p) ")")
+              (nd/set-type! n ty)
+              n)))
       (or (= (lex/token-kind t) lex/TK-IDENT) (= (lex/token-kind t) lex/TK-KEYWORD))
         (let [tok (advance! (mut p))]
           (match (lookup (mut p) (lex/token-text tok))
@@ -1868,15 +1977,25 @@
           (expect! (mut p) ";")
           (nd/node-unary a nd/ND-EXPR-STMT e tok)))))
 
+(defn return-type [(p (mut Parser))] (-> (ptr ct/Type))
+  (let [f (load (field p current-fn))]
+    (if (null-obj? f)
+        (nil-type)
+        (param-target-type (mut p) (ct/ty-base (nd/obj-type f))))))
+
 (defn parse-stmt [(p (mut Parser))] (-> (ptr nd/Node))
   (let [a (load (field p a))]
     (cond
       (punct? (mut p) "{") (parse-compound (mut p))
+      ;; The returned value is converted to the function's return type, the same
+      ;; conversion an assignment to a variable of that type would make.
       (word? (mut p) "return")
         (let [tok (advance! (mut p))]
           (if (punct? (mut p) ";")
               (do (advance! (mut p)) (nd/node-new a nd/ND-RETURN tok))
-              (let [e (decay (mut p) (parse-expr (mut p)))]
+              (let [e (convert-to (mut p)
+                                  (decay (mut p) (parse-expr (mut p)))
+                                  (return-type (mut p)))]
                 (expect! (mut p) ";")
                 (nd/node-unary a nd/ND-RETURN e tok))))
       (word? (mut p) "if")

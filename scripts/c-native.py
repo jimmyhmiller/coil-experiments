@@ -31,6 +31,22 @@ def reference(source: pathlib.Path, work: pathlib.Path) -> tuple[int, str]:
     return got.returncode, got.stdout
 
 
+def system_includes() -> list[str]:
+    """Where the target's headers live.
+
+    A C compiler has to be told this; the driver takes -I like any other. The
+    host toolchain is asked rather than guessed, so the gate keeps working when
+    the SDK moves.
+    """
+    paths = []
+    for command in (["xcrun", "--show-sdk-path"], ["clang", "-print-resource-dir"]):
+        got = subprocess.run(command, capture_output=True, text=True)
+        if got.returncode == 0:
+            root = got.stdout.strip()
+            paths.append(f"{root}/usr/include" if command[0] == "xcrun" else f"{root}/include")
+    return [f"-I{p}" for p in paths]
+
+
 def native(coil: str, source: pathlib.Path, work: pathlib.Path) -> tuple[int, str, str]:
     generated = work / (source.stem + ".coil")
     binary = work / (source.stem + "-coil")
@@ -38,7 +54,7 @@ def native(coil: str, source: pathlib.Path, work: pathlib.Path) -> tuple[int, st
     lowered = run([coil, "run", str(ROOT / "src/dialects/c/cc.coil"), "--",
                    "-o", str(generated), str(source),
                    "-include", str(target / "darwin-arm64.h"),
-                   "-include", str(target / "builtins.h")])
+                   "-include", str(target / "builtins.h")] + system_includes())
     if lowered.returncode or not generated.exists():
         return -1, "", (lowered.stdout + lowered.stderr).strip()
     built = run([coil, "build", str(generated), "-O0", "-o", str(binary)])

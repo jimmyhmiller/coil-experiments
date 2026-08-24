@@ -44,6 +44,10 @@
    ;; Names with a definition somewhere in the program, which decides whether a
    ;; global is storage of ours or a symbol somebody else's object file has.
    (defined-data (hm/HashMap (slice u8) bool))
+   ;; The outgoing argument area each call to a variadic function of this
+   ;; program's own writes into, by call site. They are allocated once at the
+   ;; top of the function, never inside a loop.
+   (va-areas (hm/HashMap (slice u8) (slice u8)))
    (serial i64)
    (break-labels (al/ArrayList (slice u8)))
    (continue-labels (al/ArrayList (slice u8)))
@@ -358,7 +362,84 @@
   (put! (mut e) ")")
   0)
 
+(defn nil-obj [] (-> (ptr nd/Obj)) (primitive/cast (ptr nd/Obj) 0))
+
+;; A call site is identified by address, the same way an object is: two calls to
+;; the same function need two argument areas.
+(defn node-key [(e (mut Emitter)) (n (ptr nd/Node))] (-> (slice u8))
+  (let [(mut b) (str/sb-new (load (field e a)))]
+    (str/sb-push-str! (mut b) "n")
+    (str/sb-push-i64! (mut b) (primitive/cast i64 n))
+    (str/sb-str (load (mut b)))))
+
+;; The object a call names, when it is a variadic function defined in this
+;; program rather than one the C library provides. Those two are passed
+;; differently: the library's take the platform's variadic convention, which
+;; Coil emits directly, while this program's take a pointer to an area the
+;; caller fills.
+(defn variadic-target [(e (mut Emitter)) (n (ptr nd/Node))] (-> (ptr nd/Obj))
+  (let [callee (nd/nd-lhs n)]
+    (if (not (and (= (nd/nd-kind callee) nd/ND-CAST)
+                  (= (nd/nd-kind (nd/nd-lhs callee)) nd/ND-VAR)))
+        (nil-obj)
+        (let [o (nd/nd-obj (nd/nd-lhs callee))]
+          (if (and (= (ct/ty-kind (nd/obj-type o)) ct/TY-FUNC)
+                   (and (ct/ty-variadic? (nd/obj-type o))
+                        (hm/hm-contains? (load (field e defined)) (nd/obj-name o))))
+              o
+              (nil-obj))))))
+
+(defn va-area-of [(e (mut Emitter)) (n (ptr nd/Node))] (-> (slice u8))
+  (match (hm/hm-get (load (field e va-areas)) (node-key (mut e) n))
+    (Some [s] s)
+    (None [] "")))
+
+;; The area is laid out the way the platform lays out variadic arguments on this
+;; target: one eight-byte slot each, in order. That is what lets a `va_list`
+;; taken from it be handed straight to the C library's `vfprintf`.
+(defn emit-variadic-call! [(e (mut Emitter)) (n (ptr nd/Node)) (o (ptr nd/Obj))] (-> i64)
+  (let [args (nd/nd-args n)
+        count (al/al-len [(ptr nd/Node)] args)
+        named (al/al-len [(ptr ct/Type)] (ct/ty-params (nd/obj-type o)))
+        area (va-area-of (mut e) n)
+        (mut i) named]
+    (if (= (slice-len area) 0)
+        (fail! (mut e) "no argument area for this variadic call" (nd/nd-token n))
+        0)
+    (put! (mut e) "(do")
+    (loop (if (>= (load i) count)
+              (break)
+              (let [arg (al/al-get [(ptr nd/Node)] args (load i))]
+                (put! (mut e) " (primitive/store! (primitive/cast (ptr ")
+                (emit-param-type! (mut e) (nd/nd-type arg))
+                (put! (mut e) ") (primitive/index (primitive/cast (ptr u8) ")
+                (put! (mut e) area)
+                (put! (mut e) ") ")
+                (put-int! (mut e) (* (- (load i) named) 8))
+                (put! (mut e) ")) ")
+                (emit-expr! (mut e) arg)
+                (put! (mut e) ")")
+                (store! i (+ (load i) 1)))))
+    (put! (mut e) " (")
+    (put! (mut e) (callee-name (mut e) o))
+    (store! i 0)
+    (loop (if (>= (load i) named)
+              (break)
+              (do (put! (mut e) " ")
+                  (emit-expr! (mut e) (al/al-get [(ptr nd/Node)] args (load i)))
+                  (store! i (+ (load i) 1)))))
+    (put! (mut e) " (primitive/cast (ptr i8) ")
+    (put! (mut e) area)
+    (put! (mut e) ")))"))
+  0)
+
 (defn emit-call! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
+  (let [target (variadic-target (mut e) n)]
+    (if (!= (primitive/cast i64 target) 0)
+        (emit-variadic-call! (mut e) n target)
+        (emit-plain-call! (mut e) n))))
+
+(defn emit-plain-call! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
   (let [callee (nd/nd-lhs n)
         args (nd/nd-args n)
         count (al/al-len [(ptr nd/Node)] args)
@@ -464,6 +545,29 @@
                 (emit-type! (mut e) t)
                 (put! (mut e) "))"))
           (= k nd/ND-CALL) (emit-call! (mut e) n)
+          ;; `va_start` points the list at the area the caller filled, which
+          ;; arrived as the function's last parameter.
+          (= k nd/ND-VA-START)
+            (do (put! (mut e) "(do (primitive/store! ")
+                (emit-addr! (mut e) (nd/nd-lhs n))
+                (put! (mut e) " c_va) 0)"))
+          ;; `va_arg` reads the slot the list points at and steps past it.
+          (= k nd/ND-VA-ARG)
+            (let [slot (fresh (mut e) "va")]
+              (put! (mut e) "(let [")
+              (put! (mut e) slot)
+              (put! (mut e) " (primitive/load ")
+              (emit-addr! (mut e) (nd/nd-lhs n))
+              (put! (mut e) ")] (do (primitive/store! ")
+              (emit-addr! (mut e) (nd/nd-lhs n))
+              (put! (mut e) " (primitive/index ")
+              (put! (mut e) slot)
+              (put! (mut e) " 8)) (primitive/load (primitive/cast (ptr ")
+              (emit-param-type! (mut e) t)
+              (put! (mut e) ") ")
+              (put! (mut e) slot)
+              ;; closes: cast, load, do, let
+              (put! (mut e) "))))"))
           (= k nd/ND-NEG)
             (do (put! (mut e) "(")
                 (put! (mut e) (if (ct/floating? t) "primitive/fsub" "primitive/isub"))
@@ -842,6 +946,53 @@
 
 ;; Parameters arrive as values and are copied into their slots, so the body can
 ;; treat them exactly like any other local.
+;; Walks a function body allocating one outgoing argument area per call to a
+;; variadic function of this program's own. Both jobs are done in one pass: the
+;; binding has to be emitted here, in the function's `let`, and the name has to
+;; be remembered for the call site that will use it.
+(defn emit-va-areas! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
+  (if (= (primitive/cast i64 n) 0)
+      0
+      (do
+        (if (= (nd/nd-kind n) nd/ND-CALL)
+            (let [target (variadic-target (mut e) n)]
+              (if (= (primitive/cast i64 target) 0)
+                  0
+                  (let [named (al/al-len [(ptr ct/Type)] (ct/ty-params (nd/obj-type target)))
+                        count (al/al-len [(ptr nd/Node)] (nd/nd-args n))
+                        slots (- count named)
+                        area (fresh (mut e) "va")]
+                    (hm/hm-put! [(slice u8) (slice u8)]
+                                (mut (field e va-areas))
+                                (node-key (mut e) n)
+                                area)
+                    (put! (mut e) " ")
+                    (put! (mut e) area)
+                    (put! (mut e) " (primitive/alloc-stack (array u8 ")
+                    (put-int! (mut e) (if (<= slots 0) 8 (* slots 8)))
+                    (put! (mut e) "))")
+                    0)))
+            0)
+        (emit-va-areas! (mut e) (nd/nd-lhs n))
+        (emit-va-areas! (mut e) (nd/nd-rhs n))
+        (emit-va-areas! (mut e) (nd/nd-test n))
+        (emit-va-areas! (mut e) (nd/nd-then n))
+        (emit-va-areas! (mut e) (nd/nd-else n))
+        (emit-va-areas! (mut e) (nd/nd-setup n))
+        (emit-va-areas! (mut e) (nd/nd-step n))
+        (emit-va-areas-list! (mut e) (nd/nd-body n))
+        (emit-va-areas-list! (mut e) (nd/nd-args n))
+        0)))
+
+(defn emit-va-areas-list! [(e (mut Emitter)) (list (al/ArrayList (ptr nd/Node)))] (-> i64)
+  (let [n (al/al-len [(ptr nd/Node)] list)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do (emit-va-areas! (mut e) (al/al-get [(ptr nd/Node)] list (load i)))
+                  (store! i (+ (load i) 1))))))
+  0)
+
 (defn emit-param-copies! [(e (mut Emitter)) (f (ptr nd/Obj))] (-> i64)
   (let [params (nd/obj-params f)
         count (al/al-len [(ptr nd/Obj)] params)
@@ -875,10 +1026,17 @@
                 (emit-param-type! (mut e) (nd/obj-type (al/al-get [(ptr nd/Obj)] params (load i))))
                 (put! (mut e) ")")
                 (store! i (+ (load i) 1)))))
+    ;; A variadic function of this program's own takes its caller's argument
+    ;; area as one more parameter. Nothing in C names it, so it is given a name
+    ;; nothing in C can produce.
+    (if (ct/ty-variadic? ty)
+        (do (if (> count 0) (put! (mut e) " ") 0) (put! (mut e) "(c_va (ptr i8))"))
+        0)
     (put! (mut e) "] (-> ")
     (emit-return-type! (mut e) (ct/ty-base ty))
     (put! (mut e) ")\n  (let [")
     (emit-locals! (mut e) f)
+    (emit-va-areas! (mut e) (nd/obj-body f))
     (put! (mut e) "]\n    (control/scope :c_return (do")
     (emit-param-copies! (mut e) f)
     (put! (mut e) " ")
@@ -1070,6 +1228,7 @@
                         :emitted (hm/hm-new [(slice u8) bool] a (str/str-keyops))
                         :used (hm/hm-new [(slice u8) bool] a (str/str-keyops))
                         :defined-data (hm/hm-new [(slice u8) bool] a (str/str-keyops))
+                        :va-areas (hm/hm-new [(slice u8) (slice u8)] a (str/str-keyops))
                         :serial 0
                         :break-labels (al/al-new [(slice u8)] a)
                         :continue-labels (al/al-new [(slice u8)] a)
