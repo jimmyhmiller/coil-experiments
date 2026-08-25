@@ -52,6 +52,74 @@
           (= raw 0x7c) 4
           :else (primitive/error "WebAssembly validation: invalid MVP block type"))))
 
+;; Consume an unreachable suffix through this region's else or end delimiter.
+;; Every MVP immediate is decoded so delimiter-looking bytes inside constants,
+;; indices, and memory arguments cannot terminate the scan accidentally.
+(defn skip-unreachable-region! [(context Code) (p (mut wasm/Parser))] (-> i64)
+  (let [(mut depth) 0
+        (mut stopped) false
+        (mut delimiter) 0]
+    (loop
+      (if (or (.failed p) (load stopped))
+          (break)
+          (let [opcode (wasm/parser-byte! (mut p))]
+            (cond (or (= opcode 0x02) (or (= opcode 0x03) (= opcode 0x04)))
+                    (do
+                      (wasm/parser-byte! (mut p))
+                      (store! depth (+ (load depth) 1)))
+                  (= opcode 0x05)
+                    (if (= (load depth) 0)
+                        (do (store! delimiter opcode) (store! stopped true))
+                        0)
+                  (= opcode 0x0b)
+                    (if (= (load depth) 0)
+                        (do (store! delimiter opcode) (store! stopped true))
+                        (store! depth (- (load depth) 1)))
+                  (or (= opcode 0x0c)
+                      (or (= opcode 0x0d)
+                          (or (= opcode 0x10)
+                              (or (= opcode 0x20)
+                                  (or (= opcode 0x21)
+                                      (or (= opcode 0x22)
+                                          (or (= opcode 0x23) (= opcode 0x24))))))))
+                    (do (wasm/parser-u32! (mut p)) 0)
+                  (= opcode 0x0e)
+                    (let [count (wasm/parser-u32! (mut p))
+                          (mut i) 0]
+                      (loop
+                        (if (> (load i) count)
+                            (break)
+                            (do
+                              (wasm/parser-u32! (mut p))
+                              (store! i (+ (load i) 1))))))
+                  (= opcode 0x11)
+                    (do (wasm/parser-u32! (mut p))
+                        (wasm/parser-byte! (mut p))
+                        0)
+                  (and (>= opcode 0x28) (<= opcode 0x3e))
+                    (do (wasm/parser-u32! (mut p))
+                        (wasm/parser-u32! (mut p))
+                        0)
+                  (or (= opcode 0x3f) (= opcode 0x40))
+                    (do (wasm/parser-byte! (mut p)) 0)
+                  (= opcode 0x41) (do (wasm/parser-signed! (mut p) 32) 0)
+                  (= opcode 0x42) (do (wasm/parser-signed! (mut p) 64) 0)
+                  (= opcode 0x43) (do (wasm/parser-fixed-bits! (mut p) 4) 0)
+                  (= opcode 0x44) (do (wasm/parser-fixed-bits! (mut p) 8) 0)
+                  (or (<= opcode 0x01)
+                      (or (= opcode 0x0f)
+                          (or (= opcode 0x1a)
+                              (or (= opcode 0x1b)
+                                  (and (>= opcode 0x45) (<= opcode 0xbf))))))
+                    0
+                  :else
+                    (primitive/error "WebAssembly validation: invalid opcode in unreachable code")))))
+    (if (.failed p)
+        (primitive/error (.message p))
+        (if (not (load stopped))
+            (primitive/error "WebAssembly expression lacks a final end opcode")
+            (load delimiter)))))
+
 (defn finish-region [(a (dyn alloc/Allocator)) (base Code) (stack (mut Code)) (forms CodeBuilder)
                      (result-tag i64)] (-> Code)
   (let [body-forms (primitive/code-list-done forms)]
@@ -63,6 +131,15 @@
           (if (or (!= (node-kind value) result-tag)
                   (not (primitive/code-eq base (load stack))))
               (primitive/error "WebAssembly validation: block result type mismatch")
+              `(do ~@body-forms ~(primitive/code-nth value 1)))))))
+
+(defn finish-return [(stack (mut Code)) (forms CodeBuilder) (result-tag i64)] (-> Code)
+  (let [body-forms (primitive/code-list-done forms)]
+    (if (= result-tag 0)
+        `(do ~@body-forms)
+        (let [value (pop-node! (mut stack))]
+          (if (!= (node-kind value) result-tag)
+              (primitive/error "WebAssembly validation: return type mismatch")
               `(do ~@body-forms ~(primitive/code-nth value 1)))))))
 
 (defn integer-binop! [(stack (mut Code)) (kind wasm/ValType) (operator Code)]
@@ -245,7 +322,7 @@
 (defn compile-region! [(a (dyn alloc/Allocator)) (context Code)
                        (p (mut wasm/Parser)) (stack (mut Code))
                        (forms-builder CodeBuilder) (allow-else bool)
-                       (region-base Code) (region-result-tag i64)
+                       (region-base Code) (region-result-tag i64) (function-result-tag i64)
                        (locals Code) (globals Code) (memory Code) (table Code)
                        (function-names Code)
                        (function-indices (al/ArrayList i64))
@@ -262,18 +339,40 @@
                     (if allow-else
                         (do (store! stop-opcode opcode) (store! ended true))
                         (primitive/error "WebAssembly validation: else outside if"))
-                  (= opcode 0x02)
+                  (or (= opcode 0x02) (= opcode 0x03))
                     (let [result-tag (parse-block-tag! context (mut p))
                           base (load stack)
                           (mut block-stack) base
                           block-forms (primitive/code-list-new)
                           block-stop (compile-region! a context (mut p) (mut block-stack)
                                                       block-forms false base result-tag
+                                                      function-result-tag
                                                       locals globals memory table function-names
                                                       function-indices types)]
-                      (if (!= block-stop 0x0b)
-                          (primitive/error "WebAssembly validation: malformed block")
-                          (let [expression
+                      (if (= block-stop 0x0f)
+                          (let [expression (finish-return (mut block-stack) block-forms
+                                                          function-result-tag)]
+                            (store! stack `())
+                            (cond (= function-result-tag 0)
+                                    (do (primitive/code-list-push! forms-builder expression) 0)
+                                  (= function-result-tag 1)
+                                    (push-node! (mut stack) (wasm/I32) expression)
+                                  (= function-result-tag 2)
+                                    (push-node! (mut stack) (wasm/I64) expression)
+                                  (= function-result-tag 3)
+                                    (push-node! (mut stack) (wasm/F32) expression)
+                                  (= function-result-tag 4)
+                                    (push-node! (mut stack) (wasm/F64) expression)
+                                  :else
+                                    (primitive/error "WebAssembly codegen internal error: invalid return result"))
+                            (skip-unreachable-region! context (mut p))
+                            (store! stop-opcode 0x0f)
+                            (store! ended true))
+                          (if (!= block-stop 0x0b)
+                              (primitive/error "WebAssembly validation: malformed block")
+                              (if (= opcode 0x03)
+                                  (primitive/error "WebAssembly codegen: loop control is not implemented yet")
+                                  (let [expression
                                   (finish-region a base (mut block-stack)
                                                  block-forms result-tag)]
                             (if (= result-tag 0)
@@ -287,7 +386,7 @@
                                       (= result-tag 4)
                                         (push-node! (mut stack) (wasm/F64) expression)
                                       :else
-                                        (primitive/error "WebAssembly codegen internal error: invalid block result"))))))
+                                        (primitive/error "WebAssembly codegen internal error: invalid block result"))))))))
                   (= opcode 0x04)
                     (let [result-tag (parse-block-tag! context (mut p))
                           condition (pop-node! (mut stack))]
@@ -298,6 +397,7 @@
                                 then-forms (primitive/code-list-new)
                                 then-stop (compile-region! a context (mut p) (mut then-stack)
                                                            then-forms true base result-tag
+                                                           function-result-tag
                                                            locals globals memory table function-names
                                                            function-indices types)
                                 then-code (finish-region a base (mut then-stack) then-forms result-tag)
@@ -308,6 +408,7 @@
                                                       (compile-region! a context (mut p)
                                                                        (mut else-stack) else-forms
                                                                        false base result-tag
+                                                                       function-result-tag
                                                                        locals globals memory table function-names
                                                                        function-indices types)]
                                                 (if (!= else-stop 0x0b)
@@ -334,12 +435,10 @@
                                       :else
                                         (primitive/error "WebAssembly codegen internal error: invalid block result"))))))
                   (= opcode 0x0f)
-                    (let [next (wasm/parser-byte! (mut p))]
-                      (if (!= next 0x0b)
-                          (primitive/error "WebAssembly codegen: non-terminal return is not implemented yet")
-                          (do
-                            (store! stop-opcode 0x0b)
-                            (store! ended true))))
+                    (do
+                      (skip-unreachable-region! context (mut p))
+                      (store! stop-opcode 0x0f)
+                      (store! ended true))
                   (= opcode 0x0d)
                     (let [depth (wasm/parser-u32! (mut p))
                           condition (pop-node! (mut stack))]
@@ -356,7 +455,8 @@
                                     continue-stop
                                       (compile-region! a context (mut p) (mut continue-stack)
                                                        continue-forms false region-base
-                                                       region-result-tag locals globals memory table function-names
+                                                       region-result-tag function-result-tag
+                                                       locals globals memory table function-names
                                                        function-indices types)
                                     continue-code
                                       (if (!= continue-stop 0x0b)
@@ -1011,8 +1111,9 @@
                        0
                        (kind-tag (al/al-get (.results signature) 0)))
         stop (compile-region! a context (mut p) (mut stack) forms-builder false `() result-tag
+                              result-tag
                               locals globals memory table function-names function-indices types)]
-    (if (!= stop 0x0b)
+    (if (and (!= stop 0x0b) (!= stop 0x0f))
         (primitive/error "WebAssembly function expression ended unexpectedly")
         0)
     (if (!= (wasm/remaining (.cursor p)) 0)

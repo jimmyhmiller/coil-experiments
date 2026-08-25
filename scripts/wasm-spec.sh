@@ -350,6 +350,16 @@ test_tables() {
   echo "call_indirect assert_trap: $trap_count checks passed"
 }
 
+test_control() {
+  coil_bin=${COIL:-coil}
+  "$coil_bin" run "$root/tests/wasm/control_return.wasm" \
+    --use experiments.wasm.lang -- --assert-scalar-batch \
+    top i32 41 0 \
+    from-block i64 42 0 \
+    from-loop f32 1110179840 0
+  echo "focused top-level, block, and loop return checks passed"
+}
+
 case "${1:-inventory}" in
   fetch) fetch_suite ;;
   fetch-wabt) fetch_wabt ;;
@@ -360,8 +370,9 @@ case "${1:-inventory}" in
   test-conversions) test_conversions ;;
   test-memory) test_memory ;;
   test-tables) test_tables ;;
+  test-control) test_control ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control]" >&2
     exit 2
     ;;
 esac

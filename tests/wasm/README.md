@@ -43,6 +43,7 @@ scripts/wasm-spec.sh test-floats
 scripts/wasm-spec.sh test-conversions
 scripts/wasm-spec.sh test-memory
 scripts/wasm-spec.sh test-tables
+scripts/wasm-spec.sh test-control
 ```
 
 `test-integers` compiles each official `i32` and `i64` module through the reader
@@ -67,6 +68,10 @@ assertions, and all 36 official `memory_size` assertions across four modules.
 executes every runnable assertion in the official MVP `call_indirect` file: 103
 returns and 13 process traps. Together, the semantic harnesses above currently
 execute 6,176 official assertions.
+
+`test-control` exercises function returns before unreachable instructions and
+returns propagated through nested blocks and loops. It is focused coverage; the
+official control-flow files remain the next conformance milestone.
 
 An individual exported integer function can be checked through the same reader
 entry path:
