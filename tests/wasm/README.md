@@ -48,6 +48,7 @@ scripts/wasm-spec.sh test-loops
 scripts/wasm-spec.sh test-structured-control
 scripts/wasm-spec.sh test-start
 scripts/wasm-spec.sh test-basic-instructions
+scripts/wasm-spec.sh test-evaluation-order
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -109,6 +110,12 @@ official assertion total is 7,034.
 `switch`, `local_get`, `local_set`, `local_tee`, `call`, `select`, and
 `unreachable` files: 357 returns, 129 validation failures, and 64 runtime traps.
 The cumulative official assertion total is 7,584.
+
+`test-evaluation-order` passes the complete official MVP `labels` and
+`left-to-right` files: 120 returns and three validation failures. Typed
+`br_if`, `br_table`, `select`, and `call_indirect` operands are materialized in
+WASM order and evaluated exactly once, including fallthrough and discarded
+stack values. The cumulative official assertion total is 7,707.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and

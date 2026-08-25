@@ -350,6 +350,9 @@
                         (primitive/code-list-push!
                           arguments-builder (primitive/code-nth reversed (load j))))))
                 (let [arguments (primitive/code-list-done arguments-builder)
+                      argument-bindings (primitive/code-list-new)
+                      call-arguments-builder (primitive/code-list-new)
+                      (mut argument-slot) 0
                       result-count (al/al-len (.results wanted))
                       trap-name (if (= result-count 0)
                                     "wasmrt/trap-void"
@@ -363,6 +366,18 @@
                       cast-id (primitive/datum->syntax context "primitive/cast")
                       (mut dispatch) `(~trap-id)
                       (mut slot) (primitive/code-count table)]
+                  (loop
+                    (if (>= (load argument-slot) (primitive/code-count arguments))
+                        (break)
+                        (let [id (primitive/fresh-identifier "wasm-indirect-argument")]
+                          (primitive/code-list-push! argument-bindings id)
+                          (primitive/code-list-push!
+                            argument-bindings
+                            (primitive/code-nth arguments (load argument-slot)))
+                          (primitive/code-list-push! call-arguments-builder id)
+                          (store! argument-slot (+ (load argument-slot) 1)))))
+                  (let [call-arguments
+                          (primitive/code-list-done call-arguments-builder)]
                   (loop
                     (if (= (load slot) 0)
                         (break)
@@ -380,19 +395,21 @@
                                         (store! dispatch
                                                 `(if (= ~index-id
                                                         (~cast-id i32 ~(load slot)))
-                                                     (~callee ~@arguments)
+                                                     (~callee ~@call-arguments)
                                                      ~(load dispatch))))
                                       0))
                                 0)))))
-                  (let [index-expression (primitive/code-nth table-index 1)
-                        call `(let [~index-id ~index-expression] ~(load dispatch))]
+                  (let [bindings-code (primitive/code-list-done argument-bindings)
+                        index-expression (primitive/code-nth table-index 1)
+                        call `(let [~@bindings-code ~index-id ~index-expression]
+                                ~(load dispatch))]
                     (if (= result-count 0)
                         (do (primitive/code-list-push! forms call) 0)
-                        (push-node! (mut stack) (al/al-get (.results wanted) 0) call))))))))))
+                        (push-node! (mut stack) (al/al-get (.results wanted) 0) call)))))))))))
 
 (defn compile-region! [(a (dyn alloc/Allocator)) (context Code)
                        (p (mut wasm/Parser)) (stack (mut Code))
-                       (forms-builder CodeBuilder) (allow-else bool)
+                       (forms-builder CodeBuilder) (bindings CodeBuilder) (allow-else bool)
                        (region-base Code) (region-result-tag i64) (region-label Code)
                        (label-names Code) (label-tags Code) (label-loops Code)
                        (function-result-tag i64)
@@ -451,7 +468,7 @@
                           (mut block-stack) base
                           block-forms (primitive/code-list-new)
                           block-stop (compile-region! a context (mut p) (mut block-stack)
-                                                      block-forms false base result-tag
+                                                      block-forms bindings false base result-tag
                                                       label child-names child-tags child-loops
                                                       function-result-tag
                                                       locals globals memory table function-names
@@ -507,7 +524,7 @@
                                 (mut then-stack) base
                                 then-forms (primitive/code-list-new)
                                 then-stop (compile-region! a context (mut p) (mut then-stack)
-                                                           then-forms true base result-tag
+                                                           then-forms bindings true base result-tag
                                                            label child-names child-tags child-loops
                                                            function-result-tag
                                                            locals globals memory table function-names
@@ -527,7 +544,7 @@
                                       (let [else-stop
                                               (compile-region! a context (mut p)
                                                                (mut else-stack) else-forms
-                                                               false base result-tag
+                                                               bindings false base result-tag
                                                                label child-names child-tags child-loops
                                                                function-result-tag
                                                                locals globals memory table function-names
@@ -615,29 +632,59 @@
                                     target-loop (= (primitive/code-int
                                                      (primitive/code-nth label-loops depth)) 1)
                                     target-label (primitive/code-nth label-names depth)
-                                    (mut branch-stack) (load stack)
-                                    branch-value
-                                      (if (= target-tag 0)
-                                          `0
-                                          (if (primitive/code-eq region-base
-                                                                 (load branch-stack))
-                                              (primitive/error "WebAssembly validation: br_if operand is below current frame")
-                                              (let [node (pop-node! (mut branch-stack))]
-                                                (if (!= (node-kind node) target-tag)
-                                                    (primitive/error "WebAssembly validation: br_if value type mismatch")
-                                                    (primitive/code-nth node 1)))))
                                     if-id (primitive/datum->syntax context "if")
                                     ne-id (primitive/datum->syntax context "primitive/icmp-ne")
                                     return-id (primitive/datum->syntax context "break")
-                                    transfer (if target-loop
-                                                 `(continue ~target-label)
-                                                 `(~return-id ~target-label ~branch-value))
-                                    c (primitive/code-nth condition 1)
-                                    expression `(~if-id (~ne-id ~c 0)
-                                                       ~transfer
-                                                       ~(if target-loop `(do) `0))]
-                                (primitive/code-list-push! forms-builder expression)
-                                0))))
+                                    c (primitive/code-nth condition 1)]
+                                (if (= target-tag 0)
+                                    (let [transfer (if target-loop
+                                                       `(continue ~target-label)
+                                                       `(~return-id ~target-label 0))
+                                          expression `(~if-id (~ne-id ~c 0)
+                                                             ~transfer
+                                                             ~(if target-loop `(do) `0))]
+                                      (primitive/code-list-push! forms-builder expression)
+                                      0)
+                                    (if (primitive/code-eq region-base (load stack))
+                                        (primitive/error "WebAssembly validation: br_if operand is below current frame")
+                                        (let [node (pop-node! (mut stack))
+                                              cell (primitive/fresh-identifier
+                                                     "wasm-br-if-cell")
+                                              value-id (primitive/fresh-identifier
+                                                         "wasm-br-if-value")
+                                              condition-id (primitive/fresh-identifier
+                                                             "wasm-br-if-condition")
+                                              store-id (primitive/datum->syntax context "store!")
+                                              load-id (primitive/datum->syntax context "load")]
+                                          (if (!= (node-kind node) target-tag)
+                                              (primitive/error "WebAssembly validation: br_if value type mismatch")
+                                              (let [value (primitive/code-nth node 1)
+                                                    transfer `(~return-id ~target-label ~value-id)
+                                                    expression
+                                                      `(let [~value-id ~value
+                                                             ~condition-id ~c]
+                                                         (do
+                                                           (~store-id ~cell ~value-id)
+                                                           (~if-id (~ne-id ~condition-id 0)
+                                                                   ~transfer
+                                                                   ~(zero-expression context target-tag))))
+                                                    loaded `(~load-id ~cell)]
+                                                (primitive/code-list-push!
+                                                  bindings
+                                                  `((mut ~cell)
+                                                    ~(zero-expression context target-tag)))
+                                                (primitive/code-list-push!
+                                                  forms-builder expression)
+                                                (cond (= target-tag 1)
+                                                        (push-node! (mut stack) (wasm/I32) loaded)
+                                                      (= target-tag 2)
+                                                        (push-node! (mut stack) (wasm/I64) loaded)
+                                                      (= target-tag 3)
+                                                        (push-node! (mut stack) (wasm/F32) loaded)
+                                                      (= target-tag 4)
+                                                        (push-node! (mut stack) (wasm/F64) loaded)
+                                                      :else
+                                                        (primitive/error "WebAssembly codegen internal error: invalid br_if target type")))))))))))
                   (= opcode 0x0c)
                     (let [depth (wasm/parser-u32! (mut p))]
                       (if (>= depth (primitive/code-count label-tags))
@@ -718,7 +765,7 @@
                       (let [selector (pop-node! (mut stack))]
                         (if (!= (node-kind selector) 1)
                             (primitive/error "WebAssembly validation: br_table selector must be i32")
-                            (let [branch-value
+                            (let [branch-expression
                                     (if (= target-tag 0)
                                         `0
                                         (if (primitive/code-eq region-base (load stack))
@@ -727,6 +774,8 @@
                                               (if (!= (node-kind node) target-tag)
                                                   (primitive/error "WebAssembly validation: br_table value type mismatch")
                                                   (primitive/code-nth node 1)))))
+                                  value-id (primitive/fresh-identifier "wasm-br-table-value")
+                                  branch-value value-id
                                   selector-expression (primitive/code-nth selector 1)
                                   return-id (primitive/datum->syntax context "break")
                                   selector-id (primitive/fresh-identifier "wasm-br-table-index")
@@ -773,7 +822,8 @@
                                                               (~cast-id i32 ~count))
                                                       ~tree
                                                       ~default-dispatch))
-                                    transfer `(let [~selector-id ~selector-expression]
+                                    transfer `(let [~value-id ~branch-expression
+                                                    ~selector-id ~selector-expression]
                                                 ~dispatch)
                                     expression
                                       transfer]
@@ -1010,9 +1060,19 @@
                                 c (primitive/code-nth condition 1)
                                 l (primitive/code-nth left 1)
                                 r (primitive/code-nth right 1)
+                                left-id (primitive/fresh-identifier "wasm-select-left")
+                                right-id (primitive/fresh-identifier "wasm-select-right")
+                                condition-id (primitive/fresh-identifier "wasm-select-condition")
                                 tag (node-kind left)]
                             (store! stack
-                                    `(~tag (~if-id (~ne-id ~c ~zero) ~l ~r) ~(load stack)))
+                                    `(~tag
+                                      (let [~left-id ~l
+                                            ~right-id ~r
+                                            ~condition-id ~c]
+                                        (~if-id (~ne-id ~condition-id ~zero)
+                                                ~left-id
+                                                ~right-id))
+                                      ~(load stack)))
                             0)))
                   (= opcode 0x41)
                     (let [value (wasm/parser-signed! (mut p) 32)]
@@ -1349,6 +1409,7 @@
 
 (defn compile-expression [(a (dyn alloc/Allocator)) (context Code)
                           (signature wasm/FuncType) (body wasm/FuncBody)
+                          (bindings CodeBuilder)
                           (locals Code) (globals Code) (memory Code) (table Code)
                           (function-names Code)
                           (function-indices (al/ArrayList i64))
@@ -1364,7 +1425,7 @@
         label-names `(~function-label)
         label-tags `(~result-tag)
         label-loops `(0)
-        stop (compile-region! a context (mut p) (mut stack) forms-builder false `() result-tag
+        stop (compile-region! a context (mut p) (mut stack) forms-builder bindings false `() result-tag
                               function-label label-names label-tags label-loops
                               result-tag
                               locals globals memory table function-names function-indices types)]
@@ -1432,6 +1493,8 @@
             (store! i (+ (load i) 1)))))
     (let [param-code (primitive/code-list-done params)
           local-code (primitive/code-list-done locals)
+          body-code (compile-expression a context sig b bindings local-code
+                                        globals memory table function-names function-indices types)
           binding-pairs (primitive/code-list-done bindings)
           binding-code (primitive/code-list-new)
           (mut j) 0]
@@ -1443,8 +1506,6 @@
               (primitive/code-list-push! binding-code (primitive/code-nth pair 1))
               (store! j (+ (load j) 1)))))
       (let [binding-vector (primitive/code-list-done binding-code)
-            body-code (compile-expression a context sig b local-code
-                                          globals memory table function-names function-indices types)
             result-type (if (= (al/al-len (.results sig)) 0)
                             `void
                             (type-code context (al/al-get (.results sig) 0)))]
@@ -1654,6 +1715,10 @@
                         (= export-name "load") "wasm-load"
                         (= export-name "while") "wasm-while"
                         (= export-name "for") "wasm-for"
+                        (= export-name "block") "wasm-block"
+                        (= export-name "if") "wasm-if"
+                        (= export-name "return") "wasm-return"
+                        (= export-name "loop") "wasm-loop"
                         :else export-name)
         name (primitive/datum->syntax context name-text)
         params (primitive/code-list-new)
@@ -1710,6 +1775,12 @@
                                 name-text (cond (= (.name e) "and") "wasm-and"
                                                 (= (.name e) "or") "wasm-or"
                                                 (= (.name e) "load") "wasm-load"
+                                                (= (.name e) "while") "wasm-while"
+                                                (= (.name e) "for") "wasm-for"
+                                                (= (.name e) "block") "wasm-block"
+                                                (= (.name e) "if") "wasm-if"
+                                                (= (.name e) "return") "wasm-return"
+                                                (= (.name e) "loop") "wasm-loop"
                                                 :else (.name e))
                                 name (primitive/datum->syntax context name-text)
                                 load-id (primitive/datum->syntax context "load")
@@ -1822,6 +1893,10 @@
                                           (= (.item-name entry) "load") "wasm-load"
                                           (= (.item-name entry) "while") "wasm-while"
                                           (= (.item-name entry) "for") "wasm-for"
+                                          (= (.item-name entry) "block") "wasm-block"
+                                          (= (.item-name entry) "if") "wasm-if"
+                                          (= (.item-name entry) "return") "wasm-return"
+                                          (= (.item-name entry) "loop") "wasm-loop"
                                           :else (.item-name entry))
                           callee (primitive/datum->syntax
                                    context
