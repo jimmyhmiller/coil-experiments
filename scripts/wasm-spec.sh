@@ -362,6 +362,17 @@ test_control() {
     from-if-else i32 9 2 i32 1 i32 9 \
     from-if-else i32 4 2 i32 0 i32 9
   echo "focused top-level, block, and loop return checks passed"
+  "$coil_bin" run "$root/tests/wasm/control_br.wasm" \
+    --use experiments.wasm.lang -- --assert-i32 branch 42
+  "$coil_bin" run "$root/tests/wasm/control_br_if.wasm" \
+    --use experiments.wasm.lang -- --assert-scalar-batch \
+    choose i32 9 1 i32 1 \
+    choose i32 13 1 i32 0
+  "$coil_bin" run "$root/tests/wasm/control_br_table.wasm" \
+    --use experiments.wasm.lang -- --assert-scalar-batch \
+    branch-table i32 42 1 i32 0 \
+    branch-table i32 42 1 i32 10
+  echo "focused nonterminal br, br_if, and br_table checks passed"
 
   command -v jq >/dev/null 2>&1 || {
     echo "error: jq is required to run prepared spec assertions" >&2

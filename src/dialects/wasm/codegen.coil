@@ -20,6 +20,14 @@
     (wasm/F32 [] `f32)
     (wasm/F64 [] `f64)))
 
+(defn zero-expression [(context Code) (tag i64)] (-> Code)
+  (let [cast-id (primitive/datum->syntax context "primitive/cast")]
+    (cond (= tag 1) `(~cast-id i32 0)
+          (= tag 2) `0
+          (= tag 3) `(~cast-id f32 0)
+          (= tag 4) `0.0
+          :else `0)))
+
 ;; Compile-time operand stacks are persistent Code triples `(tag expr tail)`.
 ;; Code has no runtime layout, so it must not be put in an ordinary struct or
 ;; ArrayList element.
@@ -325,7 +333,8 @@
 (defn compile-region! [(a (dyn alloc/Allocator)) (context Code)
                        (p (mut wasm/Parser)) (stack (mut Code))
                        (forms-builder CodeBuilder) (allow-else bool)
-                       (region-base Code) (region-result-tag i64) (function-result-tag i64)
+                       (region-base Code) (region-result-tag i64) (region-label Code)
+                       (function-result-tag i64)
                        (locals Code) (globals Code) (memory Code) (table Code)
                        (function-names Code)
                        (function-indices (al/ArrayList i64))
@@ -345,10 +354,12 @@
                   (or (= opcode 0x02) (= opcode 0x03))
                     (let [result-tag (parse-block-tag! context (mut p))
                           base (load stack)
+                          label `:wasm-block
                           (mut block-stack) base
                           block-forms (primitive/code-list-new)
                           block-stop (compile-region! a context (mut p) (mut block-stack)
                                                       block-forms false base result-tag
+                                                      label
                                                       function-result-tag
                                                       locals globals memory table function-names
                                                       function-indices types)]
@@ -375,9 +386,11 @@
                               (primitive/error "WebAssembly validation: malformed block")
                               (if (= opcode 0x03)
                                   (primitive/error "WebAssembly codegen: loop control is not implemented yet")
-                                  (let [expression
-                                  (finish-region a base (mut block-stack)
-                                                 block-forms result-tag)]
+                                  (let [body (finish-region a base (mut block-stack)
+                                                           block-forms result-tag)
+                                        scope-id (primitive/datum->syntax
+                                                   context "control/scope")
+                                        expression `(~scope-id ~label ~body)]
                             (if (= result-tag 0)
                                 (do (primitive/code-list-push! forms-builder expression) 0)
                                 (cond (= result-tag 1)
@@ -400,6 +413,7 @@
                                 then-forms (primitive/code-list-new)
                                 then-stop (compile-region! a context (mut p) (mut then-stack)
                                                            then-forms true base result-tag
+                                                           region-label
                                                            function-result-tag
                                                            locals globals memory table function-names
                                                            function-indices types)
@@ -419,6 +433,7 @@
                                               (compile-region! a context (mut p)
                                                                (mut else-stack) else-forms
                                                                false base result-tag
+                                                               region-label
                                                                function-result-tag
                                                                locals globals memory table function-names
                                                                function-indices types)]
@@ -470,69 +485,59 @@
                           (primitive/error "WebAssembly codegen: outer br_if is not implemented yet")
                           (if (!= (node-kind condition) 1)
                               (primitive/error "WebAssembly validation: br_if condition must be i32")
-                              (let [(mut taken-stack) (load stack)
-                                    taken-forms (primitive/code-list-new)
-                                    taken-code (finish-region a region-base (mut taken-stack)
-                                                              taken-forms region-result-tag)
-                                    (mut continue-stack) (load stack)
-                                    continue-forms (primitive/code-list-new)
-                                    continue-stop
-                                      (compile-region! a context (mut p) (mut continue-stack)
-                                                       continue-forms false region-base
-                                                       region-result-tag function-result-tag
-                                                       locals globals memory table function-names
-                                                       function-indices types)
-                                    continue-code
-                                      (if (!= continue-stop 0x0b)
-                                          (primitive/error "WebAssembly validation: malformed br_if region")
-                                          (finish-region a region-base (mut continue-stack)
-                                                         continue-forms region-result-tag))
+                              (let [(mut branch-stack) (load stack)
+                                    branch-value
+                                      (if (= region-result-tag 0)
+                                          `0
+                                          (let [node (pop-node! (mut branch-stack))]
+                                            (if (!= (node-kind node) region-result-tag)
+                                                (primitive/error "WebAssembly validation: br_if value type mismatch")
+                                                (primitive/code-nth node 1))))
                                     if-id (primitive/datum->syntax context "if")
                                     ne-id (primitive/datum->syntax context "primitive/icmp-ne")
+                                    return-id (primitive/datum->syntax
+                                                context "control/return-from")
                                     c (primitive/code-nth condition 1)
-                                    expression `(~if-id (~ne-id ~c 0) ~taken-code ~continue-code)]
-                                (store! stack region-base)
-                                (if (= region-result-tag 0)
-                                    (do (primitive/code-list-push! forms-builder expression) 0)
-                                    (cond (= region-result-tag 1)
-                                            (push-node! (mut stack) (wasm/I32) expression)
-                                          (= region-result-tag 2)
-                                            (push-node! (mut stack) (wasm/I64) expression)
-                                          (= region-result-tag 3)
-                                            (push-node! (mut stack) (wasm/F32) expression)
-                                          (= region-result-tag 4)
-                                            (push-node! (mut stack) (wasm/F64) expression)
-                                          :else
-                                            (primitive/error "WebAssembly codegen internal error: invalid branch result")))
-                                (store! stop-opcode 0x0b)
-                                (store! ended true)))))
+                                    expression `(~if-id (~ne-id ~c 0)
+                                                       (~return-id ~region-label ~branch-value)
+                                                       0)]
+                                (primitive/code-list-push! forms-builder expression)
+                                0))))
                   (= opcode 0x0c)
                     (let [depth (wasm/parser-u32! (mut p))]
                       (if (!= depth 0)
                           (primitive/error "WebAssembly codegen: outer br is not implemented yet")
-                          (let [(mut branch-stack) (load stack)
-                                branch-forms (primitive/code-list-new)
-                                expression (finish-region a region-base (mut branch-stack)
-                                                          branch-forms region-result-tag)
-                                next (wasm/parser-byte! (mut p))]
-                            (if (!= next 0x0b)
-                                (primitive/error "WebAssembly codegen: non-terminal br is not implemented yet")
-                                (do
-                                  (store! stack region-base)
+                          (let [branch-value
                                   (if (= region-result-tag 0)
-                                      (do (primitive/code-list-push! forms-builder expression) 0)
-                                      (cond (= region-result-tag 1)
-                                              (push-node! (mut stack) (wasm/I32) expression)
-                                            (= region-result-tag 2)
-                                              (push-node! (mut stack) (wasm/I64) expression)
-                                            (= region-result-tag 3)
-                                              (push-node! (mut stack) (wasm/F32) expression)
-                                            (= region-result-tag 4)
-                                              (push-node! (mut stack) (wasm/F64) expression)
-                                            :else
-                                              (primitive/error "WebAssembly codegen internal error: invalid branch result")))
-                                  (store! stop-opcode 0x0b)
-                                  (store! ended true))))))
+                                      `0
+                                      (let [node (pop-node! (mut stack))]
+                                        (if (!= (node-kind node) region-result-tag)
+                                            (primitive/error "WebAssembly validation: br value type mismatch")
+                                            (primitive/code-nth node 1))))
+                                return-id (primitive/datum->syntax
+                                            context "control/return-from")
+                                delimiter (skip-unreachable-region! context (mut p))]
+                            (primitive/code-list-push!
+                              forms-builder `(~return-id ~region-label ~branch-value))
+                            (store! stack region-base)
+                            (if (!= region-result-tag 0)
+                                (cond (= region-result-tag 1)
+                                        (push-node! (mut stack) (wasm/I32)
+                                                    (zero-expression context 1))
+                                      (= region-result-tag 2)
+                                        (push-node! (mut stack) (wasm/I64)
+                                                    (zero-expression context 2))
+                                      (= region-result-tag 3)
+                                        (push-node! (mut stack) (wasm/F32)
+                                                    (zero-expression context 3))
+                                      (= region-result-tag 4)
+                                        (push-node! (mut stack) (wasm/F64)
+                                                    (zero-expression context 4))
+                                      :else
+                                        (primitive/error "WebAssembly codegen internal error: invalid branch result"))
+                                0)
+                            (store! stop-opcode delimiter)
+                            (store! ended true))))
                   (= opcode 0x0e)
                     (let [count (wasm/parser-u32! (mut p))
                           (mut i) 0]
@@ -546,31 +551,40 @@
                       (let [selector (pop-node! (mut stack))]
                         (if (!= (node-kind selector) 1)
                             (primitive/error "WebAssembly validation: br_table selector must be i32")
-                            (let [(mut branch-stack) (load stack)
-                                  branch-forms (primitive/code-list-new)
-                                  value (finish-region a region-base (mut branch-stack)
-                                                       branch-forms region-result-tag)
-                                  selector-expression (primitive/code-nth selector 1)
-                                  expression `(do ~selector-expression ~value)
-                                  next (wasm/parser-byte! (mut p))]
-                              (if (!= next 0x0b)
-                                  (primitive/error "WebAssembly codegen: non-terminal br_table is not implemented yet")
-                                  (do
-                                    (store! stack region-base)
+                            (let [branch-value
                                     (if (= region-result-tag 0)
-                                        (do (primitive/code-list-push! forms-builder expression) 0)
-                                        (cond (= region-result-tag 1)
-                                                (push-node! (mut stack) (wasm/I32) expression)
-                                              (= region-result-tag 2)
-                                                (push-node! (mut stack) (wasm/I64) expression)
-                                              (= region-result-tag 3)
-                                                (push-node! (mut stack) (wasm/F32) expression)
-                                              (= region-result-tag 4)
-                                                (push-node! (mut stack) (wasm/F64) expression)
-                                              :else
-                                                (primitive/error "WebAssembly codegen internal error: invalid branch-table result")))
-                                    (store! stop-opcode 0x0b)
-                                    (store! ended true)))))))
+                                        `0
+                                        (let [node (pop-node! (mut stack))]
+                                          (if (!= (node-kind node) region-result-tag)
+                                              (primitive/error "WebAssembly validation: br_table value type mismatch")
+                                              (primitive/code-nth node 1))))
+                                  selector-expression (primitive/code-nth selector 1)
+                                  return-id (primitive/datum->syntax
+                                              context "control/return-from")
+                                  delimiter (skip-unreachable-region! context (mut p))]
+                              (primitive/code-list-push!
+                                forms-builder
+                                `(do ~selector-expression
+                                     (~return-id ~region-label ~branch-value)))
+                              (store! stack region-base)
+                              (if (!= region-result-tag 0)
+                                  (cond (= region-result-tag 1)
+                                          (push-node! (mut stack) (wasm/I32)
+                                                      (zero-expression context 1))
+                                        (= region-result-tag 2)
+                                          (push-node! (mut stack) (wasm/I64)
+                                                      (zero-expression context 2))
+                                        (= region-result-tag 3)
+                                          (push-node! (mut stack) (wasm/F32)
+                                                      (zero-expression context 3))
+                                        (= region-result-tag 4)
+                                          (push-node! (mut stack) (wasm/F64)
+                                                      (zero-expression context 4))
+                                        :else
+                                          (primitive/error "WebAssembly codegen internal error: invalid branch-table result"))
+                                  0)
+                              (store! stop-opcode delimiter)
+                              (store! ended true)))))
                   (= opcode 0x20)
                     (let [index (wasm/parser-u32! (mut p))]
                       (if (>= index (primitive/code-count locals))
@@ -1134,7 +1148,9 @@
         result-tag (if (= (al/al-len (.results signature)) 0)
                        0
                        (kind-tag (al/al-get (.results signature) 0)))
+        function-label `:wasm-function
         stop (compile-region! a context (mut p) (mut stack) forms-builder false `() result-tag
+                              function-label
                               result-tag
                               locals globals memory table function-names function-indices types)]
     (if (and (!= stop 0x0b) (< stop 0x100))
