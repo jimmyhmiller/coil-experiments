@@ -121,7 +121,6 @@ static double mouse_dx;
 static double mouse_dy;
 static int last_buttons;
 
-extern int CGAssociateMouseAndMouseCursorPosition(int connected);
 
 /* Darwin's nanosecond clock is used rather than gettimeofday because it takes
    and returns scalars: a record declared in a system header is opaque to
@@ -196,29 +195,21 @@ static void update_modifiers(unsigned long flags)
 
 static void post_mouse(void);
 
-/* The cursor is hidden and decoupled from the pointer only while this window has
-   the keyboard. Doing it once at start-up would leave the machine without a
-   cursor whenever Doom is not the app in front. `hide` and `unhide` are counted,
-   so each transition is taken exactly once. */
-static int grabbed;
+/* The cursor is never taken. Doom reads the motion the window is sent, which is
+   relative and arrives whether or not the pointer is captured, so turning still
+   works; the pointer stays visible and stays yours. Motion gathered while the
+   window did not have the keyboard is dropped, so coming back does not arrive
+   as one large turn. */
+static int had_focus;
 
 static void follow_focus(void)
 {
     /* A BOOL is returned in the low byte, so only the low byte is read. */
     int key = (int) (SEND0(long, window, SEL_("isKeyWindow")) & 1);
 
-    if (key && !grabbed)
+    if (key != had_focus)
     {
-        CGAssociateMouseAndMouseCursorPosition(0);
-        SEND0(id, CLS("NSCursor"), SEL_("hide"));
-        grabbed = 1;
-    }
-    else if (!key && grabbed)
-    {
-        SEND0(id, CLS("NSCursor"), SEL_("unhide"));
-        CGAssociateMouseAndMouseCursorPosition(1);
-        grabbed = 0;
-        /* Motion gathered while leaving would arrive as a jump on return. */
+        had_focus = key;
         mouse_dx = 0.0;
         mouse_dy = 0.0;
         mouse_buttons = 0;
@@ -346,8 +337,8 @@ void DG_Init(void)
     run_loop_mode = SEND1(id, CLS("NSString"), SEL_("stringWithUTF8String:"),
                           const char *, "kCFRunLoopDefaultMode");
 
-    /* Report motion continuously. The cursor itself is hidden and decoupled by
-       follow_focus, only while the window has the keyboard. */
+    /* Report motion continuously. The pointer is never captured or hidden -- the
+       motion Doom turns with is relative either way. */
     SEND1(id, window, SEL_("setAcceptsMouseMovedEvents:"), long, 1);
 }
 
