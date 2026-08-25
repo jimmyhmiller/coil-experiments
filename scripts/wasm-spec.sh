@@ -384,6 +384,14 @@ test_control() {
     count i32 0 1 i32 0 \
     count i32 5 1 i32 5 \
     count i32 20 1 i32 20
+  "$coil_bin" run "$root/tests/wasm/control_loop_value.wasm" \
+    --use experiments.wasm.lang -- --assert-scalar-batch \
+    unary i32 2 0 \
+    binary i32 42 0
+  "$coil_bin" run "$root/tests/wasm/control_loop_i64.wasm" \
+    --use experiments.wasm.lang -- --assert-scalar-batch \
+    before-loop i64 1 1 i64 0 \
+    before-loop i64 120 1 i64 5
   echo "focused lexical branch, branch-table, and loop continuation checks passed"
 
   command -v jq >/dev/null 2>&1 || {
@@ -427,6 +435,50 @@ test_control() {
   echo "return assert_invalid: $invalid_count checks passed"
 }
 
+test_loops() {
+  coil_bin=${COIL:-coil}
+  command -v jq >/dev/null 2>&1 || {
+    echo "error: jq is required to run prepared spec assertions" >&2
+    exit 1
+  }
+  json="$prepared/loop/script.json"
+  dir=${json%/*}
+  wasm="$dir/script.0.wasm"
+  args_file=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-loop.XXXXXX")
+  invalid_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-loop-invalid.XXXXXX")
+  trap 'rm -f "$args_file" "$invalid_out"' EXIT HUP INT TERM
+
+  jq -r '
+    .commands[] | select(.type == "assert_return")
+    | .action.field,
+      (if (.expected | length) == 0 then "void" else .expected[0].type end),
+      (if (.expected | length) == 0 then "0" else .expected[0].value end),
+      (.action.args | length | tostring),
+      (.action.args[] | .type, .value)
+  ' "$json" > "$args_file"
+  xargs "$coil_bin" run "$wasm" --use experiments.wasm.lang -- \
+    --assert-scalar-batch < "$args_file"
+  echo "loop assert_return: 66 checks passed"
+
+  invalid_count=0
+  for file in $(jq -r '.commands[] | select(.type == "assert_invalid") | .filename' "$json"); do
+    if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+         > "$invalid_out" 2>&1; then
+      echo "error: expected WebAssembly validation failure from $file" >&2
+      exit 1
+    fi
+    if ! grep -q 'WebAssembly validation:' "$invalid_out"; then
+      echo "error: $file failed without a WebAssembly validation diagnostic" >&2
+      cat "$invalid_out" >&2
+      exit 1
+    fi
+    invalid_count=$((invalid_count + 1))
+  done
+  rm -f "$args_file" "$invalid_out"
+  trap - EXIT HUP INT TERM
+  echo "loop assert_invalid: $invalid_count checks passed"
+}
+
 test_wat() {
   coil_bin=${COIL:-coil}
   "$coil_bin" run "$root/tests/wasm/wat_features.wat" \
@@ -455,9 +507,10 @@ case "${1:-inventory}" in
   test-memory) test_memory ;;
   test-tables) test_tables ;;
   test-control) test_control ;;
+  test-loops) test_loops ;;
   test-wat) test_wat ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-wat]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-wat]" >&2
     exit 2
     ;;
 esac

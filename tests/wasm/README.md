@@ -44,6 +44,7 @@ scripts/wasm-spec.sh test-conversions
 scripts/wasm-spec.sh test-memory
 scripts/wasm-spec.sh test-tables
 scripts/wasm-spec.sh test-control
+scripts/wasm-spec.sh test-loops
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -74,11 +75,18 @@ returns propagated through nested blocks, loops, and conditionals. It also
 checks nonterminal and outer-depth `br`, both paths of nonterminal and
 outer-depth `br_if`, and multi-target/default `br_table` selection across nested
 typed Coil labeled blocks. A stateful counting loop verifies `br 0` as a loop
-continuation and an outer `br_if` carrying the function result. It also passes
+continuation and an outer `br_if` carrying the function result. An i64 factorial
+loop verifies that assignments before an immediate outer branch are preserved.
+It also passes
 the complete official MVP `return`
 file: 63 returns and 20 validation
-failures. Together, the harnesses above currently execute 6,259 official
-assertions.
+failures.
+
+`test-loops` passes the complete official MVP `loop` file: 66 return assertions
+and 12 validation failures. This includes loops in operand positions, deep
+nesting, branches to inner and outer labels, stateful continuation, and
+polymorphic unreachable instruction sequences. Together, the harnesses above
+currently execute 6,337 official assertions.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and
