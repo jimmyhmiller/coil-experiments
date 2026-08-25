@@ -49,6 +49,7 @@ scripts/wasm-spec.sh test-structured-control
 scripts/wasm-spec.sh test-start
 scripts/wasm-spec.sh test-basic-instructions
 scripts/wasm-spec.sh test-evaluation-order
+scripts/wasm-spec.sh test-functions
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -116,6 +117,13 @@ The cumulative official assertion total is 7,584.
 `br_if`, `br_table`, `select`, and `call_indirect` operands are materialized in
 WASM order and evaluated exactly once, including fallthrough and discarded
 stack values. The cumulative official assertion total is 7,707.
+
+`test-functions` passes the complete official MVP `func`, `forward`, `fac`,
+`unwind`, `func_ptrs`, and `stack` files across every generated module: 145
+returns, 38 validation failures, 16 malformed-text rejections, and 14 runtime
+traps. This covers recursion, forward calls, function/table index validation,
+deep stack use, and trap unwinding. The cumulative official assertion total is
+7,920.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and

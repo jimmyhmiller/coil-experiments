@@ -740,6 +740,115 @@ test_evaluation_order() {
   echo "evaluation order assert_invalid: $invalid_total checks passed"
 }
 
+test_functions() {
+  coil_bin=${COIL:-coil}
+  command -v jq >/dev/null 2>&1 || {
+    echo "error: jq is required to run prepared spec assertions" >&2
+    exit 1
+  }
+  args_file=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-functions.XXXXXX")
+  failure_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-functions-failure.XXXXXX")
+  trap 'rm -f "$args_file" "$failure_out"' EXIT HUP INT TERM
+  return_total=0
+  invalid_total=0
+  malformed_total=0
+  trap_total=0
+
+  for suite in func forward fac unwind func_ptrs stack; do
+    json="$prepared/$suite/script.json"
+    dir=${json%/*}
+    for wasm in "$dir"/script.*.wasm; do
+      file=${wasm##*/}
+      jq -r --arg file "$file" '
+        .commands
+        | reduce .[] as $command
+            ({current: "", selected: []};
+             if $command.type == "module" then .current = $command.filename
+             elif ($command.type == "assert_return" and .current == $file)
+             then .selected += [$command]
+             else . end)
+        | .selected[]
+        | .action.field,
+          (if (.expected | length) == 0 then "void" else .expected[0].type end),
+          (if (.expected | length) == 0 then "0" else .expected[0].value end),
+          (.action.args | length | tostring),
+          (.action.args[] | .type, .value)
+      ' "$json" > "$args_file"
+      if [ -s "$args_file" ]; then
+        xargs "$coil_bin" run "$wasm" --use experiments.wasm.lang -- \
+          --assert-scalar-batch < "$args_file"
+      fi
+    done
+    count=$(jq -r '[.commands[] | select(.type == "assert_return")] | length' "$json")
+    return_total=$((return_total + count))
+
+    for file in $(jq -r '.commands[] | select(.type == "assert_invalid") | .filename' "$json"); do
+      if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+           > "$failure_out" 2>&1; then
+        echo "error: expected validation failure from $suite/$file" >&2
+        exit 1
+      fi
+      if ! grep -q 'WebAssembly validation:' "$failure_out"; then
+        echo "error: $suite/$file failed without a validation diagnostic" >&2
+        cat "$failure_out" >&2
+        exit 1
+      fi
+      invalid_total=$((invalid_total + 1))
+    done
+
+    for file in $(jq -r '.commands[] | select(.type == "assert_malformed") | .filename' "$json"); do
+      if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+           > "$failure_out" 2>&1; then
+        echo "error: expected malformed WAT rejection from $suite/$file" >&2
+        exit 1
+      fi
+      if ! grep -q 'WAT reader:' "$failure_out"; then
+        echo "error: $suite/$file failed without a WAT reader diagnostic" >&2
+        cat "$failure_out" >&2
+        exit 1
+      fi
+      malformed_total=$((malformed_total + 1))
+    done
+
+    jq -r '
+      .commands
+      | reduce .[] as $command
+          ({current: "", selected: []};
+           if $command.type == "module" then .current = $command.filename
+           elif $command.type == "assert_trap"
+           then .selected += [{file: .current, action: $command.action}]
+           else . end)
+      | .selected[]
+      | ([.file, .action.field, (.action.args | length | tostring)]
+         + [.action.args[] | .type, .value])
+      | join(" ")
+    ' "$json" > "$args_file"
+    while IFS= read -r line; do
+      set -- $line
+      file=$1
+      shift
+      if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang -- \
+           --invoke-scalar "$@" > "$failure_out" 2>&1; then
+        echo "error: expected WebAssembly trap from $suite/$file export $1" >&2
+        exit 1
+      fi
+      if ! grep -q 'program terminated by signal 6' "$failure_out"; then
+        echo "error: $suite/$file export $1 failed without the expected runtime trap" >&2
+        cat "$failure_out" >&2
+        exit 1
+      fi
+      trap_total=$((trap_total + 1))
+    done < "$args_file"
+  done
+
+  rm -f "$args_file" "$failure_out"
+  trap - EXIT HUP INT TERM
+  echo "functions assert_return: $return_total checks passed"
+  echo "functions assert_invalid: $invalid_total checks passed"
+  echo "functions assert_malformed: $malformed_total checks passed"
+  echo "functions assert_trap: $trap_total checks passed"
+}
+
 test_wat() {
   coil_bin=${COIL:-coil}
   "$coil_bin" run "$root/tests/wasm/wat_features.wat" \
@@ -773,9 +882,10 @@ case "${1:-inventory}" in
   test-start) test_start ;;
   test-basic-instructions) test_basic_instructions ;;
   test-evaluation-order) test_evaluation_order ;;
+  test-functions) test_functions ;;
   test-wat) test_wat ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-wat]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-wat]" >&2
     exit 2
     ;;
 esac
