@@ -7,7 +7,10 @@
 (import "coil.result" :use *)
 
 (extern printf :cc c [(ptr i8) ...] (-> i32))
-(extern realloc :cc c [(ptr i8) i64] (-> (ptr i8)))
+(extern malloc :cc c [u64] (-> (ptr i8)))
+(extern calloc :cc c [u64 u64] (-> (ptr i8)))
+(extern realloc :cc c [(ptr i8) u64] (-> (ptr i8)))
+(extern free :cc c [(ptr i8)] (-> i64))
 
 (defstruct Entry
   [(id i64)
@@ -33,7 +36,12 @@
    (index i64)
    (name (slice u8))
    (type-name (slice u8))
-   (offset i64)])
+   (offset i64)
+   (kind i64)
+   (size i64)
+   (unsigned bool)
+   (bit-offset i64)
+   (bit-width i64)])
 
 ; Deliberately bounded: this is an experiment and avoids making registry allocations
 ; recursively inspectable. The transform excludes this package in any case.
@@ -63,6 +71,8 @@
   (primitive/alloc-static i64))
 (defn json-failed [] (-> (ptr bool))
   (primitive/alloc-static bool))
+(defn json-current-type [] (-> (ptr i64))
+  (primitive/alloc-static i64))
 
 ; The registry cannot allocate through `coil.alloc`: doing so would recursively
 ; inspect its own bookkeeping. A tiny spin mutex over static storage is sufficient
@@ -82,7 +92,7 @@
         (loop (if (>= (load capacity) needed)
                   (break)
                   (set! capacity (* (load capacity) 2))))
-        (let [p (realloc (primitive/cast (ptr i8) (json-buffer)) (load capacity))]
+        (let [p (realloc (primitive/cast (ptr i8) (json-buffer)) (primitive/cast u64 (load capacity)))]
           (if (= (primitive/cast i64 p) 0)
               (do (set! (json-failed) true) false)
               (do (set! (json-buffer-cell) (primitive/cast (ptr u8) p))
@@ -142,6 +152,29 @@
     0))
 (defn json-int! [(v i64)] (-> i64)
   (if (< v 0) (do (json-byte! (primitive/cast u8 #\-)) (json-nat! (- 0 v))) (json-nat! v)))
+(defn json-u64! [(v u64)] (-> i64)
+  (let [digits (primitive/alloc-stack (array u8 24))
+        (mut n) 0
+        (mut x) v]
+    (if (= (load x) 0)
+        (json-byte! (primitive/cast u8 #\0))
+        (do
+          (loop (if (= (load x) 0)
+                    (break)
+                    (do
+                      (set! (primitive/index digits (load n))
+                            (primitive/cast u8
+                                            (+ 48
+                                               (primitive/cast i64
+                                                               (% (load x) (primitive/cast u64 10))))))
+                      (set! n (+ (load n) 1))
+                      (set! x (/ (load x) (primitive/cast u64 10))))))
+          (loop (if (<= (load n) 0)
+                    (break)
+                    (do
+                      (set! n (- (load n) 1))
+                      (json-byte! (load (primitive/index digits (load n)))))))))
+    0))
 (extern snprintf :cc c [(ptr i8) i64 (ptr i8) ...] (-> i32))
 (defn json-f64! [(v f64)] (-> i64)
   (let [buf (primitive/alloc-stack (array i8 64))
@@ -153,6 +186,21 @@
   (if (= (primitive/cast i64 p) 0)
       (json-text! "null")
       (do (json-text! "{\"pointer\":") (json-int! (primitive/cast i64 p)) (json-byte! (primitive/cast u8 #\})))))
+(defn json-bytes-value! [(p (ptr i8)) (total i64)] (-> i64)
+  (let [safe-total (if (< total 0) 0 total)
+        limit (if (< safe-total 64) safe-total 64)]
+    (json-text! "{\"bytes\":[")
+    (for [byte 0 limit]
+      (do
+        (if (> byte 0) (json-byte! (primitive/cast u8 #\,)) 0)
+        (json-int! (primitive/cast i64
+                                   (primitive/cast u8 (load (primitive/index p byte)))))))
+    (json-text! "],\"shown\":")
+    (json-int! limit)
+    (json-text! ",\"total\":")
+    (json-int! safe-total)
+    (json-byte! (primitive/cast u8 #\}))
+    0))
 
 (defn type-index-for-runtime-id [(runtime-id i64)] (-> i64)
   (let [(mut i) 0 (mut found) -1]
@@ -215,6 +263,7 @@
     (json-text! "\"value\":")
     (if (>= ti 0)
         (let [t (primitive/index (types) ti)]
+          (set! (json-current-type) ti)
           (if (= (if (>= (.initialized e) 0) (.initialized e) (.count e)) 1)
               (primitive/call-ptr (.json t) (.p e))
               (do
@@ -227,14 +276,7 @@
                       (primitive/call-ptr (.json t) (primitive/index (.p e) (* item (.size t)))))))
                 (json-byte! (primitive/cast u8 #\])))))
         (do
-          (json-text! "{\"bytes\":[")
-          (let [limit (if (< (.bytes e) 64) (.bytes e) 64)]
-            (for [byte 0 limit]
-              (do (if (> byte 0) (json-byte! (primitive/cast u8 #\,)) 0)
-                  (json-int! (primitive/cast i64 (load (primitive/index (.p e) byte))))))
-            (json-text! "],\"shown\":") (json-int! limit)
-            (json-text! ",\"total\":") (json-int! (.bytes e))
-            (json-byte! (primitive/cast u8 #\})))))
+          (json-bytes-value! (.p e) (.bytes e))))
   0))
 
 (defn inspector-memory [(id i64) (offset i64)] (-> (slice u8))
@@ -255,7 +297,10 @@
                       (json-text! ",\"bytes\":[")
                       (for [byte 0 length]
                         (do (if (> byte 0) (json-byte! (primitive/cast u8 #\,)) 0)
-                            (json-int! (primitive/cast i64 (load (primitive/index (.p e) (+ start byte)))))))
+                            (json-int! (primitive/cast i64
+                                                       (primitive/cast u8
+                                                                       (load (primitive/index (.p e)
+                                                                                              (+ start byte))))))))
                       (json-text! "]}")
                       (set! found true)
                       (break))
@@ -421,6 +466,11 @@
                       (set! (.name f) name)
                       (set! (.type-name f) type-name)
                       (set! (.offset f) offset)
+                      (set! (.kind f) 0)
+                      (set! (.size f) 0)
+                      (set! (.unsigned f) false)
+                      (set! (.bit-offset f) 0)
+                      (set! (.bit-width f) -1)
                       (set! (field-n) (+ at 1))
                       (unlock!)
                       0))))))))
@@ -565,6 +615,132 @@
   ; the underlying allocator is allowed to reclaim or reuse the address.
   (unregister-instance memory)
   (alloc/raw-free a memory request))
+
+; Opt-in translated-C allocation boundary markers. The transform excludes this
+; runtime module, so these calls always reach libc rather than recursively wrapping.
+(defn inspect-c-malloc :inline (Never) [(bytes u64)] (-> (ptr i8))
+  (let [p (malloc bytes)]
+    (if (= (primitive/cast i64 p) 0) p
+        (do (register-allocation p
+                                 (alloc/AllocRequest :type-id 0
+                                                     :count (primitive/cast i64 bytes)
+                                                     :bytes (primitive/cast i64 bytes)
+                                                     :align 1)
+                                 (primitive/fnptr-of show-raw))
+            p))))
+(defn inspect-c-calloc :inline (Never) [(count u64) (size u64)] (-> (ptr i8))
+  (let [p (calloc count size) bytes (primitive/imul count size)]
+    (if (= (primitive/cast i64 p) 0) p
+        (do (register-allocation p
+                                 (alloc/AllocRequest :type-id 0
+                                                     :count (primitive/cast i64 bytes)
+                                                     :bytes (primitive/cast i64 bytes)
+                                                     :align 1)
+                                 (primitive/fnptr-of show-raw))
+            p))))
+(defn inspect-c-realloc :inline (Never) [(memory (ptr i8)) (bytes u64)] (-> (ptr i8))
+  (let [p (realloc memory bytes)]
+    (if (= (primitive/cast i64 p) 0) p
+        (do (if (!= (primitive/cast i64 memory) 0) (unregister-instance memory) 0)
+            (register-allocation p
+                                 (alloc/AllocRequest :type-id 0
+                                                     :count (primitive/cast i64 bytes)
+                                                     :bytes (primitive/cast i64 bytes)
+                                                     :align 1)
+                                 (primitive/fnptr-of show-raw))
+            p))))
+(defn inspect-c-free :inline (Never) [(memory (ptr i8))] (-> i64)
+  (if (!= (primitive/cast i64 memory) 0) (unregister-instance memory) 0)
+  (free memory))
+
+(defn track-c-region :inline (Never) [(memory (ptr i8)) (bytes i64)] (-> (ptr i8))
+  (if (or (= (primitive/cast i64 memory) 0) (<= bytes 0))
+      memory
+      (do
+        (lock!)
+        (let [known (!= (primitive/cast i64 (find-live-entry memory)) 0)]
+          (unlock!)
+          (if known
+              0
+              (register-allocation memory
+                                   (alloc/AllocRequest :type-id 0 :count bytes :bytes bytes :align 1)
+                                   (primitive/fnptr-of show-raw))))
+        memory)))
+(defn retire-c-region [(memory (ptr i8))] (-> i64)
+  (unregister-instance memory))
+
+; Associate a translated-C region with the real explicit-layout Coil struct
+; emitted by the C frontend. `tid` names the ordinary generated TypeInfo, so C
+; records use the same field metadata and JSON decoder as native Coil structs.
+(defn track-c-struct-view [T] [(memory (ptr i8))
+                                                (size i64)
+                                                (tid i64)
+                                                (show (fnptr c [(ptr i8)] i64))] (-> (ptr i8))
+  (if (or (= (primitive/cast i64 memory) 0) (or (<= size 0) (< tid 0)))
+      memory
+      (do
+        (lock!)
+        (let [e (find-live-entry memory)
+              t (if (< tid (load (type-n)))
+                    (primitive/index (types) tid)
+                    (primitive/cast (ptr TypeInfo) 0))]
+          (if (or (= (primitive/cast i64 e) 0) (= (primitive/cast i64 t) 0))
+              0
+              (do
+                (set! (.type-id e) (.runtime-id t))
+                (set! (.count e) (if (>= (.bytes e) size) (primitive/idiv (.bytes e) size) 1))
+                (set! (.initialized e) (.count e))
+                (set! (.show e) show))))
+        (unlock!)
+        memory)))
+
+; The C frontend can preserve an exact record name/size/alignment around an
+; allocation even though its executable pointer representation remains ptr i8.
+(defn json-c-record-placeholder [(memory (ptr i8))] (-> i64)
+  (json-text! "null"))
+(defn track-c-type-view :inline (Never) [(memory (ptr i8))
+                                         (name (slice u8))
+                                         (size i64)
+                                         (align i64)] (-> (ptr i8))
+  (if (or (= (primitive/cast i64 memory) 0) (<= size 0))
+      memory
+      (do
+        (lock!)
+        (let [(mut ti) -1 (mut i) 0]
+          (loop (if (>= (load i) (load (type-n)))
+                    (break)
+                    (let [t (primitive/index (types) (load i))]
+                      (if (and (= (.name t) name) (= (.size t) size))
+                          (do (set! ti (load i)) (break))
+                          (set! i (+ (load i) 1))))))
+          (if (< (load ti) 0)
+              (let [id (load (type-n))]
+                (if (< id 256)
+                    (let [t (primitive/index (types) id)]
+                      (set! (.name t) name)
+                      (set! (.runtime-id t) (- 0 (+ 1000000 id)))
+                      (set! (.size t) size)
+                      (set! (.align t) align)
+                      (set! (.fields t) 0)
+                      (set! (.show t) (primitive/fnptr-of show-raw))
+                      (set! (.json t) (primitive/fnptr-of json-c-record-placeholder))
+                      (set! (type-n) (+ id 1))
+                      (set! ti id))
+                    0))
+              0)
+          (if (>= (load ti) 0)
+              (let [e (find-live-entry memory)
+                    t (primitive/index (types) (load ti))]
+                (if (= (primitive/cast i64 e) 0)
+                    0
+                    (do
+                      (set! (.type-id e) (.runtime-id t))
+                      (set! (.count e) (if (>= (.bytes e) size) (primitive/idiv (.bytes e) size) 1))
+                      (set! (.initialized e) (.count e))
+                      (set! (.show e) (primitive/fnptr-of show-raw)))))
+              0))
+        (unlock!)
+        memory)))
 
 ;; Stable, non-generic query API. These print to stdout so they are directly callable
 ;; from submitted JIT forms without sharing allocator-owned result memory.

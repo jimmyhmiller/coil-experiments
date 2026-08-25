@@ -127,6 +127,35 @@ This is an allocation inspector, not a language object browser:
 There is no garbage collector, reachability analysis, tracing root set, moving
 objects, or hidden ownership model.
 
+## Translated C programs
+
+The C frontend can preserve allocation facts that its ordinary lowering erases.
+It emits an identity marker around direct casts from `malloc`, `calloc`, `realloc`,
+or `Z_Malloc` to a named record pointer. Without the inspector metaprogram the
+marker simply returns its pointer, so it has no allocation policy or global hook.
+With the inspector enabled, the transform consumes the marker and associates the
+live region with the C record name, size, alignment, and derived element count.
+
+The transform also wraps translated calls to the four libc allocation functions.
+Doom's zone allocator needs one additional boundary: `Z_Malloc` subregions are
+registered and `Z_Free` retires them because the surrounding zone is one large libc
+allocation. This is still a transparent, opt-in metaprogram; Coil's allocator and
+standard library are unchanged.
+
+This recovers exact record identity only where the C source retains a direct typed
+allocation cast. Untyped `void *` dataflow cannot be reconstructed after lowering.
+When a marker names one of the frontend's real explicit-layout Coil structs, the
+inspector uses that declaration directly. It reports member names and offsets,
+decodes integer, float, boolean, and pointer fields, and presents fixed arrays as
+bounded inline byte values. Nested records, sums, and opaque foreign values remain
+structural placeholders until reflection exposes enough qualified shape information
+to generate their decoders safely.
+
+Very large generated C modules can overflow an LLVM `-O3` optimization worker stack
+independently of the inspector. Build those artifacts with `-O0` while that LLVM
+pipeline limitation remains; the metaprogram and explicit-layout metadata work at
+that optimization level.
+
 ## Current files
 
 - `transform.coil` — semantic discovery, allocator-boundary rewriting, metadata
@@ -136,6 +165,7 @@ objects, or hidden ownership model.
 - `viewer.coil` — background localhost HTTP server and asset/API routing.
 - `viewer/` — separate HTML, JavaScript, and CSS viewer assets.
 - `demo.coil` — typed allocations, inspection, snapshot, and free behavior.
+- `c_struct_demo.coil` — translated-C marker and explicit-layout value regression.
 - `jit_demo.coil` — runtime query submission through Coil JIT.
 
 ## Remaining production work
