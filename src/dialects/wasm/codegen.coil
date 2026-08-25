@@ -140,11 +140,114 @@
                     forms `(~callee (~memory-accessor) ~av ~offset ~vv))
                   0))))))
 
+(defn valtype-equal [(left wasm/ValType) (right wasm/ValType)] (-> bool)
+  (= (kind-tag left) (kind-tag right)))
+
+(defn function-type-equal [(left wasm/FuncType) (right wasm/FuncType)] (-> bool)
+  (let [l left
+        r right
+        (mut equal) (and (= (al/al-len (.params l)) (al/al-len (.params r)))
+                         (= (al/al-len (.results l)) (al/al-len (.results r))))
+        (mut i) 0]
+    (loop
+      (if (or (not (load equal)) (>= (load i) (al/al-len (.params l))))
+          (break)
+          (do
+            (if (not (valtype-equal (al/al-get (.params l) (load i))
+                                    (al/al-get (.params r) (load i))))
+                (store! equal false)
+                0)
+            (store! i (+ (load i) 1)))))
+    (if (and (load equal) (= (al/al-len (.results l)) 1))
+        (valtype-equal (al/al-get (.results l) 0) (al/al-get (.results r) 0))
+        (load equal))))
+
+(defn indirect-call! [(a (dyn alloc/Allocator)) (context Code)
+                      (p (mut wasm/Parser)) (stack (mut Code)) (forms CodeBuilder)
+                      (table Code) (function-names Code)
+                      (function-indices (al/ArrayList i64))
+                      (types (al/ArrayList wasm/FuncType))] (-> i64)
+  (let [wanted-index (wasm/parser-u32! (mut p))
+        reserved (wasm/parser-byte! (mut p))]
+    (if (or (!= reserved 0) (>= wanted-index (al/al-len types)))
+        (primitive/error "WebAssembly validation: invalid call_indirect type")
+        (if (= (primitive/code-count table) 0)
+            (primitive/error "WebAssembly validation: call_indirect without table")
+            (let [wanted (al/al-get types wanted-index)
+                  table-index (pop-node! (mut stack))
+                  reversed-builder (primitive/code-list-new)
+                  (mut argument-index) (al/al-len (.params wanted))]
+              (if (!= (node-kind table-index) 1)
+                  (primitive/error "WebAssembly validation: call_indirect index must be i32")
+                  0)
+              (loop
+                (if (= (load argument-index) 0)
+                    (break)
+                    (do
+                      (store! argument-index (- (load argument-index) 1))
+                      (let [argument (pop-node! (mut stack))
+                            parameter (al/al-get (.params wanted) (load argument-index))]
+                        (if (!= (node-kind argument) (kind-tag parameter))
+                            (primitive/error "WebAssembly validation: call_indirect argument mismatch")
+                            (primitive/code-list-push!
+                              reversed-builder (primitive/code-nth argument 1)))))))
+              (let [reversed (primitive/code-list-done reversed-builder)
+                    arguments-builder (primitive/code-list-new)
+                    (mut j) (primitive/code-count reversed)]
+                (loop
+                  (if (= (load j) 0)
+                      (break)
+                      (do
+                        (store! j (- (load j) 1))
+                        (primitive/code-list-push!
+                          arguments-builder (primitive/code-nth reversed (load j))))))
+                (let [arguments (primitive/code-list-done arguments-builder)
+                      result-count (al/al-len (.results wanted))
+                      trap-name (if (= result-count 0)
+                                    "wasmrt/trap-void"
+                                    (match (al/al-get (.results wanted) 0)
+                                      (wasm/I32 [] "wasmrt/trap-i32")
+                                      (wasm/I64 [] "wasmrt/trap-i64")
+                                      (wasm/F32 [] "wasmrt/trap-f32")
+                                      (wasm/F64 [] "wasmrt/trap-f64")))
+                      trap-id (primitive/datum->syntax context trap-name)
+                      index-id (primitive/fresh-identifier "wasm-table-index")
+                      cast-id (primitive/datum->syntax context "primitive/cast")
+                      (mut dispatch) `(~trap-id)
+                      (mut slot) (primitive/code-count table)]
+                  (loop
+                    (if (= (load slot) 0)
+                        (break)
+                        (do
+                          (store! slot (- (load slot) 1))
+                          (let [function-index
+                                  (primitive/code-int
+                                    (primitive/code-nth table (load slot)))]
+                            (if (and (>= function-index 0)
+                                     (< function-index (primitive/code-count function-names)))
+                                (let [actual-index (al/al-get function-indices function-index)
+                                      actual (al/al-get types actual-index)]
+                                  (if (function-type-equal wanted actual)
+                                      (let [callee (primitive/code-nth function-names function-index)]
+                                        (store! dispatch
+                                                `(if (= ~index-id
+                                                        (~cast-id i32 ~(load slot)))
+                                                     (~callee ~@arguments)
+                                                     ~(load dispatch))))
+                                      0))
+                                0)))))
+                  (let [index-expression (primitive/code-nth table-index 1)
+                        call `(let [~index-id ~index-expression] ~(load dispatch))]
+                    (if (= result-count 0)
+                        (do (primitive/code-list-push! forms call) 0)
+                        (push-node! (mut stack) (al/al-get (.results wanted) 0) call))))))))))
+
 (defn compile-region! [(a (dyn alloc/Allocator)) (context Code)
                        (p (mut wasm/Parser)) (stack (mut Code))
                        (forms-builder CodeBuilder) (allow-else bool)
                        (region-base Code) (region-result-tag i64)
-                       (locals Code) (globals Code) (memory Code) (function-names Code)
+                       (locals Code) (globals Code) (memory Code) (table Code)
+                       (function-names Code)
                        (function-indices (al/ArrayList i64))
                        (types (al/ArrayList wasm/FuncType))] (-> i64)
   (let [(mut ended) false
@@ -166,7 +269,7 @@
                           block-forms (primitive/code-list-new)
                           block-stop (compile-region! a context (mut p) (mut block-stack)
                                                       block-forms false base result-tag
-                                                      locals globals memory function-names
+                                                      locals globals memory table function-names
                                                       function-indices types)]
                       (if (!= block-stop 0x0b)
                           (primitive/error "WebAssembly validation: malformed block")
@@ -195,7 +298,7 @@
                                 then-forms (primitive/code-list-new)
                                 then-stop (compile-region! a context (mut p) (mut then-stack)
                                                            then-forms true base result-tag
-                                                           locals globals memory function-names
+                                                           locals globals memory table function-names
                                                            function-indices types)
                                 then-code (finish-region a base (mut then-stack) then-forms result-tag)
                                 (mut else-stack) base
@@ -205,7 +308,7 @@
                                                       (compile-region! a context (mut p)
                                                                        (mut else-stack) else-forms
                                                                        false base result-tag
-                                                                       locals globals memory function-names
+                                                                       locals globals memory table function-names
                                                                        function-indices types)]
                                                 (if (!= else-stop 0x0b)
                                                     (primitive/error "WebAssembly validation: malformed if")
@@ -246,7 +349,7 @@
                                     continue-stop
                                       (compile-region! a context (mut p) (mut continue-stack)
                                                        continue-forms false region-base
-                                                       region-result-tag locals globals memory function-names
+                                                       region-result-tag locals globals memory table function-names
                                                        function-indices types)
                                     continue-code
                                       (if (!= continue-stop 0x0b)
@@ -527,6 +630,9 @@
                                     (push-node! (mut stack)
                                                 (al/al-get (.results callee-type) 0)
                                                 call)))))))
+                  (= opcode 0x11)
+                    (indirect-call! a context (mut p) (mut stack) forms-builder
+                                    table function-names function-indices types)
                   (= opcode 0x01)
                     0
                   (= opcode 0x1a)
@@ -886,7 +992,8 @@
 
 (defn compile-expression [(a (dyn alloc/Allocator)) (context Code)
                           (signature wasm/FuncType) (body wasm/FuncBody)
-                          (locals Code) (globals Code) (memory Code) (function-names Code)
+                          (locals Code) (globals Code) (memory Code) (table Code)
+                          (function-names Code)
                           (function-indices (al/ArrayList i64))
                           (types (al/ArrayList wasm/FuncType))] (-> Code)
   (let [b body
@@ -897,7 +1004,7 @@
                        0
                        (kind-tag (al/al-get (.results signature) 0)))
         stop (compile-region! a context (mut p) (mut stack) forms-builder false `() result-tag
-                              locals globals memory function-names function-indices types)]
+                              locals globals memory table function-names function-indices types)]
     (if (!= stop 0x0b)
         (primitive/error "WebAssembly function expression ended unexpectedly")
         0)
@@ -922,7 +1029,7 @@
 
 (defn function-form [(a (dyn alloc/Allocator)) (context Code) (name Code)
                      (signature wasm/FuncType) (body wasm/FuncBody)
-                     (globals Code) (memory Code) (function-names Code)
+                     (globals Code) (memory Code) (table Code) (function-names Code)
                      (function-indices (al/ArrayList i64))
                      (types (al/ArrayList wasm/FuncType))] (-> Code)
   (let [sig signature
@@ -967,7 +1074,7 @@
               (store! j (+ (load j) 1)))))
       (let [binding-vector (primitive/code-list-done binding-code)
             body-code (compile-expression a context sig b local-code
-                                          globals memory function-names function-indices types)
+                                          globals memory table function-names function-indices types)
             result-type (if (= (al/al-len (.results sig)) 0)
                             `void
                             (type-code context (al/al-get (.results sig) 0)))]
@@ -1108,6 +1215,66 @@
                                                   (al/al-get memories 0) segments))
                           `(1 ~accessor)))))))))))
 
+(defn table-code [(a (dyn alloc/Allocator)) (table-payload (slice u8))
+                  (element-payload (slice u8)) (function-count i64)] (-> Code)
+  (if (= (slice-len table-payload) 0)
+      (if (= (slice-len element-payload) 0)
+          `()
+          (primitive/error "WebAssembly validation: element segment without table"))
+      (match (wasm/table-section a table-payload)
+        (wasm/DecodeError [_ message] (primitive/error message))
+        (wasm/Decoded [tables]
+          (if (= (al/al-len tables) 0)
+              `()
+              (let [table-type (al/al-get tables 0)
+                    (mut entries) (al/al-new [i64] a)
+                    (mut i) 0]
+                (loop
+                  (if (>= (load i) (.minimum table-type))
+                      (break)
+                      (do
+                        (al/al-push! [i64] (mut entries) -1)
+                        (store! i (+ (load i) 1)))))
+                (if (= (slice-len element-payload) 0)
+                    0
+                    (match (wasm/element-section a element-payload)
+                      (wasm/DecodeError [_ message] (primitive/error message))
+                      (wasm/Decoded [segments]
+                        (do
+                          (store! i 0)
+                          (loop
+                            (if (>= (load i) (al/al-len segments))
+                                (break)
+                                (let [segment (al/al-get segments (load i))
+                                      offset (primitive/cast
+                                               i64 (primitive/cast u32 (.offset segment)))
+                                      (mut j) 0]
+                                  (if (> (+ offset (al/al-len (.functions segment)))
+                                         (al/al-len (load entries)))
+                                      (primitive/error "WebAssembly element segment does not fit table")
+                                      0)
+                                  (loop
+                                    (if (>= (load j) (al/al-len (.functions segment)))
+                                        (break)
+                                        (let [function-index
+                                                (al/al-get (.functions segment) (load j))]
+                                          (if (>= function-index function-count)
+                                              (primitive/error "WebAssembly element function index out of bounds")
+                                              (al/al-set! [i64] (mut entries)
+                                                          (+ offset (load j)) function-index))
+                                          (store! j (+ (load j) 1)))))
+                                  (store! i (+ (load i) 1)))))
+                          0))))
+                (let [builder (primitive/code-list-new)]
+                  (store! i 0)
+                  (loop
+                    (if (>= (load i) (al/al-len (load entries)))
+                        (break)
+                        (do
+                          (primitive/code-list-push! builder `~(al/al-get (load entries) (load i)))
+                          (store! i (+ (load i) 1)))))
+                  (primitive/code-list-done builder))))))))
+
 (defn export-wrapper-form [(context Code) (export-name (slice u8)) (callee Code)
                            (signature wasm/FuncType)] (-> Code)
   (let [sig signature
@@ -1219,7 +1386,9 @@
                                   names-builder
                                   (primitive/fresh-identifier "wasm-function"))
                                 (store! i (+ (load i) 1)))))
-                        (let [names (primitive/code-list-done names-builder)]
+                        (let [names (primitive/code-list-done names-builder)
+                              table (table-code a (.tables s) (.elements s)
+                                                (al/al-len indices))]
                           (store! i 0)
                           (loop
                             (if (>= (load i) (al/al-len indices))
@@ -1233,7 +1402,7 @@
                                                        (primitive/code-nth names (load i))
                                                        (al/al-get types type-index)
                                                        (al/al-get bodies (load i))
-                                                       globals memory names indices types)))
+                                                       globals memory table names indices types)))
                                   (store! i (+ (load i) 1)))))
                           (if (= (slice-len (.exports s)) 0)
                               0
