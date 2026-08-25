@@ -3,7 +3,7 @@
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :as al)
-(import "coil.slice" :use [slice-len slice-get])
+(import "coil.slice" :as slice :use [slice-len slice-get])
 (import "experiments.wasm.decoder" :as wasm)
 
 (defn kind-tag [(kind wasm/ValType)] (-> i64)
@@ -28,25 +28,40 @@
           (= tag 4) `0.0
           :else `0)))
 
-(defn wasm-control-label [(depth i64)] (-> Code)
-  (cond (= depth 0) `:wasm-function
-        (= depth 1) `:wasm-label-1
-        (= depth 2) `:wasm-label-2
-        (= depth 3) `:wasm-label-3
-        (= depth 4) `:wasm-label-4
-        (= depth 5) `:wasm-label-5
-        (= depth 6) `:wasm-label-6
-        (= depth 7) `:wasm-label-7
-        (= depth 8) `:wasm-label-8
-        (= depth 9) `:wasm-label-9
-        (= depth 10) `:wasm-label-10
-        (= depth 11) `:wasm-label-11
-        (= depth 12) `:wasm-label-12
-        (= depth 13) `:wasm-label-13
-        (= depth 14) `:wasm-label-14
-        (= depth 15) `:wasm-label-15
-        (= depth 16) `:wasm-label-16
-        :else (primitive/error "WebAssembly codegen: control nesting exceeds temporary label pool")))
+(defn wasm-label [(a (dyn alloc/Allocator)) (serial i64)] (-> Code)
+  (match (alloc/alloc [u8] a 28)
+    (None [] (primitive/error "WebAssembly codegen: label allocation failed"))
+    (Some [storage]
+      (let [p (alloc/alloc-slice-data storage)
+            prefix ":wasm-label-"
+            (mut i) 0]
+        (loop
+          (if (>= (load i) 12)
+              (break)
+              (do
+                (store! (primitive/index p (load i)) (slice-get prefix (load i)))
+                (store! i (+ (load i) 1)))))
+        (store! i 0)
+        (loop
+          (if (>= (load i) 16)
+              (break)
+              (let [shift (* (- 15 (load i)) 4)
+                    nibble (primitive/iand
+                             (primitive/ishr serial shift) 15)
+                    byte (if (< nibble 10) (+ 48 nibble) (+ 87 nibble))]
+                (store! (primitive/index p (+ 12 (load i)))
+                        (primitive/cast u8 byte))
+                (store! i (+ (load i) 1)))))
+        (let [parsed (primitive/code-read (slice/slice-new p 28) `(reader-config))]
+          (cond (primitive/code-keyword? parsed) parsed
+                (and (primitive/code-list? parsed)
+                     (= (primitive/code-count parsed) 1))
+                  (primitive/code-nth parsed 0)
+                (and (primitive/code-list? parsed)
+                     (= (primitive/code-count parsed) 2))
+                  (primitive/code-nth parsed 1)
+                :else
+                  (primitive/error "WebAssembly codegen: generated label did not parse as a keyword")))))))
 
 ;; Compile-time operand stacks are persistent Code triples `(tag expr tail)`.
 ;; Code has no runtime layout, so it must not be put in an ordinary struct or
@@ -354,7 +369,7 @@
                        (p (mut wasm/Parser)) (stack (mut Code))
                        (forms-builder CodeBuilder) (allow-else bool)
                        (region-base Code) (region-result-tag i64) (region-label Code)
-                       (label-depth i64) (label-tags Code)
+                       (label-names Code) (label-tags Code) (label-loops Code)
                        (function-result-tag i64)
                        (locals Code) (globals Code) (memory Code) (table Code)
                        (function-names Code)
@@ -368,6 +383,35 @@
           (let [opcode (wasm/parser-byte! (mut p))]
             (cond (= opcode 0x0b)
                     (do (store! stop-opcode opcode) (store! ended true))
+                  (= opcode 0x00)
+                    (let [trap-name (cond (= region-result-tag 0) "wasmrt/trap-void"
+                                          (= region-result-tag 1) "wasmrt/trap-i32"
+                                          (= region-result-tag 2) "wasmrt/trap-i64"
+                                          (= region-result-tag 3) "wasmrt/trap-f32"
+                                          (= region-result-tag 4) "wasmrt/trap-f64"
+                                          :else
+                                            (primitive/error "WebAssembly codegen internal error: invalid unreachable result"))
+                          trap-id (primitive/datum->syntax context trap-name)
+                          delimiter (skip-unreachable-region! context (mut p))]
+                      (primitive/code-list-push! forms-builder `(~trap-id))
+                      (store! stack region-base)
+                      (if (!= region-result-tag 0)
+                          (cond (= region-result-tag 1)
+                                  (push-node! (mut stack) (wasm/I32)
+                                              (zero-expression context 1))
+                                (= region-result-tag 2)
+                                  (push-node! (mut stack) (wasm/I64)
+                                              (zero-expression context 2))
+                                (= region-result-tag 3)
+                                  (push-node! (mut stack) (wasm/F32)
+                                              (zero-expression context 3))
+                                (= region-result-tag 4)
+                                  (push-node! (mut stack) (wasm/F64)
+                                              (zero-expression context 4))
+                                :else 0)
+                          0)
+                      (store! stop-opcode delimiter)
+                      (store! ended true))
                   (= opcode 0x05)
                     (if allow-else
                         (do (store! stop-opcode opcode) (store! ended true))
@@ -375,13 +419,15 @@
                   (or (= opcode 0x02) (= opcode 0x03))
                     (let [result-tag (parse-block-tag! context (mut p))
                           base (load stack)
-                          label (wasm-control-label (+ label-depth 1))
-                          child-tags `(~result-tag ~@label-tags)
+                          label (wasm-label a (.at (.cursor p)))
+                          child-names `(~label ~@label-names)
+                          child-tags `(~(if (= opcode 0x03) 0 result-tag) ~@label-tags)
+                          child-loops `(~(if (= opcode 0x03) 1 0) ~@label-loops)
                           (mut block-stack) base
                           block-forms (primitive/code-list-new)
                           block-stop (compile-region! a context (mut p) (mut block-stack)
                                                       block-forms false base result-tag
-                                                      label (+ label-depth 1) child-tags
+                                                      label child-names child-tags child-loops
                                                       function-result-tag
                                                       locals globals memory table function-names
                                                       function-indices types)]
@@ -406,13 +452,11 @@
                             (store! ended true))
                           (if (!= block-stop 0x0b)
                               (primitive/error "WebAssembly validation: malformed block")
-                              (if (= opcode 0x03)
-                                  (primitive/error "WebAssembly codegen: loop control is not implemented yet")
-                                  (let [body (finish-region a base (mut block-stack)
+                              (let [body (finish-region a base (mut block-stack)
                                                            block-forms result-tag)
-                                        scope-id (primitive/datum->syntax
-                                                   context "control/block")
-                                        expression `(~scope-id ~label ~body)]
+                                    break-value (if (= result-tag 0) `(do ~body 0) body)
+                                    expression
+                                      `(loop ~label (break ~label ~break-value))]
                             (if (= result-tag 0)
                                 (do (primitive/code-list-push! forms-builder expression) 0)
                                 (cond (= result-tag 1)
@@ -424,7 +468,7 @@
                                       (= result-tag 4)
                                         (push-node! (mut stack) (wasm/F64) expression)
                                       :else
-                                        (primitive/error "WebAssembly codegen internal error: invalid block result"))))))))
+                                        (primitive/error "WebAssembly codegen internal error: invalid block result")))))))
                   (= opcode 0x04)
                     (let [result-tag (parse-block-tag! context (mut p))
                           condition (pop-node! (mut stack))]
@@ -435,7 +479,7 @@
                                 then-forms (primitive/code-list-new)
                                 then-stop (compile-region! a context (mut p) (mut then-stack)
                                                            then-forms true base result-tag
-                                                           region-label label-depth label-tags
+                                                           region-label label-names label-tags label-loops
                                                            function-result-tag
                                                            locals globals memory table function-names
                                                            function-indices types)
@@ -455,7 +499,7 @@
                                               (compile-region! a context (mut p)
                                                                (mut else-stack) else-forms
                                                                false base result-tag
-                                                               region-label label-depth label-tags
+                                                               region-label label-names label-tags label-loops
                                                                function-result-tag
                                                                locals globals memory table function-names
                                                                function-indices types)]
@@ -509,7 +553,9 @@
                               (primitive/error "WebAssembly validation: br_if condition must be i32")
                               (let [target-tag (primitive/code-int
                                                  (primitive/code-nth label-tags depth))
-                                    target-label (wasm-control-label (- label-depth depth))
+                                    target-loop (= (primitive/code-int
+                                                     (primitive/code-nth label-loops depth)) 1)
+                                    target-label (primitive/code-nth label-names depth)
                                     (mut branch-stack) (load stack)
                                     branch-value
                                       (if (= target-tag 0)
@@ -523,11 +569,13 @@
                                                     (primitive/code-nth node 1)))))
                                     if-id (primitive/datum->syntax context "if")
                                     ne-id (primitive/datum->syntax context "primitive/icmp-ne")
-                                    return-id (primitive/datum->syntax
-                                                context "control/return-from")
+                                    return-id (primitive/datum->syntax context "break")
+                                    transfer (if target-loop
+                                                 `(continue ~target-label)
+                                                 `(~return-id ~target-label ~branch-value))
                                     c (primitive/code-nth condition 1)
                                     expression `(~if-id (~ne-id ~c 0)
-                                                       (~return-id ~target-label ~branch-value)
+                                                       ~transfer
                                                        0)]
                                 (primitive/code-list-push! forms-builder expression)
                                 0))))
@@ -537,7 +585,9 @@
                           (primitive/error "WebAssembly validation: br depth out of bounds")
                           (let [target-tag (primitive/code-int
                                              (primitive/code-nth label-tags depth))
-                                target-label (wasm-control-label (- label-depth depth))
+                                target-loop (= (primitive/code-int
+                                                 (primitive/code-nth label-loops depth)) 1)
+                                target-label (primitive/code-nth label-names depth)
                                 branch-value
                                   (if (= target-tag 0)
                                       `0
@@ -547,11 +597,13 @@
                                             (if (!= (node-kind node) target-tag)
                                                 (primitive/error "WebAssembly validation: br value type mismatch")
                                                 (primitive/code-nth node 1)))))
-                                return-id (primitive/datum->syntax
-                                            context "control/return-from")
+                                return-id (primitive/datum->syntax context "break")
+                                transfer (if target-loop
+                                             `(continue ~target-label)
+                                             `(~return-id ~target-label ~branch-value))
                                 delimiter (skip-unreachable-region! context (mut p))]
                             (primitive/code-list-push!
-                              forms-builder `(~return-id ~target-label ~branch-value))
+                              forms-builder transfer)
                             (store! stack region-base)
                             (if (!= region-result-tag 0)
                                 (cond (= region-result-tag 1)
@@ -573,32 +625,83 @@
                             (store! ended true))))
                   (= opcode 0x0e)
                     (let [count (wasm/parser-u32! (mut p))
+                          depths-builder (primitive/code-list-new)
                           (mut i) 0]
                       (loop
                         (if (> (load i) count)
                             (break)
                             (let [depth (wasm/parser-u32! (mut p))]
-                              (if (!= depth 0)
-                                  (primitive/error "WebAssembly codegen: outer br_table is not implemented yet")
-                                  (store! i (+ (load i) 1))))))
+                              (if (>= depth (primitive/code-count label-tags))
+                                  (primitive/error "WebAssembly validation: br_table depth out of bounds")
+                                  (do
+                                    (primitive/code-list-push! depths-builder `~depth)
+                                    (store! i (+ (load i) 1)))))))
+                      (let [depths (primitive/code-list-done depths-builder)
+                            default-depth (primitive/code-int
+                                            (primitive/code-nth depths count))
+                            target-tag (primitive/code-int
+                                         (primitive/code-nth label-tags default-depth))
+                            (mut j) 0]
+                        (loop
+                          (if (> (load j) count)
+                              (break)
+                              (let [depth (primitive/code-int
+                                            (primitive/code-nth depths (load j)))
+                                    tag (primitive/code-int
+                                          (primitive/code-nth label-tags depth))]
+                                (if (!= tag target-tag)
+                                    (primitive/error "WebAssembly validation: br_table target type mismatch")
+                                    (store! j (+ (load j) 1))))))
                       (let [selector (pop-node! (mut stack))]
                         (if (!= (node-kind selector) 1)
                             (primitive/error "WebAssembly validation: br_table selector must be i32")
                             (let [branch-value
-                                    (if (= region-result-tag 0)
+                                    (if (= target-tag 0)
                                         `0
-                                        (let [node (pop-node! (mut stack))]
-                                          (if (!= (node-kind node) region-result-tag)
-                                              (primitive/error "WebAssembly validation: br_table value type mismatch")
-                                              (primitive/code-nth node 1))))
+                                        (if (primitive/code-eq region-base (load stack))
+                                            (primitive/error "WebAssembly validation: br_table operand is below current frame")
+                                            (let [node (pop-node! (mut stack))]
+                                              (if (!= (node-kind node) target-tag)
+                                                  (primitive/error "WebAssembly validation: br_table value type mismatch")
+                                                  (primitive/code-nth node 1)))))
                                   selector-expression (primitive/code-nth selector 1)
-                                  return-id (primitive/datum->syntax
-                                              context "control/return-from")
+                                  return-id (primitive/datum->syntax context "break")
+                                  selector-id (primitive/fresh-identifier "wasm-br-table-index")
+                                  cast-id (primitive/datum->syntax context "primitive/cast")
+                                  default-label (primitive/code-nth label-names default-depth)
+                                  default-loop (= (primitive/code-int
+                                                    (primitive/code-nth label-loops
+                                                                        default-depth)) 1)
+                                  (mut dispatch)
+                                    (if default-loop
+                                        `(continue ~default-label)
+                                        `(~return-id ~default-label ~branch-value))
+                                  (mut case-index) count
                                   delimiter (skip-unreachable-region! context (mut p))]
+                              (loop
+                                (if (= (load case-index) 0)
+                                    (break)
+                                    (do
+                                      (store! case-index (- (load case-index) 1))
+                                      (let [depth (primitive/code-int
+                                                    (primitive/code-nth depths
+                                                                        (load case-index)))
+                                            label (primitive/code-nth label-names depth)
+                                            target-loop (= (primitive/code-int
+                                                             (primitive/code-nth label-loops
+                                                                                 depth)) 1)
+                                            transfer (if target-loop
+                                                         `(continue ~label)
+                                                         `(~return-id ~label ~branch-value))]
+                                        (store! dispatch
+                                                `(if (= ~selector-id
+                                                        (~cast-id i32 ~(load case-index)))
+                                                     ~transfer
+                                                     ~(load dispatch)))))))
                               (primitive/code-list-push!
                                 forms-builder
-                                `(do ~selector-expression
-                                     (~return-id ~region-label ~branch-value)))
+                                `(let [~selector-id ~selector-expression]
+                                   ~(load dispatch)))
                               (store! stack region-base)
                               (if (!= region-result-tag 0)
                                   (cond (= region-result-tag 1)
@@ -617,7 +720,7 @@
                                           (primitive/error "WebAssembly codegen internal error: invalid branch-table result"))
                                   0)
                               (store! stop-opcode delimiter)
-                              (store! ended true)))))
+                              (store! ended true))))))
                   (= opcode 0x20)
                     (let [index (wasm/parser-u32! (mut p))]
                       (if (>= index (primitive/code-count locals))
@@ -1182,9 +1285,11 @@
                        0
                        (kind-tag (al/al-get (.results signature) 0)))
         function-label `:wasm-function
+        label-names `(~function-label)
         label-tags `(~result-tag)
+        label-loops `(0)
         stop (compile-region! a context (mut p) (mut stack) forms-builder false `() result-tag
-                              function-label 0 label-tags
+                              function-label label-names label-tags label-loops
                               result-tag
                               locals globals memory table function-names function-indices types)]
     (if (and (!= stop 0x0b) (< stop 0x100))
@@ -1209,10 +1314,11 @@
                     (primitive/error "WebAssembly validation: function result type mismatch")
                     (let [result (primitive/code-nth value 1)]
                       `(do ~@forms ~result))))))
-          scope-id (primitive/datum->syntax context "control/block")]
+          scope-id (primitive/datum->syntax context "loop")
+          break-id (primitive/datum->syntax context "break")]
       (if (= result-count 0)
           body-code
-          `(~scope-id ~function-label ~body-code)))))
+          `(~scope-id ~function-label (~break-id ~function-label ~body-code))))))
 
 (defn function-form [(a (dyn alloc/Allocator)) (context Code) (name Code)
                      (signature wasm/FuncType) (body wasm/FuncBody)

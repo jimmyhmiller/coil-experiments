@@ -375,8 +375,16 @@ test_control() {
   "$coil_bin" run "$root/tests/wasm/control_br_table.wasm" \
     --use experiments.wasm.lang -- --assert-scalar-batch \
     branch-table i32 42 1 i32 0 \
-    branch-table i32 42 1 i32 10
-  echo "focused nonterminal and outer-depth br/br_if plus br_table checks passed"
+    branch-table i32 42 1 i32 10 \
+    multi-target i32 43 1 i32 0 \
+    multi-target i32 42 1 i32 1 \
+    multi-target i32 42 1 i32 10
+  "$coil_bin" run "$root/tests/wasm/control_loop.wasm" \
+    --use experiments.wasm.lang -- --assert-scalar-batch \
+    count i32 0 1 i32 0 \
+    count i32 5 1 i32 5 \
+    count i32 20 1 i32 20
+  echo "focused lexical branch, branch-table, and loop continuation checks passed"
 
   command -v jq >/dev/null 2>&1 || {
     echo "error: jq is required to run prepared spec assertions" >&2

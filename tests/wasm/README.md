@@ -72,9 +72,11 @@ returns and 13 process traps.
 `test-control` exercises function returns before unreachable instructions and
 returns propagated through nested blocks, loops, and conditionals. It also
 checks nonterminal and outer-depth `br`, both paths of nonterminal and
-outer-depth `br_if`, and depth-zero `br_table` selection through typed Coil
-labeled blocks. It also
-passes the complete official MVP `return` file: 63 returns and 20 validation
+outer-depth `br_if`, and multi-target/default `br_table` selection across nested
+typed Coil labeled blocks. A stateful counting loop verifies `br 0` as a loop
+continuation and an outer `br_if` carrying the function result. It also passes
+the complete official MVP `return`
+file: 63 returns and 20 validation
 failures. Together, the harnesses above currently execute 6,259 official
 assertions.
 
