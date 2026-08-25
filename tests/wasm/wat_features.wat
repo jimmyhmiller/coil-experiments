@@ -16,4 +16,21 @@
   (func (export "mixed-folded-flat") (result i64)
     i64.const 40
     (i64.add (i64.const 1) (i64.const 1))
-    i64.add))
+    i64.add)
+  (func (export "set-local") (param $value i32) (result i32)
+    (local $temporary i32)
+    local.get $value
+    local.set $temporary
+    local.get $temporary
+    i32.const 2
+    i32.add)
+  (func (export "tee-local") (result i64)
+    (local $temporary i64)
+    i64.const 40
+    local.tee $temporary
+    i64.const 2
+    i64.add)
+  (func (export "set-parameter") (param $value i32) (result i32)
+    i32.const 42
+    local.set $value
+    local.get $value))

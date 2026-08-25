@@ -78,7 +78,9 @@ assertions.
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and
 all four MVP scalar result types. Flat, folded, and mixed folded/flat numeric
-instruction forms are covered. It does not invoke WABT or another converter.
+instruction forms are covered, along with named/numbered mutable parameters and
+locals through `local.get`, `local.set`, and `local.tee`. It does not invoke WABT
+or another converter.
 
 An individual exported integer function can be checked through the same reader
 entry path:

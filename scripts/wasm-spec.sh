@@ -414,8 +414,11 @@ test_wat() {
     f32-constant f32 1069547520 0 \
     f64-constant f64 4609434218613702656 0 \
     folded-add i32 42 1 i32 40 \
-    mixed-folded-flat i64 42 0
-  echo "focused textual WAT flat/folded, named-local, and constant checks passed"
+    mixed-folded-flat i64 42 0 \
+    set-local i32 42 1 i32 40 \
+    tee-local i64 42 0 \
+    set-parameter i32 42 1 i32 0
+  echo "focused textual WAT expression and mutable-local checks passed"
 }
 
 case "${1:-inventory}" in
