@@ -42,6 +42,7 @@ scripts/wasm-spec.sh test-integers
 scripts/wasm-spec.sh test-floats
 scripts/wasm-spec.sh test-conversions
 scripts/wasm-spec.sh test-memory
+scripts/wasm-spec.sh test-tables
 ```
 
 `test-integers` compiles each official `i32` and `i64` module through the reader
@@ -61,6 +62,11 @@ do not count as passing trap assertions.
 `test-memory` checks state persistence, all representative load/store widths,
 growth, zero-filled new pages, active data initialization, 68 official byte-order
 assertions, and all 36 official `memory_size` assertions across four modules.
+
+`test-tables` checks focused table initialization and indirect dispatch, then
+executes every runnable assertion in the official MVP `call_indirect` file: 103
+returns and 13 process traps. Together, the semantic harnesses above currently
+execute 6,176 official assertions.
 
 An individual exported integer function can be checked through the same reader
 entry path:
