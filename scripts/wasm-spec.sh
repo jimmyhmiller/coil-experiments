@@ -412,8 +412,10 @@ test_wat() {
     i32-constant i32 4294967295 0 \
     i64-constant i64 9223372036854775807 0 \
     f32-constant f32 1069547520 0 \
-    f64-constant f64 4609434218613702656 0
-  echo "focused textual WAT named-local and numeric-constant checks passed"
+    f64-constant f64 4609434218613702656 0 \
+    folded-add i32 42 1 i32 40 \
+    mixed-folded-flat i64 42 0
+  echo "focused textual WAT flat/folded, named-local, and constant checks passed"
 }
 
 case "${1:-inventory}" in
