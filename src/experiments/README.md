@@ -7,6 +7,8 @@ not part of the standard library or compiler surface:
 - [`transparent-gc/`](transparent-gc/) — the follow-on transform that inserts roots.
 - [`heap-inspector/`](heap-inspector/) — automatic heap-struct census, reflection,
   and JIT-queryable inspection as a whole-program transform.
+- [`safety/`](safety/) — Zig-style fixed-array bounds checks inserted by a
+  whole-program transform, with a documented checked-runtime build profile.
 
 The production-scale demonstration of transparent GC lives in
 [`src/apps/mini-scheme/`](../apps/mini-scheme/).

@@ -1,0 +1,117 @@
+(module experiments.safety.runtime)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use [ArrayList al-elem al-get al-len al-set!])
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use [slice-get slice-len slice-set! subslice])
+
+(extern printf :cc c [(ptr i8) ...] (-> i32))
+(extern dladdr :cc c [(ptr i8) (ptr i8)] (-> i32))
+
+;; Runtime half of the safety dialect. Kept deliberately non-generic so each
+;; checked access only adds two integer comparisons in an optimized build.
+(defn bounds-check [(index i64) (length i64)] (-> i64)
+  (if (or (< index 0) (>= index length))
+      (do
+        (printf c"safety trap: index %lld outside array[0..%lld)\n" index length)
+        (alloc/abort))
+      index))
+
+(defn range-check [(low i64) (high i64) (length i64)] (-> i64)
+  (if (or (< low 0) (or (< high low) (> high length)))
+      (do
+        (printf c"safety trap: invalid range [%lld..%lld) for length %lld\n" low high length)
+        (alloc/abort))
+      high))
+
+(defn checked-slice-get [T] [(s (slice T)) (index i64)] (-> T)
+  (slice-get s (bounds-check index (slice-len s))))
+
+(defn checked-slice-set! [T] [(s (slice T)) (index i64) (value T)] (-> i64)
+  (slice-set! s (bounds-check index (slice-len s)) value))
+
+(defn checked-subslice [T] [(s (slice T)) (low i64) (high i64)] (-> (slice T))
+  (subslice s low (range-check low high (slice-len s))))
+
+(defn checked-al-get [T] [(items (ArrayList T)) (index i64)] (-> T)
+  (al-get items (bounds-check index (al-len items))))
+
+(defn checked-al-set! [T] [(items (mut (ArrayList T))) (index i64) (value T)] (-> i64)
+  (al-set! (mut items) (bounds-check index (al-len (load items))) value))
+
+(defn checked-al-elem [T] [(items (ptr (ArrayList T))) (index i64)] (-> (ptr T))
+  (al-elem items (bounds-check index (al-len (load items)))))
+
+;; Returns the address so generated code can cast it back to its original pointer
+;; type without requiring one runtime helper per pointee type.
+(defn pointer-check [(address i64) (alignment i64)] (-> i64)
+  (if (= address 0)
+      (do
+        (printf c"safety trap: null pointer dereference\n")
+        (alloc/abort))
+      (if (and (> alignment 1) (!= (% address alignment) 0))
+          (do
+            (printf c"safety trap: pointer %lld is not aligned to %lld bytes\n"
+                    address
+                    alignment)
+            (alloc/abort))
+          address)))
+
+(defn pointer-cast-check [(address i64)] (-> i64)
+  (if (= address 0)
+      (do
+        (printf c"safety trap: invalid null pointer cast\n")
+        (alloc/abort))
+      address))
+
+(defn indirect-target-check [(address i64)] (-> i64)
+  (if (or (= address 0) (!= (% address 2) 0))
+      (do
+        (printf c"safety trap: invalid indirect call target\n")
+        (alloc/abort))
+      (let [info (primitive/alloc-stack (array i64 4))]
+        (if (= (dladdr (primitive/cast (ptr i8) address)
+                       (primitive/cast (ptr i8) info))
+               0)
+            (do
+              (printf c"safety trap: indirect call target is not in a loaded image\n")
+              (alloc/abort))
+            address))))
+
+(defn dynamic-object-check [(data i64) (vtable i64)] (-> i64)
+  (pointer-check data 1)
+  ;; Safe Coil can only obtain a dynamic vtable from compiler-generated
+  ;; make-dyn lowering. Forging one requires an explicit unsafe operation, so a
+  ;; loaded-image lookup here adds no guarantee to safe code and makes every
+  ;; dispatch call into the dynamic loader. The method body checks `data` again
+  ;; at the concrete implementer's alignment before dereferencing it.
+  (pointer-check vtable (primitive/sizeof (ptr i8))))
+
+(defn cast-check-signed [(value i64) (minimum i64) (maximum i64)] (-> i64)
+  (if (or (< value minimum) (> value maximum))
+      (do
+        (printf c"safety trap: signed value %lld is outside cast range [%lld, %lld]\n"
+                value
+                minimum
+                maximum)
+        (alloc/abort))
+      value))
+
+(defn cast-check-unsigned [(value u64) (maximum u64)] (-> u64)
+  (if (> value maximum)
+      (do
+        (printf c"safety trap: unsigned value is outside cast range\n")
+        (primitive/cast u64 (alloc/abort)))
+      value))
+
+(defn cast-check-f64 [(value f64) (minimum f64) (upper-exclusive f64)] (-> f64)
+  (if (or (not (primitive/fcmp-eq value value))
+          (or (primitive/fcmp-lt value minimum)
+              (primitive/fcmp-ge value upper-exclusive)))
+      (do
+        (printf c"safety trap: floating-point value is outside integer cast range\n")
+        (primitive/cast f64 (alloc/abort)))
+      value))
+
+(defn safety-abort [(message (ptr i8))] (-> i64)
+  (printf c"safety trap: %s\n" message)
+  (alloc/abort))
