@@ -46,6 +46,7 @@ scripts/wasm-spec.sh test-tables
 scripts/wasm-spec.sh test-control
 scripts/wasm-spec.sh test-loops
 scripts/wasm-spec.sh test-structured-control
+scripts/wasm-spec.sh test-start
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -95,6 +96,13 @@ malformed-text rejections, and one runtime trap. Large branch tables are lowered
 to balanced unsigned decision trees, avoiding parser-depth growth while keeping
 each target as a lexical Coil transfer. The cumulative official total is 7,024
 assertions.
+
+`test-start` passes the complete official MVP `start` file: six returns, three
+validation failures, and one instantiation trap. Start functions run exactly
+once before direct CLI access or an exported function/global, including starts
+that call imported `spectest` functions. The three successful import-only/start
+modules and the suite's ordered actions are also instantiated. The cumulative
+official assertion total is 7,034.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and

@@ -568,6 +568,55 @@ test_structured_control() {
   echo "structured control assert_trap: $trap_total checks passed"
 }
 
+test_start() {
+  coil_bin=${COIL:-coil}
+  dir="$prepared/start"
+  failure_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-start-failure.XXXXXX")
+  trap 'rm -f "$failure_out"' EXIT HUP INT TERM
+
+  for file in 0 1 2; do
+    if "$coil_bin" run "$dir/script.$file.wasm" --use experiments.wasm.lang \
+         > "$failure_out" 2>&1; then
+      echo "error: expected invalid start module script.$file.wasm" >&2
+      exit 1
+    fi
+    if ! grep -q 'WebAssembly validation:' "$failure_out"; then
+      echo "error: invalid start module lacked a validation diagnostic" >&2
+      cat "$failure_out" >&2
+      exit 1
+    fi
+  done
+
+  for file in 3 4; do
+    "$coil_bin" run "$dir/script.$file.wasm" --use experiments.wasm.lang -- \
+      --assert-scalar-batch \
+      get i32 68 0 \
+      inc void 0 0 \
+      get i32 69 0 \
+      inc void 0 0 \
+      get i32 70 0
+  done
+
+  for file in 5 6 7; do
+    "$coil_bin" run "$dir/script.$file.wasm" --use experiments.wasm.lang
+  done
+
+  if "$coil_bin" run "$dir/script.8.wasm" --use experiments.wasm.lang \
+       > "$failure_out" 2>&1; then
+    echo "error: expected trapping start function" >&2
+    exit 1
+  fi
+  if ! grep -q 'program terminated by signal 6' "$failure_out"; then
+    echo "error: start function failed without the expected runtime trap" >&2
+    cat "$failure_out" >&2
+    exit 1
+  fi
+  rm -f "$failure_out"
+  trap - EXIT HUP INT TERM
+  echo "start: 6 returns, 3 invalid modules, 1 instantiation trap passed"
+  echo "start: imported spectest starts and action ordering passed"
+}
+
 test_wat() {
   coil_bin=${COIL:-coil}
   "$coil_bin" run "$root/tests/wasm/wat_features.wat" \
@@ -598,9 +647,10 @@ case "${1:-inventory}" in
   test-control) test_control ;;
   test-loops) test_loops ;;
   test-structured-control) test_structured_control ;;
+  test-start) test_start ;;
   test-wat) test_wat ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-wat]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-wat]" >&2
     exit 2
     ;;
 esac

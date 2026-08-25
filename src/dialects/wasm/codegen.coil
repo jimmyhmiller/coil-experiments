@@ -1646,6 +1646,7 @@
                   (primitive/code-list-done builder))))))))
 
 (defn export-wrapper-form [(context Code) (export-name (slice u8)) (callee Code)
+                           (initializer Code)
                            (signature wasm/FuncType)] (-> Code)
   (let [sig signature
         name-text (cond (= export-name "and") "wasm-and"
@@ -1673,14 +1674,15 @@
                           (type-code context (al/al-get (.results sig) 0)))]
       `((export ~name)
         (defn ~name [~@param-code] (-> ~result-type)
-          (~callee ~@argument-code))))))
+          (do (~initializer) (~callee ~@argument-code)))))))
 
 (defn emit-export-wrappers! [(context Code) (forms CodeBuilder) (names Code)
                              (globals Code)
                              (indices (al/ArrayList i64))
                              (types (al/ArrayList wasm/FuncType))
                              (exports (al/ArrayList wasm/Export))] (-> i64)
-  (let [(mut i) 0]
+  (let [initializer (primitive/datum->syntax context "__coil_wasm_instantiate")
+        (mut i) 0]
     (loop
       (if (>= (load i) (al/al-len exports))
           (break)
@@ -1693,6 +1695,7 @@
                             wrapper (export-wrapper-form
                                       context (.name e)
                                       (primitive/code-nth names function-index)
+                                      initializer
                                       (al/al-get types type-index))]
                         (primitive/code-list-push! forms (primitive/code-nth wrapper 0))
                         (primitive/code-list-push! forms (primitive/code-nth wrapper 1))
@@ -1718,9 +1721,114 @@
                             (primitive/code-list-push! forms `(export ~name))
                             (primitive/code-list-push!
                               forms
-                              `(defn ~name [] (-> ~type) (~load-id (~accessor))))
+                              `(defn ~name [] (-> ~type)
+                                 (do (~initializer) (~load-id (~accessor)))))
                             0)))
                     0))
+            (store! i (+ (load i) 1)))))
+    0))
+
+(defn emit-start! [(context Code) (forms CodeBuilder) (payload (slice u8))
+                   (names Code) (indices (al/ArrayList i64))
+                   (types (al/ArrayList wasm/FuncType))] (-> i64)
+  (let [initializer (primitive/datum->syntax context "__coil_wasm_instantiate")]
+    (if (= (slice-len payload) 0)
+        (do
+          (primitive/code-list-push! forms `(defn ~initializer [] (-> void) (do)))
+          0)
+        (match (wasm/start-section payload)
+        (wasm/DecodeError [_ message] (primitive/error message))
+        (wasm/Decoded [function-index]
+          (if (>= function-index (primitive/code-count names))
+              (primitive/error "WebAssembly validation: start function index out of bounds")
+              (let [type-index (al/al-get indices function-index)]
+                (if (>= type-index (al/al-len types))
+                    (primitive/error "WebAssembly validation: start function type index out of bounds")
+                    (let [signature (al/al-get types type-index)]
+                      (if (or (!= (al/al-len (.params signature)) 0)
+                              (!= (al/al-len (.results signature)) 0))
+                          (primitive/error "WebAssembly validation: start function must have type [] -> []")
+                          (let [initialized (primitive/fresh-identifier
+                                              "wasm-start-initialized")
+                                alloc-static-id
+                                  (primitive/datum->syntax context "primitive/alloc-static")
+                                load-id (primitive/datum->syntax context "load")
+                                store-id (primitive/datum->syntax context "store!")]
+                            (primitive/code-list-push!
+                              forms
+                              `(defn ~initializer [] (-> void)
+                                 (let [~initialized (~alloc-static-id i32)]
+                                   (if (= (~load-id ~initialized) 0)
+                                       (do
+                                         (~store-id ~initialized 1)
+                                         (~(primitive/code-nth names function-index)))
+                                       0))))
+                            0)))))))))))
+
+(defn decoded-types [(a (dyn alloc/Allocator)) (payload (slice u8))]
+                    (-> (al/ArrayList wasm/FuncType))
+  (if (= (slice-len payload) 0)
+      (al/al-new [wasm/FuncType] a)
+      (match (wasm/type-section a payload)
+        (wasm/DecodeError [_ message] (primitive/error message))
+        (wasm/Decoded [values] values))))
+
+(defn decoded-indices [(a (dyn alloc/Allocator)) (payload (slice u8))]
+                      (-> (al/ArrayList i64))
+  (if (= (slice-len payload) 0)
+      (al/al-new [i64] a)
+      (match (wasm/index-section a payload)
+        (wasm/DecodeError [_ message] (primitive/error message))
+        (wasm/Decoded [values] values))))
+
+(defn decoded-bodies [(a (dyn alloc/Allocator)) (payload (slice u8))]
+                     (-> (al/ArrayList wasm/FuncBody))
+  (if (= (slice-len payload) 0)
+      (al/al-new [wasm/FuncBody] a)
+      (match (wasm/code-section a payload)
+        (wasm/DecodeError [_ message] (primitive/error message))
+        (wasm/Decoded [values] values))))
+
+(defn decoded-imports [(a (dyn alloc/Allocator)) (payload (slice u8))]
+                      (-> (al/ArrayList wasm/Import))
+  (if (= (slice-len payload) 0)
+      (al/al-new [wasm/Import] a)
+      (match (wasm/import-section a payload)
+        (wasm/DecodeError [_ message] (primitive/error message))
+        (wasm/Decoded [values] values))))
+
+(defn emit-function-imports! [(context Code) (forms CodeBuilder)
+                              (imports (al/ArrayList wasm/Import))
+                              (types (al/ArrayList wasm/FuncType))
+                              (names CodeBuilder) (indices (mut (al/ArrayList i64)))]
+                             (-> i64)
+  (let [(mut i) 0]
+    (loop
+      (if (>= (load i) (al/al-len imports))
+          (break)
+          (let [entry (al/al-get imports (load i))]
+            (if (!= (.kind entry) 0)
+                (primitive/error "WebAssembly codegen: non-function imports are not implemented yet")
+                (if (>= (.type-index entry) (al/al-len types))
+                    (primitive/error "WebAssembly validation: imported function type index out of bounds")
+                    (let [alias (primitive/datum->syntax
+                                  context
+                                  (primitive/code-symbol "wasm-import-" (load i)))
+                          module-path (if (= (.module-name entry) "spectest")
+                                          "experiments.wasm.spectest"
+                                          (.module-name entry))
+                          item-name (cond (= (.item-name entry) "and") "wasm-and"
+                                          (= (.item-name entry) "or") "wasm-or"
+                                          (= (.item-name entry) "load") "wasm-load"
+                                          (= (.item-name entry) "while") "wasm-while"
+                                          (= (.item-name entry) "for") "wasm-for"
+                                          :else (.item-name entry))
+                          callee (primitive/datum->syntax
+                                   context
+                                   (primitive/code-symbol alias "/" item-name))]
+                      (primitive/code-list-push! forms `(import ~module-path :as ~alias))
+                      (primitive/code-list-push! names callee)
+                      (al/al-push! [i64] (mut indices) (.type-index entry)))))
             (store! i (+ (load i) 1)))))
     0))
 
@@ -1729,57 +1837,61 @@
   (let [s sections
         forms (primitive/code-list-new)
         globals (compile-globals a context (.globals s) forms)
-        memory (compile-memory a context (.memories s) (.data s) forms)]
-    (if (= (slice-len (.functions s)) 0)
-        (primitive/code-list-done forms)
-        (match (wasm/type-section a (.types s))
-          (wasm/DecodeError [_ message] (primitive/error message))
-          (wasm/Decoded [types]
-            (match (wasm/index-section a (.functions s))
+        memory (compile-memory a context (.memories s) (.data s) forms)
+        types (decoded-types a (.types s))
+        defined-indices (decoded-indices a (.functions s))
+        bodies (decoded-bodies a (.codes s))
+        imports (decoded-imports a (.imports s))
+        imported-names (primitive/code-list-new)
+        (mut indices) (al/al-new [i64] a)
+        (mut i) 0]
+    (if (!= (al/al-len defined-indices) (al/al-len bodies))
+        (primitive/error "WebAssembly validation: function/code count mismatch")
+        0)
+    (emit-function-imports! context forms imports types imported-names (mut indices))
+    (let [imports-code (primitive/code-list-done imported-names)
+          names-builder (primitive/code-list-new)
+          (mut j) 0]
+      (loop
+        (if (>= (load j) (primitive/code-count imports-code))
+            (break)
+            (do
+              (primitive/code-list-push!
+                names-builder (primitive/code-nth imports-code (load j)))
+              (store! j (+ (load j) 1)))))
+      (loop
+        (if (>= (load i) (al/al-len defined-indices))
+            (break)
+            (do
+              (primitive/code-list-push!
+                names-builder (primitive/fresh-identifier "wasm-function"))
+              (al/al-push! [i64] (mut indices) (al/al-get defined-indices (load i)))
+              (store! i (+ (load i) 1)))))
+      (let [names (primitive/code-list-done names-builder)
+            imported-count (primitive/code-count imports-code)
+            table (table-code a (.tables s) (.elements s)
+                              (primitive/code-count names))]
+        (store! i 0)
+        (loop
+          (if (>= (load i) (al/al-len defined-indices))
+              (break)
+              (let [type-index (al/al-get defined-indices (load i))]
+                (if (>= type-index (al/al-len types))
+                    (primitive/error "WebAssembly validation: type index out of bounds")
+                    (primitive/code-list-push!
+                      forms
+                      (function-form a context
+                                     (primitive/code-nth names (+ imported-count (load i)))
+                                     (al/al-get types type-index)
+                                     (al/al-get bodies (load i))
+                                     globals memory table names (load indices) types)))
+                (store! i (+ (load i) 1)))))
+        (emit-start! context forms (.start s) names (load indices) types)
+        (if (= (slice-len (.exports s)) 0)
+            0
+            (match (wasm/export-section a (.exports s))
               (wasm/DecodeError [_ message] (primitive/error message))
-              (wasm/Decoded [indices]
-                (match (wasm/code-section a (.codes s))
-                  (wasm/DecodeError [_ message] (primitive/error message))
-                  (wasm/Decoded [bodies]
-                    (do
-                      (if (!= (slice-len (.imports s)) 0)
-                          (primitive/error "WebAssembly codegen: imports are not implemented yet")
-                          0)
-                      (if (!= (al/al-len indices) (al/al-len bodies))
-                          (primitive/error "WebAssembly validation: function/code count mismatch")
-                          0)
-                      (let [names-builder (primitive/code-list-new)
-                            (mut i) 0]
-                        (loop
-                          (if (>= (load i) (al/al-len indices))
-                              (break)
-                              (do
-                                (primitive/code-list-push!
-                                  names-builder
-                                  (primitive/fresh-identifier "wasm-function"))
-                                (store! i (+ (load i) 1)))))
-                        (let [names (primitive/code-list-done names-builder)
-                              table (table-code a (.tables s) (.elements s)
-                                                (al/al-len indices))]
-                          (store! i 0)
-                          (loop
-                            (if (>= (load i) (al/al-len indices))
-                                (break)
-                                (let [type-index (al/al-get indices (load i))]
-                                  (if (>= type-index (al/al-len types))
-                                      (primitive/error "WebAssembly validation: type index out of bounds")
-                                      (primitive/code-list-push!
-                                        forms
-                                        (function-form a context
-                                                       (primitive/code-nth names (load i))
-                                                       (al/al-get types type-index)
-                                                       (al/al-get bodies (load i))
-                                                       globals memory table names indices types)))
-                                  (store! i (+ (load i) 1)))))
-                          (if (= (slice-len (.exports s)) 0)
-                              0
-                              (match (wasm/export-section a (.exports s))
-                                (wasm/DecodeError [_ message] (primitive/error message))
-                                (wasm/Decoded [exports]
-                                  (emit-export-wrappers! context forms names globals indices types exports))))))
-                      (primitive/code-list-done forms)))))))))))
+              (wasm/Decoded [exports]
+                (emit-export-wrappers! context forms names globals
+                                       (load indices) types exports))))
+        (primitive/code-list-done forms)))))
