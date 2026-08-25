@@ -69,6 +69,15 @@
    ;; and only the complete one describes the storage.
    (storage (hm/HashMap (slice u8) i64))
    (storage-size (hm/HashMap (slice u8) i64))
+   ;; The `defstruct` declared for each C record, by the shape it was declared
+   ;; with, and the records and names to declare in order.
+   (record-names (hm/HashMap (slice u8) (slice u8)))
+   (records (al/ArrayList (ptr ct/Type)))
+   (record-decls (al/ArrayList (slice u8)))
+   (record-taken (hm/HashMap (slice u8) bool))
+   ;; The names already used inside the function being emitted, so that two C
+   ;; locals of the same name in different scopes stay apart.
+   (names-taken (hm/HashMap (slice u8) bool))
    ;; What each object with static storage is defined to hold, filled in from
    ;; the start-up stores whose values are constants.
    (images (hm/HashMap (slice u8) (ptr Image)))
@@ -304,6 +313,223 @@
       (= kind nd/ND-LE) (if f "fcmp-le" "icmp-le")
       :else "")))
 
+;; ------------------------------------------------------ records as structs
+
+;; A C record is declared as a `defstruct` whose layout is stated rather than
+;; inferred: `:layout explicit` with the byte offset this compiler's own layout
+;; pass assigned to every member. Nothing has to agree with anything -- the
+;; offsets in the declaration are the offsets `experiments.c.ctype` computed --
+;; and the members get their names back, so `ld->flags` is `(.flags ld)` instead
+;; of a byte offset into a blob.
+;;
+;; The blob is still the storage. A record travels between functions, and in and
+;; out of memory, as the array of words it always was; the struct is the view
+;; that names the parts. That keeps one representation for anything a
+;; `defstruct` cannot describe -- a bitfield, an anonymous member, a flexible
+;; array -- which then reaches its member the old way, by offset.
+
+;; Whether this record can be declared at all. An incomplete one has no members
+;; to name, and a zero-sized one has nothing to place them in.
+(defn declarable-record? [(t (ptr ct/Type))] (-> bool)
+  (and (!= (primitive/cast i64 t) 0)
+       (and (ct/record? t)
+            (and (ct/ty-complete? t)
+                 (and (> (ct/ty-size t) 0)
+                      (> (al/al-len [ct/Member] (ct/ty-members t)) 0))))))
+
+;; Whether one member can be named in the declaration. A bitfield is not
+;; addressable, an anonymous member has no name to use, and a member of no size
+;; -- a flexible array -- has nothing to declare.
+(defn declarable-member? [(m ct/Member)] (-> bool)
+  (and (not (ct/member-bitfield? m))
+       (and (> (slice-len (ct/member-name m)) 0)
+            (> (ct/ty-size (ct/member-type m)) 0))))
+
+;; What tells two records apart. Every translation unit that includes a header
+;; declares the same struct again, and one declaration should serve all of them,
+;; so records are matched on the shape they would be declared with rather than
+;; on which unit produced them.
+(defn record-key [(a (dyn alloc/Allocator)) (t (ptr ct/Type))] (-> (slice u8))
+  (let [(mut b) (str/sb-new a)
+        members (ct/ty-members t)
+        count (al/al-len [ct/Member] members)
+        (mut i) 0]
+    (str/sb-push-str! (mut b) (ct/ty-name t))
+    (str/sb-push-str! (mut b) "/")
+    (str/sb-push-i64! (mut b) (ct/ty-size t))
+    (str/sb-push-str! (mut b) "/")
+    (str/sb-push-i64! (mut b) (ct/ty-align t))
+    (loop (if (>= (load i) count)
+              (break)
+              (let [m (al/al-get [ct/Member] members (load i))
+                    mt (ct/member-type m)]
+                (if (declarable-member? m)
+                    (do (str/sb-push-str! (mut b) "|")
+                        (str/sb-push-str! (mut b) (ct/member-name m))
+                        (str/sb-push-str! (mut b) ":")
+                        (str/sb-push-i64! (mut b) (ct/member-offset m))
+                        (str/sb-push-str! (mut b) ":")
+                        (str/sb-push-i64! (mut b) (ct/ty-kind mt))
+                        (str/sb-push-str! (mut b) ":")
+                        (str/sb-push-i64! (mut b) (ct/ty-size mt))
+                        (str/sb-push-str! (mut b) ":")
+                        (str/sb-push-i64! (mut b) (ct/ty-align mt))
+                        (str/sb-push-str! (mut b) ":")
+                        (str/sb-push-i64! (mut b) (if (ct/ty-unsigned? mt) 1 0))
+                        (str/sb-push-str! (mut b) ":")
+                        (str/sb-push-i64! (mut b) (member-shape mt))
+                        0)
+                    0)
+                (store! i (+ (load i) 1)))))
+    (str/sb-str (load (mut b)))))
+
+;; Enough of a member's type to tell apart two that would be declared
+;; differently: what a pointer points at, and how long an array is.
+(defn member-shape [(t (ptr ct/Type))] (-> i64)
+  (let [k (ct/ty-kind t)]
+    (cond
+      (= k ct/TY-PTR) (+ 1000 (ct/ty-kind (ct/ty-base t)))
+      (= k ct/TY-ARRAY) (+ (+ 2000 (* 16 (ct/ty-array-len t))) (ct/ty-kind (ct/ty-base t)))
+      :else 0)))
+
+;; The `defstruct` for a record, declared once and remembered by the shape it
+;; was declared with.
+(defn record-struct [(e (mut Emitter)) (t (ptr ct/Type))] (-> (slice u8))
+  (if (not (declarable-record? t))
+      ""
+      (let [a (load (field e a))
+            key (record-key a t)]
+        (match (hm/hm-get (load (field e record-names)) key)
+          (Some [name] name)
+          (None []
+            (let [tag (if (> (slice-len (ct/ty-name t)) 0) (ct/ty-name t) "rec")
+                  name (numbered (mut e) (ident (mut e) "c_s_" tag))]
+              (hm/hm-put! [(slice u8) (slice u8)] (mut (field e record-names)) key name)
+              (al/al-push! [(ptr ct/Type)] (mut (field e records)) t)
+              (al/al-push! [(slice u8)] (mut (field e record-decls)) name)
+              name))))))
+
+;; A name of this record's own, since two different structs may share a tag.
+(defn numbered [(e (mut Emitter)) (stem (slice u8))] (-> (slice u8))
+  (if (not (hm/hm-contains? (load (field e record-taken)) stem))
+      (do (hm/hm-put! [(slice u8) bool] (mut (field e record-taken)) stem true) stem)
+      (let [(mut b) (str/sb-new (load (field e a)))]
+        (str/sb-push-str! (mut b) stem)
+        (str/sb-push-str! (mut b) "_")
+        (str/sb-push-i64! (mut b) (al/al-len [(ptr ct/Type)] (load (field e records))))
+        (let [name (str/sb-str (load (mut b)))]
+          (hm/hm-put! [(slice u8) bool] (mut (field e record-taken)) name true)
+          name))))
+
+(defn emit-record-decls! [(e (mut Emitter))] (-> i64)
+  (let [types (load (field e records))
+        names (load (field e record-decls))
+        count (al/al-len [(ptr ct/Type)] types)
+        (mut i) 0]
+    (if (> count 0)
+        (do (put! (mut e) "\n;; C's records, laid out where this compiler put them. The offsets are\n")
+            (put! (mut e) ";; stated rather than inferred, so they are the offsets the rest of the\n")
+            (put! (mut e) ";; program computes with.\n"))
+        0)
+    (loop (if (>= (load i) count)
+              (break)
+              (do (emit-record-decl! (mut e)
+                                     (al/al-get [(ptr ct/Type)] types (load i))
+                                     (al/al-get [(slice u8)] names (load i)))
+                  (store! i (+ (load i) 1)))))
+    (if (> count 0) (put! (mut e) "\n") 0))
+  0)
+
+(defn emit-record-decl! [(e (mut Emitter)) (t (ptr ct/Type)) (name (slice u8))] (-> i64)
+  (let [members (ct/ty-members t)
+        count (al/al-len [ct/Member] members)
+        (mut i) 0
+        (mut first) 1]
+    (put! (mut e) "(defstruct ")
+    (put! (mut e) name)
+    (put! (mut e) " :layout explicit :size ")
+    (put-int! (mut e) (ct/ty-size t))
+    (put! (mut e) " :align ")
+    (put-int! (mut e) (ct/ty-align t))
+    (put! (mut e) "\n  [")
+    (loop (if (>= (load i) count)
+              (break)
+              (let [m (al/al-get [ct/Member] members (load i))]
+                (if (declarable-member? m)
+                    (do (if (= (load first) 0) (put! (mut e) "\n   ") 0)
+                        (store! first 0)
+                        (put! (mut e) "(")
+                        (put! (mut e) (ct/member-name m))
+                        (put! (mut e) " ")
+                        (emit-type! (mut e) (ct/member-type m))
+                        (put! (mut e) " :at ")
+                        (put-int! (mut e) (ct/member-offset m))
+                        (put! (mut e) ")"))
+                    0)
+                (store! i (+ (load i) 1)))))
+    (put! (mut e) "])\n"))
+  0)
+
+;; Whether this member access can be written as a field of a declared struct,
+;; which needs the record to be declarable and the member to be one of the ones
+;; the declaration names.
+(defn field-access? [(e (mut Emitter)) (n (ptr nd/Node))] (-> bool)
+  (and (< (nd/nd-member-bit-width n) 0)
+       (and (> (slice-len (nd/nd-member-name n)) 0)
+            (> (slice-len (record-struct (mut e) (nd/nd-type (nd/nd-lhs n)))) 0))))
+
+;; Every record the program reaches a member of gets a declaration. Collected
+;; before anything is written, because the declarations come first.
+(defn collect-records! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
+  (if (= (primitive/cast i64 n) 0)
+      0
+      (do
+        (if (and (= (nd/nd-kind n) nd/ND-MEMBER) (< (nd/nd-member-bit-width n) 0))
+            (do (record-struct (mut e) (nd/nd-type (nd/nd-lhs n))) 0)
+            0)
+        (collect-records! (mut e) (nd/nd-lhs n))
+        (collect-records! (mut e) (nd/nd-rhs n))
+        (collect-records! (mut e) (nd/nd-test n))
+        (collect-records! (mut e) (nd/nd-then n))
+        (collect-records! (mut e) (nd/nd-else n))
+        (collect-records! (mut e) (nd/nd-setup n))
+        (collect-records! (mut e) (nd/nd-step n))
+        (collect-records-list! (mut e) (nd/nd-body n))
+        (collect-records-list! (mut e) (nd/nd-args n))
+        0)))
+
+(defn collect-records-list! [(e (mut Emitter)) (list (al/ArrayList (ptr nd/Node)))] (-> i64)
+  (let [n (al/al-len [(ptr nd/Node)] list)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do (collect-records! (mut e) (al/al-get [(ptr nd/Node)] list (load i)))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+;; A statement with nothing in it: a declaration that only names storage, or a
+;; block of them.
+(defn nothing-to-do? [(n (ptr nd/Node))] (-> bool)
+  (if (= (primitive/cast i64 n) 0)
+      true
+      (let [k (nd/nd-kind n)]
+        (cond
+          (= k nd/ND-NULL) true
+          (= k nd/ND-BLOCK) (all-nothing? (nd/nd-body n))
+          :else false))))
+
+(defn all-nothing? [(list (al/ArrayList (ptr nd/Node)))] (-> bool)
+  (let [count (al/al-len [(ptr nd/Node)] list)
+        (mut i) 0
+        (mut empty) true]
+    (loop (if (>= (load i) count)
+              (break)
+              (do (if (nothing-to-do? (al/al-get [(ptr nd/Node)] list (load i)))
+                      0
+                      (store! empty false))
+                  (store! i (+ (load i) 1)))))
+    (load empty)))
+
 ;; --------------------------------------------------------- addresses
 
 ;; Whether an expression is arithmetic whose operands are all constants, so the
@@ -387,12 +613,22 @@
       ;; layout assigned, then reinterpreted. The first member is not advanced
       ;; at all -- it starts where the record does -- and most members are the
       ;; first of something.
-      (and (= k nd/ND-MEMBER) (= (nd/nd-member-offset n) 0))
+      (and (= k nd/ND-MEMBER)
+           (and (= (nd/nd-member-offset n) 0) (not (field-access? (mut e) n))))
         (do
           (put! (mut e) "(cast (ptr ")
           (emit-type! (mut e) (nd/nd-type n))
           (put! (mut e) ") ")
           (emit-addr! (mut e) (nd/nd-lhs n))
+          (put! (mut e) ")"))
+      (field-access? (mut e) n)
+        (do
+          (put! (mut e) "(c_of ")
+          (put! (mut e) (record-struct (mut e) (nd/nd-type (nd/nd-lhs n))))
+          (put! (mut e) " ")
+          (emit-at-base! (mut e) (nd/nd-lhs n))
+          (put! (mut e) " ")
+          (put! (mut e) (nd/nd-member-name n))
           (put! (mut e) ")"))
       (= k nd/ND-MEMBER)
         (do
@@ -1279,9 +1515,12 @@
               (put! (mut e) "(do")
               (loop (if (>= (load i) count)
                         (break)
-                        (do
-                          (put! (mut e) " ")
-                          (emit-stmt! (mut e) (al/al-get [(ptr nd/Node)] body (load i)))
+                        (let [s (al/al-get [(ptr nd/Node)] body (load i))]
+                          ;; `int x;` declares storage and says nothing else, so
+                          ;; there is nothing to write for it here.
+                          (if (nothing-to-do? s)
+                              0
+                              (do (put! (mut e) " ") (emit-stmt! (mut e) s)))
                           (store! i (+ (load i) 1)))))
               (put! (mut e) " 0)"))
           ;; The value is discarded, so it is never produced.
@@ -1817,6 +2056,25 @@
 ;; rather than a mutable binding: it is C's automatic storage, and it is what
 ;; makes `&x` mean anything. The slots are declared once at the top of the
 ;; function, never inside a loop.
+;; A local is named after the variable it holds. The `v_` keeps it out of the
+;; way of everything Coil already means by a bare name -- `load`, `index`, `not`
+;; -- which a C program is perfectly entitled to use for a variable.
+(defn local-name! [(e (mut Emitter)) (o (ptr nd/Obj))] (-> (slice u8))
+  (let [name (nd/obj-name o)]
+    (if (= (slice-len name) 0)
+        (fresh (mut e) "v")
+        (let [stem (ident (mut e) "v_" name)]
+          (if (not (hm/hm-contains? (load (field e names-taken)) stem))
+              (do (hm/hm-put! [(slice u8) bool] (mut (field e names-taken)) stem true) stem)
+              ;; The same name in two scopes of one function is two variables.
+              (let [(mut b) (str/sb-new (load (field e a)))]
+                (str/sb-push-str! (mut b) stem)
+                (str/sb-push-str! (mut b) "_")
+                (str/sb-push-i64! (mut b) (hm/hm-len [(slice u8) bool] (load (field e names-taken))))
+                (let [unique (str/sb-str (load (mut b)))]
+                  (hm/hm-put! [(slice u8) bool] (mut (field e names-taken)) unique true)
+                  unique)))))))
+
 (defn emit-locals! [(e (mut Emitter)) (f (ptr nd/Obj))] (-> i64)
   (let [locals (nd/obj-locals f)
         count (al/al-len [(ptr nd/Obj)] locals)
@@ -1824,7 +2082,7 @@
     (loop (if (>= (load i) count)
               (break)
               (let [o (al/al-get [(ptr nd/Obj)] locals (load i))
-                    slot (fresh (mut e) "v")]
+                    slot (local-name! (mut e) o)]
                 (bind-slot! (mut e) o slot)
                 (put! (mut e) " ")
                 (put! (mut e) slot)
@@ -1883,6 +2141,16 @@
                   (store! i (+ (load i) 1))))))
   0)
 
+;; The incoming value of a parameter, which the body immediately copies into the
+;; local of the same name. `a_` keeps the two apart.
+(defn param-name [(e (mut Emitter)) (o (ptr nd/Obj)) (index i64)] (-> (slice u8))
+  (if (= (slice-len (nd/obj-name o)) 0)
+      (let [(mut b) (str/sb-new (load (field e a)))]
+        (str/sb-push-str! (mut b) "a")
+        (str/sb-push-i64! (mut b) index)
+        (str/sb-str (load (mut b))))
+      (ident (mut e) "a_" (nd/obj-name o))))
+
 (defn emit-param-copies! [(e (mut Emitter)) (f (ptr nd/Obj))] (-> i64)
   (let [params (nd/obj-params f)
         count (al/al-len [(ptr nd/Obj)] params)
@@ -1892,8 +2160,8 @@
               (let [o (al/al-get [(ptr nd/Obj)] params (load i))]
                 (put! (mut e) " (set! ")
                 (put! (mut e) (slot-of (mut e) o))
-                (put! (mut e) " a")
-                (put-int! (mut e) (load i))
+                (put! (mut e) " ")
+                (put! (mut e) (param-name (mut e) o (load i)))
                 (put! (mut e) ")")
                 (store! i (+ (load i) 1))))))
   0)
@@ -1920,6 +2188,8 @@
   0)
 
 (defn emit-function! [(e (mut Emitter)) (f (ptr nd/Obj))] (-> i64)
+  (store! (field e names-taken)
+          (hm/hm-new [(slice u8) bool] (load (field e a)) (str/str-keyops)))
   (let [ty (nd/obj-type f)
         params (nd/obj-params f)
         count (al/al-len [(ptr nd/Obj)] params)
@@ -1932,8 +2202,8 @@
               (break)
               (do
                 (if (> (load i) 0) (put! (mut e) " ") 0)
-                (put! (mut e) "(a")
-                (put-int! (mut e) (load i))
+                (put! (mut e) "(")
+                (put! (mut e) (param-name (mut e) (al/al-get [(ptr nd/Obj)] params (load i)) (load i)))
                 (put! (mut e) " ")
                 (emit-param-type! (mut e) (nd/obj-type (al/al-get [(ptr nd/Obj)] params (load i))))
                 (put! (mut e) ")")
@@ -2677,6 +2947,11 @@
                         :defined-data (hm/hm-new [(slice u8) bool] a (str/str-keyops))
                         :storage (hm/hm-new [(slice u8) i64] a (str/str-keyops))
                         :storage-size (hm/hm-new [(slice u8) i64] a (str/str-keyops))
+                        :record-names (hm/hm-new [(slice u8) (slice u8)] a (str/str-keyops))
+                        :records (al/al-new [(ptr ct/Type)] a)
+                        :record-decls (al/al-new [(slice u8)] a)
+                        :record-taken (hm/hm-new [(slice u8) bool] a (str/str-keyops))
+                        :names-taken (hm/hm-new [(slice u8) bool] a (str/str-keyops))
                         :images (hm/hm-new [(slice u8) (ptr Image)] a (str/str-keyops))
                         :scratch (alloc/box! a i64 0)
                         :va-areas (hm/hm-new [(slice u8) (slice u8)] a (str/str-keyops))
@@ -2721,6 +2996,13 @@
                 (if (nd/obj-definition? o) (collect-uses! (mut e) (nd/obj-body o)) 0)
                 (store! i (+ (load i) 1)))))
     (collect-uses! (mut e) init)
+    (store! i 0)
+    (loop (if (>= (load i) count)
+              (break)
+              (let [o (al/al-get [(ptr nd/Obj)] globals (load i))]
+                (if (nd/obj-definition? o) (collect-records! (mut e) (nd/obj-body o)) 0)
+                (store! i (+ (load i) 1)))))
+    (collect-records! (mut e) init)
     ;; Everything a static initialiser can say now, said now.
     (store! start-up (fold-statics! (mut e) globals init))
 
@@ -2754,7 +3036,13 @@
     (put! (mut e) "  `(control/scope ~brk (loop (do (control/scope ~cnt ~body) (if ~test 0 (break))))))\n")
     (put! (mut e) "\n;; What C means by `if (x)`: not zero. A comparison is already a\n")
     (put! (mut e) ";; condition and does not come through here.\n")
-    (put! (mut e) "(defn c_true [(v Code)] (-> Code) `(icmp-ne (cast i64 ~v) 0))\n\n")
+    (put! (mut e) "(defn c_true [(v Code)] (-> Code) `(icmp-ne (cast i64 ~v) 0))\n")
+    (put! (mut e) "\n;; The address of `name` within `base`, seen as a `rec`. The companion of\n")
+    (put! (mut e) ";; `c_at`: the same address, reached by the member's name instead of by the\n")
+    (put! (mut e) ";; byte offset the layout gave it.\n")
+    (put! (mut e) "(defn c_of [(rec Code) (base Code) (name Code)] (-> Code)\n")
+    (put! (mut e) "  `(field (cast (ptr ~rec) ~base) ~name))\n\n")
+    (emit-record-decls! (mut e))
     (put! (mut e) ";; Allocation type evidence retained for opt-in metaprograms.\n")
     (put! (mut e) "(defn c_type_hint [(name (slice u8)) (size i64) (align i64) (value (ptr i8))] (-> (ptr i8)) value)\n\n")
     ;; `destructor` functions are registered here rather than called from the
