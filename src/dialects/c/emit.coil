@@ -78,6 +78,9 @@
    ;; The names already used inside the function being emitted, so that two C
    ;; locals of the same name in different scopes stay apart.
    (names-taken (hm/HashMap (slice u8) bool))
+   ;; The locals of the function being emitted whose address is taken, and so
+   ;; need storage rather than a binding.
+   (addressed (hm/HashMap (slice u8) bool))
    ;; What each object with static storage is defined to hold, filled in from
    ;; the start-up stores whose values are constants.
    (images (hm/HashMap (slice u8) (ptr Image)))
@@ -530,6 +533,67 @@
                   (store! i (+ (load i) 1)))))
     (load empty)))
 
+;; ------------------------------------------------ which locals need storage
+
+;; C says every local is memory: `&x` is always available, and the compiler
+;; works out afterwards which variables never needed an address. Coil says the
+;; opposite -- a binding is a value, and `alloc-stack` is the explicit request
+;; for memory -- so the frontend has to do that working-out itself.
+;;
+;; A local is a plain mutable binding unless something wants its address. What
+;; wants an address is `&x`, and anything reached through the variable rather
+;; than being the variable: a member, an element, a record passed by value. The
+;; first is found here; the rest are ruled out by only ever binding scalars.
+
+;; Whether this local could be a binding at all. An array decays to its address
+;; wherever it is mentioned, and a record is reached through one, so both need
+;; storage whatever else happens to them.
+(defn bindable-type? [(t (ptr ct/Type))] (-> bool)
+  (if (= (primitive/cast i64 t) 0)
+      false
+      (let [k (ct/ty-kind t)]
+        (and (!= k ct/TY-ARRAY)
+             (and (!= k ct/TY-FUNC)
+                  (and (not (ct/record? t)) (!= k ct/TY-VLA)))))))
+
+;; Every local whose address the function takes.
+(defn find-addressed! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
+  (if (= (primitive/cast i64 n) 0)
+      0
+      (do
+        (if (= (nd/nd-kind n) nd/ND-ADDR) (note-addressed! (mut e) (nd/nd-lhs n)) 0)
+        (find-addressed! (mut e) (nd/nd-lhs n))
+        (find-addressed! (mut e) (nd/nd-rhs n))
+        (find-addressed! (mut e) (nd/nd-test n))
+        (find-addressed! (mut e) (nd/nd-then n))
+        (find-addressed! (mut e) (nd/nd-else n))
+        (find-addressed! (mut e) (nd/nd-setup n))
+        (find-addressed! (mut e) (nd/nd-step n))
+        (find-addressed-list! (mut e) (nd/nd-body n))
+        (find-addressed-list! (mut e) (nd/nd-args n))
+        0)))
+
+(defn find-addressed-list! [(e (mut Emitter)) (list (al/ArrayList (ptr nd/Node)))] (-> i64)
+  (let [count (al/al-len [(ptr nd/Node)] list)
+        (mut i) 0]
+    (loop (if (>= (load i) count)
+              (break)
+              (do (find-addressed! (mut e) (al/al-get [(ptr nd/Node)] list (load i)))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn note-addressed! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
+  (if (and (!= (primitive/cast i64 n) 0) (= (nd/nd-kind n) nd/ND-VAR))
+      (let [o (nd/nd-obj n)]
+        (if (and (!= (primitive/cast i64 o) 0) (nd/obj-local? o))
+            (do (hm/hm-put! [(slice u8) bool] (mut (field e addressed)) (obj-key (mut e) o) true) 0)
+            0))
+      0))
+
+(defn bound-local? [(e (mut Emitter)) (o (ptr nd/Obj))] (-> bool)
+  (and (bindable-type? (nd/obj-type o))
+       (not (hm/hm-contains? (load (field e addressed)) (obj-key (mut e) o)))))
+
 ;; --------------------------------------------------------- addresses
 
 ;; Whether an expression is arithmetic whose operands are all constants, so the
@@ -547,6 +611,20 @@
   (or (or (= k nd/ND-ADD) (or (= k nd/ND-SUB) (or (= k nd/ND-MUL) (= k nd/ND-DIV))))
       (or (or (= k nd/ND-MOD) (or (= k nd/ND-BITAND) (or (= k nd/ND-BITOR) (= k nd/ND-BITXOR))))
           (or (= k nd/ND-SHL) (or (= k nd/ND-SHR) (or (= k nd/ND-NEG) (= k nd/ND-BITNOT)))))))
+
+;; Whether a member is the whole of what it is a member of, which is what an
+;; initialiser produces for an object that is not a record: one leaf, at offset
+;; zero, of the object's own type.
+(defn whole-object? [(n (ptr nd/Node))] (-> bool)
+  (if (!= (nd/nd-member-offset n) 0)
+      false
+      (let [base (nd/nd-type (nd/nd-lhs n))
+            mine (nd/nd-type n)]
+        (and (!= (primitive/cast i64 base) 0)
+             (and (!= (primitive/cast i64 mine) 0)
+                  (and (not (ct/record? base))
+                       (and (!= (ct/ty-kind base) ct/TY-ARRAY)
+                            (= (ct/ty-size base) (ct/ty-size mine)))))))))
 
 ;; A pointer to something that is not a function, which is the only kind of
 ;; address `c_at` cares about: it reinterprets its base as bytes either way.
@@ -613,6 +691,10 @@
       ;; layout assigned, then reinterpreted. The first member is not advanced
       ;; at all -- it starts where the record does -- and most members are the
       ;; first of something.
+      ;; An initialiser reaches even a scalar through a member at offset zero,
+      ;; and there the member is the object: there is nothing to reinterpret.
+      (and (= k nd/ND-MEMBER) (whole-object? n))
+        (emit-addr! (mut e) (nd/nd-lhs n))
       (and (= k nd/ND-MEMBER)
            (and (= (nd/nd-member-offset n) 0) (not (field-access? (mut e) n))))
         (do
@@ -767,18 +849,31 @@
           (put! (mut e) ")"))))
 
 ;; `x op= y` and `x++`: the target's address is worked out once, the operation
+;; A variable is its own address: nothing is evaluated to reach it, so `x += 1`
+;; needs no binding to reach it once. Everything else -- `*p++ += 1` above all --
+;; does, which is the whole reason the address is bound.
+(defn plain-variable? [(n (ptr nd/Node))] (-> bool)
+  (and (!= (primitive/cast i64 n) 0)
+       (and (= (nd/nd-kind n) nd/ND-VAR)
+            (nd/obj-local? (nd/nd-obj n)))))
+
 ;; reads through it, and the result goes back to it. `value` says whether the
 ;; expression's own value is what the target held before the update.
 (defn emit-compound! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
   (let [target (nd/nd-lhs n)
         value (nd/nd-rhs n)
-        at (fresh (mut e) "at")
+        bind (not (plain-variable? target))
+        at (if (plain-variable? target)
+               (slot-of (mut e) (nd/nd-obj target))
+               (fresh (mut e) "at"))
         was (fresh (mut e) "was")]
-    (put! (mut e) "(let [")
-    (put! (mut e) at)
-    (put! (mut e) " ")
-    (emit-addr! (mut e) target)
-    (put! (mut e) "] ")
+    (if bind
+        (do (put! (mut e) "(let [")
+            (put! (mut e) at)
+            (put! (mut e) " ")
+            (emit-addr! (mut e) target)
+            (put! (mut e) "] "))
+        0)
     (al/al-push! [(slice u8)] (mut (field e target-addrs)) at)
     (if (= (nd/nd-value n) 1)
         (do (put! (mut e) "(let [")
@@ -789,12 +884,14 @@
             (emit-target-store! (mut e) target at value)
             (put! (mut e) " ")
             (put! (mut e) was)
-            (put! (mut e) ")))"))
+            (put! (mut e) "))")
+            (if bind (put! (mut e) ")") 0))
         (do (put! (mut e) "(do ")
             (emit-target-store! (mut e) target at value)
             (put! (mut e) " ")
             (emit-target-load! (mut e) target at)
-            (put! (mut e) "))")))
+            (put! (mut e) ")")
+            (if bind (put! (mut e) ")") 0)))
     (al/al-pop! [(slice u8)] (mut (field e target-addrs))))
   0)
 
@@ -1059,19 +1156,27 @@
         ;; The address is worked out once and bound. An assignment yields the
         ;; value stored, which means reading the target back, and computing its
         ;; address a second time would run the target's own side effects twice:
-        ;; `*++p = v` would step the pointer twice.
-        (let [slot (fresh (mut e) "at")]
-          (put! (mut e) "(let [")
-          (put! (mut e) slot)
-          (put! (mut e) " ")
-          (emit-addr! (mut e) target)
-          (put! (mut e) "] (do (set! ")
+        ;; `*++p = v` would step the pointer twice. A variable has no address to
+        ;; work out, so there is nothing to bind.
+        (let [bind (not (plain-variable? target))
+              slot (if (plain-variable? target)
+                       (slot-of (mut e) (nd/nd-obj target))
+                       (fresh (mut e) "at"))]
+          (if bind
+              (do (put! (mut e) "(let [")
+                  (put! (mut e) slot)
+                  (put! (mut e) " ")
+                  (emit-addr! (mut e) target)
+                  (put! (mut e) "] "))
+              0)
+          (put! (mut e) "(do (set! ")
           (put! (mut e) slot)
           (put! (mut e) " ")
           (emit-expr! (mut e) value)
           (put! (mut e) ") (load ")
           (put! (mut e) slot)
-          (put! (mut e) ")))"))))
+          (put! (mut e) "))")
+          (if bind (put! (mut e) ")") 0))))
   0)
 
 ;; An assignment or an update evaluated for its effect. Producing the value as
@@ -1093,16 +1198,21 @@
 (defn emit-compound-only! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
   (let [target (nd/nd-lhs n)
         value (nd/nd-rhs n)
-        at (fresh (mut e) "at")]
-    (put! (mut e) "(let [")
-    (put! (mut e) at)
-    (put! (mut e) " ")
-    (emit-addr! (mut e) target)
-    (put! (mut e) "] ")
+        bind (not (plain-variable? target))
+        at (if (plain-variable? target)
+               (slot-of (mut e) (nd/nd-obj target))
+               (fresh (mut e) "at"))]
+    (if bind
+        (do (put! (mut e) "(let [")
+            (put! (mut e) at)
+            (put! (mut e) " ")
+            (emit-addr! (mut e) target)
+            (put! (mut e) "] "))
+        0)
     (al/al-push! [(slice u8)] (mut (field e target-addrs)) at)
     (emit-target-store! (mut e) target at value)
     (al/al-pop! [(slice u8)] (mut (field e target-addrs)))
-    (put! (mut e) ")"))
+    (if bind (put! (mut e) ")") 0))
   0)
 
 (defn emit-discarded! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
@@ -2084,11 +2194,17 @@
               (let [o (al/al-get [(ptr nd/Obj)] locals (load i))
                     slot (local-name! (mut e) o)]
                 (bind-slot! (mut e) o slot)
-                (put! (mut e) " ")
-                (put! (mut e) slot)
-                (put! (mut e) " (alloc-stack ")
-                (emit-type! (mut e) (nd/obj-type o))
-                (put! (mut e) ")")
+                (if (bound-local? (mut e) o)
+                    (do (put! (mut e) " (mut ")
+                        (put! (mut e) slot)
+                        (put! (mut e) ") (zeroed ")
+                        (emit-type! (mut e) (nd/obj-type o))
+                        (put! (mut e) ")"))
+                    (do (put! (mut e) " ")
+                        (put! (mut e) slot)
+                        (put! (mut e) " (alloc-stack ")
+                        (emit-type! (mut e) (nd/obj-type o))
+                        (put! (mut e) ")")))
                 (store! i (+ (load i) 1))))))
   0)
 
@@ -2190,6 +2306,9 @@
 (defn emit-function! [(e (mut Emitter)) (f (ptr nd/Obj))] (-> i64)
   (store! (field e names-taken)
           (hm/hm-new [(slice u8) bool] (load (field e a)) (str/str-keyops)))
+  (store! (field e addressed)
+          (hm/hm-new [(slice u8) bool] (load (field e a)) (str/str-keyops)))
+  (find-addressed! (mut e) (nd/obj-body f))
   (let [ty (nd/obj-type f)
         params (nd/obj-params f)
         count (al/al-len [(ptr nd/Obj)] params)
@@ -2952,6 +3071,7 @@
                         :record-decls (al/al-new [(slice u8)] a)
                         :record-taken (hm/hm-new [(slice u8) bool] a (str/str-keyops))
                         :names-taken (hm/hm-new [(slice u8) bool] a (str/str-keyops))
+                        :addressed (hm/hm-new [(slice u8) bool] a (str/str-keyops))
                         :images (hm/hm-new [(slice u8) (ptr Image)] a (str/str-keyops))
                         :scratch (alloc/box! a i64 0)
                         :va-areas (hm/hm-new [(slice u8) (slice u8)] a (str/str-keyops))
