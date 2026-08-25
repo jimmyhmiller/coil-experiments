@@ -652,6 +652,158 @@
   (and (primitive/code-list? f)
        (>= (primitive/code-count f) 5)
        (primitive/code-eq (primitive/code-nth f 0) `defn)))
+
+(defn live-scalar-kind [(T Code)] (-> i64)
+  (cond (primitive/code-eq T `i64) 1
+        (primitive/code-eq T `bool) 2
+        (primitive/code-eq T `f64) 3
+        :else 0))
+(defn live-return-kind [(r Code)] (-> i64)
+  (if (and (primitive/code-list? r)
+           (and (> (primitive/code-count r) 0)
+                (primitive/code-eq (primitive/code-nth r 0) `->)))
+      (if (= (primitive/code-count r) 1)
+          4
+          (if (= (primitive/code-count r) 2)
+              (let [kind (live-scalar-kind (primitive/code-nth r 1))]
+                (if (> kind 0) kind 5))
+              0))
+      0))
+(defn live-concrete-params? [(ps Code) (i i64)] (-> bool)
+  (if (>= i (primitive/code-count ps))
+      true
+      (let [p (primitive/code-nth ps i)]
+        (and (primitive/code-list? p)
+             (and (= (primitive/code-count p) 2)
+                  (live-concrete-params? ps (+ i 1)))))))
+(defn live-function? [(f Code)] (-> bool)
+  (and (primitive/code-from-user? f)
+       (and (defn-form? f)
+            (and (not (same? (last-name (primitive/code-nth f 1)) "main"))
+                 (and (primitive/code-vector? (primitive/code-nth f 2))
+                      (and (> (live-return-kind (primitive/code-nth f 3)) 0)
+                           (live-concrete-params? (primitive/code-nth f 2) 0)))))))
+(defn live-type-name [(T Code)] (-> (slice u8))
+  (cond (primitive/code-eq T `i64) "i64"
+        (primitive/code-eq T `bool) "bool"
+        (primitive/code-eq T `f64) "f64"
+        :else (primitive/code-str T)))
+(defn live-param-binding [(T Code)] (-> i64)
+  (if (and (primitive/code-list? T)
+           (and (= (primitive/code-count T) 2)
+                (and (primitive/code-eq (primitive/code-nth T 0) `dyn)
+                     (same? (last-name (primitive/code-nth T 1)) "Allocator"))))
+      1
+      0))
+(defn live-pointer? [(T Code)] (-> bool)
+  (and (primitive/code-list? T)
+       (and (= (primitive/code-count T) 2)
+            (primitive/code-eq (primitive/code-nth T 0) `ptr))))
+(defn live-call-args [(ps Code) (args-id Code) (i i64) (body-i i64)] (-> Code)
+  (let [out (primitive/code-list-new) (mut at) i (mut input-at) body-i]
+    (loop (if (>= (load at) (primitive/code-count ps))
+              (break)
+              (let [T (primitive/code-nth (primitive/code-nth ps (load at)) 1)
+                    binding (live-param-binding T)
+                    pointer? (live-pointer? T)
+                    pointee (if pointer? (primitive/code-nth T 1) `i8)
+                    arg (cond (= binding 1) `(alloc/malloc-allocator)
+                              pointer? `(call-arg-allocation-ptr [~pointee] ~args-id ~(load input-at))
+                              (= (live-scalar-kind T) 1) `(call-arg-i64 ~args-id ~(load input-at))
+                              (= (live-scalar-kind T) 2) `(call-arg-bool ~args-id ~(load input-at))
+                              (= (live-scalar-kind T) 3) `(call-arg-f64 ~args-id ~(load input-at))
+                              :else `(call-arg-raw [~T] ~args-id ~(load input-at)))]
+                (primitive/code-list-push! out arg)
+                (if (= binding 0) (set! input-at (+ (load input-at) 1)) 0)
+                (set! at (+ (load at) 1)))))
+    (primitive/code-list-done out)))
+(defn live-adapter [(f Code) (wrapper Code)] (-> Code)
+  (let [name (primitive/code-nth f 1)
+        ps (primitive/code-nth f 2)
+        r (primitive/code-nth f 3)
+        rk (live-return-kind r)
+        RT (if (= rk 4) `i64 (primitive/code-nth r 1))
+        args-id (primitive/fresh-identifier "call_args")
+        result-id (primitive/fresh-identifier "call_result")
+        call `(~name ~@(live-call-args ps args-id 0 0))]
+    `(defn ~wrapper [(~args-id (slice u8))] (-> i64)
+       (json-reset!)
+       (json-text! "{\"ok\":true,\"value\":")
+       ~(cond (= rk 1) `(json-int! ~call)
+              (= rk 2) `(if ~call (json-text! "true") (json-text! "false"))
+              (= rk 3) `(json-f64! ~call)
+              (= rk 4) `(do ~call (json-text! "null"))
+              :else `(let [~result-id (primitive/alloc-stack ~RT)]
+                       (set! ~result-id ~call)
+                       (json-typed-bytes-value! ~(live-type-name RT)
+                                                (primitive/cast (ptr i8) ~result-id)
+                                                (primitive/sizeof ~RT))))
+       (json-byte! (primitive/cast u8 #\}))
+       0)))
+(defn live-param-registration-calls [(ps Code) (id Code) (i i64)] (-> Code)
+  (let [out (primitive/code-list-new) (mut at) i]
+    (loop (if (>= (load at) (primitive/code-count ps))
+              (break)
+              (let [p (primitive/code-nth ps (load at))]
+                (primitive/code-list-push!
+                  out
+                  `(register-function-param ~id
+                                            ~(primitive/code-str (primitive/code-nth p 0))
+                                            ~(live-type-name (primitive/code-nth p 1))
+                                            (primitive/sizeof ~(primitive/code-nth p 1))
+                                            ~(live-param-binding (primitive/code-nth p 1))))
+                (set! at (+ (load at) 1)))))
+    (primitive/code-list-done out)))
+(defn live-function-plan [(m Code)] (-> Code)
+  (let [out (primitive/code-list-new) (mut i) 1]
+    (loop (if (>= (load i) (primitive/code-count m))
+              (break)
+              (let [f (primitive/code-nth m (load i))]
+                (if (live-function? f)
+                    (do (primitive/code-list-push! out
+                          `(~f ~(primitive/fresh-identifier "heap_inspector_invoke")))
+                        0)
+                    0)
+                (set! i (+ (load i) 1)))))
+    (primitive/code-list-done out)))
+(defn module-functions-injected? [(m Code) (i i64)] (-> bool)
+  (if (>= i (primitive/code-count m))
+      false
+      (let [f (primitive/code-nth m i)]
+        (if (and (defn-form? f)
+                 (same? (last-name (primitive/code-nth f 1)) "heap_inspector_function_catalog"))
+            true
+            (module-functions-injected? m (+ i 1))))))
+(defn live-registrar-body [(plan Code) (module-name (slice u8)) (i i64)] (-> Code)
+  (if (>= i (primitive/code-count plan))
+      `0
+      (let [item (primitive/code-nth plan i)
+            f (primitive/code-nth item 0)
+            wrapper (primitive/code-nth item 1)
+            ps (primitive/code-nth f 2)
+            ret (primitive/code-nth f 3)
+            id (primitive/fresh-identifier "function_id")]
+        `(let [~id (register-function ~(primitive/code-str (primitive/code-nth f 1))
+                                      ~module-name
+                                      ~(if (= (live-return-kind ret) 4)
+                                           "void"
+                                           (live-type-name (primitive/code-nth ret 1)))
+                                      ~(if (= (live-return-kind ret) 4)
+                                           `0
+                                           `(primitive/sizeof ~(primitive/code-nth ret 1)))
+                                      (primitive/fnptr-of ~wrapper))]
+           ~@(live-param-registration-calls ps id 0)
+           ~(live-registrar-body plan module-name (+ i 1))))))
+(defn inject-function-registrars [(f Code) (calls Code)] (-> Code)
+  (if (or (not (main-defn? f)) (= (primitive/code-count calls) 0))
+      f
+      (let [out (primitive/code-list-new) (mut i) 4]
+        (loop (if (>= (load i) (primitive/code-count f))
+                  (break)
+                  (do (primitive/code-list-push! out (primitive/code-nth f (load i)))
+                      (set! i (+ (load i) 1)))))
+        `(defn ~(primitive/code-nth f 1) ~(primitive/code-nth f 2) ~(primitive/code-nth f 3)
+           (do ~@calls ~@(primitive/code-list-done out))))))
 (defn type-registration-injected? [(f Code)] (-> bool)
   (if (not (defn-form? f))
       false
@@ -699,9 +851,13 @@
           (own? m)
           (and (not (any-user? m)) (not (allocator-boundary-module? m))))
       m
-      (let [plan (if (module-types-injected? m 1)
+      (let [functions-done (module-functions-injected? m 1)
+            plan (if (module-types-injected? m 1)
                      `()
                      (hi-discover-allocations m `()))
+            function-plan (if functions-done `() (live-function-plan m))
+            function-registrar (primitive/fresh-identifier "heap_inspector_function_catalog")
+            calls (if (> (primitive/code-count function-plan) 0) `((~function-registrar)) `())
             registrar `__heap_inspector_metadata_catalog__]
           (let [out (primitive/code-list-new)
               (mut i) 1]
@@ -709,7 +865,8 @@
           (loop (if (>= (load i) (primitive/code-count m))
                     (break)
                     (do
-                      (let [booted (inject-boot (primitive/code-nth m (load i)))
+                      (let [with-functions (inject-function-registrars (primitive/code-nth m (load i)) calls)
+                            booted (inject-boot with-functions)
                             form (if (> (primitive/code-count plan) 0)
                                      (inject-type-registration booted registrar)
                                      booted)]
@@ -735,6 +892,23 @@
                              ~@(registration-calls plan 0 (primitive/code-count plan))
                              0)))))
                 0)
+              0)
+          (for [j 0 (primitive/code-count function-plan)]
+            (let [item (primitive/code-nth function-plan j)]
+              (primitive/code-list-push! out
+                (live-adapter (primitive/code-nth item 0) (primitive/code-nth item 1)))))
+          (if (> (primitive/code-count function-plan) 0)
+              (do (primitive/code-list-push!
+                    out
+                    `(defn ~function-registrar [] (-> i64)
+                       (let [done (primitive/alloc-static bool)]
+                         (if (load done)
+                             0
+                             (do (set! done true)
+                                 ~(live-registrar-body function-plan
+                                                       (primitive/code-str (primitive/code-nth m 0))
+                                                       0))))))
+                  0)
               0)
           (primitive/code-list-done out)))))
 (defn xf-mods [(ms Code) (i i64) (n i64)] (-> Code)

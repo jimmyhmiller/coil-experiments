@@ -62,6 +62,33 @@ a size-weighted address map, sortable allocation census, type-layout memory map,
 raw-byte display, and a focused value inspector. Polling pauses while the tab is
 hidden and can also be paused explicitly from the toolbar.
 
+### Live functions
+
+The **Functions** view reflects every concrete top-level function from the entry
+module and renders an inline invocation form for each one. Clicking **Run** executes
+the already-compiled Coil function inside the inspected process, then refreshes the
+heap snapshot. This is a direct typed call through a generated adapter, not an eval
+VM, JIT session, subprocess, or erased calling convention.
+
+`i64`, `bool`, and `f64` use readable controls and JSON values. Every other concrete
+sized Coil value—including narrower integers, structs, sums, arrays, slices,
+pointers, and function pointers—uses its exact in-memory byte representation as the
+universal fallback. Raw arguments are entered as little-endian hex and raw results
+carry their type, size, and complete byte sequence. This makes the callable surface
+complete without inventing ownership or constructors for types the inspector does
+not yet understand. Rich recursive editors and structured result rendering can be
+layered over the same typed adapters later.
+
+`main` is omitted because recursively entering the program entry point is not a
+meaningful live operation. Uninstantiated generic definitions still require a type
+argument/monomorph selection layer. Imported-module catalogs and live code
+redefinition are also later layers; the current registry describes the entry
+module's concrete callable surface.
+
+The endpoints are `GET /api/functions` and `POST /api/call/<id>`. Calls carry one
+plain-text scalar per line in signature order. Function IDs are process-local and
+stable for the lifetime of that process.
+
 ### Byte buffers and slice references
 
 Selecting any live allocation opens a paged hex and ASCII memory explorer. The
@@ -165,6 +192,8 @@ that optimization level.
 - `viewer.coil` — background localhost HTTP server and asset/API routing.
 - `viewer/` — separate HTML, JavaScript, and CSS viewer assets.
 - `demo.coil` — typed allocations, inspection, snapshot, and free behavior.
+- `viewer_demo.coil` — live heap values plus scalar functions used to exercise
+  browser-side discovery and in-process invocation.
 - `c_struct_demo.coil` — translated-C marker and explicit-layout value regression.
 - `jit_demo.coil` — runtime query submission through Coil JIT.
 
@@ -177,6 +206,10 @@ that optimization level.
 - Observable arena lifecycle/reset where an existing checked API provides it.
 - Configurable bind address/port and authentication before non-loopback binding.
 - Browser and concurrency stress tests.
+- Imported-module function catalogs, rich editors/renderers over the universal raw
+  representation, generic monomorph selection, invocation coordination with
+  application threads, and opt-in live redefinition through Coil's typed `Var`
+  machinery.
 
 The architectural constraint remains fixed: this stays an opt-in transparent
 metaprogram; none of it belongs in Coil core or `coil.alloc`.

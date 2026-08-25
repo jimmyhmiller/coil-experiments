@@ -1,5 +1,6 @@
 "use strict";
-const state={snapshot:null,previous:null,selectedType:null,selectedContainer:null,selectedAllocation:null,selectedSlot:null,view:"allocations",query:"",sort:"id",paused:false,showZeroTypes:false,history:[],loading:false,memory:null,memoryOffset:0,memoryLoading:false,details:new Map(),detailLoading:new Set()};
+const state={snapshot:null,previous:null,functions:[],callResults:new Map(),callDrafts:new Map(),calling:new Set(),visibleValueIds:new Set(),valueListKey:null,selectedType:null,selectedContainer:null,selectedAllocation:null,selectedSlot:null,view:"allocations",query:"",sort:"id",paused:false,showZeroTypes:false,history:[],loading:false,memory:null,memoryOffset:0,memoryLoading:false,details:new Map(),detailLoading:new Set()};
+let valueObserver=null;
 const colors=["#77a7ff","#69d59f","#e8ae6d","#c491e8","#62c6d8","#ef7b83","#a6d46f"];
 const $=s=>document.querySelector(s);
 const shortType=n=>{if(!n)return "raw bytes";const leaf=n.split(".").pop();return leaf.startsWith("slice__")?`(slice ${shortType(leaf.slice(7))})`:leaf};
@@ -17,8 +18,12 @@ const isByteStorage=(allocation,type)=>!allocation?.type||type?.size===1;
 async function load(){
   if(state.loading)return;state.loading=true;const started=performance.now();
   try{
-    const next=await fetch("/api/snapshot",{cache:"no-store"}).then(r=>{if(!r.ok)throw Error("HTTP "+r.status);return r.json()});
+    const [next,functionData]=await Promise.all([
+      fetch("/api/snapshot",{cache:"no-store"}).then(r=>{if(!r.ok)throw Error("HTTP "+r.status);return r.json()}),
+      fetch("/api/functions",{cache:"no-store"}).then(r=>{if(!r.ok)throw Error("HTTP "+r.status);return r.json()})
+    ]);
     state.previous=state.snapshot;state.snapshot=next;
+    state.functions=functionData.functions||[];
     state.history.push({time:Date.now(),allocations:next.summary.allocations,bytes:next.summary.bytes});
     if(state.history.length>60)state.history.shift();
     setConnection("live",Math.round(performance.now()-started)+" ms");
@@ -28,11 +33,15 @@ async function load(){
   }catch(e){setConnection("down","disconnected")}finally{state.loading=false}
 }
 function setConnection(kind,label){$("#live-dot").className=kind;$("#connection-label").textContent=label}
-function render(){
+function render({renderFunctionContent=false}={}){
   if(!state.snapshot)return;const{summary,types}=state.snapshot;
   $("#top-stats").innerHTML=`<span><b>${summary.allocations}</b> allocations</span><span><b>${formatBytes(summary.bytes)}</b> live</span>`;
   $("#all-count").textContent=summary.allocations;
-  renderOverview();renderTypes();renderHeapMap();renderContent();renderDetail();
+  $("#function-count").textContent=state.functions.length;
+  $("#overview").style.display=state.view==="functions"?"none":"grid";
+  renderOverview();renderTypes();renderHeapMap();
+  if(state.view!=="functions"||renderFunctionContent)renderContent();
+  renderDetail();
 }
 function metric(label,value,sub,series){return `<article class="metric"><div class="metric-label">${label}</div><div class="metric-value">${value}</div><div class="metric-sub">${sub}</div>${series?`<canvas data-series="${series}"></canvas>`:""}</article>`}
 function renderOverview(){
@@ -72,10 +81,15 @@ async function loadAllocationDetail(id,renderAfter=true){
   try{const detail=await fetch(`/api/allocation/${id}`,{cache:"no-store"}).then(r=>r.json());if(!detail.error)state.details.set(id,detail)}finally{state.detailLoading.delete(id);if(renderAfter)render()}
 }
 async function refreshVisibleDetails(){
-  const ids=new Set();if(state.selectedAllocation)ids.add(state.selectedAllocation);
-  if(state.selectedType!=null){const type=state.snapshot.types.find(t=>t.runtimeId===state.selectedType);if(!isByteType(type))state.snapshot.allocations.filter(a=>a.typeId===state.selectedType).forEach(a=>ids.add(a.id))}
-  if(ids.size){await Promise.all([...ids].map(id=>loadAllocationDetail(id,false)));render()}
+  if(state.view==="functions")return;
+  const ids=[...state.visibleValueIds];if(state.selectedAllocation&&!ids.includes(state.selectedAllocation))ids.unshift(state.selectedAllocation);
+  await Promise.all(ids.slice(0,50).map(id=>loadAllocationDetail(id,false)));
+  updateVisibleValuePreviews();
+  if(state.selectedAllocation)renderDetail();
   if(state.selectedAllocation)loadMemory();
+}
+function updateVisibleValuePreviews(){
+  document.querySelectorAll("[data-value-preview]").forEach(cell=>{const id=Number(cell.dataset.valuePreview),allocation=state.snapshot?.allocations.find(a=>a.id===id),value=allocation&&allocationValue(allocation);cell.textContent=value===undefined?"Loading live value…":valueSummary(Array.isArray(value)?value[0]:value)});
 }
 function renderTypes(){
   const q=state.query.toLowerCase();
@@ -102,10 +116,12 @@ function renderHeapMap(){
   document.querySelectorAll(".heap-block").forEach(el=>el.onclick=()=>selectAllocation(Number(el.dataset.allocation)));
 }
 function renderContent(){
+  if(state.view==="functions"){renderFunctions();return}
   const type=state.snapshot.types.find(t=>t.runtimeId===state.selectedType);
   const items=filteredAllocations(),max=Math.max(1,...items.map(a=>a.bytes));
   const container=state.selectedContainer?state.selectedContainer.split(":"):null,containerType=container&&state.snapshot.types.find(t=>t.runtimeId===Number(container[1]));
   if(type&&!container&&!isByteType(type)){renderTypeValues(type,items);return}
+  state.valueListKey=null;if(valueObserver)valueObserver.disconnect();state.visibleValueIds.clear();
   $("#content-kicker").textContent=container?"Logical containers and backing storage":isByteType(type)?"Live byte storage":type?"Filtered allocation census":"Allocation census";
   $("#title").textContent=container?`(${container[0]} ${shortType(containerType?.name)})`:isByteType(type)?"Byte buffers":type?shortType(type.name):"All live allocations";$("#visible-count").textContent=isByteType(type)?`${items.length} regions · ${formatBytes(items.reduce((n,a)=>n+a.bytes,0))}`:items.length+" visible";$("#sort").style.display="block";
   $("#content").innerHTML=items.length?`<table class="allocation-table"><thead><tr><th>ID</th><th>Type</th><th>Shape</th><th>Address</th><th>Size</th></tr></thead><tbody>${items.map(a=>`
@@ -116,17 +132,52 @@ function renderContent(){
     </tr>`).join("")}</tbody></table>`:'<div class="empty"><strong>No live allocations</strong>Change the filter or exercise the running program.</div>';
   document.querySelectorAll("tr[data-allocation]").forEach(row=>row.onclick=()=>selectAllocation(Number(row.dataset.allocation)));
 }
+function functionSignature(fn){return `${fn.name}(${fn.params.map(p=>`${p.name}: ${p.type}`).join(", ")}) → ${fn.returns}`}
+function pointerPointee(param){const match=/^ptr__(.+)$/.exec(param.type);return match&&!match[1].startsWith("ptr__")&&match[1]!=="i8"?match[1]:null}
+function pointerCandidates(param){const pointee=pointerPointee(param);if(!pointee)return[];return(state.snapshot?.allocations||[]).filter(a=>a.type&&shortType(a.type)===shortType(pointee)&&a.count>=1)}
+function needsLiveBinding(param){return !param.binding&&(/dyn__|\bdyn\b|fnptr/.test(param.type)||(/ptr__|\bptr\b/.test(param.type)&&pointerCandidates(param).length===0))}
+function functionDraft(fn,index,param){const key=`${fn.id}:${index}`;if(state.callDrafts.has(key))return state.callDrafts.get(key);return param.type==="bool"?"false":param.type==="f64"?"0.0":param.type==="i64"?"0":""}
+function functionInput(param,index,fn){
+  const id=`fn-${fn.id}-arg-${index}`,value=functionDraft(fn,index,param);
+  if(param.binding)return `<div class="call-field"><span>${escapeHtml(param.name)} <code>${escapeHtml(param.type)}</code></span><small>Automatically bound: ${escapeHtml(param.binding)}</small></div>`;
+  const candidates=pointerCandidates(param);
+  if(candidates.length){const selected=candidates.some(a=>String(a.id)===value)?value:String(candidates[0].id);if(!state.callDrafts.has(`${fn.id}:${index}`))state.callDrafts.set(`${fn.id}:${index}`,selected);return `<label class="call-field"><span>${escapeHtml(param.name)} <code>${escapeHtml(param.type)}</code></span><select id="${id}">${candidates.map(a=>`<option value="${a.id}" ${String(a.id)===selected?"selected":""}>#${a.id} · ${escapeHtml(shortType(a.type))} · ${formatAddress(a.address)}</option>`).join("")}</select></label>`}
+  if(param.type==="bool")return `<label class="call-field"><span>${escapeHtml(param.name)} <code>${param.type}</code></span><select id="${id}"><option value="false" ${value==="false"?"selected":""}>false</option><option value="true" ${value==="true"?"selected":""}>true</option></select></label>`;
+  if(param.type==="i64"||param.type==="f64")return `<label class="call-field"><span>${escapeHtml(param.name)} <code>${param.type}</code></span><input id="${id}" type="number" ${param.type==="i64"?'step="1"':'step="any"'} value="${escapeHtml(value)}"></label>`;
+  if(needsLiveBinding(param))return `<div class="call-field raw-call-field"><span>${escapeHtml(param.name)} <code>${escapeHtml(param.type)}</code></span><small>Requires a live application binding; arbitrary/null pointers are never synthesized.</small></div>`;
+  return `<label class="call-field raw-call-field"><span>${escapeHtml(param.name)} <code>${escapeHtml(param.type)}</code> · ${param.size} bytes</span><input id="${id}" type="text" value="${escapeHtml(value)}" spellcheck="false" autocomplete="off" placeholder="${param.size*2} hex digits"></label>`
+}
+function renderFunctions(){
+  const q=state.query.toLowerCase().trim(),items=state.functions.filter(fn=>!q||`${fn.module} ${functionSignature(fn)}`.toLowerCase().includes(q));
+  $("#content-kicker").textContent="Live program surface";$("#title").textContent="Callable functions";$("#visible-count").textContent=`${items.length} available`;$("#sort").style.display="none";
+  $("#content").innerHTML=items.length?`<div class="function-list">${items.map(fn=>{const result=state.callResults.get(fn.id),bound=fn.params.every(p=>!needsLiveBinding(p));return `<article class="function-card"><div class="function-head"><div><span class="function-module">${escapeHtml(fn.module)}</span><h3>${escapeHtml(functionSignature(fn))}</h3></div><button class="invoke-button" data-call-function="${fn.id}" ${state.calling.has(fn.id)||!bound?"disabled":""}>${state.calling.has(fn.id)?"Running…":bound?"Run":"Needs binding"}</button></div>${fn.params.length?`<div class="call-fields">${fn.params.map((p,i)=>functionInput(p,i,fn)).join("")}</div>`:'<div class="zero-args">No arguments</div>'}${result?`<div class="call-result ${result.ok?"ok":"error"}"><span>${result.ok?"Returned":"Error"}</span><code>${escapeHtml(result.ok?JSON.stringify(result.value):result.error)}</code></div>`:""}</article>`}).join("")}</div>`:'<div class="empty"><strong>No matching callable functions</strong>No concrete entry-module functions matched this filter.</div>';
+  document.querySelectorAll("[data-call-function]").forEach(button=>button.onclick=()=>invokeFunction(Number(button.dataset.callFunction)));
+  items.forEach(fn=>fn.params.forEach((param,index)=>{const input=$(`#fn-${fn.id}-arg-${index}`);if(input)input.oninput=()=>state.callDrafts.set(`${fn.id}:${index}`,input.value)}));
+}
+async function invokeFunction(id){
+  const fn=state.functions.find(f=>f.id===id);if(!fn||state.calling.has(id))return;
+  if(fn.params.some(needsLiveBinding))return;
+  const supplied=fn.params.map((p,i)=>({p,value:p.binding?null:$(`#fn-${id}-arg-${i}`).value})).filter(x=>!x.p.binding),args=supplied.map(x=>x.value);
+  for(const {p,value} of supplied){if(!pointerCandidates(p).length&&p.type!=="i64"&&p.type!=="f64"&&p.type!=="bool"&&!new RegExp(`^[0-9a-fA-F]{${p.size*2}}$`).test(value)){showToast(`${p.name} requires exactly ${p.size*2} hex digits`);return}}
+  state.calling.add(id);renderFunctions();
+  try{const result=await fetch(`/api/call/${id}`,{method:"POST",headers:{"Content-Type":"text/plain; charset=utf-8"},body:args.join("\n")}).then(r=>r.json());state.callResults.set(id,result);showToast(result.ok?`${fn.name} returned`:result.error||"Call failed")}
+  catch(error){state.callResults.set(id,{ok:false,error:String(error)})}finally{state.calling.delete(id);await load();renderFunctions()}
+}
 function valueSummary(value){
   if(value==null)return "null";if(typeof value!=="object")return String(value);
   if(Object.hasOwn(value,"text"))return value.text;
   const entries=Object.entries(value).slice(0,3);return entries.map(([k,v])=>`${k}: ${v&&typeof v==="object"&&Object.hasOwn(v,"text")?v.text:typeof v==="object"?"…":String(v)}`).join(" · ");
 }
 function renderTypeValues(type,allocations){
-  const missing=allocations.filter(a=>!allocationDetail(a.id));missing.forEach(a=>loadAllocationDetail(a.id));
-  const values=[];allocations.forEach(a=>{const value=allocationValue(a);if(value===undefined)return;const length=a.initialized??(a.count===1?1:0),items=Array.isArray(value)?value:[value];for(let slot=0;slot<Math.min(length,items.length);slot++)values.push({allocation:a,slot,value:items[slot]})});
-  $("#content-kicker").textContent="Known initialized values";$("#title").textContent=shortType(type.name);$("#visible-count").textContent=`${values.length} live value${values.length===1?"":"s"} · ${allocations.length} backing region${allocations.length===1?"":"s"}`;$("#sort").style.display="none";
-  $("#content").innerHTML=values.length?`<table class="allocation-table value-table"><thead><tr><th>Value</th><th>Type</th><th>Preview</th><th>Storage</th></tr></thead><tbody>${values.map((item,index)=>`<tr data-allocation="${item.allocation.id}" data-slot="${item.slot}" class="${state.selectedAllocation===item.allocation.id&&state.selectedSlot===item.slot?"selected":""}"><td class="id">#${index}</td><td class="type-primary"><b>${escapeHtml(shortType(type.name))}</b><small>element ${item.slot}</small></td><td class="value-preview">${escapeHtml(valueSummary(item.value))}</td><td class="shape">region #${item.allocation.id}<br>+${item.slot*type.size} bytes</td></tr>`).join("")}</tbody></table>`:missing.length?'<div class="empty"><strong>Loading live values…</strong>Allocation metadata is live; values are fetched only when opened.</div>':'<div class="empty"><strong>No initialized values are known</strong>The allocation exists, but its logical length was not observed.</div>';
-  document.querySelectorAll("tr[data-slot]").forEach(row=>row.onclick=()=>selectAllocation(Number(row.dataset.allocation),Number(row.dataset.slot)));
+  const key=`${type.runtimeId}|${allocations.map(a=>a.id).join(",")}`;
+  $("#content-kicker").textContent="Live typed allocations";$("#title").textContent=shortType(type.name);$("#visible-count").textContent=`${allocations.length} live`;$("#sort").style.display="block";
+  if(state.valueListKey===key&&document.querySelector("[data-value-preview]")){document.querySelectorAll("tr[data-slot]").forEach(row=>row.classList.toggle("selected",Number(row.dataset.allocation)===state.selectedAllocation));updateVisibleValuePreviews();return}
+  state.valueListKey=key;
+  $("#content").innerHTML=allocations.length?`<table class="allocation-table value-table"><thead><tr><th>ID</th><th>Type</th><th>Live value</th><th>Storage</th></tr></thead><tbody>${allocations.map(allocation=>{const value=allocationValue(allocation);return `<tr data-allocation="${allocation.id}" data-slot="0" class="${state.selectedAllocation===allocation.id?"selected":""}"><td class="id">#${allocation.id}</td><td class="type-primary"><b>${escapeHtml(shortType(type.name))}</b><small>live object</small></td><td class="value-preview" data-value-preview="${allocation.id}">${value===undefined?"Loading live value…":escapeHtml(valueSummary(Array.isArray(value)?value[0]:value))}</td><td class="shape">${formatAddress(allocation.address)}<br>${formatBytes(allocation.bytes)}</td></tr>`}).join("")}</tbody></table>`:'<div class="empty"><strong>No live values</strong>No allocations of this type are currently live.</div>';
+  document.querySelectorAll("tr[data-slot]").forEach(row=>row.onclick=()=>selectAllocation(Number(row.dataset.allocation),0));
+  if(valueObserver)valueObserver.disconnect();state.visibleValueIds.clear();
+  valueObserver=new IntersectionObserver(entries=>{const entered=[];entries.forEach(entry=>{const id=Number(entry.target.dataset.allocation);if(entry.isIntersecting){state.visibleValueIds.add(id);entered.push(id)}else state.visibleValueIds.delete(id)});if(entered.length)Promise.all(entered.map(id=>loadAllocationDetail(id,false))).then(updateVisibleValuePreviews)},{root:null,rootMargin:"120px 0px"});
+  document.querySelectorAll("tr[data-slot]").forEach(row=>valueObserver.observe(row));
 }
 function selectAllocation(id,slot=null){state.selectedAllocation=id;state.selectedSlot=slot;state.memory=null;state.memoryOffset=slot==null?0:(state.snapshot.types.find(t=>t.runtimeId===state.snapshot.allocations.find(a=>a.id===id)?.typeId)?.size||0)*slot;renderHeapMap();renderContent();renderDetail();loadAllocationDetail(id);loadMemory()}
 async function loadMemory(){
@@ -178,8 +229,8 @@ function valueTree(value){
 }
 function scalar(v){const cls=v===null?"null":typeof v==="string"?"string":typeof v==="boolean"?"bool":"number";return `<span class="v-${cls}">${v===null?"null":typeof v==="string"?escapeHtml(JSON.stringify(v)):escapeHtml(v)}</span>`}
 function updateNav(){document.querySelectorAll(".nav-item").forEach(n=>n.classList.toggle("selected",n.dataset.view===state.view))}
-document.querySelectorAll(".nav-item").forEach(n=>n.onclick=()=>{state.view=n.dataset.view;if(state.view==="allocations"){state.selectedType=null;state.selectedContainer=null}state.selectedAllocation=null;updateNav();render()});
-$("#search").oninput=e=>{state.query=e.target.value;render()};$("#sort").onchange=e=>{state.sort=e.target.value;renderContent();renderHeapMap()};$("#refresh").onclick=()=>load();
+document.querySelectorAll(".nav-item").forEach(n=>n.onclick=()=>{state.view=n.dataset.view;if(state.view==="allocations"){state.selectedType=null;state.selectedContainer=null}state.selectedAllocation=null;updateNav();render({renderFunctionContent:state.view==="functions"})});
+$("#search").oninput=e=>{state.query=e.target.value;render({renderFunctionContent:state.view==="functions"})};$("#sort").onchange=e=>{state.sort=e.target.value;renderContent();renderHeapMap()};$("#refresh").onclick=()=>load();
 $("#zero-types").onchange=e=>{state.showZeroTypes=e.target.value==="show";if(!state.showZeroTypes&&state.selectedType!=null){const t=state.snapshot?.types.find(t=>t.runtimeId===state.selectedType);if(t&&(t.regions??t.live)===0)state.selectedType=null}render()};
 $("#pause").onclick=()=>{state.paused=!state.paused;$("#pause").classList.toggle("active",state.paused);$("#pause").textContent=state.paused?"▶":"Ⅱ";showToast(state.paused?"Live refresh paused":"Live refresh resumed");if(!state.paused)load()};
 function showToast(message){const t=$("#toast");t.textContent=message;t.classList.add("show");clearTimeout(showToast.timer);showToast.timer=setTimeout(()=>t.classList.remove("show"),1400)}

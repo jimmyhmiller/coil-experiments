@@ -11,6 +11,8 @@
 (extern calloc :cc c [u64 u64] (-> (ptr i8)))
 (extern realloc :cc c [(ptr i8) u64] (-> (ptr i8)))
 (extern free :cc c [(ptr i8)] (-> i64))
+(extern strtod :cc c [(ptr i8) (ptr (ptr i8))] (-> f64))
+(extern usleep :cc c [i64] (-> i32))
 
 (defstruct Entry
   [(id i64)
@@ -42,6 +44,16 @@
    (unsigned bool)
    (bit-offset i64)
    (bit-width i64)])
+(defstruct FunctionInfo
+  [(name (slice u8))
+   (module-name (slice u8))
+   (param-start i64)
+   (param-count i64)
+   (returns (slice u8))
+   (return-size i64)
+   (invoke (fnptr c [(slice u8)] i64))])
+(defstruct FunctionParam
+  [(name (slice u8)) (type-name (slice u8)) (size i64) (binding i64)])
 
 ; Deliberately bounded: this is an experiment and avoids making registry allocations
 ; recursively inspectable. The transform excludes this package in any case.
@@ -51,12 +63,26 @@
   (primitive/alloc-static (array TypeInfo 256)))
 (defn fields [] (-> (ptr (array FieldInfo 4096)))
   (primitive/alloc-static (array FieldInfo 4096)))
+(defn functions [] (-> (ptr (array FunctionInfo 512)))
+  (primitive/alloc-static (array FunctionInfo 512)))
+(defn function-params [] (-> (ptr (array FunctionParam 2048)))
+  (primitive/alloc-static (array FunctionParam 2048)))
 (defn entry-n [] (-> (ptr i64))
   (primitive/alloc-static i64))
 (defn type-n [] (-> (ptr i64))
   (primitive/alloc-static i64))
 (defn field-n [] (-> (ptr i64))
   (primitive/alloc-static i64))
+(defn function-n [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+(defn function-param-n [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+(defn call-dispatch-mode [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn pending-call-state [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn pending-call-id [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn pending-call-length [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn pending-call-body [] (-> (ptr (array u8 65536)))
+  (primitive/alloc-static (array u8 65536)))
 (defn next-id [] (-> (ptr i64))
   (primitive/alloc-static i64))
 (defn registry-lock [] (-> (ptr i64))
@@ -73,6 +99,112 @@
   (primitive/alloc-static bool))
 (defn json-current-type [] (-> (ptr i64))
   (primitive/alloc-static i64))
+
+; Live-call arguments use a deliberately tiny wire format: one UTF-8 scalar per
+; line, in signature order. Generated, typed adapters parse these bytes and make
+; an ordinary direct Coil call. No interpreter or erased ABI is involved.
+(defn call-arg-range [(body (slice u8)) (wanted i64) (start (ptr i64)) (end (ptr i64))] (-> bool)
+  (let [(mut i) 0 (mut arg) 0 (mut lo) 0 (mut found) false]
+    (loop (if (>= (load i) (slice-len body))
+              (break)
+              (if (= (primitive/cast i64 (slice-get body (load i))) 10)
+                  (if (= (load arg) wanted)
+                      (do (set! start (load lo)) (set! end (load i)) (set! found true) (break))
+                      (do (set! arg (+ (load arg) 1)) (set! lo (+ (load i) 1)) (set! i (+ (load i) 1))))
+                  (set! i (+ (load i) 1)))))
+    (if (load found)
+        true
+        (if (= (load arg) wanted)
+            (do (set! start (load lo)) (set! end (slice-len body)) true)
+            false))))
+
+(defn call-arg-i64 [(body (slice u8)) (wanted i64)] (-> i64)
+  (let [lo (primitive/alloc-stack i64) hi (primitive/alloc-stack i64)]
+    (if (not (call-arg-range body wanted lo hi))
+        0
+        (let [(mut i) (load lo) (mut sign) 1 (mut value) 0]
+          (if (and (< (load i) (load hi)) (= (primitive/cast i64 (slice-get body (load i))) 45))
+              (do (set! sign -1) (set! i (+ (load i) 1))) 0)
+          (loop (if (>= (load i) (load hi))
+                    (break)
+                    (let [c (primitive/cast i64 (slice-get body (load i)))]
+                      (if (and (>= c 48) (<= c 57))
+                          (do (set! value (+ (* (load value) 10) (- c 48))) (set! i (+ (load i) 1)))
+                          (break)))))
+          (* (load sign) (load value))))))
+
+(defn call-arg-bool [(body (slice u8)) (wanted i64)] (-> bool)
+  (let [lo (primitive/alloc-stack i64) hi (primitive/alloc-stack i64)]
+    (and (call-arg-range body wanted lo hi)
+         (and (= (- (load hi) (load lo)) 4)
+              (and (= (primitive/cast i64 (slice-get body (load lo))) 116)
+                   (= (primitive/cast i64 (slice-get body (+ (load lo) 1))) 114))))))
+
+(defn call-arg-f64 [(body (slice u8)) (wanted i64)] (-> f64)
+  (let [lo (primitive/alloc-stack i64) hi (primitive/alloc-stack i64)]
+    (if (not (call-arg-range body wanted lo hi))
+        0.0
+        (strtod (primitive/cast (ptr i8) (primitive/index (slice-data body) (load lo)))
+                (primitive/cast (ptr (ptr i8)) 0)))))
+
+; Pointer arguments cross the wire as stable inspector allocation IDs. Resolve the
+; current address under the registry lock and reject objects of the wrong runtime
+; type instead of accepting user-supplied addresses.
+(defn call-arg-allocation-ptr [T] [(body (slice u8)) (wanted i64)] (-> (ptr T))
+  (let [wanted-id (call-arg-i64 body wanted)
+        wanted-type (alloc/type-id [T])
+        (mut result) (primitive/cast (ptr T) 0)]
+    (lock!)
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (load (entry-n)))
+                (break)
+                (let [e (primitive/index (entries) (load i))]
+                  (if (and (.live e)
+                           (and (= (.id e) wanted-id) (= (.type-id e) wanted-type)))
+                      (do (set! result (primitive/cast (ptr T) (.p e))) (break))
+                      (set! i (+ (load i) 1)))))))
+    (unlock!)
+    (load result)))
+
+(defn call-hex-nibble [(c u8)] (-> i64)
+  (let [v (primitive/cast i64 c)]
+    (cond (and (>= v 48) (<= v 57)) (- v 48)
+          (and (>= v 97) (<= v 102)) (+ (- v 97) 10)
+          (and (>= v 65) (<= v 70)) (+ (- v 65) 10)
+          :else 0)))
+
+(defn call-arg-raw [T] [(body (slice u8)) (wanted i64)] (-> T)
+  (let [value (primitive/alloc-stack T)
+        bytes (primitive/cast (ptr u8) value)
+        lo (primitive/alloc-stack i64)
+        hi (primitive/alloc-stack i64)]
+    (for [i 0 (primitive/sizeof T)] (set! (primitive/index bytes i) (primitive/cast u8 0)))
+    (if (call-arg-range body wanted lo hi)
+        (let [(mut source) (load lo) (mut out) 0]
+          (loop (if (or (>= (+ (load source) 1) (load hi))
+                        (>= (load out) (primitive/sizeof T)))
+                    (break)
+                    (do
+                      (set! (primitive/index bytes (load out))
+                            (primitive/cast u8
+                              (+ (* (call-hex-nibble (slice-get body (load source))) 16)
+                                 (call-hex-nibble (slice-get body (+ (load source) 1))))))
+                      (set! source (+ (load source) 2))
+                      (set! out (+ (load out) 1)))))
+          0)
+        0)
+    (load value)))
+
+(defn json-typed-bytes-value! [(type-name (slice u8)) (p (ptr i8)) (size i64)] (-> i64)
+  (json-text! "{\"type\":") (json-quoted! type-name)
+  (json-text! ",\"size\":") (json-int! size)
+  (json-text! ",\"representation\":\"bytes\",\"bytes\":[")
+  (for [i 0 size]
+    (do (if (> i 0) (json-byte! (primitive/cast u8 #\,)) 0)
+        (json-int! (primitive/cast i64 (primitive/cast u8 (load (primitive/index p i)))))))
+  (json-text! "]}")
+  0)
+
 
 ; The registry cannot allocate through `coil.alloc`: doing so would recursively
 ; inspect its own bookkeeping. A tiny spin mutex over static storage is sufficient
@@ -770,6 +902,114 @@
                 (printf c" offset=%ld\n" (.offset f)))
               0)))))
   0)
+
+(defn register-function [(name (slice u8))
+                         (module-name (slice u8))
+                         (returns (slice u8))
+                         (return-size i64)
+                         (invoke (fnptr c [(slice u8)] i64))] (-> i64)
+  (let [(mut result) -1]
+    (lock!)
+    (let [n (load (function-n))]
+      (if (< n 512)
+          (let [f (primitive/index (functions) n)]
+            (set! (.name f) name)
+            (set! (.module-name f) module-name)
+            (set! (.param-start f) (load (function-param-n)))
+            (set! (.param-count f) 0)
+            (set! (.returns f) returns)
+            (set! (.return-size f) return-size)
+            (set! (.invoke f) invoke)
+            (set! (function-n) (+ n 1))
+            (set! result n))
+          0))
+    (unlock!)
+    (load result)))
+
+(defn register-function-param [(function-id i64) (name (slice u8)) (type-name (slice u8))
+                              (size i64) (binding i64)] (-> i64)
+  (lock!)
+  (let [n (load (function-param-n))]
+    (if (and (>= function-id 0) (and (< function-id (load (function-n))) (< n 2048)))
+        (let [p (primitive/index (function-params) n)
+              f (primitive/index (functions) function-id)]
+          (set! (.name p) name) (set! (.type-name p) type-name) (set! (.size p) size)
+          (set! (.binding p) binding)
+          (set! (.param-count f) (+ (.param-count f) 1))
+          (set! (function-param-n) (+ n 1)))
+        0))
+  (unlock!)
+  0)
+
+(defn inspector-functions [] (-> (slice u8))
+  (lock!)
+  (json-reset!)
+  (json-text! "{\"functions\":[")
+  (for [i 0 (load (function-n))]
+    (let [f (primitive/index (functions) i)]
+      (if (> i 0) (json-byte! (primitive/cast u8 #\,)) 0)
+      (json-text! "{\"id\":") (json-int! i)
+      (json-text! ",\"name\":") (json-quoted! (.name f))
+      (json-text! ",\"module\":") (json-quoted! (.module-name f))
+      (json-text! ",\"params\":[")
+      (for [j 0 (.param-count f)]
+        (let [p (primitive/index (function-params) (+ (.param-start f) j))]
+          (if (> j 0) (json-byte! (primitive/cast u8 #\,)) 0)
+          (json-text! "{\"name\":") (json-quoted! (.name p))
+          (json-text! ",\"type\":") (json-quoted! (.type-name p))
+          (json-text! ",\"size\":") (json-int! (.size p))
+          (if (= (.binding p) 1)
+              (json-text! ",\"binding\":\"malloc-allocator\"")
+              0)
+          (json-byte! (primitive/cast u8 #\}))))
+      (json-byte! (primitive/cast u8 #\]))
+      (json-text! ",\"returns\":") (json-quoted! (.returns f))
+      (json-text! ",\"returnSize\":") (json-int! (.return-size f))
+      (json-byte! (primitive/cast u8 #\}))))
+  (json-text! "]}")
+  (unlock!)
+  (slice-new (json-buffer) (load (json-length))))
+
+(defn inspector-dispatch-calls-on-main-thread! [] (-> i64)
+  (atomic/atomic-store (call-dispatch-mode) 1))
+
+; Called by an application's main/event loop. At most one request exists because
+; the embedded HTTP server serves connections serially.
+(defn inspector-pump-call! [] (-> i64)
+  (if (= (atomic/atomic-cas (pending-call-state) 1 4) 1)
+      (do
+        (let [id (load (pending-call-id))
+              body (slice-new (primitive/index (pending-call-body) 0)
+                              (load (pending-call-length)))]
+          (if (or (< id 0) (>= id (load (function-n))))
+              (do (json-reset!) (json-text! "{\"ok\":false,\"error\":\"unknown function\"}"))
+              (primitive/call-ptr (.invoke (primitive/index (functions) id)) body)))
+        (atomic/atomic-store (pending-call-state) 2)
+        1)
+      0))
+
+(defn inspector-call-on-main-thread [(id i64) (body (slice u8))] (-> (slice u8))
+  (loop (if (= (atomic/atomic-cas (pending-call-state) 0 3) 0) (break) (usleep 100)))
+  (let [n (if (> (slice-len body) 65535) 65535 (slice-len body))]
+    (for [i 0 n] (set! (primitive/index (pending-call-body) i) (slice-get body i)))
+    (set! (pending-call-id) id)
+    (set! (pending-call-length) n)
+    (atomic/atomic-store (pending-call-state) 1)
+    (loop (if (= (atomic/atomic-load (pending-call-state)) 2) (break) (usleep 100)))
+    (let [result (slice-new (json-buffer) (load (json-length)))]
+      (atomic/atomic-store (pending-call-state) 0)
+      result)))
+
+(defn inspector-call [(id i64) (body (slice u8))] (-> (slice u8))
+  ; Do not hold the registry lock while application code runs: an invoked function
+  ; may allocate, free, or ask the inspector questions itself.
+  (if (= (atomic/atomic-load (call-dispatch-mode)) 1)
+      (inspector-call-on-main-thread id body)
+      (do
+        (if (or (< id 0) (>= id (load (function-n))))
+            (do (json-reset!) (json-text! "{\"ok\":false,\"error\":\"unknown function\"}"))
+            (primitive/call-ptr (.invoke (primitive/index (functions) id)) body))
+        (slice-new (json-buffer) (load (json-length))))))
 (defn inspector-list-instances [] (-> i64)
   (printf c"instances:\n")
   (for [i 0 (load (entry-n))]

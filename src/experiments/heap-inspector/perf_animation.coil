@@ -1,8 +1,11 @@
 (module experiments.heap-inspector.perf-animation)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
+(import "coil.atomic" :as atomic)
+(import "coil.arraylist" :as al)
 (import "coil.result" :use *)
 (import "experiments.invaders.objc" :use *)
+(import "experiments.heap-inspector.runtime" :as inspector)
 
 (extern printf :cc c [(ptr i8) ...] (-> i32))
 (extern snprintf :cc c [(ptr i8) i64 (ptr i8) ...] (-> i32))
@@ -14,33 +17,60 @@
 (defstruct CGRect [(x f64) (y f64) (w f64) (h f64)])
 (defstruct FrameProbe [(frame i64) (dt-ms f64) (x f64) (y f64)])
 (defstruct BallState [(number i64) (x f64) (y f64) (vx f64) (vy f64) (frames i64)])
-(const BALL_MAX 200)
+(defstruct BallCollections
+  [(balls (al/ArrayList (ptr i8)))
+   (colors (al/ArrayList (ptr i8)))
+   (states (al/ArrayList (ptr BallState)))])
+(defstruct BallApplication
+  [(app (ptr i8))
+   (window (ptr i8))
+   (mode (ptr i8))
+   (layer (ptr i8))
+   (slider (ptr i8))
+   (allocator (dyn alloc/Allocator))
+   (active i64)
+   (collections BallCollections)])
+; Inspector calls arrive on the viewer's server thread. They publish intent only;
+; AppKit objects and allocator-owned ball state remain exclusively on the main
+; application thread.
+(defn requested-ball-count-cell [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+(defn live-ball-count-cell [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defn set-ball-count [(count i64)] (-> i64)
+  (let [safe-count (if (< count 1) 1 count)]
+    (atomic/atomic-store (requested-ball-count-cell) safe-count)
+    safe-count))
+
+(defn ball-count [] (-> i64)
+  (atomic/atomic-load (live-ball-count-cell)))
 
 (defn rect [(x f64) (y f64) (w f64) (h f64)] (-> CGRect)
   (let [r (primitive/alloc-stack CGRect)]
     (set! (.x r) x) (set! (.y r) y) (set! (.w r) w) (set! (.h r) h)
     (load r)))
 
-(defn pump! [(app (ptr i8)) (mode (ptr i8))] (-> i64)
+(defn pump! [(context (ptr BallApplication))] (-> i64)
   (while true
-    (let [event (msg (ptr i8) app
+    (let [event (msg (ptr i8) (.app context)
                      (sel c"nextEventMatchingMask:untilDate:inMode:dequeue:")
                      [i64 (ptr i8) (ptr i8) i64]
-                     -1 (primitive/cast (ptr i8) 0) mode 1)]
+                     -1 (primitive/cast (ptr i8) 0) (.mode context) 1)]
       (if (= (primitive/cast i64 event) 0)
           (break 0)
-          (msg (ptr i8) app (sel c"sendEvent:") [(ptr i8)] event))))
+          (msg (ptr i8) (.app context) (sel c"sendEvent:") [(ptr i8)] event))))
   0)
 
-(defn set-title! [(window (ptr i8)) (fps f64) (worst-ms f64)] (-> i64)
+(defn set-title! [(context (ptr BallApplication)) (fps f64) (worst-ms f64)] (-> i64)
   (let [buffer (primitive/alloc-stack (array i8 128))]
     (snprintf (primitive/index buffer 0) 128 c"Heap inspector animation — %.1f FPS — worst %.2f ms" fps worst-ms)
     (let [title (msg (ptr i8) (class c"NSString") (sel c"stringWithUTF8String:") [(ptr i8)] (primitive/index buffer 0))]
-      (msg (ptr i8) window (sel c"setTitle:") [(ptr i8)] title)))
+      (msg (ptr i8) (.window context) (sel c"setTitle:") [(ptr i8)] title)))
   0)
 
-(defn frame-allocation! [(a (dyn alloc/Allocator)) (frame i64)] (-> i64)
-  (match (alloc/alloc [FrameProbe] a 1)
+(defn frame-allocation! [(context (ptr BallApplication)) (frame i64)] (-> i64)
+  (match (alloc/alloc [FrameProbe] (.allocator context) 1)
     (None [] 0)
     (Some [memory]
       (do
@@ -48,17 +78,13 @@
         (set! (.dt-ms (alloc/alloc-slice-data memory)) 0.0)
         (set! (.x (alloc/alloc-slice-data memory)) 0.0)
         (set! (.y (alloc/alloc-slice-data memory)) 0.0)
-        (alloc/free [FrameProbe] a memory)
+        (alloc/free [FrameProbe] (.allocator context) memory)
         0))))
 
-(defn create-ball! [(a (dyn alloc/Allocator))
-                    (i i64)
-                    (layer (ptr i8))
-                    (balls (ptr (ptr i8)))
-                    (colors (ptr (ptr i8)))
-                    (states (ptr (ptr BallState)))] (-> i64)
-  (let [ball (msg (ptr i8) (class c"CALayer") (sel c"layer") [])
-        state (alloc/unwrap-ptr [BallState] (alloc/create [BallState] a))
+(defn create-ball! [(context (ptr BallApplication))] (-> i64)
+  (let [i (.active context)
+        ball (msg (ptr i8) (class c"CALayer") (sel c"layer") [])
+        state (alloc/unwrap-ptr [BallState] (alloc/create [BallState] (.allocator context)))
         color (CGColorCreateGenericRGB
                 (/ (primitive/cast f64 (+ 3 (% (* i 5) 7))) 10.0)
                 (/ (primitive/cast f64 (+ 3 (% (* i 3) 7))) 10.0)
@@ -66,9 +92,9 @@
                 1.0)
         x (+ 24.0 (primitive/cast f64 (% (* i 83) 640)))
         y (+ 54.0 (primitive/cast f64 (% (* i 137) 326)))]
-    (set! (primitive/index balls i) ball)
-    (set! (primitive/index colors i) color)
-    (set! (primitive/index states i) state)
+    (al/al-push! [(ptr i8)] (mut (field (field context collections) balls)) ball)
+    (al/al-push! [(ptr i8)] (mut (field (field context collections) colors)) color)
+    (al/al-push! [(ptr BallState)] (mut (field (field context collections) states)) state)
     (set! (.number state) i) (set! (.x state) x) (set! (.y state) y)
     (set! (.vx state) (* (if (= (% i 2) 0) 1.0 -1.0) (+ 125.0 (primitive/cast f64 (% (* i 13) 190)))))
     (set! (.vy state) (* (if (= (% i 3) 0) -1.0 1.0) (+ 105.0 (primitive/cast f64 (% (* i 11) 170)))))
@@ -76,33 +102,48 @@
     (msg (ptr i8) ball (sel c"setBackgroundColor:") [(ptr i8)] color)
     (msg (ptr i8) ball (sel c"setCornerRadius:") [f64] 16.0)
     (msg (ptr i8) ball (sel c"setFrame:") [CGRect] (rect x y 32.0 32.0))
-    (msg (ptr i8) layer (sel c"addSublayer:") [(ptr i8)] ball)
-    0))
+    (msg (ptr i8) (.layer context) (sel c"addSublayer:") [(ptr i8)] ball)
+    (set! (.active context) (+ i 1))
+    (atomic/atomic-store (live-ball-count-cell) (.active context))
+    (atomic/atomic-store (requested-ball-count-cell) (.active context))
+    (.active context)))
 
-(defn destroy-ball! [(a (dyn alloc/Allocator))
-                     (i i64)
-                     (balls (ptr (ptr i8)))
-                     (colors (ptr (ptr i8)))
-                     (states (ptr (ptr BallState)))] (-> i64)
-  (msg (ptr i8) (load (primitive/index balls i)) (sel c"removeFromSuperlayer") [])
-  (CGColorRelease (load (primitive/index colors i)))
-  (alloc/destroy [BallState] a (load (primitive/index states i)))
-  0)
+(defn destroy-ball! [(context (ptr BallApplication))] (-> i64)
+  (if (<= (.active context) 0)
+      (.active context)
+      (let [i (- (.active context) 1)]
+        (msg (ptr i8) (al/al-get [(ptr i8)] (load (field (field context collections) balls)) i) (sel c"removeFromSuperlayer") [])
+        (CGColorRelease (al/al-get [(ptr i8)] (load (field (field context collections) colors)) i))
+        (alloc/destroy [BallState] (.allocator context) (al/al-get [(ptr BallState)] (load (field (field context collections) states)) i))
+        (al/al-pop! [(ptr i8)] (mut (field (field context collections) balls)))
+        (al/al-pop! [(ptr i8)] (mut (field (field context collections) colors)))
+        (al/al-pop! [(ptr BallState)] (mut (field (field context collections) states)))
+        (set! (.active context) i)
+        (atomic/atomic-store (live-ball-count-cell) i)
+        (atomic/atomic-store (requested-ball-count-cell) i)
+        i)))
 
 (defn main [] (-> i64)
   (let [app (msg (ptr i8) (class c"NSApplication") (sel c"sharedApplication") [])
         window (msg (ptr i8) (class c"NSWindow") (sel c"alloc") [])
         mode (msg (ptr i8) (class c"NSString") (sel c"stringWithUTF8String:") [(ptr i8)] c"kCFRunLoopDefaultMode")
         layer (msg (ptr i8) (class c"CALayer") (sel c"layer") [])
-        balls (primitive/alloc-stack (array (ptr i8) 200))
-        colors (primitive/alloc-stack (array (ptr i8) 200))
-        states (primitive/alloc-stack (array (ptr BallState) 200))
         dark (CGColorCreateGenericRGB 0.035 0.045 0.065 1.0)
         a (alloc/malloc-allocator)
-        (mut active) 12
+        context (alloc/unwrap-ptr [BallApplication] (alloc/create [BallApplication] a))
         pixels (match (alloc/alloc [u8] a 49152)
                  (None [] (alloc/alloc-slice-new (primitive/cast (ptr u8) 0) 0))
                  (Some [memory] memory))]
+    (set-ball-count 12)
+    (inspector/inspector-dispatch-calls-on-main-thread!)
+    (atomic/atomic-store (live-ball-count-cell) 12)
+    (set! (.app context) app) (set! (.window context) window)
+    (set! (.mode context) mode) (set! (.layer context) layer)
+    (set! (.allocator context) a)
+    (set! (.active context) 0)
+    (store! (field (field context collections) balls) (al/al-new [(ptr i8)] a))
+    (store! (field (field context collections) colors) (al/al-new [(ptr i8)] a))
+    (store! (field (field context collections) states) (al/al-new [(ptr BallState)] a))
     (for [i 0 (alloc/alloc-slice-len pixels)]
       (set! (primitive/index (alloc/alloc-slice-data pixels) i) (primitive/cast u8 (% (+ i (* (/ i 4096) 37)) 256))))
     (msg (ptr i8) window (sel c"initWithContentRect:styleMask:backing:defer:") [CGRect i64 i64 i64]
@@ -111,14 +152,15 @@
     (msg (ptr i8) (msg (ptr i8) window (sel c"contentView") []) (sel c"setWantsLayer:") [i64] 1)
     (msg (ptr i8) (msg (ptr i8) window (sel c"contentView") []) (sel c"setLayer:") [(ptr i8)] layer)
     (msg (ptr i8) layer (sel c"setBackgroundColor:") [(ptr i8)] dark)
-    (for [i 0 12] (create-ball! a i layer (primitive/index balls 0) (primitive/index colors 0) (primitive/index states 0)))
+    (for [i 0 12] (create-ball! context))
     (let [slider (msg (ptr i8) (class c"NSSlider") (sel c"alloc") [])]
       (msg (ptr i8) slider (sel c"initWithFrame:") [CGRect] (rect 24.0 12.0 672.0 28.0))
       (msg (ptr i8) slider (sel c"setMinValue:") [f64] 1.0)
-      (msg (ptr i8) slider (sel c"setMaxValue:") [f64] 200.0)
+      (msg (ptr i8) slider (sel c"setMaxValue:") [f64] 2000.0)
       (msg (ptr i8) slider (sel c"setDoubleValue:") [f64] 12.0)
       (msg (ptr i8) slider (sel c"setContinuous:") [i64] 1)
       (msg (ptr i8) (msg (ptr i8) window (sel c"contentView") []) (sel c"addSubview:") [(ptr i8)] slider)
+    (set! (.slider context) slider)
     (msg (ptr i8) window (sel c"makeKeyAndOrderFront:") [(ptr i8)] (primitive/cast (ptr i8) 0))
     (msg (ptr i8) app (sel c"activateIgnoringOtherApps:") [i64] 1)
     (msg (ptr i8) app (sel c"finishLaunching") [])
@@ -128,21 +170,35 @@
           (mut report-frames) 0
           (mut worst-ms) 0.0
           (mut deadline) (+ (load last) (/ 1.0 60.0))]
+      (let [(mut last-slider-value) 12 (mut slider-max) 2000]
       (while (= (msg i64 window (sel c"isVisible") []) 1)
         (let [now (CFAbsoluteTimeGetCurrent) dt (- now (load last))]
           (set! last now)
-          (pump! app mode)
-          (let [desired (msg i64 slider (sel c"integerValue") [])]
-            (while (< (load active) desired)
-              (do (create-ball! a (load active) layer (primitive/index balls 0) (primitive/index colors 0) (primitive/index states 0))
-                  (set! active (+ (load active) 1))))
-            (while (> (load active) desired)
-              (do (set! active (- (load active) 1))
-                  (destroy-ball! a (load active) (primitive/index balls 0) (primitive/index colors 0) (primitive/index states 0)))))
+          (inspector/inspector-pump-call!)
+          (pump! context)
+          (let [slider-value (msg i64 slider (sel c"integerValue") [])]
+            (if (!= slider-value (load last-slider-value))
+                (do (set-ball-count slider-value)
+                    (set! last-slider-value slider-value))
+                (let [requested (atomic/atomic-load (requested-ball-count-cell))]
+                  (if (!= requested slider-value)
+                      (do (if (> requested (load slider-max))
+                              (do (set! slider-max requested)
+                                  (msg (ptr i8) slider (sel c"setMaxValue:") [f64]
+                                       (primitive/cast f64 requested))
+                                  0)
+                              0)
+                          (msg (ptr i8) slider (sel c"setDoubleValue:") [f64]
+                               (primitive/cast f64 requested))
+                          (set! last-slider-value requested))
+                      0))))
+          (let [desired (atomic/atomic-load (requested-ball-count-cell))]
+            (while (< (.active context) desired) (create-ball! context))
+            (while (> (.active context) desired) (destroy-ball! context)))
           (msg (ptr i8) (class c"CATransaction") (sel c"begin") [])
           (msg (ptr i8) (class c"CATransaction") (sel c"setDisableActions:") [i64] 1)
-          (for [i 0 (load active)]
-            (let [state (load (primitive/index states i))
+          (for [i 0 (.active context)]
+            (let [state (al/al-get [(ptr BallState)] (load (field (field context collections) states)) i)
                   x (+ (.x state) (* (.vx state) dt))
                   y (+ (.y state) (* (.vy state) dt))]
               (set! (.x state) x)
@@ -152,10 +208,10 @@
               (if (< x 24.0) (do (set! (.x state) 24.0) (set! (.vx state) (- 0.0 (.vx state)))) 0)
               (if (> y 384.0) (do (set! (.y state) 384.0) (set! (.vy state) (- 0.0 (.vy state)))) 0)
               (if (< y 54.0) (do (set! (.y state) 54.0) (set! (.vy state) (- 0.0 (.vy state)))) 0)
-              (msg (ptr i8) (load (primitive/index balls i)) (sel c"setFrame:") [CGRect]
+              (msg (ptr i8) (al/al-get [(ptr i8)] (load (field (field context collections) balls)) i) (sel c"setFrame:") [CGRect]
                    (rect (.x state) (.y state) 32.0 32.0))))
           (msg (ptr i8) (class c"CATransaction") (sel c"commit") [])
-          (frame-allocation! a (load frame))
+          (frame-allocation! context (load frame))
           (set! frame (+ (load frame) 1))
           (set! report-frames (+ (load report-frames) 1))
           (let [frame-ms (* dt 1000.0)] (if (> frame-ms (load worst-ms)) (set! worst-ms frame-ms) 0))
@@ -166,10 +222,14 @@
             (if (>= elapsed 1.0)
                 (let [fps (/ (primitive/cast f64 (load report-frames)) elapsed)]
                   (printf c"animation: fps=%.2f worst_ms=%.2f frames=%ld\n" fps (load worst-ms) (load frame))
-                  (set-title! window fps (load worst-ms))
+                  (set-title! context fps (load worst-ms))
                   (set! report-start finished) (set! report-frames 0) (set! worst-ms 0.0))
-                0)))))
-    (for [i 0 (load active)] (destroy-ball! a i (primitive/index balls 0) (primitive/index colors 0) (primitive/index states 0)))
+                0))))))
+    (while (> (.active context) 0) (destroy-ball! context))
+    (al/al-free! [(ptr i8)] (mut (field (field context collections) balls)))
+    (al/al-free! [(ptr i8)] (mut (field (field context collections) colors)))
+    (al/al-free! [(ptr BallState)] (mut (field (field context collections) states)))
     (alloc/free [u8] a pixels)
+    (alloc/destroy [BallApplication] a context)
     (CGColorRelease dark)
     0)))
