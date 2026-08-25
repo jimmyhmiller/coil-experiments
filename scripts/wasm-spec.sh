@@ -404,6 +404,18 @@ test_control() {
   echo "return assert_invalid: $invalid_count checks passed"
 }
 
+test_wat() {
+  coil_bin=${COIL:-coil}
+  "$coil_bin" run "$root/tests/wasm/wat_features.wat" \
+    --use experiments.wasm.lang -- --assert-scalar-batch \
+    named-add i32 42 2 i32 20 i32 22 \
+    i32-constant i32 4294967295 0 \
+    i64-constant i64 9223372036854775807 0 \
+    f32-constant f32 1069547520 0 \
+    f64-constant f64 4609434218613702656 0
+  echo "focused textual WAT named-local and numeric-constant checks passed"
+}
+
 case "${1:-inventory}" in
   fetch) fetch_suite ;;
   fetch-wabt) fetch_wabt ;;
@@ -415,8 +427,9 @@ case "${1:-inventory}" in
   test-memory) test_memory ;;
   test-tables) test_tables ;;
   test-control) test_control ;;
+  test-wat) test_wat ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-wat]" >&2
     exit 2
     ;;
 esac

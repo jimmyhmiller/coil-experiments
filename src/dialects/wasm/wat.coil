@@ -2,6 +2,7 @@
 
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
+(import "coil.slice" :as slice)
 
 (defn sym=? [(code Code) (name (slice u8))] (-> bool)
   (and (primitive/code-sym? code) (= (primitive/code-sym code) name)))
@@ -10,6 +11,13 @@
   (and (primitive/code-list? code)
        (> (primitive/code-count code) 0)
        (sym=? (primitive/code-nth code 0) name)))
+
+(defn named-symbol? [(code Code)] (-> bool)
+  (if (not (primitive/code-sym? code))
+      false
+      (let [name (primitive/code-sym code)]
+        (and (> (slice/slice-len name) 0)
+             (= (slice/slice-get name 0) (primitive/cast u8 36))))))
 
 (defn type-tag [(type Code)] (-> i64)
   (cond (sym=? type "i32") 1
@@ -56,16 +64,70 @@
                       (if (>= (+ (load i) 1) n)
                           (primitive/error "WAT reader: local.get lacks an index")
                           0)
-                      (let [index-code (primitive/code-nth func (+ (load i) 1))]
-                        (if (not (primitive/code-int? index-code))
-                            (primitive/error "WAT reader: named locals are not implemented yet")
-                            (let [index (primitive/code-int index-code)]
-                              (if (>= index (primitive/code-count locals))
+                      (let [reference (primitive/code-nth func (+ (load i) 1))]
+                        (if (primitive/code-int? reference)
+                            (let [index (primitive/code-int reference)]
+                              (if (or (< index 0) (>= index (primitive/code-count locals)))
                                   (primitive/error "WAT validation: local index out of bounds")
                                   (let [local (primitive/code-nth locals index)
                                         tag (primitive/code-int (primitive/code-nth local 0))
                                         value (primitive/code-nth local 1)]
-                                    (store! stack `(~tag ~value ~(load stack))))))))
+                                    (store! stack `(~tag ~value ~(load stack))))))
+                            (if (primitive/code-sym? reference)
+                                (let [(mut j) 0
+                                      (mut found?) false]
+                                  (loop
+                                    (if (or (load found?)
+                                            (>= (load j) (primitive/code-count locals)))
+                                        (break)
+                                        (let [local (primitive/code-nth locals (load j))]
+                                          (if (and (= (primitive/code-count local) 3)
+                                                   (primitive/code-eq
+                                                     (primitive/code-nth local 2) reference))
+                                              (let [tag (primitive/code-int
+                                                          (primitive/code-nth local 0))
+                                                    value (primitive/code-nth local 1)]
+                                                (store! stack `(~tag ~value ~(load stack)))
+                                                (store! found? true))
+                                              0)
+                                          (store! j (+ (load j) 1)))))
+                                  (if (not (load found?))
+                                      (primitive/error "WAT validation: unknown named local")
+                                      0))
+                                (primitive/error "WAT validation: malformed local reference"))))
+                      (store! i (+ (load i) 1))
+                      0)
+                  (or (sym=? item "i32.const") (sym=? item "i64.const"))
+                    (do
+                      (if (>= (+ (load i) 1) n)
+                          (primitive/error "WAT reader: integer constant lacks a value")
+                          0)
+                      (let [value (primitive/code-nth func (+ (load i) 1))
+                            i32-mode (sym=? item "i32.const")
+                            cast-id (primitive/datum->syntax context "primitive/cast")]
+                        (if (not (primitive/code-int? value))
+                            (primitive/error "WAT reader: expected an integer constant")
+                            (store! stack
+                                    `(~(if i32-mode 1 2)
+                                      ~(if i32-mode `(~cast-id i32 ~value) value)
+                                      ~(load stack)))))
+                      (store! i (+ (load i) 1))
+                      0)
+                  (or (sym=? item "f32.const") (sym=? item "f64.const"))
+                    (do
+                      (if (>= (+ (load i) 1) n)
+                          (primitive/error "WAT reader: floating constant lacks a value")
+                          0)
+                      (let [value (primitive/code-nth func (+ (load i) 1))
+                            f32-mode (sym=? item "f32.const")
+                            cast-id (primitive/datum->syntax context "primitive/cast")]
+                        (if (not (or (primitive/code-int? value)
+                                     (primitive/code-float? value)))
+                            (primitive/error "WAT reader: expected a numeric floating constant")
+                            (store! stack
+                                    `(~(if f32-mode 3 4)
+                                      ~(if f32-mode `(~cast-id f32 ~value) value)
+                                      ~(load stack)))))
                       (store! i (+ (load i) 1))
                       0)
                   (sym=? item "i32.add")
@@ -111,16 +173,28 @@
                         (store! export-name (primitive/code-str (primitive/code-nth item 1)))
                         (primitive/error "WAT reader: malformed inline export"))
                   (list-head=? item "param")
-                    (let [(mut j) 1
-                          pn (primitive/code-count item)]
-                      (loop
-                        (if (>= (load j) pn)
-                            (break)
-                            (let [type (primitive/code-nth item (load j))
-                                  id (primitive/fresh-identifier "wat-param")]
-                              (primitive/code-list-push! params `(~id ~type))
-                              (primitive/code-list-push! locals `(~(type-tag type) ~id))
-                              (store! j (+ (load j) 1))))))
+                    (let [pn (primitive/code-count item)]
+                      (if (and (= pn 3)
+                               (named-symbol? (primitive/code-nth item 1))
+                               (or (sym=? (primitive/code-nth item 2) "i32")
+                                   (or (sym=? (primitive/code-nth item 2) "i64")
+                                       (or (sym=? (primitive/code-nth item 2) "f32")
+                                           (sym=? (primitive/code-nth item 2) "f64")))))
+                          (let [name (primitive/code-nth item 1)
+                                type (primitive/code-nth item 2)
+                                id (primitive/fresh-identifier "wat-param")]
+                            (primitive/code-list-push! params `(~id ~type))
+                            (primitive/code-list-push! locals `(~(type-tag type) ~id ~name))
+                            0)
+                          (let [(mut j) 1]
+                            (loop
+                              (if (>= (load j) pn)
+                                  (break)
+                                  (let [type (primitive/code-nth item (load j))
+                                        id (primitive/fresh-identifier "wat-param")]
+                                    (primitive/code-list-push! params `(~id ~type))
+                                    (primitive/code-list-push! locals `(~(type-tag type) ~id))
+                                    (store! j (+ (load j) 1))))))))
                   (list-head=? item "result")
                     (if (= (primitive/code-count item) 2)
                         (do (store! result-type (primitive/code-nth item 1))

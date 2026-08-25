@@ -44,6 +44,7 @@ scripts/wasm-spec.sh test-conversions
 scripts/wasm-spec.sh test-memory
 scripts/wasm-spec.sh test-tables
 scripts/wasm-spec.sh test-control
+scripts/wasm-spec.sh test-wat
 ```
 
 `test-integers` compiles each official `i32` and `i64` module through the reader
@@ -73,6 +74,10 @@ returns propagated through nested blocks, loops, and conditionals. It also
 passes the complete official MVP `return` file: 63 returns and 20 validation
 failures. Together, the harnesses above currently execute 6,259 official
 assertions.
+
+`test-wat` exercises the Coil-native text reader directly, including named
+parameters, named `local.get`, signed integer constants, floating constants, and
+all four MVP scalar result types. It does not invoke WABT or another converter.
 
 An individual exported integer function can be checked through the same reader
 entry path:
