@@ -294,6 +294,62 @@ test_memory() {
   echo "memory_size: 36 official assertions passed"
 }
 
+test_tables() {
+  command -v jq >/dev/null 2>&1 || {
+    echo "error: jq is required to run prepared spec assertions" >&2
+    exit 1
+  }
+  coil_bin=${COIL:-coil}
+  "$coil_bin" run "$root/tests/wasm/table.wasm" --use experiments.wasm.lang -- \
+    --assert-scalar-batch \
+    dispatch i32 42 3 i32 1 i32 20 i32 22 \
+    dispatch i32 42 3 i32 2 i32 64 i32 22
+  echo "focused call_indirect dispatch checks passed"
+
+  json="$prepared/call_indirect/script.json"
+  wasm="$prepared/call_indirect/script.0.wasm"
+  args_file=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-call-indirect.XXXXXX")
+  trap_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-call-indirect-trap.XXXXXX")
+  trap 'rm -f "$args_file" "$trap_out"' EXIT HUP INT TERM
+  jq -r '
+    .commands[]
+    | select(.type == "assert_return")
+    | .action.field,
+      (if (.expected | length) == 0 then "void" else .expected[0].type end),
+      (if (.expected | length) == 0 then "0" else .expected[0].value end),
+      (.action.args | length | tostring),
+      (.action.args[] | .type, .value)
+  ' "$json" > "$args_file"
+  xargs "$coil_bin" run "$wasm" --use experiments.wasm.lang -- \
+    --assert-scalar-batch < "$args_file"
+  echo "call_indirect assert_return: 103 checks passed"
+
+  jq -r '
+    .commands[] | select(.type == "assert_trap")
+    | ([.action.field, (.action.args | length | tostring)]
+       + [.action.args[] | .type, .value])
+    | join(" ")
+  ' "$json" > "$args_file"
+  trap_count=0
+  while IFS= read -r line; do
+    set -- $line
+    if "$coil_bin" run "$wasm" --use experiments.wasm.lang -- \
+         --invoke-scalar "$@" > "$trap_out" 2>&1; then
+      echo "error: expected WebAssembly trap from call_indirect export $1" >&2
+      exit 1
+    fi
+    if ! grep -q 'program terminated by signal 6' "$trap_out"; then
+      echo "error: call_indirect export $1 failed without the expected runtime trap" >&2
+      cat "$trap_out" >&2
+      exit 1
+    fi
+    trap_count=$((trap_count + 1))
+  done < "$args_file"
+  rm -f "$args_file" "$trap_out"
+  trap - EXIT HUP INT TERM
+  echo "call_indirect assert_trap: $trap_count checks passed"
+}
+
 case "${1:-inventory}" in
   fetch) fetch_suite ;;
   fetch-wabt) fetch_wabt ;;
@@ -303,8 +359,9 @@ case "${1:-inventory}" in
   test-floats) test_floats ;;
   test-conversions) test_conversions ;;
   test-memory) test_memory ;;
+  test-tables) test_tables ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables]" >&2
     exit 2
     ;;
 esac
