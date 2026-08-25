@@ -1,15 +1,14 @@
 # CoilRS: a Rust-like surface syntax for Coil
 
-Status: implemented reader, structured parser, conservative canonical renderer,
-tree converter, and self-host integration gate.
+The Coil-native reader, converter, import bridge, tree converter, and self-host
+integration gate are implemented. Pleasant declarations and expressions share
+one exact recursive structural representation with open-ended Coil forms.
 
-The implementation includes the lossless native escape, tree
+The implementation includes lossless structural syntax, tree
 conversion/materialization, and dedicated syntax for the constructs in this
-document. The canonical renderer proves each converted form reconstructs the
-same native syntax tree before using dedicated syntax; forms it cannot prove use
-`coil_item` automatically. This is not an error or a lossy approximation—the
-escape is the compatibility representation for macros, future forms, malformed
-reader fixtures, and deliberately unusual syntax.
+document. The structural notation recursively represents lists, vectors, atoms,
+and quote forms; it never embeds verbatim native Coil. This is the compatibility
+representation for macros, future forms, and deliberately unusual syntax.
 
 CoilRS is a different spelling of Coil, not a new language and not a Rust
 frontend. The reader turns a `.coilrs` file into ordinary Coil `Code`; after that,
@@ -23,16 +22,14 @@ The design has two goals:
 2. Every Coil program must be representable, including forms invented by user
    macros after this reader was written.
 
-The second goal is guaranteed by the native escape:
+The second goal is guaranteed by recursive structural syntax:
 
 ```rust
-coil {
-    (any ordinary Coil form, copied verbatim)
-}
+item form!(atom!("some-new-macro"), atom!("x"), [atom!("a"), atom!("b")]);
 ```
 
-A converter may use pleasant CoilRS syntax for forms it knows and a `coil` escape
-for everything else. Consequently conversion is total and this round trip is
+A converter may use pleasant CoilRS syntax for forms it knows and structural
+nodes for everything else. Consequently conversion is total and this round trip is
 required to preserve the native Coil syntax tree:
 
 ```text
@@ -49,7 +46,7 @@ deterministic and idempotent.
 ```rust
 module example::points;
 
-use coil::io::{stdout, print_str};
+use coil::io::{stdout, print-int, print-str};
 use coil::alloc as alloc;
 
 #[derive(Eq, Hash)]
@@ -59,10 +56,6 @@ struct Point {
 }
 
 impl Point {
-    fn new(x: i64, y: i64) -> Point {
-        Point { x: x, y: y }
-    }
-
     fn sum(p: Point) -> i64 {
         p.x + p.y
     }
@@ -71,10 +64,11 @@ impl Point {
 fn main() -> i64 {
     let mut total = 0;
     for i in 0..10 {
-        let p = Point::new(i, i * 2);
+        let p = Point { x: i, y: i * 2 };
         total = total + sum(p);
     }
-    println("total={}", load(total));
+    print-int(stdout(), load(total));
+    print-str(stdout(), "\n");
     0
 }
 ```
@@ -87,9 +81,10 @@ type rules.
 
 ## Lexical syntax
 
-Line comments are `// ...`; nested block comments are `/* ... */`. Doc comments
-are `/// ...` and lower to Coil `;;` documentation attached to the following
-declaration. The canonical renderer uses four-space indentation.
+Line comments are `// ...`; nested block comments are `/* ... */`. `/// ...` is
+accepted as a line comment, but comments are not part of Coil `Code` and are not
+preserved by syntax-tree conversion. The canonical renderer uses four-space
+indentation.
 
 CoilRS accepts Coil's integer and floating literals, including radix prefixes and
 underscores. It accepts `true`, `false`, strings, C strings (`c"..."`), character
@@ -110,7 +105,7 @@ let `+` = add_function;
 segment form the module alias/name, and the final segment is the member. A module
 declaration maps every `::` to `.`, so `module my::app::main;` becomes
 `(module my.app.main)`. This intentionally leaves `/` available only inside a
-backtick identifier or a native escape.
+backtick identifier or an `atom!(...)` structural node.
 
 Reserved words may be used as names when backtick-quoted. No identifier is
 case-folded.
@@ -182,7 +177,7 @@ fn add(x: i64, y: i64) -> i64 {
 }
 
 fn show_all<T: Show, Args...>(x: T, args...: Args...) -> i64 {
-    coil { (consume x args...) }
+    form!(atom!("consume"), atom!("x"), atom!("args..."))
 }
 ```
 
@@ -245,9 +240,10 @@ impl Point {
 
 These lower to `deftrait`, trait `impl`, generic `impl`, and inherent `impl`.
 Receiver dispatch remains Coil's: `sum(p)` is an ordinary call whose owner is
-inferred from argument zero, and associated calls are `Point::origin()`.
-`p.sum()` is deliberately not syntax in version 1 because it would obscure this
-distinction and collide with field access.
+inferred from argument zero. Receiverless inherent functions do not become
+surrounding-module functions, so CoilRS does not invent a `Point::origin()` call
+that Coil cannot resolve. `p.sum()` is deliberately not syntax in version 1
+because it would obscure this distinction and collide with field access.
 
 Derives use `#[derive(...)]` on a struct or enum and lower to a following native
 `derive` form. Configured derives use expression syntax:
@@ -269,14 +265,18 @@ cimport "sys/ioctl.h" { ioctl };
 export_c { run as "run" };
 ```
 
-These lower to `extern`, `cimport`, and `export-c`. An `extern` item may carry
-`#[header("...")]`. Calling conventions other than `c` are accepted as string or
-identifier values and emitted as their native keyword/value.
+These lower to `extern`, `cimport`, and `export-c`. Calling conventions other
+than `c` are accepted as string or identifier values and emitted as their native
+keyword/value. Open-ended foreign-declaration annotations use structural items.
 
-Metaprogram declarations whose surface is too specialized (`defannotation`,
-`defderive`, `register-derive`, reader-provider registration) initially use the
-native escape. They remain fully representable and may gain dedicated sugar
-without changing the language's completeness.
+Metaprogram declarations whose surface is deliberately open-ended
+(`defannotation`, `defderive`, `register-derive`, and reader-provider
+registration) use structural items. For example:
+
+```rust
+item form!(atom!("reader-provider"), string!("my.reader"), atom!("read-mine"));
+item form!(atom!("defannotation"), atom!(":http/route"), atom!("Route"));
+```
 
 ## Bindings, places, and assignment
 
@@ -304,7 +304,7 @@ x -= y;  // analogous; also *=, /=, %=, &=, |=, ^=, <<=, >>=
 ```
 
 Compound assignment currently requires a simple named place such as `x`. Use an
-explicit `load`/`store!` sequence (or `coil`) for projected places whose address
+explicit `load`/`store!` sequence for projected places whose address
 must be evaluated exactly once.
 
 Indexing and fields are surface sugar:
@@ -316,7 +316,7 @@ place(p, index)      // explicit project/library place operation
 ```
 
 Low-level `primitive::index`, `field`, `load`, and `store!` remain available as
-ordinary calls or through `coil`.
+ordinary calls or structural expressions.
 
 ## Expressions and operators
 
@@ -325,7 +325,6 @@ Calls, constructors, literals, and blocks are expressions. Array literals use
 
 ```rust
 f(a, b)
-Type::<T>::associated(x)
 generic::<T, U>(x)
 if condition { then_value } else { else_value }
 ```
@@ -363,7 +362,7 @@ All control constructs are expressions and preserve Coil's result typing.
 if test { a } else { b }
 
 match value {
-    Some { value } => value,
+    Some[value] => value,
     None => 0,
 }
 
@@ -435,13 +434,17 @@ transform_once one_pass;
 These lower to `comptime`, `meta`, `checker`, `transform`, and
 `transform-once`. `before_expand` lowers to `:phase before-expand`.
 
-Quote, unquote, and splice operate on Coil syntax rather than CoilRS syntax in
-version 1. This is intentional: macro templates must preserve Coil's exact
-hygiene and syntax-object model, and the native escape already provides it:
+Quote, quasiquote, unquote, and splice are structural nodes. This preserves the
+exact Coil syntax-object shape without embedding native source text:
 
 ```rust
 fn when_macro(c: Code, body: Code) -> Code {
-    coil { `(if ~c (do ~@body) 0) }
+    quasiquote(form!(
+        atom!("if"),
+        unquote(atom!("c")),
+        form!(atom!("do"), splice(atom!("body"))),
+        int!(0)
+    ))
 }
 ```
 
@@ -449,14 +452,12 @@ Because a function with `Code` parameters and a `Code` result is already how Coi
 defines a macro, no `macro` keyword is introduced. Reflection and `primitive::code_*`
 operations are ordinary functions.
 
-Registration forms and arbitrary generated top-level forms are always available
-through `coil`:
+Registration forms and arbitrary generated top-level forms use structural
+items:
 
 ```rust
-coil {
-    (reader-provider "my.reader" read-mine)
-    (defannotation :http/route Route)
-}
+item form!(atom!("reader-provider"), string!("my.reader"), atom!("read-mine"));
+item form!(atom!("defannotation"), atom!(":http/route"), atom!("Route"));
 ```
 
 ## Tests and documentation
@@ -478,96 +479,86 @@ not a Coil source declaration, and remains in `Coil.toml` under `[test.suites.*]
 Assertions and property-test vocabulary are ordinary calls and therefore need no
 reader support.
 
-## Native Coil escape
+## Recursive structural syntax
 
-The escape is part of the core grammar, not a preprocessor:
-
-```rust
-coil { ONE_OR_MORE_NATIVE_COIL_FORMS }
-```
-
-At item or statement position, all enclosed native forms are spliced into the
-surrounding sequence. In expression position, exactly one native form is required
-and becomes that expression. The content is passed to Coil's built-in configurable
-s-expression reader; it is not tokenized as CoilRS first. Native strings, C
-strings, characters, comments, quote/unquote/splice, vectors, and nested
-parentheses therefore keep their ordinary meanings.
-
-Braces delimiting an escape are recognized only outside native strings,
-characters, and line comments. To avoid ambiguity, a top-level native `}` symbol
-inside an escape must be written with an equivalent escaped spelling or placed in
-a string. Canonical output never emits such an ambiguous bare symbol.
-
-Two convenient single-form escapes are also defined:
+Structural syntax represents `Code` as Rust-like data; it never contains native
+Coil source. It is valid in expressions, and `item NODE;` places one node at the
+top level:
 
 ```rust
-let x = coil_expr { (some-new-macro a b) };
-coil_item { (some-new-declaration Name ...) }
+item form!(atom!("some-new-declaration"), atom!("Name"), [atom!("a"), atom!("b")]);
+form!(atom!("some-new-macro"), atom!("x"), int!(42))
 ```
 
-`coil_expr` requires exactly one form. `coil_item` is legal only where an item is
-legal and may contain one or more forms. Bare `coil` infers the required mode from
-its syntactic position.
+The complete structural vocabulary is:
 
-Escaped forms may refer to bindings created by CoilRS because the reader parses
-the complete source into one syntax context. The implementation must not parse
-each escape in an unrelated hygiene context.
+```rust
+form!(NODE, ...)       // list
+[NODE, ...]            // vector
+atom!("spelling")      // exact atom spelling and kind inferred by Coil's reader
+symbol!("spelling")    // explicit symbolic atom alias
+string!("text")        // string atom
+int!(42)               // integer atom
+float!(3.5)             // floating atom
+quote(NODE)
+quasiquote(NODE)
+unquote(NODE)
+splice(NODE)
+```
+
+Because list and vector children are structural nodes recursively, this notation
+represents future macros, unusual symbols, quote templates, and every source
+syntax tree accepted by Coil without hiding native text in a string.
 
 ## Canonical conversion and round-trip policy
 
 The project should expose both directions:
 
 ```sh
-coil run input.coilrs --use experiments.coilrs.lang
-coil run experiments.coilrs.lang input.coilrs > output.coil
-coilrs from-coil input.coil > output.coilrs
-coilrs to-coil input.coilrs > output.coil
+coil run input.coilrs --use experiments.rust-like.lang
+coil run experiments.rust-like.lang input.coilrs > output.coil
+coil run input.coil --use experiments.rust-like.convert > output.coilrs
 ```
 
 The repository implementation is currently invoked directly:
 
 ```sh
-python3 src/dialects/rust/coilrs.py from-coil input.coil \
-  --structured-pretty > output.coilrs
-python3 src/dialects/rust/coilrs.py to-coil input.coilrs > output.coil
-python3 src/dialects/rust/coilrs.py from-coil-tree COIL_CHECKOUT CONVERTED \
-  --install-reader --structured-pretty
+coil run input.coil --use experiments.rust-like.convert > output.coilrs
+coil run experiments.rust-like.lang output.coilrs > output.coil
+coil run experiments.rust-like.tree -- COIL_CHECKOUT CONVERTED
 cd CONVERTED
-coil build src/compiler/main_a64.coilrs --use experiments.rust.lang -o coilrs-compiler
+coil build src/compiler/main_a64.coilrs --use experiments.rust-like.lang -o coilrs-compiler
 ```
 
 Tree conversion writes `.coilrs` sources and small `.coil` namespace-index
-stubs. The one entry reader invocation materializes all adjacent `.coilrs`
-modules into ordinary Coil before the loader follows imports. This is necessary
-because Coil reader providers replace the entry read; textual imports otherwise
-retain the default reader. Materialization uses atomic replacement and is
-confined to the explicitly converted copy.
+stubs. Each stub invokes the Coil-native `rust-like-items` macro over its module
+text because reader providers replace the entry read while textual imports retain
+the default reader. Compilation does not rewrite or materialize files.
 
-`from-coil` without `--structured-pretty` is the byte-exact archival mode: it
-wraps the complete source in one `coil` escape. `--pretty` structures the module
-declaration and retains one fallback body. `--structured-pretty` is the normal
-canonical conversion: it renders every form whose exact tree round trip it can
-prove and falls back per form otherwise.
+The canonical Coil converter is itself a Coil reader provider. Its universal
+structural notation uses Rust-macro-shaped `form!(...)` and `atom!(...)` nodes;
+it never embeds native source. Dedicated surface renderings may replace a
+structural node only when they preserve the same parsed form.
 
 The exact CLI packaging may differ, but the following behavior is required:
 
 - The reader accepts every construct documented above.
 - `to-coil` prints ordinary Coil accepted by the default reader.
-- `from-coil` uses dedicated CoilRS syntax only when it can reproduce the exact
-  native form shape; otherwise it emits `coil_item` or `coil_expr`.
+- Native-to-CoilRS conversion uses dedicated syntax only when it reproduces the
+  exact native form shape; otherwise it emits recursive structural nodes.
 - Reading canonical CoilRS and printing it again is idempotent.
 - Native Coil -> canonical CoilRS -> native Coil preserves parsed `Code` modulo
   source locations and hygiene metadata that cannot originate in source text.
 - CoilRS -> native Coil -> canonical CoilRS preserves semantics and becomes stable
   after the first canonicalization.
-- Comments are best-effort in the source converter. Doc comments attached to
-  declarations must be preserved; arbitrary comments are not part of `Code` and
-  require a token-preserving conversion path if exact retention is desired.
+- Comments, including doc comments, are not part of `Code` and therefore are not
+  preserved by syntax-tree conversion. A separate token-preserving tool would be
+  required for comment retention.
 
-The first test corpus should include one example for every section in this file,
-then run the converter over the repository's ordinary `.coil` programs. Any form
-the pretty surface cannot yet express must still pass via an escape; unsupported
-syntax is never grounds for a failed conversion.
+The conformance corpus covers the constructs in this file and runs the converter
+over every valid `.coil` program in a clean compiler checkout. Forms without
+dedicated surface sugar pass through recursive structural syntax; unsupported
+surface sugar is never grounds for a failed conversion.
 
 ## Deliberate non-features
 
@@ -578,8 +569,8 @@ syntax is never grounds for a failed conversion.
   `do` does.
 - No Rust tuple, reference, closure, async, or `?` semantics unless a future Coil
   library/dialect defines them and the syntax lowers transparently to that API.
-- No attempt to reserve all future Coil forms. Native escape is the compatibility
-  boundary.
+- No attempt to reserve all future Coil forms. Recursive structural syntax is the
+  compatibility boundary.
 
 Those omissions keep CoilRS honest: it is readable Rust-like notation for Coil's
 actual semantics, with an exact route back to Coil whenever surface sugar would

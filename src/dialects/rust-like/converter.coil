@@ -1,0 +1,1126 @@
+(module experiments.rust-like.converter)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :as slice)
+(import "coil.str" :as str)
+(import "coil.io" :as io)
+
+(extern abort :cc c [] (-> i64))
+
+(defn converter-fail [(message (slice u8))] (-> i64)
+  (do (io/print-str (io/stderr) message) (abort) 0))
+
+(defn hex-digit [(value i64)] (-> u8)
+  (primitive/cast u8 (if (< value 10) (+ 48 value) (+ 87 value))))
+
+(defn json-string! [(out (mut str/StrBuf)) (value (slice u8))] (-> i64)
+  (do
+    (str/sb-push-byte! (mut out) (primitive/cast u8 34))
+    (let [(mut i) 0]
+      (loop
+        (if (>= (load i) (slice/slice-len value)) (break)
+            (let [byte (primitive/cast i64 (slice/slice-get value (load i)))]
+              (cond (= byte 34) (str/sb-push-str! (mut out) "\\\"")
+                    (= byte 92) (str/sb-push-str! (mut out) "\\\\")
+                    (= byte 10) (str/sb-push-str! (mut out) "\\n")
+                    (= byte 13) (str/sb-push-str! (mut out) "\\r")
+                    (= byte 9) (str/sb-push-str! (mut out) "\\t")
+                    (< byte 32)
+                      (do (str/sb-push-str! (mut out) "\\u00")
+                          (str/sb-push-byte! (mut out) (hex-digit (/ byte 16)))
+                          (str/sb-push-byte! (mut out) (hex-digit (% byte 16))))
+                    :else (str/sb-push-byte! (mut out) (primitive/cast u8 byte)))
+              (store! i (+ (load i) 1))))))
+    (str/sb-push-byte! (mut out) (primitive/cast u8 34))))
+
+(defstruct NativeCursor [(source (slice u8)) (at i64)])
+
+(defn nc-byte [(p (ptr NativeCursor))] (-> i64)
+  (if (>= (.at p) (slice/slice-len (.source p))) -1
+      (primitive/cast i64 (slice/slice-get (.source p) (.at p)))))
+
+(defn nc-step! [(p (ptr NativeCursor))] (-> i64)
+  (set! (.at p) (+ (.at p) 1)))
+
+(defn nc-prefix? [(p (ptr NativeCursor)) (text (slice u8))] (-> bool)
+  (let [n (slice/slice-len text) (mut i) 0
+        (mut yes) (<= n (- (slice/slice-len (.source p)) (.at p)))]
+    (loop
+      (if (or (not (load yes)) (>= (load i) n)) (break)
+          (do
+            (if (not (= (slice/slice-get (.source p) (+ (.at p) (load i)))
+                        (slice/slice-get text (load i))))
+                (store! yes false) 0)
+            (store! i (+ (load i) 1)))))
+    (load yes)))
+
+(defn nc-skip! [(p (ptr NativeCursor))] (-> i64)
+  (let [(mut more) true]
+    (loop
+      (if (not (load more)) (break)
+          (let [c (nc-byte p)]
+            (if (or (= c 32) (or (= c 9) (or (= c 10) (= c 13))))
+                (nc-step! p)
+                (if (= c 59)
+                    (loop (if (or (= (nc-byte p) -1) (= (nc-byte p) 10))
+                              (break) (nc-step! p)))
+                    (store! more false))))))
+    0))
+
+(defn nc-delim? [(c i64)] (-> bool)
+  (or (= c -1) (or (= c 32) (or (= c 9) (or (= c 10) (or (= c 13)
+      (or (= c 40) (or (= c 41) (or (= c 91) (or (= c 93) (= c 59)))))))))))
+
+(defn nc-read-atom! [(p (ptr NativeCursor))] (-> (slice u8))
+  (do
+    (nc-skip! p)
+    (let [start (.at p)]
+      (loop (if (nc-delim? (nc-byte p)) (break) (nc-step! p)))
+      (slice/subslice (.source p) start (.at p)))))
+
+(defn nc-form-head? [(p (ptr NativeCursor)) (name (slice u8))] (-> bool)
+  (let [saved (.at p) (mut yes) false]
+    (nc-skip! p)
+    (if (= (nc-byte p) 40)
+        (do
+          (nc-step! p)
+          (if (= (nc-read-atom! p) name) (store! yes true) 0)) 0)
+    (set! (.at p) saved)
+    (load yes)))
+
+(defn nc-skip-node! [(p (ptr NativeCursor))] (-> i64)
+  (do
+    (nc-skip! p)
+    (let [c (nc-byte p)]
+      (cond (nc-prefix? p "#(")
+              (do
+                (nc-step! p) (nc-step! p)
+                (loop
+                  (nc-skip! p)
+                  (if (= (nc-byte p) 41) (break) (nc-skip-node! p)))
+                (nc-step! p))
+            (= c 40)
+              (do
+                (nc-step! p)
+                (loop
+                  (nc-skip! p)
+                  (if (= (nc-byte p) 41) (break) (nc-skip-node! p)))
+                (nc-step! p))
+            (= c 91)
+              (do
+                (nc-step! p)
+                (loop
+                  (nc-skip! p)
+                  (if (= (nc-byte p) 93) (break) (nc-skip-node! p)))
+                (nc-step! p))
+            (or (= c 39) (or (= c 96) (= c 126)))
+              (do
+                (nc-step! p)
+                (if (and (= c 126) (= (nc-byte p) 64)) (nc-step! p) 0)
+                (nc-skip-node! p))
+            (= c 34) (nc-string-end! p false)
+            (and (= c 99) (nc-prefix? p "c\"")) (nc-string-end! p true)
+            (nc-prefix? p "#\\")
+              (do
+                (nc-step! p) (nc-step! p)
+                (if (= (nc-byte p) -1)
+                    (converter-fail "rust-like converter: incomplete character\n")
+                    (nc-step! p))
+                (if (not (nc-delim? (nc-byte p)))
+                    (loop (if (nc-delim? (nc-byte p)) (break) (nc-step! p))) 0))
+            (= c 92)
+              (do
+                (nc-step! p)
+                (if (= (nc-byte p) -1)
+                    (converter-fail "rust-like converter: incomplete legacy character\n")
+                    (nc-step! p))
+                (if (not (nc-delim? (nc-byte p)))
+                    (loop (if (nc-delim? (nc-byte p)) (break) (nc-step! p))) 0))
+            :else
+              (do
+                (if (nc-delim? c)
+                    (converter-fail "rust-like converter: unexpected delimiter while scanning\n") 0)
+                (loop (if (nc-delim? (nc-byte p)) (break) (nc-step! p))))))
+    0))
+
+(defn nc-list-arity? [(p (ptr NativeCursor)) (arity i64)] (-> bool)
+  (let [saved (.at p) (mut count) 0 (mut valid) true]
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 40)) (store! valid false)
+        (do
+          (nc-step! p)
+          (loop
+            (nc-skip! p)
+            (if (= (nc-byte p) 41) (break)
+                (if (= (nc-byte p) -1) (do (store! valid false) (break))
+                    (do
+                      (nc-skip-node! p)
+                      (store! count (+ (load count) 1))))))))
+    (set! (.at p) saved)
+    (and (load valid) (= (load count) arity))))
+
+(defn raw-number-start? [(p (ptr NativeCursor))] (-> bool)
+  (let [c (nc-byte p)]
+    (or (and (>= c 48) (<= c 57))
+        (and (= c 45)
+             (let [next (+ (.at p) 1)]
+               (and (< next (slice/slice-len (.source p)))
+                    (let [n (primitive/cast i64 (slice/slice-get (.source p) next))]
+                      (and (>= n 48) (<= n 57)))))))))
+
+(defn raw-atom-number? [(atom (slice u8))] (-> bool)
+  (and (> (slice/slice-len atom) 0)
+       (let [c (primitive/cast i64 (slice/slice-get atom 0))]
+         (or (and (>= c 48) (<= c 57))
+             (and (= c 45)
+                  (and (> (slice/slice-len atom) 1)
+                       (let [n (primitive/cast i64 (slice/slice-get atom 1))]
+                         (and (>= n 48) (<= n 57)))))))))
+
+(defn surface-binary-head? [(head (slice u8))] (-> bool)
+  (or (= head "+") (or (= head "-") (or (= head "*")
+    (or (= head "/") (or (= head "%") (or (= head "=")
+    (or (= head "!=") (or (= head "<") (or (= head "<=")
+    (or (= head ">") (or (= head ">=") (or (= head "&")
+    (or (= head "|") (or (= head "^") (or (= head "<<")
+    (or (= head ">>") (or (= head "and") (= head "or")))))))))))))))))))
+
+(defn raw-field-head? [(head (slice u8))] (-> bool)
+  (and (> (slice/slice-len head) 1)
+       (= (slice/slice-get head 0) (primitive/cast u8 46))))
+
+(defn nc-keyword-call? [(p (ptr NativeCursor))] (-> bool)
+  (let [saved (.at p) (mut yes) true (mut any) false]
+    (nc-skip! p) (nc-step! p) (nc-read-atom! p)
+    (loop
+      (nc-skip! p)
+      (if (or (not (load yes)) (= (nc-byte p) 41)) (break)
+          (let [key (nc-read-atom! p)]
+            (if (or (= (slice/slice-len key) 0)
+                    (not (= (slice/slice-get key 0) (primitive/cast u8 58))))
+                (store! yes false)
+                (do
+                  (store! any true)
+                  (nc-skip! p)
+                  (if (= (nc-byte p) 41) (store! yes false)
+                      (nc-skip-node! p)))))))
+    (set! (.at p) saved)
+    (and (load yes) (load any))))
+
+(defn render-surface-expr! [(p (ptr NativeCursor))
+                            (out (mut str/StrBuf))] (-> i64)
+  (do
+    (nc-skip! p)
+    (let [c (nc-byte p)]
+      (cond (nc-prefix? p "#(") (render-native-node! p (mut out))
+            (= c 91)
+              (do
+                (nc-step! p)
+                (str/sb-push-byte! (mut out) (primitive/cast u8 91))
+                (let [(mut first) true]
+                  (loop
+                    (nc-skip! p)
+                    (if (= (nc-byte p) 93) (break)
+                        (do
+                          (if (load first) (store! first false)
+                              (str/sb-push-str! (mut out) ", "))
+                          (render-surface-expr! p (mut out))))))
+                (nc-step! p)
+                (str/sb-push-byte! (mut out) (primitive/cast u8 93)))
+            (= c 40)
+              (let [saved (.at p)]
+                (nc-step! p)
+                (let [head (nc-read-atom! p)]
+                  (set! (.at p) saved)
+                  (if (= (slice/slice-len head) 0)
+                      (render-native-node! p (mut out))
+                      (cond (and (= head "quote") (nc-list-arity? p 2))
+                              (render-native-prefix-list! p (mut out) "quote")
+                            (and (= head "quasiquote") (nc-list-arity? p 2))
+                              (render-native-prefix-list! p (mut out) "quasiquote")
+                            (and (= head "unquote") (nc-list-arity? p 2))
+                              (render-native-prefix-list! p (mut out) "unquote")
+                            (and (= head "unquote-splicing") (nc-list-arity? p 2))
+                              (render-native-prefix-list! p (mut out) "splice")
+                            (and (raw-field-head? head) (nc-list-arity? p 2))
+                              (do
+                                (nc-step! p) (nc-read-atom! p)
+                                (render-surface-expr! p (mut out))
+                                (str/sb-push-byte! (mut out) (primitive/cast u8 46))
+                                (render-raw-name!
+                                  (slice/subslice head 1 (slice/slice-len head)) (mut out))
+                                (nc-skip! p) (nc-step! p))
+                            (nc-keyword-call? p)
+                              (do
+                                (nc-step! p)
+                                (render-raw-name! (nc-read-atom! p) (mut out))
+                                (str/sb-push-str! (mut out) " { ")
+                                (let [(mut first) true]
+                                  (loop
+                                    (nc-skip! p)
+                                    (if (= (nc-byte p) 41) (break)
+                                        (let [key (nc-read-atom! p)]
+                                          (if (load first) (store! first false)
+                                              (str/sb-push-str! (mut out) ", "))
+                                          (render-raw-name!
+                                            (slice/subslice key 1 (slice/slice-len key)) (mut out))
+                                          (str/sb-push-str! (mut out) ": ")
+                                          (render-surface-expr! p (mut out))))))
+                                (nc-step! p)
+                                (str/sb-push-str! (mut out) " }") )
+                            (and (nc-list-arity? p 3) (surface-binary-head? head))
+                              (do
+                                (nc-step! p) (nc-read-atom! p)
+                                (str/sb-push-byte! (mut out) (primitive/cast u8 40))
+                                (render-surface-expr! p (mut out))
+                                (str/sb-push-byte! (mut out) (primitive/cast u8 32))
+                                (cond (= head "=") (str/sb-push-str! (mut out) "==")
+                                      (= head "and") (str/sb-push-str! (mut out) "&&")
+                                      (= head "or") (str/sb-push-str! (mut out) "||")
+                                      :else (str/sb-push-str! (mut out) head))
+                                (str/sb-push-byte! (mut out) (primitive/cast u8 32))
+                                (render-surface-expr! p (mut out))
+                                (nc-skip! p) (nc-step! p)
+                                (str/sb-push-byte! (mut out) (primitive/cast u8 41)))
+                            (and (= head "not") (nc-list-arity? p 2))
+                              (do
+                                (nc-step! p) (nc-read-atom! p)
+                                (str/sb-push-str! (mut out) "(!")
+                                (render-surface-expr! p (mut out))
+                                (nc-skip! p) (nc-step! p)
+                                (str/sb-push-byte! (mut out) (primitive/cast u8 41)))
+                            (and (= head "if") (nc-list-arity? p 4))
+                              (do
+                                (nc-step! p) (nc-read-atom! p)
+                                (str/sb-push-str! (mut out) "if ")
+                                (render-surface-expr! p (mut out))
+                                (str/sb-push-str! (mut out) " { ")
+                                (render-surface-expr! p (mut out))
+                                (str/sb-push-str! (mut out) " } else { ")
+                                (render-surface-expr! p (mut out))
+                                (str/sb-push-str! (mut out) " }")
+                                (nc-skip! p) (nc-step! p))
+                            :else
+                              (do
+                                (nc-step! p)
+                                (render-raw-name! (nc-read-atom! p) (mut out))
+                                (str/sb-push-byte! (mut out) (primitive/cast u8 40))
+                                (let [(mut first) true]
+                                  (loop
+                                    (nc-skip! p)
+                                    (if (= (nc-byte p) 41) (break)
+                                        (do
+                                          (if (load first) (store! first false)
+                                              (str/sb-push-str! (mut out) ", "))
+                                          (render-surface-expr! p (mut out))))))
+                                (nc-step! p)
+                                (str/sb-push-byte! (mut out) (primitive/cast u8 41)))))))
+            (or (= c 39) (or (= c 96) (= c 126)))
+              (render-native-node! p (mut out))
+            (= c 34)
+              (let [start (.at p)]
+                (nc-string-end! p false)
+                (str/sb-push-str! (mut out) (slice/subslice (.source p) start (.at p))))
+            (and (= c 99) (nc-prefix? p "c\""))
+              (let [start (.at p)]
+                (nc-string-end! p true)
+                (str/sb-push-str! (mut out) (slice/subslice (.source p) start (.at p))))
+            (or (nc-prefix? p "#\\") (= c 92))
+              (render-native-node! p (mut out))
+            :else
+              (let [atom (nc-read-atom! p)]
+                (if (or (raw-atom-number? atom)
+                        (or (= atom "true") (= atom "false")))
+                    (str/sb-push-str! (mut out) atom)
+                    (if (and (> (slice/slice-len atom) 0)
+                             (= (slice/slice-get atom 0) (primitive/cast u8 58)))
+                        (str/sb-push-str! (mut out) atom)
+                        (render-raw-name! atom (mut out)))))))
+    0))
+
+(defn render-raw-name! [(name (slice u8)) (out (mut str/StrBuf))] (-> i64)
+  (do
+    (str/sb-push-byte! (mut out) (primitive/cast u8 96))
+    (str/sb-push-str! (mut out) name)
+    (str/sb-push-byte! (mut out) (primitive/cast u8 96))))
+
+(defn render-raw-module! [(p (ptr NativeCursor)) (out (mut str/StrBuf))] (-> i64)
+  (do
+    (nc-skip! p) (nc-step! p)
+    (nc-read-atom! p)
+    (let [name (nc-read-atom! p)]
+      (str/sb-push-str! (mut out) "module ")
+      (let [(mut i) 0]
+        (loop
+          (if (>= (load i) (slice/slice-len name)) (break)
+              (do
+                (if (= (slice/slice-get name (load i)) (primitive/cast u8 46))
+                    (str/sb-push-str! (mut out) "::")
+                    (str/sb-push-byte! (mut out) (slice/slice-get name (load i))))
+                (store! i (+ (load i) 1))))))
+      (nc-skip! p)
+      (if (not (= (nc-byte p) 41))
+          (converter-fail "rust-like converter: malformed module form\n") 0)
+      (nc-step! p)
+      (str/sb-push-str! (mut out) ";\n\n"))))
+
+(defn render-raw-const! [(p (ptr NativeCursor)) (out (mut str/StrBuf))] (-> i64)
+  (do
+    (nc-skip! p) (nc-step! p)
+    (nc-read-atom! p)
+    (let [name (nc-read-atom! p)]
+      (str/sb-push-str! (mut out) "const ")
+      (render-raw-name! name (mut out))
+      (str/sb-push-str! (mut out) " = ")
+      (render-surface-expr! p (mut out))
+      (nc-skip! p)
+      (if (not (= (nc-byte p) 41))
+          (converter-fail "rust-like converter: malformed const form\n") 0)
+      (nc-step! p)
+      (str/sb-push-str! (mut out) ";\n\n"))))
+
+(defn nc-vector-is-fields? [(p (ptr NativeCursor))] (-> bool)
+  (let [saved (.at p)]
+    (nc-skip! p)
+    (if (= (nc-byte p) 91) (nc-step! p) 0)
+    (nc-skip! p)
+    (let [result (or (= (nc-byte p) 40) (= (nc-byte p) 93))]
+      (set! (.at p) saved)
+      result)))
+
+(defn render-raw-generics! [(p (ptr NativeCursor)) (out (mut str/StrBuf))] (-> i64)
+  (do
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 91))
+        (converter-fail "rust-like converter: expected generic vector\n") 0)
+    (nc-step! p)
+    (str/sb-push-byte! (mut out) (primitive/cast u8 60))
+    (let [(mut first) true]
+      (loop
+        (nc-skip! p)
+        (if (= (nc-byte p) 93) (break)
+            (do
+              (if (load first) (store! first false)
+                  (str/sb-push-str! (mut out) ", "))
+              (if (= (nc-byte p) 40)
+                  (do
+                    (nc-step! p)
+                    (render-raw-name! (nc-read-atom! p) (mut out))
+                    (nc-skip! p)
+                    (if (not (= (nc-byte p) 41))
+                        (do
+                          (str/sb-push-str! (mut out) ": ")
+                          (let [(mut first-bound) true]
+                            (loop
+                              (nc-skip! p)
+                              (if (= (nc-byte p) 41) (break)
+                                  (do
+                                    (if (load first-bound) (store! first-bound false)
+                                        (str/sb-push-str! (mut out) " + "))
+                                    (render-raw-name! (nc-read-atom! p) (mut out))))))) 0)
+                    (nc-step! p))
+                  (render-raw-name! (nc-read-atom! p) (mut out)))))))
+    (nc-step! p)
+    (str/sb-push-byte! (mut out) (primitive/cast u8 62))))
+
+(defn render-raw-fields! [(p (ptr NativeCursor)) (out (mut str/StrBuf))] (-> i64)
+  (do
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 91))
+        (converter-fail "rust-like converter: expected field vector\n") 0)
+    (nc-step! p)
+    (loop
+      (nc-skip! p)
+      (if (= (nc-byte p) 93) (break)
+          (do
+            (if (not (= (nc-byte p) 40))
+                (converter-fail "rust-like converter: expected field form\n") 0)
+            (nc-step! p)
+            (str/sb-push-str! (mut out) "    ")
+            (render-raw-name! (nc-read-atom! p) (mut out))
+            (str/sb-push-str! (mut out) ": ")
+            (render-native-node! p (mut out))
+            (nc-skip! p)
+            (if (not (= (nc-byte p) 41))
+                (converter-fail "rust-like converter: malformed field\n") 0)
+            (nc-step! p)
+            (str/sb-push-str! (mut out) ",\n"))))
+    (nc-step! p)))
+
+(defn render-raw-defstruct! [(p (ptr NativeCursor)) (out (mut str/StrBuf))] (-> i64)
+  (do
+    (nc-skip! p) (nc-step! p)
+    (nc-read-atom! p)
+    (let [name (nc-read-atom! p)]
+      (str/sb-push-str! (mut out) "struct ")
+      (render-raw-name! name (mut out))
+      (if (not (nc-vector-is-fields? p)) (render-raw-generics! p (mut out)) 0)
+      (str/sb-push-str! (mut out) " {\n")
+      (render-raw-fields! p (mut out))
+      (str/sb-push-str! (mut out) "}\n\n")
+      (nc-skip! p)
+      (if (not (= (nc-byte p) 41))
+          (converter-fail "rust-like converter: malformed defstruct form\n") 0)
+      (nc-step! p))))
+
+(defn nc-raw-defsum-renderable? [(p (ptr NativeCursor))] (-> bool)
+  (let [saved (.at p) (mut yes) true]
+    (nc-skip! p) (nc-step! p)
+    (nc-read-atom! p) (nc-read-atom! p)
+    (nc-skip! p)
+    (if (= (nc-byte p) 91) (nc-skip-node! p) 0)
+    (loop
+      (nc-skip! p)
+      (if (or (not (load yes)) (= (nc-byte p) 41)) (break)
+          (if (not (= (nc-byte p) 40)) (store! yes false)
+              (do
+                (nc-step! p) (nc-read-atom! p) (nc-skip! p)
+                (if (= (nc-byte p) 91)
+                    (do (nc-skip-node! p) (nc-skip! p)) 0)
+                (if (= (nc-byte p) 41) (nc-step! p) (store! yes false))))))
+    (set! (.at p) saved)
+    (load yes)))
+
+(defn render-raw-defsum! [(p (ptr NativeCursor)) (out (mut str/StrBuf))] (-> i64)
+  (do
+    (nc-skip! p) (nc-step! p) (nc-read-atom! p)
+    (str/sb-push-str! (mut out) "enum ")
+    (render-raw-name! (nc-read-atom! p) (mut out))
+    (nc-skip! p)
+    (if (= (nc-byte p) 91) (render-raw-generics! p (mut out)) 0)
+    (str/sb-push-str! (mut out) " {\n")
+    (loop
+      (nc-skip! p)
+      (if (= (nc-byte p) 41) (break)
+          (do
+            (nc-step! p)
+            (str/sb-push-str! (mut out) "    ")
+            (render-raw-name! (nc-read-atom! p) (mut out))
+            (nc-skip! p)
+            (if (= (nc-byte p) 91)
+                (do
+                  (str/sb-push-str! (mut out) " {\n")
+                  (render-raw-fields! p (mut out))
+                  (str/sb-push-str! (mut out) "    }") ) 0)
+            (nc-skip! p) (nc-step! p)
+            (str/sb-push-str! (mut out) ",\n"))))
+    (nc-step! p)
+    (str/sb-push-str! (mut out) "}\n\n")))
+
+(defn render-raw-trait-method! [(p (ptr NativeCursor))
+                                (out (mut str/StrBuf))] (-> i64)
+  (do
+    (nc-skip! p) (nc-step! p)
+    (str/sb-push-str! (mut out) "    fn ")
+    (render-raw-name! (nc-read-atom! p) (mut out))
+    (if (nc-vector-followed-by-vector? p) (render-raw-generics! p (mut out)) 0)
+    (render-raw-params! p (mut out))
+    (str/sb-push-str! (mut out) " -> ")
+    (render-raw-return! p (mut out))
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 41))
+        (converter-fail "rust-like converter: malformed trait method\n") 0)
+    (nc-step! p)
+    (str/sb-push-str! (mut out) ";\n")))
+
+(defn nc-raw-trait-method-renderable? [(p (ptr NativeCursor))] (-> bool)
+  (let [saved (.at p) (mut yes) true]
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 40)) (store! yes false)
+        (do
+          (nc-step! p) (nc-read-atom! p)
+          (if (nc-vector-followed-by-vector? p)
+              (nc-skip-node! p) 0)
+          (if (not (nc-simple-params? p)) (store! yes false)
+              (nc-skip-node! p))
+          (nc-skip! p)
+          (if (not (nc-form-head? p "->")) (store! yes false)
+              (nc-skip-node! p))
+          (nc-skip! p)
+          (if (not (= (nc-byte p) 41)) (store! yes false) 0)))
+    (set! (.at p) saved)
+    (load yes)))
+
+(defn nc-raw-deftrait-renderable? [(p (ptr NativeCursor))] (-> bool)
+  (let [saved (.at p) (mut yes) true]
+    (nc-skip! p) (nc-step! p)
+    (nc-read-atom! p) (nc-read-atom! p)
+    (nc-skip! p)
+    (if (= (nc-byte p) 91) (nc-skip-node! p)
+        (store! yes false))
+    (loop
+      (nc-skip! p)
+      (if (or (not (load yes)) (= (nc-byte p) 41)) (break)
+          (if (not (nc-raw-trait-method-renderable? p)) (store! yes false)
+              (nc-skip-node! p))))
+    (set! (.at p) saved)
+    (load yes)))
+
+(defn render-raw-deftrait! [(p (ptr NativeCursor)) (out (mut str/StrBuf))] (-> i64)
+  (do
+    (nc-skip! p) (nc-step! p) (nc-read-atom! p)
+    (str/sb-push-str! (mut out) "trait ")
+    (render-raw-name! (nc-read-atom! p) (mut out))
+    (render-raw-generics! p (mut out))
+    (str/sb-push-str! (mut out) " {\n")
+    (loop
+      (nc-skip! p)
+      (if (= (nc-byte p) 41) (break)
+          (render-raw-trait-method! p (mut out))))
+    (nc-step! p)
+    (str/sb-push-str! (mut out) "}\n\n")))
+
+(defn nc-simple-fields? [(p (ptr NativeCursor))] (-> bool)
+  (let [(mut yes) true]
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 91)) false
+        (do
+          (nc-step! p)
+          (loop
+            (nc-skip! p)
+            (if (or (not (load yes)) (= (nc-byte p) 93)) (break)
+                (if (not (= (nc-byte p) 40)) (store! yes false)
+                    (do
+                      (nc-step! p)
+                      (nc-read-atom! p)
+                      (nc-skip-node! p)
+                      (nc-skip! p)
+                      (if (= (nc-byte p) 41) (nc-step! p) (store! yes false))))))
+          (load yes)))))
+
+(defn nc-raw-defstruct-renderable? [(p (ptr NativeCursor))] (-> bool)
+  (let [saved (.at p) (mut yes) true]
+    (nc-skip! p) (nc-step! p)
+    (nc-read-atom! p) (nc-read-atom! p)
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 91)) (store! yes false)
+        (do
+          (if (not (nc-vector-is-fields? p))
+              (do (nc-skip-node! p) (nc-skip! p)) 0)
+          (if (not (nc-simple-fields? p)) (store! yes false) 0)))
+    (set! (.at p) saved)
+    (load yes)))
+
+(defn nc-vector-followed-by-vector? [(p (ptr NativeCursor))] (-> bool)
+  (let [saved (.at p)]
+    (nc-skip-node! p)
+    (nc-skip! p)
+    (let [result (= (nc-byte p) 91)]
+      (set! (.at p) saved)
+      result)))
+
+(defn render-raw-params! [(p (ptr NativeCursor)) (out (mut str/StrBuf))] (-> i64)
+  (do
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 91))
+        (converter-fail "rust-like converter: expected parameter vector\n") 0)
+    (nc-step! p)
+    (str/sb-push-byte! (mut out) (primitive/cast u8 40))
+    (let [(mut first) true]
+      (loop
+        (nc-skip! p)
+        (if (= (nc-byte p) 93) (break)
+            (do
+              (if (load first) (store! first false)
+                  (str/sb-push-str! (mut out) ", "))
+              (if (not (= (nc-byte p) 40))
+                  (converter-fail "rust-like converter: malformed parameter\n") 0)
+              (nc-step! p)
+              (render-raw-name! (nc-read-atom! p) (mut out))
+              (str/sb-push-str! (mut out) ": ")
+              (render-native-node! p (mut out))
+              (nc-skip! p)
+              (if (not (= (nc-byte p) 41))
+                  (converter-fail "rust-like converter: malformed parameter form\n") 0)
+              (nc-step! p)))))
+    (nc-step! p)
+    (str/sb-push-byte! (mut out) (primitive/cast u8 41))))
+
+(defn nc-simple-params? [(p (ptr NativeCursor))] (-> bool)
+  (let [saved (.at p) (mut yes) true]
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 91)) (store! yes false)
+        (do
+          (nc-step! p)
+          (loop
+            (nc-skip! p)
+            (if (or (not (load yes)) (= (nc-byte p) 93)) (break)
+                (if (not (= (nc-byte p) 40)) (store! yes false)
+                    (do
+                      (nc-step! p)
+                      (nc-read-atom! p)
+                      (nc-skip-node! p)
+                      (nc-skip! p)
+                      (if (= (nc-byte p) 41) (nc-step! p) (store! yes false))))))))
+    (set! (.at p) saved)
+    (load yes)))
+
+(defn render-raw-return! [(p (ptr NativeCursor)) (out (mut str/StrBuf))] (-> i64)
+  (do
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 40))
+        (converter-fail "rust-like converter: expected return form\n") 0)
+    (nc-step! p)
+    (if (not (= (nc-read-atom! p) "->"))
+        (converter-fail "rust-like converter: expected -> return form\n") 0)
+    (render-native-node! p (mut out))
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 41))
+        (converter-fail "rust-like converter: malformed return form\n") 0)
+    (nc-step! p)))
+
+(defn nc-raw-defn-renderable? [(p (ptr NativeCursor))] (-> bool)
+  (let [saved (.at p) (mut yes) true]
+    (nc-skip! p) (nc-step! p)
+    (nc-read-atom! p) (nc-read-atom! p)
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 91)) (store! yes false)
+        (do
+          (if (nc-vector-followed-by-vector? p)
+              (nc-skip-node! p) 0)
+          (if (not (nc-simple-params? p)) (store! yes false) 0)
+          (nc-skip-node! p)
+          (nc-skip! p)
+          (if (= (nc-byte p) 40)
+              (nc-skip-node! p)
+              (store! yes false))
+          (nc-skip! p)
+          (if (or (= (nc-byte p) 41) (= (nc-byte p) -1)) (store! yes false)
+              (do
+                (nc-skip-node! p)
+                (nc-skip! p)
+                (if (not (= (nc-byte p) 41)) (store! yes false) 0)))))
+    (set! (.at p) saved)
+    (load yes)))
+
+(defn nc-raw-method-renderable? [(p (ptr NativeCursor))] (-> bool)
+  (let [saved (.at p) (mut yes) true]
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 40)) (store! yes false)
+        (do
+          (nc-step! p) (nc-read-atom! p)
+          (if (nc-vector-followed-by-vector? p)
+              (nc-skip-node! p) 0)
+          (if (not (nc-simple-params? p)) (store! yes false)
+              (nc-skip-node! p))
+          (nc-skip! p)
+          (if (not (nc-form-head? p "->")) (store! yes false)
+              (nc-skip-node! p))
+          (nc-skip! p)
+          (if (or (= (nc-byte p) 41) (= (nc-byte p) -1)) (store! yes false)
+              (nc-skip-node! p))
+          (nc-skip! p)
+          (if (not (= (nc-byte p) 41)) (store! yes false) 0)))
+    (set! (.at p) saved)
+    (load yes)))
+
+(defn nc-raw-impl-renderable? [(p (ptr NativeCursor))] (-> bool)
+  (let [saved (.at p) (mut yes) true]
+    (nc-skip! p) (nc-step! p) (nc-read-atom! p)
+    (nc-skip! p)
+    (if (= (nc-byte p) 91) (nc-skip-node! p) 0)
+    (nc-skip-node! p)
+    (nc-skip! p)
+    (if (and (not (= (nc-byte p) 41)) (not (nc-raw-method-renderable? p)))
+        (do (nc-skip-node! p) (nc-skip! p)) 0)
+    (loop
+      (nc-skip! p)
+      (if (or (not (load yes)) (= (nc-byte p) 41)) (break)
+          (if (not (nc-raw-method-renderable? p)) (store! yes false)
+              (nc-skip-node! p))))
+    (set! (.at p) saved)
+    (load yes)))
+
+(defn render-raw-impl-method! [(p (ptr NativeCursor))
+                               (out (mut str/StrBuf))] (-> i64)
+  (do
+    (nc-skip! p) (nc-step! p)
+    (str/sb-push-str! (mut out) "    fn ")
+    (render-raw-name! (nc-read-atom! p) (mut out))
+    (if (nc-vector-followed-by-vector? p) (render-raw-generics! p (mut out)) 0)
+    (render-raw-params! p (mut out))
+    (str/sb-push-str! (mut out) " -> ")
+    (render-raw-return! p (mut out))
+    (str/sb-push-str! (mut out) " {\n        ")
+    (render-surface-expr! p (mut out))
+    (str/sb-push-str! (mut out) "\n    }")
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 41))
+        (converter-fail "rust-like converter: malformed impl method\n") 0)
+    (nc-step! p)
+    (str/sb-push-byte! (mut out) (primitive/cast u8 10))))
+
+(defn render-raw-impl! [(p (ptr NativeCursor)) (out (mut str/StrBuf))] (-> i64)
+  (do
+    (nc-skip! p) (nc-step! p) (nc-read-atom! p)
+    (str/sb-push-str! (mut out) "impl")
+    (nc-skip! p)
+    (if (= (nc-byte p) 91) (render-raw-generics! p (mut out)) 0)
+    (str/sb-push-byte! (mut out) (primitive/cast u8 32))
+    (let [first-start (.at p)]
+      (nc-skip-node! p)
+      (nc-skip! p)
+      (let [inherent (or (= (nc-byte p) 41) (nc-raw-method-renderable? p))]
+        (set! (.at p) first-start)
+        (render-native-node! p (mut out))
+        (if inherent 0
+            (do
+              (str/sb-push-str! (mut out) " for ")
+              (render-native-node! p (mut out))))))
+    (str/sb-push-str! (mut out) " {\n")
+    (loop
+      (nc-skip! p)
+      (if (= (nc-byte p) 41) (break)
+          (render-raw-impl-method! p (mut out))))
+    (nc-step! p)
+    (str/sb-push-str! (mut out) "}\n\n")))
+
+(defn render-raw-defn! [(p (ptr NativeCursor)) (out (mut str/StrBuf))] (-> i64)
+  (do
+    (nc-skip! p) (nc-step! p)
+    (nc-read-atom! p)
+    (let [name (nc-read-atom! p)]
+      (str/sb-push-str! (mut out) "fn ")
+      (render-raw-name! name (mut out))
+      (if (nc-vector-followed-by-vector? p) (render-raw-generics! p (mut out)) 0)
+      (render-raw-params! p (mut out))
+      (str/sb-push-str! (mut out) " -> ")
+      (render-raw-return! p (mut out))
+      (str/sb-push-str! (mut out) " {\n    ")
+      (render-surface-expr! p (mut out))
+      (str/sb-push-str! (mut out) "\n}\n\n")
+      (nc-skip! p)
+      (if (not (= (nc-byte p) 41))
+          (converter-fail "rust-like converter: malformed defn form\n") 0)
+      (nc-step! p))))
+
+(defn render-raw-import! [(p (ptr NativeCursor)) (out (mut str/StrBuf))] (-> i64)
+  (do
+    (nc-skip! p) (nc-step! p)
+    (nc-read-atom! p)
+    (nc-skip! p)
+    (let [module-start (.at p)]
+      (if (= (nc-byte p) 34) (nc-string-end! p false)
+          (converter-fail "rust-like converter: import path must be a string\n"))
+      (str/sb-push-str! (mut out) "use ")
+      (str/sb-push-str! (mut out)
+        (slice/subslice (.source p) module-start (.at p)))
+      (nc-skip! p)
+      (if (= (nc-byte p) 41)
+          (do (nc-step! p) (str/sb-push-str! (mut out) ";\n\n"))
+          (do
+            (str/sb-push-str! (mut out) " with {\n")
+            (loop
+              (nc-skip! p)
+              (if (= (nc-byte p) 41) (break)
+                  (let [key (nc-read-atom! p)]
+                    (if (or (= (slice/slice-len key) 0)
+                            (not (= (slice/slice-get key 0) (primitive/cast u8 58))))
+                        (converter-fail "rust-like converter: malformed import clause\n") 0)
+                    (str/sb-push-str! (mut out) "    ")
+                    (str/sb-push-str! (mut out)
+                      (slice/subslice key 1 (slice/slice-len key)))
+                    (str/sb-push-str! (mut out) ": ")
+                    (nc-skip! p)
+                    (if (= key ":reexport")
+                        (str/sb-push-str! (mut out) "true")
+                        (if (and (= key ":use")
+                                 (nc-prefix? p "*"))
+                            (do (nc-step! p) (str/sb-push-byte! (mut out) (primitive/cast u8 42)))
+                            (render-native-node! p (mut out))))
+                    (str/sb-push-str! (mut out) ",\n"))))
+            (nc-step! p)
+            (str/sb-push-str! (mut out) "};\n\n"))))))
+
+(defn render-raw-export! [(p (ptr NativeCursor)) (out (mut str/StrBuf))] (-> i64)
+  (do
+    (nc-skip! p) (nc-step! p) (nc-read-atom! p)
+    (str/sb-push-str! (mut out) "export { ")
+    (let [(mut first) true]
+      (loop
+        (nc-skip! p)
+        (if (= (nc-byte p) 41) (break)
+            (do
+              (if (load first) (store! first false)
+                  (str/sb-push-str! (mut out) ", "))
+              (render-raw-name! (nc-read-atom! p) (mut out))))))
+    (nc-step! p)
+    (str/sb-push-str! (mut out) " };\n\n")))
+
+(defn render-raw-registration! [(p (ptr NativeCursor))
+                                (out (mut str/StrBuf))
+                                (spelling (slice u8))] (-> i64)
+  (do
+    (nc-skip! p) (nc-step! p) (nc-read-atom! p)
+    (str/sb-push-str! (mut out) spelling)
+    (str/sb-push-byte! (mut out) (primitive/cast u8 32))
+    (render-raw-name! (nc-read-atom! p) (mut out))
+    (nc-skip! p)
+    (if (= (nc-byte p) 41) 0
+        (do
+          (let [phase (nc-read-atom! p) value (nc-read-atom! p)]
+            (if (and (= phase ":phase") (= value "before-expand"))
+                (str/sb-push-str! (mut out) " before_expand")
+                (converter-fail "rust-like converter: unsupported registration clause\n")))
+          (nc-skip! p)))
+    (if (not (= (nc-byte p) 41))
+        (converter-fail "rust-like converter: malformed registration\n") 0)
+    (nc-step! p)
+    (str/sb-push-str! (mut out) ";\n\n")))
+
+(defn render-raw-meta! [(p (ptr NativeCursor)) (out (mut str/StrBuf))] (-> i64)
+  (do
+    (nc-skip! p) (nc-step! p) (nc-read-atom! p)
+    (str/sb-push-str! (mut out) "meta { ")
+    (render-surface-expr! p (mut out))
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 41))
+        (converter-fail "rust-like converter: malformed meta form\n") 0)
+    (nc-step! p)
+    (str/sb-push-str! (mut out) " }\n\n")))
+
+(defn nc-raw-extern-renderable? [(p (ptr NativeCursor))] (-> bool)
+  (let [saved (.at p) (mut yes) true]
+    (nc-skip! p) (nc-step! p)
+    (nc-read-atom! p) (nc-read-atom! p)
+    (if (not (= (nc-read-atom! p) ":cc")) (store! yes false) 0)
+    (nc-skip-node! p)
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 91)) (store! yes false)
+        (nc-skip-node! p))
+    (nc-skip! p)
+    (if (not (nc-form-head? p "->")) (store! yes false)
+        (nc-skip-node! p))
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 41)) (store! yes false) 0)
+    (set! (.at p) saved)
+    (load yes)))
+
+(defn render-raw-extern! [(p (ptr NativeCursor)) (out (mut str/StrBuf))] (-> i64)
+  (do
+    (nc-skip! p) (nc-step! p) (nc-read-atom! p)
+    (let [name (nc-read-atom! p)]
+      (nc-read-atom! p)
+      (let [cc (nc-read-atom! p)]
+        (str/sb-push-str! (mut out) "extern ")
+        (json-string! (mut out) cc)
+        (str/sb-push-str! (mut out) " {\n    fn ")
+        (render-raw-name! name (mut out))))
+    (nc-skip! p) (nc-step! p)
+    (str/sb-push-byte! (mut out) (primitive/cast u8 40))
+    (let [(mut first) true]
+      (loop
+        (nc-skip! p)
+        (if (= (nc-byte p) 93) (break)
+            (do
+              (if (load first) (store! first false)
+                  (str/sb-push-str! (mut out) ", "))
+              (str/sb-push-str! (mut out) "_arg")
+              (str/sb-push-str! (mut out) ": ")
+              (render-native-node! p (mut out))))))
+    (nc-step! p)
+    (str/sb-push-str! (mut out) ") -> ")
+    (nc-skip! p) (nc-step! p) (nc-read-atom! p)
+    (render-native-node! p (mut out))
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 41))
+        (converter-fail "rust-like converter: malformed extern return\n") 0)
+    (nc-step! p)
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 41))
+        (converter-fail "rust-like converter: malformed extern declaration\n") 0)
+    (nc-step! p)
+    (str/sb-push-str! (mut out) ";\n}\n\n")))
+
+(defn nc-string-end! [(p (ptr NativeCursor)) (c-prefix bool)] (-> i64)
+  (do
+    (if c-prefix (nc-step! p) 0)
+    (if (not (= (nc-byte p) 34)) (converter-fail "rust-like converter: expected string\n") 0)
+    (nc-step! p)
+    (let [(mut escaped) false (mut done) false]
+      (loop
+        (if (load done) (break)
+            (let [c (nc-byte p)]
+              (cond (= c -1) (converter-fail "rust-like converter: unterminated string\n")
+                    (load escaped) (do (store! escaped false) (nc-step! p))
+                    (= c 92) (do (store! escaped true) (nc-step! p))
+                    (= c 34) (do (nc-step! p) (store! done true))
+                    :else (nc-step! p)))))
+    0)))
+
+(defn render-native-prefix-list! [(p (ptr NativeCursor))
+                                  (out (mut str/StrBuf))
+                                  (spelling (slice u8))] (-> i64)
+  (do
+    (nc-skip! p) (nc-step! p)
+    (nc-read-atom! p)
+    (str/sb-push-str! (mut out) spelling)
+    (str/sb-push-byte! (mut out) (primitive/cast u8 40))
+    (render-native-node! p (mut out))
+    (nc-skip! p)
+    (if (not (= (nc-byte p) 41))
+        (converter-fail "rust-like converter: malformed quote form\n") 0)
+    (nc-step! p)
+    (str/sb-push-byte! (mut out) (primitive/cast u8 41))))
+
+(defn render-native-node! [(p (ptr NativeCursor))
+                           (out (mut str/StrBuf))] (-> i64)
+  (do
+    (nc-skip! p)
+    (let [c (nc-byte p)]
+      (cond (nc-prefix? p "#(")
+              (do
+                (nc-step! p) (nc-step! p)
+                (str/sb-push-byte! (mut out) (primitive/cast u8 91))
+                (nc-skip! p)
+                (let [(mut first) true]
+                  (loop
+                    (if (= (nc-byte p) 41) (break)
+                        (do
+                          (if (load first) (store! first false)
+                              (str/sb-push-str! (mut out) ", "))
+                          (render-native-node! p (mut out))
+                          (nc-skip! p)))))
+                (if (not (= (nc-byte p) 41))
+                    (converter-fail "rust-like converter: unclosed vector list\n") 0)
+                (nc-step! p)
+                (str/sb-push-byte! (mut out) (primitive/cast u8 93)))
+            (and (nc-form-head? p "quote") (nc-list-arity? p 2))
+              (render-native-prefix-list! p (mut out) "quote")
+            (and (nc-form-head? p "quasiquote") (nc-list-arity? p 2))
+              (render-native-prefix-list! p (mut out) "quasiquote")
+            (and (nc-form-head? p "unquote") (nc-list-arity? p 2))
+              (render-native-prefix-list! p (mut out) "unquote")
+            (and (nc-form-head? p "unquote-splicing") (nc-list-arity? p 2))
+              (render-native-prefix-list! p (mut out) "splice")
+            (= c 40)
+              (do (nc-step! p) (str/sb-push-str! (mut out) "form!(")
+                  (nc-skip! p)
+                  (let [(mut first) true]
+                    (loop
+                      (if (= (nc-byte p) 41) (break)
+                          (do (if (load first) (store! first false)
+                                  (str/sb-push-str! (mut out) ", "))
+                              (render-native-node! p (mut out))
+                              (nc-skip! p)))))
+                  (if (not (= (nc-byte p) 41)) (converter-fail "rust-like converter: unclosed list\n") 0)
+                  (nc-step! p) (str/sb-push-byte! (mut out) (primitive/cast u8 41)))
+            (= c 91)
+              (do (nc-step! p) (str/sb-push-byte! (mut out) (primitive/cast u8 91))
+                  (nc-skip! p)
+                  (let [(mut first) true]
+                    (loop
+                      (if (= (nc-byte p) 93) (break)
+                          (do (if (load first) (store! first false)
+                                  (str/sb-push-str! (mut out) ", "))
+                              (render-native-node! p (mut out))
+                              (nc-skip! p)))))
+                  (if (not (= (nc-byte p) 93)) (converter-fail "rust-like converter: unclosed vector\n") 0)
+                  (nc-step! p) (str/sb-push-byte! (mut out) (primitive/cast u8 93)))
+            (= c 39)
+              (do (nc-step! p) (str/sb-push-str! (mut out) "quote(")
+                  (render-native-node! p (mut out))
+                  (str/sb-push-byte! (mut out) (primitive/cast u8 41)))
+            (= c 96)
+              (do (nc-step! p) (str/sb-push-str! (mut out) "quasiquote(")
+                  (render-native-node! p (mut out))
+                  (str/sb-push-byte! (mut out) (primitive/cast u8 41)))
+            (= c 126)
+              (do (nc-step! p)
+                  (if (= (nc-byte p) 64)
+                      (do (nc-step! p) (str/sb-push-str! (mut out) "splice("))
+                      (str/sb-push-str! (mut out) "unquote("))
+                  (render-native-node! p (mut out))
+                  (str/sb-push-byte! (mut out) (primitive/cast u8 41)))
+            :else
+              (let [start (.at p)]
+                (cond (= c 34) (nc-string-end! p false)
+                      (and (= c 99) (nc-prefix? p "c\"")) (nc-string-end! p true)
+                      (nc-prefix? p "#\\")
+                        (do (nc-step! p) (nc-step! p)
+                            (if (= (nc-byte p) -1)
+                                (converter-fail "rust-like converter: incomplete character\n")
+                                (nc-step! p))
+                            (if (not (nc-delim? (nc-byte p)))
+                                (loop (if (nc-delim? (nc-byte p)) (break) (nc-step! p))) 0))
+                      (= c 92)
+                        (do (nc-step! p)
+                            (if (= (nc-byte p) -1)
+                                (converter-fail "rust-like converter: incomplete legacy character\n")
+                                (nc-step! p))
+                            (if (not (nc-delim? (nc-byte p)))
+                                (loop (if (nc-delim? (nc-byte p)) (break) (nc-step! p))) 0))
+                      :else (loop (if (nc-delim? (nc-byte p)) (break) (nc-step! p))))
+                (if (= start (.at p))
+                    (do
+                      (io/print-str (io/stderr) "rust-like converter: unexpected delimiter at byte ")
+                      (io/print-int (io/stderr) (.at p))
+                      (io/print-str (io/stderr) "\n")
+                      (abort) 0) 0)
+                (str/sb-push-str! (mut out) "atom!(")
+                (json-string! (mut out) (slice/subslice (.source p) start (.at p)))
+                (str/sb-push-byte! (mut out) (primitive/cast u8 41)))))
+    0))
+
+(defn native-to-rust-like [(source (slice u8))] (-> (slice u8))
+  (let [a (alloc/malloc-allocator) p (primitive/alloc-stack NativeCursor)
+        (mut out) (str/sb-new a)]
+    (set! (.source p) source) (set! (.at p) 0)
+    (loop
+      (nc-skip! p)
+      (if (= (nc-byte p) -1) (break)
+          (cond (nc-form-head? p "module") (render-raw-module! p (mut out))
+                (nc-form-head? p "import") (render-raw-import! p (mut out))
+                (nc-form-head? p "export") (render-raw-export! p (mut out))
+                (and (nc-form-head? p "meta") (nc-list-arity? p 2))
+                  (render-raw-meta! p (mut out))
+                (and (nc-form-head? p "extern")
+                     (nc-raw-extern-renderable? p))
+                  (render-raw-extern! p (mut out))
+                (or (nc-form-head? p "checker")
+                    (or (nc-form-head? p "transform")
+                        (nc-form-head? p "transform-once")))
+                  (let [saved (.at p)]
+                    (nc-skip! p) (nc-step! p)
+                    (let [head (nc-read-atom! p)]
+                      (set! (.at p) saved)
+                      (cond (= head "checker")
+                              (render-raw-registration! p (mut out) "checker")
+                            (= head "transform")
+                              (render-raw-registration! p (mut out) "transform")
+                            :else
+                              (render-raw-registration! p (mut out) "transform_once"))))
+                (and (nc-form-head? p "const") (nc-list-arity? p 3))
+                  (render-raw-const! p (mut out))
+                (and (nc-form-head? p "defstruct")
+                     (nc-raw-defstruct-renderable? p))
+                  (render-raw-defstruct! p (mut out))
+                (and (nc-form-head? p "defsum")
+                     (nc-raw-defsum-renderable? p))
+                  (render-raw-defsum! p (mut out))
+                (and (nc-form-head? p "deftrait")
+                     (nc-raw-deftrait-renderable? p))
+                  (render-raw-deftrait! p (mut out))
+                (and (nc-form-head? p "defn") (nc-raw-defn-renderable? p))
+                  (render-raw-defn! p (mut out))
+                (and (nc-form-head? p "impl") (nc-raw-impl-renderable? p))
+                  (render-raw-impl! p (mut out))
+                :else
+                  (do (str/sb-push-str! (mut out) "item ")
+                      (render-native-node! p (mut out))
+                      (str/sb-push-str! (mut out) ";\n\n")))))
+    (str/sb-finish! (mut out))))
+
+;; Reader-provider mode turns native Coil input into a tiny executable which
+;; prints its Rust-like spelling. The converter itself is compiled Coil.
+(defn read-native-as-rust-like [(context Code)] (-> Code)
+  (let [a (alloc/malloc-allocator)
+        output (native-to-rust-like
+                 (primitive/code-str (primitive/code-nth context 2)))
+        (mut program) (str/sb-new a)]
+    (str/sb-push-str! (mut program)
+      "(module rust-like-converter-output)\n(import \"coil.io\")\n(defn main [] (-> i64) (do (coil.io.print-str (coil.io.stdout) ")
+    (json-string! (mut program) output)
+    (str/sb-push-str! (mut program) ") 0))\n")
+    (primitive/code-read (str/sb-finish! (mut program)) `(reader-config))))

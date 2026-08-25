@@ -1,0 +1,1411 @@
+(module experiments.rust-like.reader)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :as slice)
+(import "coil.str" :as str)
+
+(defstruct Cursor [(source (slice u8)) (at i64)])
+
+(defn cursor-byte [(p (ptr Cursor))] (-> i64)
+  (if (>= (.at p) (slice/slice-len (.source p))) -1
+      (primitive/cast i64 (slice/slice-get (.source p) (.at p)))))
+
+(defn cursor-step! [(p (ptr Cursor))] (-> i64)
+  (set! (.at p) (+ (.at p) 1)))
+
+(defn ascii-space? [(c i64)] (-> bool)
+  (or (= c 32) (or (= c 9) (or (= c 10) (= c 13)))))
+
+(defn cursor-prefix? [(p (ptr Cursor)) (text (slice u8))] (-> bool)
+  (let [n (slice/slice-len text)
+        remaining (- (slice/slice-len (.source p)) (.at p))
+        (mut i) 0 (mut same) (>= remaining n)]
+    (loop
+      (if (or (not (load same)) (>= (load i) n)) (break)
+          (do
+            (if (not (= (slice/slice-get (.source p) (+ (.at p) (load i)))
+                        (slice/slice-get text (load i))))
+                (store! same false) 0)
+            (store! i (+ (load i) 1)))))
+    (load same)))
+
+(defn cursor-consume! [(p (ptr Cursor)) (text (slice u8))] (-> bool)
+  (if (cursor-prefix? p text)
+      (do (set! (.at p) (+ (.at p) (slice/slice-len text))) true)
+      false))
+
+(defn rust-like-error [(context Code) (p (ptr Cursor)) (message (slice u8))] (-> i64)
+  (primitive/error
+    (primitive/code-str "rust-like reader: " message " in "
+                        (primitive/code-str (primitive/code-nth context 1))
+                        " at byte " (.at p))))
+
+(defn skip-space! [(context Code) (p (ptr Cursor))] (-> i64)
+  (let [(mut more) true]
+    (loop
+      (if (not (load more)) (break)
+          (let [c (cursor-byte p)]
+            (cond (ascii-space? c) (cursor-step! p)
+                  (cursor-prefix? p "//")
+                    (do (cursor-consume! p "//")
+                        (loop (if (or (= (cursor-byte p) -1) (= (cursor-byte p) 10))
+                                  (break) (cursor-step! p))))
+                  (cursor-prefix? p "/*")
+                    (do
+                      (cursor-consume! p "/*")
+                      (let [(mut depth) 1]
+                        (loop
+                          (if (= (load depth) 0) (break)
+                              (cond (= (cursor-byte p) -1)
+                                      (rust-like-error context p "unterminated block comment")
+                                    (cursor-prefix? p "/*")
+                                      (do (cursor-consume! p "/*")
+                                          (store! depth (+ (load depth) 1)))
+                                    (cursor-prefix? p "*/")
+                                      (do (cursor-consume! p "*/")
+                                          (store! depth (- (load depth) 1)))
+                                    :else (cursor-step! p))))))
+                  :else (store! more false)))))
+    0))
+
+(defn expect! [(context Code) (p (ptr Cursor)) (text (slice u8))] (-> i64)
+  (do (skip-space! context p)
+      (if (cursor-consume! p text) 0
+          (rust-like-error context p (primitive/code-str "expected '" text "'")))))
+
+(defn ident-start? [(c i64)] (-> bool)
+  (or (and (>= c 65) (<= c 90))
+      (or (and (>= c 97) (<= c 122))
+          (or (= c 95) (= c 96)))))
+
+(defn ident-part? [(c i64)] (-> bool)
+  (or (ident-start? c)
+      (or (and (>= c 48) (<= c 57))
+          (or (= c 45) (or (= c 63) (= c 33))))))
+
+(defn read-token! [(context Code) (p (ptr Cursor))] (-> (slice u8))
+  (do
+    (skip-space! context p)
+    (let [(mut start) (.at p)]
+      (if (= (cursor-byte p) 96)
+          (do
+            (cursor-step! p)
+            (set! start (.at p))
+            (loop (if (or (= (cursor-byte p) -1) (= (cursor-byte p) 96))
+                      (break) (cursor-step! p)))
+            (if (= (cursor-byte p) -1)
+                (rust-like-error context p "unterminated backtick identifier") 0)
+            (let [result (slice/subslice (.source p) start (.at p))]
+              (cursor-step! p)
+              result))
+          (do
+            (if (not (ident-start? (cursor-byte p)))
+                (rust-like-error context p "expected identifier") 0)
+            (loop (if (ident-part? (cursor-byte p)) (cursor-step! p) (break)))
+            (if (cursor-prefix? p "...")
+                (do (cursor-step! p) (cursor-step! p) (cursor-step! p) 0) 0)
+            (slice/subslice (.source p) start (.at p)))))))
+
+(defn read-one-code [(text (slice u8))] (-> Code)
+  (let [result (primitive/code-read text `(reader-config))]
+    (if (and (primitive/code-list? result)
+             (and (= (primitive/code-count result) 2)
+                  (primitive/code-eq (primitive/code-nth result 0) `do)))
+        (primitive/code-nth result 1)
+        result)))
+
+(defn token-code! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [a (alloc/malloc-allocator)
+        (mut current) (read-token! context p)
+        first (load current)
+        (mut modules) (str/sb-new a)
+        (mut qualified) false
+        (mut separators) 0]
+    (loop
+      (skip-space! context p)
+      (if (and (cursor-prefix? p "::") (not (cursor-prefix? p "::<")))
+          (do
+            (cursor-consume! p "::")
+            (if (load qualified)
+                (str/sb-push-byte! (mut modules) (primitive/cast u8 46)) 0)
+            (str/sb-push-str! (mut modules) (load current))
+            (store! current (read-token! context p))
+            (store! qualified true)
+            (store! separators (+ (load separators) 1)))
+          (break)))
+    (if (load qualified)
+        (if (and (= (load separators) 1)
+                 (let [c (primitive/cast i64 (slice/slice-get first 0))]
+                   (and (>= c 65) (<= c 90))))
+            (read-one-code (load current))
+            (do
+              (str/sb-push-byte! (mut modules) (primitive/cast u8 47))
+              (str/sb-push-str! (mut modules) (load current))
+              (read-one-code (str/sb-finish! (mut modules)))))
+        (read-one-code (load current)))))
+
+(defn parse-type! [(context Code) (p (ptr Cursor))] (-> Code)
+  (do
+  (skip-space! context p)
+  (if (= (cursor-byte p) 91)
+      (do
+        (cursor-step! p)
+        (let [items (primitive/code-list-new)]
+          (loop
+            (skip-space! context p)
+            (if (= (cursor-byte p) 93) (break)
+                (do
+                  (primitive/code-list-push! items (parse-type! context p))
+                  (skip-space! context p)
+                  (if (= (cursor-byte p) 44) (cursor-step! p)
+                      (if (not (= (cursor-byte p) 93))
+                          (rust-like-error context p
+                            "expected ',' or ']' in type vector") 0)))))
+          (expect! context p "]")
+          (let [done (primitive/code-list-done items)] `[~@done])))
+  (if (structural-node-prefix? p)
+      (let [a (alloc/malloc-allocator) (mut text) (str/sb-new a)]
+        (parse-node! context p (mut text))
+        (read-one-code (str/sb-finish! (mut text))))
+  (let [head (token-code! context p)]
+    (skip-space! context p)
+    (if (= (cursor-byte p) 60)
+        (do
+          (cursor-step! p)
+          (let [items (primitive/code-list-new)]
+            (primitive/code-list-push! items head)
+            (loop
+              (skip-space! context p)
+              (if (= (cursor-byte p) 62) (break)
+                  (do
+                    (primitive/code-list-push! items (parse-type! context p))
+                    (skip-space! context p)
+                    (if (= (cursor-byte p) 44) (cursor-step! p)
+                        (if (not (= (cursor-byte p) 62))
+                            (rust-like-error context p "expected ',' or '>' in type") 0)))))
+            (expect! context p ">")
+            (primitive/code-list-done items)))
+        head))))))
+
+(defn field-access-code? [(value Code)] (-> bool)
+  (and (primitive/code-list? value)
+       (and (= (primitive/code-count value) 2)
+            (let [head (primitive/code-nth value 0)]
+              (and (primitive/code-sym? head)
+                   (let [name (primitive/code-str head)]
+                     (and (> (slice/slice-len name) 1)
+                          (= (slice/slice-get name 0) (primitive/cast u8 46)))))))))
+
+(defn load-code? [(value Code)] (-> bool)
+  (and (primitive/code-list? value)
+       (and (= (primitive/code-count value) 2)
+            (primitive/code-eq (primitive/code-nth value 0) `load))))
+
+(defn assignment-code [(place Code) (value Code)] (-> Code)
+  (if (field-access-code? place) `(set! ~place ~value)
+      (if (load-code? place)
+          `(store! ~(primitive/code-nth place 1) ~value)
+          `(store! ~place ~value))))
+
+(defn parse-expression! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [left (parse-or! context p)]
+    (skip-space! context p)
+    (cond (cursor-consume! p "+=")
+            `(store! ~left (+ (load ~left) ~(parse-expression! context p)))
+          (cursor-consume! p "-=")
+            `(store! ~left (- (load ~left) ~(parse-expression! context p)))
+          (cursor-consume! p "*=")
+            `(store! ~left (* (load ~left) ~(parse-expression! context p)))
+          (cursor-consume! p "/=")
+            `(store! ~left (/ (load ~left) ~(parse-expression! context p)))
+          (cursor-consume! p "%=")
+            `(store! ~left (% (load ~left) ~(parse-expression! context p)))
+          (cursor-consume! p "<<=")
+            `(store! ~left (<< (load ~left) ~(parse-expression! context p)))
+          (cursor-consume! p ">>=")
+            `(store! ~left (>> (load ~left) ~(parse-expression! context p)))
+          (cursor-consume! p "&=")
+            `(store! ~left (& (load ~left) ~(parse-expression! context p)))
+          (cursor-consume! p "|=")
+            `(store! ~left (| (load ~left) ~(parse-expression! context p)))
+          (cursor-consume! p "^=")
+            `(store! ~left (^ (load ~left) ~(parse-expression! context p)))
+          (and (cursor-prefix? p "=")
+               (and (not (cursor-prefix? p "==")) (not (cursor-prefix? p "=>"))))
+            (do (cursor-step! p)
+                (assignment-code left (parse-expression! context p)))
+          :else left)))
+
+(defn parse-block-rest! [(context Code) (p (ptr Cursor))] (-> Code)
+  (do
+    (skip-space! context p)
+    (if (= (cursor-byte p) 125)
+        (do (cursor-step! p) `0)
+        (if (cursor-consume! p "let")
+            (do
+              (skip-space! context p)
+              (let [mutable (cursor-consume! p "mut")]
+                (skip-space! context p)
+                (let [name (token-code! context p)]
+                  (expect! context p "=")
+                  (let [value (parse-expression! context p)]
+                    (expect! context p ";")
+                    (let [rest (parse-block-rest! context p)]
+                      (if mutable `(let [(mut ~name) ~value] ~rest)
+                          `(let [~name ~value] ~rest)))))))
+            (let [value (parse-expression! context p)]
+              (skip-space! context p)
+              (if (= (cursor-byte p) 59)
+                  (do (cursor-step! p)
+                      `(do ~value ~(parse-block-rest! context p)))
+                  (do (expect! context p "}") value)))))))
+
+(defn parse-block-code! [(context Code) (p (ptr Cursor))] (-> Code)
+  (do (expect! context p "{") (parse-block-rest! context p)))
+
+(defn parse-string-code! [(context Code) (p (ptr Cursor))] (-> Code)
+  (do
+  (skip-space! context p)
+  (let [start (.at p) (mut escaped) false (mut done) false]
+    (cursor-step! p)
+    (loop
+      (if (load done) (break)
+          (let [c (cursor-byte p)]
+            (cond (= c -1) (rust-like-error context p "unterminated string")
+                  (load escaped) (do (store! escaped false) (cursor-step! p))
+                  (= c 92) (do (store! escaped true) (cursor-step! p))
+                  (= c 34) (do (cursor-step! p) (store! done true))
+                  :else (cursor-step! p)))))
+    (read-one-code (slice/subslice (.source p) start (.at p))))))
+
+(defn numeric-char? [(c i64)] (-> bool)
+  (or (and (>= c 48) (<= c 57))
+      (or (and (>= c 65) (<= c 90))
+          (or (and (>= c 97) (<= c 122))
+              (or (= c 46) (= c 95))))))
+
+(defn signed-number-prefix? [(p (ptr Cursor))] (-> bool)
+  (and (= (cursor-byte p) 45)
+       (let [next (+ (.at p) 1)]
+         (and (< next (slice/slice-len (.source p)))
+              (let [c (primitive/cast i64 (slice/slice-get (.source p) next))]
+                (and (>= c 48) (<= c 57)))))))
+
+(defn constructor-brace? [(context Code) (p (ptr Cursor))] (-> bool)
+  (let [saved (.at p)]
+    (cursor-step! p)
+    (skip-space! context p)
+    (let [result
+          (if (= (cursor-byte p) 125) true
+              (if (ident-start? (cursor-byte p))
+                  (do
+                    (loop (if (ident-part? (cursor-byte p)) (cursor-step! p) (break)))
+                    (skip-space! context p)
+                    (= (cursor-byte p) 58))
+                  false))]
+      (set! (.at p) saved)
+      result)))
+
+(defn structural-node-prefix? [(p (ptr Cursor))] (-> bool)
+  (or (cursor-prefix? p "form!")
+      (or (cursor-prefix? p "atom!")
+          (or (cursor-prefix? p "symbol!")
+              (or (cursor-prefix? p "string!")
+                  (or (cursor-prefix? p "int!")
+                      (or (cursor-prefix? p "float!")
+                          (or (cursor-prefix? p "quote(")
+                              (or (cursor-prefix? p "quasiquote(")
+                                  (or (cursor-prefix? p "unquote(")
+                                      (cursor-prefix? p "splice(")))))))))))
+
+(defn parse-primary! [(context Code) (p (ptr Cursor))] (-> Code)
+  (do
+    (skip-space! context p)
+    (cond (structural-node-prefix? p)
+            (let [a (alloc/malloc-allocator) (mut text) (str/sb-new a)]
+              (parse-node! context p (mut text))
+              (read-one-code (str/sb-finish! (mut text))))
+          (cursor-consume! p "when")
+            (let [condition (parse-expression! context p)]
+              `(when ~condition ~(parse-block-code! context p)))
+          (cursor-consume! p "unless")
+            (let [condition (parse-expression! context p)]
+              `(unless ~condition ~(parse-block-code! context p)))
+          (cursor-consume! p "while")
+            (let [condition (parse-expression! context p)]
+              `(while ~condition ~(parse-block-code! context p)))
+          (cursor-consume! p "for")
+            (let [name (token-code! context p)]
+              (expect! context p "in")
+              (let [start (parse-expression! context p)]
+                (expect! context p "..")
+                (let [stop (parse-expression! context p)]
+                  `(for [~name ~start ~stop] ~(parse-block-code! context p)))))
+          (cursor-consume! p "loop") `(loop ~(parse-block-code! context p))
+          (cursor-consume! p "break")
+            (do (skip-space! context p)
+                (if (= (cursor-byte p) 59) `(break)
+                    `(break ~(parse-expression! context p))))
+          (cursor-consume! p "continue") `(continue)
+          (cursor-consume! p "try") `(try ~(parse-block-code! context p))
+          (cursor-consume! p "meta") `(meta ~(parse-block-code! context p))
+          (cursor-consume! p "match")
+            (let [scrutinee (parse-expression! context p)
+                  clauses (primitive/code-list-new)]
+              (expect! context p "{")
+              (loop
+                (skip-space! context p)
+                (if (= (cursor-byte p) 125) (break)
+                    (let [variant (token-code! context p)]
+                      (skip-space! context p)
+                      (let [bindings (if (= (cursor-byte p) 91)
+                                         (do
+                                           (cursor-step! p)
+                                           (let [xs (primitive/code-list-new)]
+                                             (loop
+                                               (skip-space! context p)
+                                               (if (= (cursor-byte p) 93) (break)
+                                                   (do
+                                                     (primitive/code-list-push! xs
+                                                       (token-code! context p))
+                                                     (skip-space! context p)
+                                                     (if (= (cursor-byte p) 44)
+                                                         (cursor-step! p) 0))))
+                                             (expect! context p "]")
+                                             (let [done (primitive/code-list-done xs)] `[~@done])))
+                                         `[])]
+                        (expect! context p "=>")
+                        (let [body (parse-expression! context p)]
+                          (primitive/code-list-push! clauses `(~variant ~bindings ~body)))
+                        (skip-space! context p)
+                        (if (= (cursor-byte p) 44) (cursor-step! p) 0)))))
+              (expect! context p "}")
+              (let [done (primitive/code-list-done clauses)] `(match ~scrutinee ~@done)))
+          (cursor-consume! p "cond")
+            (do
+              (expect! context p "{")
+              (let [parts (primitive/code-list-new)]
+                (loop
+                  (skip-space! context p)
+                  (if (= (cursor-byte p) 125) (break)
+                      (let [fallback (cursor-consume! p "else")]
+                        (let [test (if fallback `true (parse-expression! context p))]
+                          (expect! context p "=>")
+                          (if (not fallback)
+                              (do (primitive/code-list-push! parts test) 0) 0)
+                          (primitive/code-list-push! parts (parse-expression! context p)))
+                        (skip-space! context p)
+                        (if (= (cursor-byte p) 44) (cursor-step! p) 0))))
+                (expect! context p "}")
+                (let [done (primitive/code-list-done parts)] `(cond ~@done))))
+          (cursor-consume! p "case")
+            (let [scrutinee (parse-expression! context p)]
+              (expect! context p "{")
+              (let [parts (primitive/code-list-new)]
+                (loop
+                  (skip-space! context p)
+                  (if (= (cursor-byte p) 125) (break)
+                      (let [fallback (cursor-consume! p "else")]
+                        (let [test (if fallback `0 (parse-expression! context p))]
+                          (expect! context p "=>")
+                          (if (not fallback)
+                              (do (primitive/code-list-push! parts test) 0) 0)
+                          (primitive/code-list-push! parts (parse-expression! context p)))
+                        (skip-space! context p)
+                        (if (= (cursor-byte p) 44) (cursor-step! p) 0))))
+                (expect! context p "}")
+                (let [done (primitive/code-list-done parts)] `(case ~scrutinee ~@done))))
+          (cursor-consume! p "comptime")
+            `(comptime ~(parse-block-code! context p))
+          (cursor-consume! p "block")
+            (do
+              (skip-space! context p)
+              (if (not (= (cursor-byte p) 58))
+                  (rust-like-error context p "block expects a keyword label") 0)
+              (cursor-step! p)
+              (let [label (read-token! context p)]
+                `(block ~(read-one-code (primitive/code-str ":" label))
+                   ~(parse-block-code! context p))))
+          (cursor-consume! p "return_from")
+            (do
+              (skip-space! context p)
+              (if (not (= (cursor-byte p) 58))
+                  (rust-like-error context p "return_from expects a keyword label") 0)
+              (cursor-step! p)
+              (let [label (read-token! context p)]
+                (expect! context p ",")
+                `(return-from ~(read-one-code (primitive/code-str ":" label))
+                   ~(parse-expression! context p))))
+          (cursor-consume! p "if")
+            (let [condition (parse-expression! context p)
+                  yes (parse-block-code! context p)]
+              (expect! context p "else")
+              `(if ~condition ~yes ~(parse-block-code! context p)))
+          (= (cursor-byte p) 123) (parse-block-code! context p)
+          (= (cursor-byte p) 40)
+            (do (cursor-step! p)
+                (let [value (parse-expression! context p)]
+                  (expect! context p ")") value))
+          (= (cursor-byte p) 34) (parse-string-code! context p)
+          (cursor-prefix? p "c\"")
+            (let [start (.at p)]
+              (cursor-step! p)
+              (parse-string-code! context p)
+              (read-one-code (slice/subslice (.source p) start (.at p))))
+          (= (cursor-byte p) 39)
+            (do
+              (cursor-step! p)
+              (let [start (.at p)]
+                (loop (if (or (= (cursor-byte p) -1) (= (cursor-byte p) 39))
+                          (break) (cursor-step! p)))
+                (if (= (cursor-byte p) -1)
+                    (rust-like-error context p "unterminated character literal") 0)
+                (let [body (slice/subslice (.source p) start (.at p))]
+                  (cursor-step! p)
+                  (read-one-code (primitive/code-str "#\\" body)))))
+          (= (cursor-byte p) 58)
+            (do (cursor-step! p)
+                (read-one-code (primitive/code-str ":" (read-token! context p))))
+          (= (cursor-byte p) 91)
+            (do
+              (cursor-step! p)
+              (let [items (primitive/code-list-new)]
+                (loop
+                  (skip-space! context p)
+                  (if (= (cursor-byte p) 93) (break)
+                      (do
+                        (primitive/code-list-push! items (parse-expression! context p))
+                        (skip-space! context p)
+                        (if (= (cursor-byte p) 44) (cursor-step! p)
+                            (if (not (= (cursor-byte p) 93))
+                                (rust-like-error context p "expected ',' or ']' in array") 0)))))
+                (expect! context p "]")
+                (let [done (primitive/code-list-done items)] `[~@done])))
+          (or (and (>= (cursor-byte p) 48) (<= (cursor-byte p) 57))
+              (signed-number-prefix? p))
+            (let [start (.at p)]
+              (if (= (cursor-byte p) 45) (cursor-step! p) 0)
+              (loop (if (and (numeric-char? (cursor-byte p))
+                             (not (cursor-prefix? p "..")))
+                        (cursor-step! p) (break)))
+              (read-one-code (slice/subslice (.source p) start (.at p))))
+          :else
+            (let [(mut value) (token-code! context p)]
+              (loop
+                (skip-space! context p)
+                (cond (cursor-prefix? p "::<")
+                        (do
+                          (cursor-consume! p "::<")
+                          (let [type-items (primitive/code-list-new)]
+                            (loop
+                              (skip-space! context p)
+                              (if (= (cursor-byte p) 62) (break)
+                                  (do
+                                    (primitive/code-list-push! type-items (parse-type! context p))
+                                    (skip-space! context p)
+                                    (if (= (cursor-byte p) 44) (cursor-step! p)
+                                        (if (not (= (cursor-byte p) 62))
+                                            (rust-like-error context p "expected ',' or '>' in type arguments") 0)))))
+                            (expect! context p ">")
+                            (expect! context p "(")
+                            (let [call (primitive/code-list-new)
+                                  type-done (primitive/code-list-done type-items)]
+                              (primitive/code-list-push! call (load value))
+                              (primitive/code-list-push! call `[~@type-done])
+                              (loop
+                                (skip-space! context p)
+                                (if (= (cursor-byte p) 41) (break)
+                                    (do
+                                      (primitive/code-list-push! call (parse-expression! context p))
+                                      (skip-space! context p)
+                                      (if (= (cursor-byte p) 44) (cursor-step! p)
+                                          (if (not (= (cursor-byte p) 41))
+                                              (rust-like-error context p "expected ',' or ')' in generic call") 0)))))
+                              (expect! context p ")")
+                              (store! value (primitive/code-list-done call)))))
+                      (= (cursor-byte p) 40)
+                        (do
+                          (cursor-step! p)
+                          (let [call (primitive/code-list-new)]
+                            (primitive/code-list-push! call (load value))
+                            (loop
+                              (skip-space! context p)
+                              (if (= (cursor-byte p) 41) (break)
+                                  (do
+                                    (primitive/code-list-push! call (parse-expression! context p))
+                                    (skip-space! context p)
+                                    (if (= (cursor-byte p) 44) (cursor-step! p)
+                                        (if (not (= (cursor-byte p) 41))
+                                            (rust-like-error context p "expected ',' or ')' in call") 0)))))
+                            (expect! context p ")")
+                            (store! value (primitive/code-list-done call))))
+                      (= (cursor-byte p) 46)
+                        (do (cursor-step! p)
+                            (let [field (read-token! context p)]
+                              (let [accessor
+                                    (read-one-code (primitive/code-str "." field))]
+                                (store! value `(~accessor ~(load value))))))
+                      (= (cursor-byte p) 91)
+                        (do
+                          (cursor-step! p)
+                          (let [index (parse-expression! context p)]
+                            (expect! context p "]")
+                            (store! value `(get ~(load value) ~index))))
+                      (and (= (cursor-byte p) 123) (constructor-brace? context p))
+                        (do
+                          (cursor-step! p)
+                          (let [ctor (primitive/code-list-new)]
+                            (primitive/code-list-push! ctor (load value))
+                            (loop
+                              (skip-space! context p)
+                              (if (= (cursor-byte p) 125) (break)
+                                  (let [field (read-token! context p)]
+                                    (expect! context p ":")
+                                    (primitive/code-list-push! ctor
+                                      (read-one-code (primitive/code-str ":" field)))
+                                    (primitive/code-list-push! ctor (parse-expression! context p))
+                                    (skip-space! context p)
+                                    (if (= (cursor-byte p) 44) (cursor-step! p)
+                                        (if (not (= (cursor-byte p) 125))
+                                            (rust-like-error context p "expected ',' or '}' in constructor") 0)))))
+                            (expect! context p "}")
+                            (store! value (primitive/code-list-done ctor))))
+                      :else (break)))
+              (load value)))))
+
+(defn parse-unary! [(context Code) (p (ptr Cursor))] (-> Code)
+  (do (skip-space! context p)
+      (cond (cursor-consume! p "!") `(not ~(parse-unary! context p))
+            (signed-number-prefix? p) (parse-primary! context p)
+            (cursor-consume! p "-") `(- 0 ~(parse-unary! context p))
+            (cursor-consume! p "mut") `(mut ~(parse-unary! context p))
+            (cursor-consume! p "*") `(load ~(parse-unary! context p))
+            :else (parse-primary! context p))))
+
+(defn parse-mul! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [(mut left) (parse-unary! context p) (mut more) true]
+    (loop (skip-space! context p)
+      (cond (and (cursor-prefix? p "*") (not (cursor-prefix? p "*=")))
+              (do (cursor-step! p) (store! left `(* ~(load left) ~(parse-unary! context p))))
+            (and (cursor-prefix? p "/") (not (cursor-prefix? p "/=")))
+              (do (cursor-step! p) (store! left `(/ ~(load left) ~(parse-unary! context p))))
+            (and (cursor-prefix? p "%") (not (cursor-prefix? p "%=")))
+              (do (cursor-step! p) (store! left `(% ~(load left) ~(parse-unary! context p))))
+            :else (do (store! more false) (break))))
+    (load left)))
+
+(defn parse-add! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [(mut left) (parse-mul! context p)]
+    (loop (skip-space! context p)
+      (cond (and (cursor-prefix? p "+") (not (cursor-prefix? p "+=")))
+              (do (cursor-step! p) (store! left `(+ ~(load left) ~(parse-mul! context p))))
+            (and (cursor-prefix? p "-") (not (cursor-prefix? p "-=")))
+              (do (cursor-step! p) (store! left `(- ~(load left) ~(parse-mul! context p))))
+            :else (break)))
+    (load left)))
+
+(defn parse-shift! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [(mut left) (parse-add! context p)]
+    (loop (skip-space! context p)
+      (cond (and (cursor-prefix? p "<<") (not (cursor-prefix? p "<<=")))
+              (do (cursor-consume! p "<<")
+                  (store! left `(<< ~(load left) ~(parse-add! context p))))
+            (and (cursor-prefix? p ">>") (not (cursor-prefix? p ">>=")))
+              (do (cursor-consume! p ">>")
+                  (store! left `(>> ~(load left) ~(parse-add! context p))))
+            :else (break)))
+    (load left)))
+
+(defn parse-compare! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [(mut left) (parse-shift! context p)]
+    (loop (skip-space! context p)
+      (cond (cursor-consume! p "<=") (store! left `(<= ~(load left) ~(parse-shift! context p)))
+            (cursor-consume! p ">=") (store! left `(>= ~(load left) ~(parse-shift! context p)))
+            (cursor-consume! p "<") (store! left `(< ~(load left) ~(parse-shift! context p)))
+            (cursor-consume! p ">") (store! left `(> ~(load left) ~(parse-shift! context p)))
+            :else (break)))
+    (load left)))
+
+(defn parse-equality! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [(mut left) (parse-compare! context p)]
+    (loop (skip-space! context p)
+      (cond (cursor-consume! p "==") (store! left `(= ~(load left) ~(parse-compare! context p)))
+            (cursor-consume! p "!=") (store! left `(!= ~(load left) ~(parse-compare! context p)))
+            :else (break)))
+    (load left)))
+
+(defn parse-bitand! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [(mut left) (parse-equality! context p)]
+    (loop (skip-space! context p)
+      (if (and (cursor-prefix? p "&")
+               (and (not (cursor-prefix? p "&&")) (not (cursor-prefix? p "&="))))
+          (do (cursor-step! p) (store! left `(& ~(load left) ~(parse-equality! context p))))
+          (break)))
+    (load left)))
+
+(defn parse-bitxor! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [(mut left) (parse-bitand! context p)]
+    (loop (skip-space! context p)
+      (if (and (cursor-prefix? p "^") (not (cursor-prefix? p "^=")))
+          (do (cursor-step! p) (store! left `(^ ~(load left) ~(parse-bitand! context p))))
+          (break)))
+    (load left)))
+
+(defn parse-bitor! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [(mut left) (parse-bitxor! context p)]
+    (loop (skip-space! context p)
+      (if (and (cursor-prefix? p "|")
+               (and (not (cursor-prefix? p "||")) (not (cursor-prefix? p "|="))))
+          (do (cursor-step! p) (store! left `(| ~(load left) ~(parse-bitxor! context p))))
+          (break)))
+    (load left)))
+
+(defn parse-and! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [(mut left) (parse-bitor! context p)]
+    (loop (skip-space! context p)
+      (if (cursor-consume! p "&&")
+          (store! left `(and ~(load left) ~(parse-bitor! context p)))
+          (break)))
+    (load left)))
+
+(defn parse-or! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [(mut left) (parse-and! context p)]
+    (loop (skip-space! context p)
+      (if (cursor-consume! p "||")
+          (store! left `(or ~(load left) ~(parse-and! context p)))
+          (break)))
+    (load left)))
+
+(defn copy-json-string! [(context Code) (p (ptr Cursor))
+                         (out (mut str/StrBuf))] (-> i64)
+  (do
+    (skip-space! context p)
+    (if (not (= (cursor-byte p) 34))
+        (rust-like-error context p "atom! expects a string literal") 0)
+    (let [start (.at p) (mut escaped) false (mut done) false]
+      (cursor-step! p)
+      (loop
+        (if (load done) (break)
+            (let [c (cursor-byte p)]
+              (cond (= c -1) (rust-like-error context p "unterminated atom! string")
+                    (load escaped) (do (store! escaped false) (cursor-step! p))
+                    (= c 92) (do (store! escaped true) (cursor-step! p))
+                    (= c 34) (do (cursor-step! p) (store! done true))
+                    :else (cursor-step! p)))))
+      (let [quoted (slice/subslice (.source p) start (.at p))
+            read-result (primitive/code-read quoted `(reader-config))
+            parsed (if (and (primitive/code-list? read-result)
+                            (= (primitive/code-count read-result) 2))
+                       (primitive/code-nth read-result 1)
+                       read-result)]
+        (if (not (primitive/code-string? parsed))
+            (rust-like-error context p "atom! payload did not parse as a string")
+            (str/sb-push-str! (mut out) (primitive/code-str parsed)))))))
+
+(defn copy-string-token! [(context Code) (p (ptr Cursor))
+                          (out (mut str/StrBuf))] (-> i64)
+  (do
+    (skip-space! context p)
+    (if (not (= (cursor-byte p) 34))
+        (rust-like-error context p "string! expects a string literal") 0)
+    (let [start (.at p) (mut escaped) false (mut done) false]
+      (cursor-step! p)
+      (loop
+        (if (load done) (break)
+            (let [c (cursor-byte p)]
+              (cond (= c -1) (rust-like-error context p "unterminated string! literal")
+                    (load escaped) (do (store! escaped false) (cursor-step! p))
+                    (= c 92) (do (store! escaped true) (cursor-step! p))
+                    (= c 34) (do (cursor-step! p) (store! done true))
+                    :else (cursor-step! p)))))
+      (str/sb-push-str! (mut out) (slice/subslice (.source p) start (.at p))))))
+
+(defn copy-until-close! [(context Code) (p (ptr Cursor))
+                         (out (mut str/StrBuf))] (-> i64)
+  (do
+    (skip-space! context p)
+    (let [start (.at p)]
+      (loop (if (or (= (cursor-byte p) -1) (= (cursor-byte p) 41))
+                (break) (cursor-step! p)))
+      (if (= start (.at p)) (rust-like-error context p "empty numeric atom")
+          (str/sb-push-str! (mut out) (slice/subslice (.source p) start (.at p)))))))
+
+(defn parse-node! [(context Code) (p (ptr Cursor))
+                   (out (mut str/StrBuf))] (-> i64)
+  (do
+    (skip-space! context p)
+    (cond (cursor-consume! p "form!")
+            (do
+              (expect! context p "(")
+              (str/sb-push-byte! (mut out) (primitive/cast u8 40))
+              (skip-space! context p)
+              (let [(mut first) true]
+                (loop
+                  (if (= (cursor-byte p) 41) (break)
+                      (do
+                        (if (load first) (store! first false)
+                            (str/sb-push-byte! (mut out) (primitive/cast u8 32)))
+                        (parse-node! context p (mut out))
+                        (skip-space! context p)
+                        (if (= (cursor-byte p) 44)
+                            (do (cursor-step! p) (skip-space! context p))
+                            (if (not (= (cursor-byte p) 41))
+                                (rust-like-error context p "expected ',' or ')' in form!") 0))))))
+              (expect! context p ")")
+              (str/sb-push-byte! (mut out) (primitive/cast u8 41)))
+          (cursor-consume! p "atom!")
+            (do (expect! context p "(") (copy-json-string! context p (mut out))
+                (expect! context p ")"))
+          (cursor-consume! p "symbol!")
+            (do (expect! context p "(") (copy-json-string! context p (mut out))
+                (expect! context p ")"))
+          (cursor-consume! p "string!")
+            (do (expect! context p "(") (copy-string-token! context p (mut out))
+                (expect! context p ")"))
+          (cursor-consume! p "int!")
+            (do (expect! context p "(") (copy-until-close! context p (mut out))
+                (expect! context p ")"))
+          (cursor-consume! p "float!")
+            (do (expect! context p "(") (copy-until-close! context p (mut out))
+                (expect! context p ")"))
+          (= (cursor-byte p) 91)
+            (do
+              (cursor-step! p)
+              (str/sb-push-byte! (mut out) (primitive/cast u8 91))
+              (skip-space! context p)
+              (let [(mut first) true]
+                (loop
+                  (if (= (cursor-byte p) 93) (break)
+                      (do
+                        (if (load first) (store! first false)
+                            (str/sb-push-byte! (mut out) (primitive/cast u8 32)))
+                        (parse-node! context p (mut out))
+                        (skip-space! context p)
+                        (if (= (cursor-byte p) 44)
+                            (do (cursor-step! p) (skip-space! context p))
+                            (if (not (= (cursor-byte p) 93))
+                                (rust-like-error context p "expected ',' or ']' in vector") 0))))))
+              (expect! context p "]")
+              (str/sb-push-byte! (mut out) (primitive/cast u8 93)))
+          (cursor-consume! p "quote")
+            (do (str/sb-push-byte! (mut out) (primitive/cast u8 39))
+                (expect! context p "(") (parse-node! context p (mut out)) (expect! context p ")"))
+          (cursor-consume! p "quasiquote")
+            (do (str/sb-push-byte! (mut out) (primitive/cast u8 96))
+                (expect! context p "(") (parse-node! context p (mut out)) (expect! context p ")"))
+          (cursor-consume! p "unquote")
+            (do (str/sb-push-byte! (mut out) (primitive/cast u8 126))
+                (expect! context p "(") (parse-node! context p (mut out)) (expect! context p ")"))
+          (cursor-consume! p "splice")
+            (do (str/sb-push-str! (mut out) "~@")
+                (expect! context p "(") (parse-node! context p (mut out)) (expect! context p ")"))
+          :else (rust-like-error context p "expected a structural Rust-like node"))))
+
+(defn parse-module! [(context Code) (p (ptr Cursor))
+                     (out (mut str/StrBuf))] (-> i64)
+  (do
+    (str/sb-push-str! (mut out) "(module ")
+    (let [(mut done) false]
+      (loop
+        (if (load done) (break)
+            (cond (= (cursor-byte p) -1)
+                    (rust-like-error context p "unterminated module declaration")
+                  (= (cursor-byte p) 59) (do (cursor-step! p) (store! done true))
+                  (cursor-prefix? p "::")
+                    (do (cursor-consume! p "::")
+                        (str/sb-push-byte! (mut out) (primitive/cast u8 46)))
+                  :else
+                    (do (str/sb-push-byte! (mut out) (primitive/cast u8 (cursor-byte p)))
+                        (cursor-step! p))))))
+    (str/sb-push-str! (mut out) ")\n")))
+
+(defn parse-fields! [(context Code) (p (ptr Cursor))] (-> Code)
+  (do
+    (expect! context p "{")
+    (let [fields (primitive/code-list-new)]
+      (loop
+        (skip-space! context p)
+        (if (= (cursor-byte p) 125) (break)
+            (let [name (token-code! context p)]
+              (expect! context p ":")
+              (primitive/code-list-push! fields `(~name ~(parse-type! context p)))
+              (skip-space! context p)
+              (if (= (cursor-byte p) 44) (cursor-step! p)
+                  (if (not (= (cursor-byte p) 125))
+                      (rust-like-error context p "expected ',' or '}' in fields") 0)))))
+      (expect! context p "}")
+      (let [done (primitive/code-list-done fields)] `[~@done]))))
+
+(defn parse-generics! [(context Code) (p (ptr Cursor))] (-> Code)
+  (do
+    (skip-space! context p)
+    (let [items (primitive/code-list-new)]
+      (if (= (cursor-byte p) 60)
+          (do
+            (cursor-step! p)
+            (loop
+              (skip-space! context p)
+              (if (= (cursor-byte p) 62) (break)
+                  (let [name (token-code! context p)]
+                    (skip-space! context p)
+                    (if (= (cursor-byte p) 58)
+                        (do
+                          (cursor-step! p)
+                          (let [bounded (primitive/code-list-new)]
+                            (primitive/code-list-push! bounded name)
+                            (loop
+                              (skip-space! context p)
+                              (primitive/code-list-push! bounded (token-code! context p))
+                              (skip-space! context p)
+                              (if (= (cursor-byte p) 43) (cursor-step! p) (break)))
+                            (primitive/code-list-push! items
+                              (primitive/code-list-done bounded))))
+                        (primitive/code-list-push! items name))
+                    (skip-space! context p)
+                    (if (= (cursor-byte p) 44) (cursor-step! p)
+                        (if (not (= (cursor-byte p) 62))
+                            (rust-like-error context p "expected ',' or '>' in generics") 0)))))
+            (expect! context p ">")) 0)
+      (let [done (primitive/code-list-done items)] `[~@done]))))
+
+(defn parse-struct-decl! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [name (token-code! context p)]
+    (let [generics (parse-generics! context p)
+          fields (parse-fields! context p)]
+      (if (= (primitive/code-count generics) 0)
+          `(defstruct ~name ~fields)
+          `(defstruct ~name ~generics ~fields)))))
+
+(defn parse-params! [(context Code) (p (ptr Cursor))] (-> Code)
+  (do
+    (expect! context p "(")
+    (let [params (primitive/code-list-new)]
+      (loop
+        (skip-space! context p)
+        (if (= (cursor-byte p) 41) (break)
+            (do
+              (if (cursor-prefix? p "...")
+                  (do
+                    (cursor-step! p) (cursor-step! p) (cursor-step! p)
+                    (primitive/code-list-push! params `(__variadic ...))
+                    0)
+                  (let [name (token-code! context p)]
+                    (expect! context p ":")
+                    (primitive/code-list-push! params `(~name ~(parse-type! context p)))
+                    0))
+              (skip-space! context p)
+              (if (= (cursor-byte p) 44) (cursor-step! p)
+                  (if (not (= (cursor-byte p) 41))
+                      (rust-like-error context p "expected ',' or ')' in parameters") 0)))))
+      (expect! context p ")")
+      (let [done (primitive/code-list-done params)] `[~@done]))))
+
+(defn parse-fn-decl! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [name (token-code! context p)]
+    (let [generics (parse-generics! context p)
+          params (parse-params! context p)]
+      (expect! context p "->")
+      (let [result (parse-type! context p)]
+        (if (= (primitive/code-count generics) 0)
+            `(defn ~name ~params (-> ~result) ~(parse-block-code! context p))
+            `(defn ~name ~generics ~params (-> ~result) ~(parse-block-code! context p)))))))
+
+(defn parse-method! [(context Code) (p (ptr Cursor)) (signature-only bool)] (-> Code)
+  (do
+    (expect! context p "fn")
+    (let [name (token-code! context p)
+          generics (parse-generics! context p)
+          params (parse-params! context p)]
+      (expect! context p "->")
+      (let [result (parse-type! context p)]
+        (if signature-only
+            (do (expect! context p ";")
+                (if (= (primitive/code-count generics) 0)
+                    `(~name ~params (-> ~result))
+                    `(~name ~generics ~params (-> ~result))))
+            (if (= (primitive/code-count generics) 0)
+                `(~name ~params (-> ~result) ~(parse-block-code! context p))
+                `(~name ~generics ~params (-> ~result) ~(parse-block-code! context p))))))))
+
+(defn parse-const-decl! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [name (token-code! context p)]
+    (skip-space! context p)
+    (if (= (cursor-byte p) 58)
+        (do (cursor-step! p) (parse-type! context p) 0) 0)
+    (expect! context p "=")
+    (let [value (parse-expression! context p)]
+      (expect! context p ";")
+      `(const ~name ~value))))
+
+(defn parse-impl-decl! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [generics (parse-generics! context p)
+        first (parse-type! context p)]
+    (skip-space! context p)
+    (let [has-trait (cursor-consume! p "for")
+          target (if has-trait (parse-type! context p) first)
+          methods (primitive/code-list-new)]
+      (expect! context p "{")
+      (loop
+        (skip-space! context p)
+        (if (= (cursor-byte p) 125) (break)
+            (primitive/code-list-push! methods (parse-method! context p false))))
+      (expect! context p "}")
+      (let [done (primitive/code-list-done methods)]
+        (if (= (primitive/code-count generics) 0)
+            (if has-trait `(impl ~first ~target ~@done) `(impl ~target ~@done))
+            (if has-trait `(impl ~generics ~first ~target ~@done)
+                `(impl ~generics ~target ~@done)))))))
+
+(defn parse-trait-decl! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [name (token-code! context p)
+        generics (parse-generics! context p)
+        methods (primitive/code-list-new)]
+    (expect! context p "{")
+    (loop
+      (skip-space! context p)
+      (if (= (cursor-byte p) 125) (break)
+          (primitive/code-list-push! methods (parse-method! context p true))))
+    (expect! context p "}")
+    (let [done (primitive/code-list-done methods)]
+      `(deftrait ~name ~generics ~@done))))
+
+(defn parse-enum-decl! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [name (token-code! context p)
+        generics (parse-generics! context p)
+        variants (primitive/code-list-new)]
+    (expect! context p "{")
+    (loop
+      (skip-space! context p)
+      (if (= (cursor-byte p) 125) (break)
+          (let [variant (token-code! context p)]
+            (skip-space! context p)
+            (if (= (cursor-byte p) 123)
+                (primitive/code-list-push! variants
+                  `(~variant ~(parse-fields! context p)))
+                (primitive/code-list-push! variants `(~variant)))
+            (skip-space! context p)
+            (if (= (cursor-byte p) 44) (cursor-step! p)
+                (if (not (= (cursor-byte p) 125))
+                    (rust-like-error context p "expected ',' or '}' in enum") 0)))))
+    (expect! context p "}")
+    (let [done (primitive/code-list-done variants)]
+      (if (= (primitive/code-count generics) 0)
+          `(defsum ~name ~@done)
+          `(defsum ~name ~generics ~@done)))))
+
+(defn parse-extern-block! [(context Code) (p (ptr Cursor)) (forms CodeBuilder)] (-> i64)
+  (do
+    (skip-space! context p)
+    (let [cc (if (= (cursor-byte p) 34)
+                 (let [quoted (parse-string-code! context p)]
+                   (read-one-code (primitive/code-str quoted)))
+                 (token-code! context p))]
+      (expect! context p "{")
+      (loop
+        (skip-space! context p)
+        (if (= (cursor-byte p) 125) (break)
+            (do
+              (expect! context p "fn")
+              (let [name (token-code! context p)
+                    named-params (parse-params! context p)
+                    type-items (primitive/code-list-new)]
+                (let [(mut i) 0]
+                  (loop
+                    (if (>= (load i) (primitive/code-count named-params)) (break)
+                        (do
+                          (primitive/code-list-push! type-items
+                            (primitive/code-nth
+                              (primitive/code-nth named-params (load i)) 1))
+                          (store! i (+ (load i) 1))))))
+                (expect! context p "->")
+                (let [result (parse-type! context p)
+                      type-done (primitive/code-list-done type-items)]
+                  (expect! context p ";")
+                  (primitive/code-list-push! forms
+                    `(extern ~name :cc ~cc [~@type-done] (-> ~result))))))))
+      (expect! context p "}")
+      0)))
+
+(defn parse-export-c! [(context Code) (p (ptr Cursor))] (-> Code)
+  (do
+    (expect! context p "{")
+    (let [entries (primitive/code-list-new)]
+      (loop
+        (skip-space! context p)
+        (if (= (cursor-byte p) 125) (break)
+            (let [name (token-code! context p)]
+              (expect! context p "as")
+              (let [external (parse-string-code! context p)]
+                (primitive/code-list-push! entries `[~name :as ~external]))
+              (skip-space! context p)
+              (if (= (cursor-byte p) 44) (cursor-step! p)
+                  (if (not (= (cursor-byte p) 125))
+                      (rust-like-error context p "expected ',' or '}' in export_c") 0)))))
+      (expect! context p "}")
+      (expect! context p ";")
+      (let [done (primitive/code-list-done entries)] `(export-c ~@done)))))
+
+(defn parse-name-set! [(context Code) (p (ptr Cursor))] (-> Code)
+  (do
+    (expect! context p "{")
+    (let [names (primitive/code-list-new)]
+      (loop
+        (skip-space! context p)
+        (if (= (cursor-byte p) 125) (break)
+            (do
+              (primitive/code-list-push! names (token-code! context p))
+              (skip-space! context p)
+              (if (= (cursor-byte p) 44) (cursor-step! p)
+                  (if (not (= (cursor-byte p) 125))
+                      (rust-like-error context p "expected ',' or '}' in name set") 0)))))
+      (expect! context p "}")
+      (let [done (primitive/code-list-done names)] done))))
+
+(defn parse-export! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [names (parse-name-set! context p)]
+    (expect! context p ";")
+    `(export ~@names)))
+
+(defn parse-cimport! [(context Code) (p (ptr Cursor))] (-> Code)
+  (let [header (parse-string-code! context p)
+        names (parse-name-set! context p)]
+    (expect! context p ";")
+    `(cimport ~header ~@names)))
+
+(defn parse-registration! [(context Code) (p (ptr Cursor)) (kind Code)] (-> Code)
+  (let [name (token-code! context p)]
+    (skip-space! context p)
+    (let [before (cursor-consume! p "before_expand")]
+      (expect! context p ";")
+      (if before `(~kind ~name :phase before-expand) `(~kind ~name)))))
+
+(defn parse-use-decl! [(context Code) (p (ptr Cursor)) (reexport bool)] (-> Code)
+  (do
+  (skip-space! context p)
+  (if (= (cursor-byte p) 34)
+      (let [module-string (parse-string-code! context p)
+            declaration (primitive/code-list-new)]
+        (primitive/code-list-push! declaration `import)
+        (primitive/code-list-push! declaration module-string)
+        (skip-space! context p)
+        (if (cursor-consume! p "with")
+            (do
+              (expect! context p "{")
+              (loop
+                (skip-space! context p)
+                (if (= (cursor-byte p) 125) (break)
+                    (let [key (read-token! context p)]
+                      (expect! context p ":")
+                      (primitive/code-list-push! declaration
+                        (read-one-code (primitive/code-str ":" key)))
+                      (skip-space! context p)
+                      (if (= key "reexport")
+                          (do (parse-expression! context p) 0)
+                      (if (= key "use")
+                          (if (= (cursor-byte p) 42)
+                              (do (cursor-step! p)
+                                  (primitive/code-list-push! declaration `*)
+                                  0)
+                              (do (primitive/code-list-push! declaration
+                                    (parse-expression! context p)) 0))
+                          (do (primitive/code-list-push! declaration
+                                (parse-expression! context p)) 0)))
+                      (skip-space! context p)
+                      (if (= (cursor-byte p) 44) (cursor-step! p)
+                          (if (not (= (cursor-byte p) 125))
+                              (rust-like-error context p "expected ',' or '}' in import clauses") 0)))))
+              (expect! context p "}")) 0)
+        (if reexport
+            (do (primitive/code-list-push! declaration `:reexport) 0) 0)
+        (expect! context p ";")
+        (primitive/code-list-done declaration))
+  (let [a (alloc/malloc-allocator) (mut path) (str/sb-new a)]
+    (str/sb-push-str! (mut path) (read-token! context p))
+    (let [(mut wildcard) false (mut done) false
+          (mut alias) (None [Code])
+          (mut excluded) (None [Code])
+          uses (primitive/code-list-new)
+          renames (primitive/code-list-new)]
+      (loop
+        (skip-space! context p)
+        (if (load done) (break)
+            (if (cursor-consume! p "::")
+                (do
+                  (skip-space! context p)
+                  (cond (= (cursor-byte p) 42)
+                          (do (cursor-step! p) (store! wildcard true) (store! done true))
+                        (= (cursor-byte p) 123)
+                          (do
+                            (cursor-step! p)
+                            (loop
+                              (skip-space! context p)
+                              (if (= (cursor-byte p) 125) (break)
+                                  (let [source-name (token-code! context p)]
+                                    (primitive/code-list-push! uses source-name)
+                                    (skip-space! context p)
+                                    (if (cursor-consume! p "as")
+                                        (do
+                                          (primitive/code-list-push! renames
+                                            `[~source-name ~(token-code! context p)])
+                                          0) 0)
+                                    (skip-space! context p)
+                                    (if (= (cursor-byte p) 44) (cursor-step! p)
+                                        (if (not (= (cursor-byte p) 125))
+                                            (rust-like-error context p
+                                              "expected ',' or '}' in grouped import") 0)))))
+                            (expect! context p "}")
+                            (store! done true))
+                        :else
+                          (do
+                            (str/sb-push-byte! (mut path) (primitive/cast u8 46))
+                            (str/sb-push-str! (mut path) (read-token! context p)))))
+                (store! done true))))
+      (skip-space! context p)
+      (if (cursor-consume! p "as")
+          (store! alias (Some (token-code! context p))) 0)
+      (skip-space! context p)
+      (if (cursor-consume! p "except")
+          (store! excluded (Some (parse-name-set! context p))) 0)
+      (expect! context p ";")
+      (let [module-path (str/sb-finish! (mut path))]
+        (let [module-string
+              (read-one-code (primitive/code-str "\"" module-path "\""))
+              declaration (primitive/code-list-new)
+              use-items (primitive/code-list-done uses)
+              rename-items (primitive/code-list-done renames)]
+          (primitive/code-list-push! declaration `import)
+          (primitive/code-list-push! declaration module-string)
+          (if (load wildcard)
+              (do (primitive/code-list-push! declaration `:use)
+                  (primitive/code-list-push! declaration `*) 0)
+              (if (> (primitive/code-count use-items) 0)
+                  (do (primitive/code-list-push! declaration `:use)
+                      (primitive/code-list-push! declaration `[~@use-items]) 0) 0))
+          (match (load alias)
+            (Some [name]
+              (do (primitive/code-list-push! declaration `:as)
+                  (primitive/code-list-push! declaration name) 0))
+            (None [] 0))
+          (match (load excluded)
+            (Some [names]
+              (do (primitive/code-list-push! declaration `:exclude)
+                  (primitive/code-list-push! declaration `[~@names]) 0))
+            (None [] 0))
+          (if (> (primitive/code-count rename-items) 0)
+              (do (primitive/code-list-push! declaration `:rename)
+                  (primitive/code-list-push! declaration `[~@rename-items]) 0) 0)
+          (if reexport
+              (do (primitive/code-list-push! declaration `:reexport) 0) 0)
+          (primitive/code-list-done declaration))))))))
+
+(defn parse-attribute! [(context Code) (p (ptr Cursor))] (-> Code)
+  (do
+    (expect! context p "#[")
+    (let [value (parse-expression! context p)]
+      (expect! context p "]")
+      value)))
+
+(defn attribute-name [(attribute Code)] (-> Code)
+  (if (primitive/code-list? attribute)
+      (primitive/code-nth attribute 0)
+      attribute))
+
+(defn attribute-named? [(attribute Code) (name Code)] (-> bool)
+  (primitive/code-eq (attribute-name attribute) name))
+
+(defn attribute-value [(attribute Code)] (-> Code)
+  (if (primitive/code-list? attribute)
+      (let [items (primitive/code-list-new) (mut i) 1]
+        (loop
+          (if (>= (load i) (primitive/code-count attribute)) (break)
+              (do
+                (primitive/code-list-push! items (primitive/code-nth attribute (load i)))
+                (store! i (+ (load i) 1)))))
+        (primitive/code-list-done items))
+      `true))
+
+(defn parse-annotated-fn! [(context Code) (p (ptr Cursor)) (attributes Code)] (-> Code)
+  (do
+    (expect! context p "fn")
+    (let [name (token-code! context p)
+          generics (parse-generics! context p)
+          params (parse-params! context p)]
+      (expect! context p "->")
+      (let [result (parse-type! context p)
+            body (parse-block-code! context p)
+            declaration (primitive/code-list-new)
+            (mut is-test) false]
+        (primitive/code-list-push! declaration `defn)
+        (primitive/code-list-push! declaration name)
+        (let [(mut i) 0]
+          (loop
+            (if (>= (load i) (primitive/code-count attributes)) (break)
+                (let [attribute (primitive/code-nth attributes (load i))]
+                  (if (attribute-named? attribute `test)
+                      (store! is-test true)
+                      (if (not (attribute-named? attribute `derive))
+                          (do
+                            (primitive/code-list-push! declaration
+                              (read-one-code
+                                (primitive/code-str ":" (primitive/code-str (attribute-name attribute)))))
+                            (primitive/code-list-push! declaration (attribute-value attribute))
+                            0) 0))
+                  (store! i (+ (load i) 1))))))
+        (if (> (primitive/code-count generics) 0)
+            (do (primitive/code-list-push! declaration generics) 0) 0)
+        (primitive/code-list-push! declaration params)
+        (primitive/code-list-push! declaration `(-> ~result))
+        (primitive/code-list-push! declaration body)
+        (let [done (primitive/code-list-done declaration)]
+          (if (load is-test) `(deftest ~name ~body) done))))))
+
+(defn push-derives! [(forms CodeBuilder) (attributes Code) (name Code)] (-> i64)
+  (let [(mut i) 0]
+    (loop
+      (if (>= (load i) (primitive/code-count attributes)) (break)
+          (let [attribute (primitive/code-nth attributes (load i))]
+            (if (attribute-named? attribute `derive)
+                (let [value (attribute-value attribute)]
+                  (let [derive-form (primitive/code-list-new)]
+                    (primitive/code-list-push! derive-form (read-one-code "derive"))
+                    (let [(mut j) 0]
+                      (loop
+                        (if (>= (load j) (primitive/code-count value)) (break)
+                            (do
+                              (primitive/code-list-push! derive-form
+                                (primitive/code-nth value (load j)))
+                              (store! j (+ (load j) 1))))))
+                    (primitive/code-list-push! derive-form name)
+                    (primitive/code-list-push! forms
+                      (primitive/code-list-done derive-form)))
+                  0) 0)
+            (store! i (+ (load i) 1)))))
+    0))
+
+(defn parse-attributed-decl! [(context Code) (p (ptr Cursor)) (forms CodeBuilder)] (-> i64)
+  (let [attributes-builder (primitive/code-list-new)]
+    (loop
+      (skip-space! context p)
+      (if (cursor-prefix? p "#[")
+          (primitive/code-list-push! attributes-builder (parse-attribute! context p))
+          (break)))
+    (let [attributes (primitive/code-list-done attributes-builder)]
+      (skip-space! context p)
+      (cond (cursor-prefix? p "fn")
+              (do
+                (primitive/code-list-push! forms (parse-annotated-fn! context p attributes))
+                0)
+            (cursor-consume! p "struct")
+              (let [declaration (parse-struct-decl! context p)
+                    name (primitive/code-nth declaration 1)]
+                (primitive/code-list-push! forms declaration)
+                (push-derives! forms attributes name))
+            (cursor-consume! p "enum")
+              (let [declaration (parse-enum-decl! context p)
+                    name (primitive/code-nth declaration 1)]
+                (primitive/code-list-push! forms declaration)
+                (push-derives! forms attributes name))
+            :else (rust-like-error context p "attributes require fn, struct, or enum")))))
+
+(defn parse-program [(context Code) (source (slice u8))] (-> Code)
+  (let [a (alloc/malloc-allocator)
+        cursor (primitive/alloc-stack Cursor)
+        forms (primitive/code-list-new)]
+    (set! (.source cursor) source)
+    (set! (.at cursor) 0)
+    (primitive/code-list-push! forms `do)
+    (loop
+      (skip-space! context cursor)
+      (if (= (cursor-byte cursor) -1) (break)
+          (cond (cursor-consume! cursor "module")
+                  (do
+                    (skip-space! context cursor)
+                    (let [(mut text) (str/sb-new a)]
+                      (parse-module! context cursor (mut text))
+                      (primitive/code-list-push! forms
+                        (read-one-code (str/sb-finish! (mut text))))
+                      0))
+                (cursor-prefix? cursor "#[")
+                  (parse-attributed-decl! context cursor forms)
+                (cursor-consume! cursor "pub")
+                  (do
+                    (expect! context cursor "use")
+                    (primitive/code-list-push! forms
+                      (parse-use-decl! context cursor true))
+                    0)
+                (cursor-consume! cursor "use")
+                  (do (primitive/code-list-push! forms
+                        (parse-use-decl! context cursor false)) 0)
+                (cursor-consume! cursor "item")
+                  (do
+                      (skip-space! context cursor)
+                      (let [(mut text) (str/sb-new a)]
+                        (parse-node! context cursor (mut text))
+                        (primitive/code-list-push! forms
+                          (read-one-code (str/sb-finish! (mut text)))))
+                      (expect! context cursor ";")
+                      0)
+                (cursor-consume! cursor "struct")
+                  (do (primitive/code-list-push! forms (parse-struct-decl! context cursor)) 0)
+                (cursor-consume! cursor "const")
+                  (do (primitive/code-list-push! forms (parse-const-decl! context cursor)) 0)
+                (cursor-consume! cursor "enum")
+                  (do (primitive/code-list-push! forms (parse-enum-decl! context cursor)) 0)
+                (cursor-consume! cursor "trait")
+                  (do (primitive/code-list-push! forms (parse-trait-decl! context cursor)) 0)
+                (cursor-consume! cursor "impl")
+                  (do (primitive/code-list-push! forms (parse-impl-decl! context cursor)) 0)
+                (cursor-consume! cursor "extern")
+                  (parse-extern-block! context cursor forms)
+                (cursor-consume! cursor "export_c")
+                  (do (primitive/code-list-push! forms (parse-export-c! context cursor)) 0)
+                (cursor-consume! cursor "export")
+                  (do (primitive/code-list-push! forms (parse-export! context cursor)) 0)
+                (cursor-consume! cursor "cimport")
+                  (do (primitive/code-list-push! forms (parse-cimport! context cursor)) 0)
+                (cursor-consume! cursor "meta")
+                  (do (primitive/code-list-push! forms
+                        `(meta ~(parse-block-code! context cursor))) 0)
+                (cursor-consume! cursor "checker")
+                  (do (primitive/code-list-push! forms
+                        (parse-registration! context cursor (read-one-code "checker"))) 0)
+                (cursor-consume! cursor "transform_once")
+                  (do (primitive/code-list-push! forms
+                        (parse-registration! context cursor (read-one-code "transform-once"))) 0)
+                (cursor-consume! cursor "transform")
+                  (do (primitive/code-list-push! forms
+                        (parse-registration! context cursor (read-one-code "transform"))) 0)
+                (cursor-consume! cursor "fn")
+                  (do (primitive/code-list-push! forms (parse-fn-decl! context cursor)) 0)
+                :else (rust-like-error context cursor "expected module, item, struct, or fn"))))
+    (primitive/code-list-done forms)))
+
+(defn read-rust-like [(context Code)] (-> Code)
+  (parse-program context (primitive/code-str (primitive/code-nth context 2))))
+
+(defn module-form? [(form Code)] (-> bool)
+  (and (primitive/code-list? form)
+       (and (> (primitive/code-count form) 0)
+            (primitive/code-eq (primitive/code-nth form 0) `module))))
+
+;; Imported files retain Coil's default reader. A generated namespace stub calls
+;; this macro with its Rust-like module text; the literal `(module ...)` remains
+;; in the stub for loader indexing, and this expansion supplies every other form.
+(defn rust-like-items [(source Code)] (-> Code)
+  (if (not (primitive/code-string? source))
+      (primitive/error "rust-like-items: expected a string literal")
+      (let [parsed (parse-program source (primitive/code-str source))
+            forms (primitive/code-list-new)
+            wrapped (and (primitive/code-list? parsed)
+                         (and (> (primitive/code-count parsed) 0)
+                              (primitive/code-eq (primitive/code-nth parsed 0) `do)))
+            count (if wrapped (primitive/code-count parsed) 1)
+            (mut i) (if wrapped 1 0)]
+        (loop
+          (if (>= (load i) count) (break)
+              (let [form (if wrapped (primitive/code-nth parsed (load i)) parsed)]
+                (if (not (module-form? form))
+                    (do (primitive/code-list-push! forms form) 0) 0)
+                (store! i (+ (load i) 1)))))
+        `(do ~@forms))))
