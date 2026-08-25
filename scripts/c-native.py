@@ -69,10 +69,24 @@ def reference(name, sources, flags, work) -> tuple[int, str]:
     return got.returncode, got.stdout
 
 
-def native(coil, name, sources, flags, work) -> tuple[int, str, str]:
+def frontend(coil, work) -> str:
+    """The C frontend, built once.
+
+    It is a Coil program like any other; building it and running the binary is
+    the same thing as `coil run` and does not repeat the build for every case.
+    """
+    binary = work / "cc"
+    built = run([coil, "build", str(ROOT / "src/dialects/c/cc.coil"), "-O2",
+                 "-o", str(binary)])
+    if built.returncode:
+        raise SystemExit(f"could not build the C frontend:\n{built.stdout}{built.stderr}")
+    return str(binary)
+
+
+def native(coil, cc, name, sources, flags, work) -> tuple[int, str, str]:
     generated = work / f"{name}.coil"
     binary = work / f"{name}-coil"
-    lowered = run([coil, "run", str(ROOT / "src/dialects/c/cc.coil"), "--",
+    lowered = run([cc,
                    "-o", str(generated), *map(str, sources),
                    "-include", str(TARGET / "darwin-arm64.h"),
                    "-include", str(TARGET / "builtins.h"),
@@ -104,9 +118,10 @@ def main() -> int:
     failures = []
     with tempfile.TemporaryDirectory() as tmp:
         work = pathlib.Path(tmp)
+        cc = frontend(args.compiler, work)
         for name, sources, flags in cases:
             want_code, want_out = reference(name, sources, flags, work)
-            got_code, got_out, error = native(args.compiler, name, sources, flags, work)
+            got_code, got_out, error = native(args.compiler, cc, name, sources, flags, work)
             if error:
                 failures.append((name, f"did not compile: {error.splitlines()[-1][:120]}"))
             elif (got_code, got_out) != (want_code, want_out):

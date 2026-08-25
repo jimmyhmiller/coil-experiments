@@ -86,7 +86,15 @@ def main() -> int:
     lowered = doom.CACHE / f"{name}.coil"
     executable = doom.CACHE / name
 
-    frontend = [args.compiler, "run", str(ROOT / "src/dialects/c/cc.coil"), "--",
+    # The frontend is a Coil program like any other: it is built once and then
+    # run, which is what `coil run` does and saves repeating for every build.
+    cc = doom.CACHE / "cc"
+    built = subprocess.run([args.compiler, "build", str(ROOT / "src/dialects/c/cc.coil"),
+                            "-O2", "-o", str(cc)], cwd=ROOT)
+    if built.returncode != 0:
+        return 1
+
+    frontend = [str(cc),
                 "-o", str(lowered), *map(str, sources),
                 "-include", str(TARGET / "darwin-arm64.h"),
                 "-include", str(TARGET / "builtins.h"),
