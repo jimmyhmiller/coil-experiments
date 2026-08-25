@@ -38,6 +38,20 @@ Fetch, verify, inventory, and prepare the suite with:
 ```sh
 scripts/wasm-spec.sh inventory
 scripts/wasm-spec.sh prepare
+scripts/wasm-spec.sh test-integers
+```
+
+`test-integers` compiles each official `i32` and `i64` module through the reader
+and executes all homogeneous, single-result integer `assert_return` commands in
+one generated Coil entry point per module. It currently covers 350 `i32` and 205
+`i64` assertions. This is a semantic test—not merely a module compile check.
+
+An individual exported integer function can be checked through the same reader
+entry path:
+
+```sh
+coil run module.wasm --use experiments.wasm.lang -- \
+  --assert-i32 add 42 20 22
 ```
 
 The harness also builds WABT 1.0.12 at pinned commit

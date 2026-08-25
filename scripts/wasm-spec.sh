@@ -66,13 +66,61 @@ inventory() {
   find "$spec/test/core" -maxdepth 1 -name '*.wast' -exec basename {} \; | LC_ALL=C sort
 }
 
+run_integer_suite() {
+  kind=$1
+  command -v jq >/dev/null 2>&1 || {
+    echo "error: jq is required to run prepared spec assertions" >&2
+    exit 1
+  }
+  coil_bin=${COIL:-coil}
+  json="$prepared/$kind/script.json"
+  wasm="$prepared/$kind/script.0.wasm"
+  if [ ! -f "$json" ] || [ ! -f "$wasm" ]; then
+    echo "error: prepared $kind suite is missing; run scripts/wasm-spec.sh prepare" >&2
+    exit 1
+  fi
+  args_file=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-$kind.XXXXXX")
+  trap 'rm -f "$args_file"' EXIT HUP INT TERM
+  jq -r --arg kind "$kind" '
+    .commands[]
+    | select(.type == "assert_return"
+             and .action.type == "invoke"
+             and (.expected | length) == 1
+             and .expected[0].type == $kind
+             and ([.action.args[].type] | all(. == $kind)))
+    | .action.field,
+      .expected[0].value,
+      (.action.args | length | tostring),
+      (.action.args[].value)
+  ' "$json" > "$args_file"
+  count=$(jq -r --arg kind "$kind" '[
+    .commands[]
+    | select(.type == "assert_return"
+             and .action.type == "invoke"
+             and (.expected | length) == 1
+             and .expected[0].type == $kind
+             and ([.action.args[].type] | all(. == $kind)))
+  ] | length' "$json")
+  xargs "$coil_bin" run "$wasm" --use experiments.wasm.lang -- \
+    "--assert-$kind-batch" < "$args_file"
+  rm -f "$args_file"
+  trap - EXIT HUP INT TERM
+  echo "$kind: $count official assert_return checks passed"
+}
+
+test_integers() {
+  run_integer_suite i32
+  run_integer_suite i64
+}
+
 case "${1:-inventory}" in
   fetch) fetch_suite ;;
   fetch-wabt) fetch_wabt ;;
   prepare) prepare_suite ;;
   inventory) inventory ;;
+  test-integers) test_integers ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers]" >&2
     exit 2
     ;;
 esac

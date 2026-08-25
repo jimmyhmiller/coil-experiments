@@ -1,7 +1,7 @@
 (module experiments.wasm.reader)
 
 (import "coil.primitive" :as primitive)
-(import "coil.alloc" :use [malloc-allocator])
+(import "coil.alloc" :as alloc)
 (import "coil.slice" :as slice)
 (import "experiments.wasm.decoder" :as decoder)
 (import "experiments.wasm.codegen" :as codegen)
@@ -32,31 +32,161 @@
                   (store! i (+ (load i) 1)))))
           (load equal)))))
 
+(defn argument-code [(a (dyn alloc/Allocator)) (text (slice u8))] (-> Code)
+  (primitive/code-read text `(reader-config)))
+
+(defn wasm-integer-code [(a (dyn alloc/Allocator)) (context Code)
+                         (text (slice u8))] (-> Code)
+  (let [n (slice/slice-len text)
+        negative (and (> n 0) (= (slice/slice-get text 0) (primitive/cast u8 45)))
+        (mut i) (if negative 1 0)
+        (mut value) 0]
+    (if (>= (load i) n)
+        (primitive/error "WASM reader: expected integer bit pattern")
+        (loop
+          (if (>= (load i) n)
+              (break)
+              (let [b (primitive/cast i64 (slice/slice-get text (load i)))]
+                (if (or (< b 48) (> b 57))
+                    (primitive/error "WASM reader: expected integer bit pattern")
+                    (do
+                      (store! value
+                              (primitive/iadd (primitive/imul (load value) 10)
+                                              (- b 48)))
+                      (store! i (+ (load i) 1))))))))
+    (let [signed (if negative (primitive/isub 0 (load value)) (load value))]
+      `~signed)))
+
+(defn integer-argument [(a (dyn alloc/Allocator)) (context Code) (cast-id Code)
+                        (i32-mode bool) (text (slice u8))] (-> Code)
+  (let [raw (wasm-integer-code a context text)]
+    (if i32-mode `(~cast-id i32 ~raw) raw)))
+
+(defn decimal-natural [(a (dyn alloc/Allocator)) (context Code)
+                       (text (slice u8))] (-> i64)
+  (let [(mut value) 0
+        (mut i) 0]
+    (if (= (slice/slice-len text) 0)
+        (primitive/error "WASM reader: expected decimal integer")
+        (loop
+          (if (>= (load i) (slice/slice-len text))
+              (break)
+              (let [b (primitive/cast i64 (slice/slice-get text (load i)))]
+                (if (or (< b 48) (> b 57))
+                    (primitive/error "WASM reader: expected decimal integer")
+                    (do (store! value (+ (* (load value) 10) (- b 48)))
+                        (store! i (+ (load i) 1))))))))
+    (load value)))
+
+(defn coil-export-name [(name (slice u8))] (-> (slice u8))
+  (cond (= name "and") "wasm-and"
+        (= name "or") "wasm-or"
+        :else name))
+
+(defn assertion-chain [(a (dyn alloc/Allocator)) (context Code) (args Code)
+                       (at i64) (i32-mode bool)] (-> Code)
+  (if (>= at (primitive/code-count args))
+      `0
+      (if (> (+ at 3) (primitive/code-count args))
+          (primitive/error "WASM reader: truncated batch assertion")
+          (let [callee (primitive/datum->syntax
+                         context
+                         (coil-export-name
+                           (primitive/code-str (primitive/code-nth args at))))
+                cast-id (primitive/datum->syntax context "primitive/cast")
+                expected (integer-argument
+                           a context cast-id i32-mode
+                           (primitive/code-str (primitive/code-nth args (+ at 1))))
+                arity (decimal-natural a context
+                        (primitive/code-str (primitive/code-nth args (+ at 2))))
+                next (+ (+ at 3) arity)]
+            (if (> next (primitive/code-count args))
+                (primitive/error "WASM reader: truncated batch assertion arguments")
+                (let [arguments (primitive/code-list-new)
+                      (mut i) (+ at 3)]
+                  (loop
+                    (if (>= (load i) next)
+                        (break)
+                        (do
+                          (primitive/code-list-push!
+                            arguments
+                            (integer-argument
+                              a context cast-id i32-mode
+                              (primitive/code-str (primitive/code-nth args (load i)))))
+                          (store! i (+ (load i) 1)))))
+                  (let [argument-list (primitive/code-list-done arguments)
+                        rest (assertion-chain a context args next i32-mode)]
+                    `(if (= (~callee ~@argument-list) ~expected) ~rest 1))))))))
+
+;; Direct reader invocations can execute an exported integer function. This is
+;; both a convenient CLI and the semantic conformance harness entry point:
+;;   coil run m.wasm --use experiments.wasm.lang -- --assert-i32 add 42 20 22
+;; Arguments after the expected value use the selected integer type.
+(defn assertion-main [(a (dyn alloc/Allocator)) (context Code) (args Code)] (-> Code)
+  (let [mode (primitive/code-str (primitive/code-nth args 1))
+        i32-mode (= mode "--assert-i32")
+        i64-mode (= mode "--assert-i64")
+        i32-batch (= mode "--assert-i32-batch")
+        i64-batch (= mode "--assert-i64-batch")]
+    (if (or i32-batch i64-batch)
+        (assertion-chain a context args 2 i32-batch)
+        (if (or (not (or i32-mode i64-mode)) (< (primitive/code-count args) 4))
+        (primitive/error "WASM reader: expected --assert-i32|--assert-i64 EXPORT EXPECTED [ARGS...]")
+        (let [callee (primitive/datum->syntax
+                       context
+                       (coil-export-name
+                         (primitive/code-str (primitive/code-nth args 2))))
+              cast-id (primitive/datum->syntax context "primitive/cast")
+              expected-raw (wasm-integer-code
+                             a context (primitive/code-str (primitive/code-nth args 3)))
+              arguments (primitive/code-list-new)
+              (mut i) 4]
+          (loop
+            (if (>= (load i) (primitive/code-count args))
+                (break)
+                (let [raw (wasm-integer-code
+                            a context
+                            (primitive/code-str (primitive/code-nth args (load i))))]
+                  (primitive/code-list-push!
+                    arguments
+                    (if i32-mode `(~cast-id i32 ~raw) raw))
+                  (store! i (+ (load i) 1)))))
+          (let [argument-list (primitive/code-list-done arguments)
+                expected (if i32-mode `(~cast-id i32 ~expected-raw) expected-raw)]
+            `(if (= (~callee ~@argument-list) ~expected) 0 1)))))))
+
+(defn generated-main [(a (dyn alloc/Allocator)) (context Code)] (-> Code)
+  (let [args (primitive/code-nth context 5)]
+    (if (> (primitive/code-count args) 1)
+        (assertion-main a context args)
+        `0)))
+
 ;; Initial reader entry. Binary validation is already Coil-native; section
 ;; decoding and code generation are added feature group by feature group.
 (defn read-wasm [(context Code)] (-> Code)
   (let [source (primitive/code-str (primitive/code-nth context 2))
         path (primitive/code-str (primitive/code-nth context 1))
-        main-name (primitive/datum->syntax context "main")]
+        main-name (primitive/datum->syntax context "main")
+        main-body (generated-main (alloc/malloc-allocator) context)]
     (if (suffix? path ".wat")
         (let [source-code (primitive/code-nth `(source ~source) 1)
               parsed (primitive/code-read source-code `(reader-config))
-              functions (wat/compile-wat (malloc-allocator) context parsed)]
+              functions (wat/compile-wat (alloc/malloc-allocator) context parsed)]
           `(do
              (module wasm-program)
              (import "coil.primitive" :as primitive)
              (import "experiments.wasm.runtime" :as wasmrt)
              ~@functions
-             (defn ~main-name [] (-> i64) 0)))
+             (defn ~main-name [] (-> i64) ~main-body)))
         (match (decoder/module-sections source)
           (decoder/DecodeError [at message]
             (primitive/error message))
           (decoder/Decoded [sections]
             (let [functions (codegen/compile-defined-functions
-                              (malloc-allocator) context sections)]
+                              (alloc/malloc-allocator) context sections)]
               `(do
                  (module wasm-program)
                  (import "coil.primitive" :as primitive)
                  (import "experiments.wasm.runtime" :as wasmrt)
                  ~@functions
-                 (defn ~main-name [] (-> i64) 0))))))))
+                 (defn ~main-name [] (-> i64) ~main-body))))))))
