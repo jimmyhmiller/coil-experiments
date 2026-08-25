@@ -2,6 +2,7 @@
 
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
+(import "coil.mem" :as mem)
 (import "coil.slice" :as slice)
 (import "coil.socket" :as socket)
 (import "coil.str" :as str)
@@ -10,8 +11,6 @@
 (import "experiments.httpd.core" :as core)
 
 (const REQUEST_BUFFER_BYTES 16384)
-(const INCOMPLETE_REQUEST 14)
-(const PARSE_PAUSED 21)
 
 (defstruct Server
   [(listener socket/TcpListener)
@@ -37,10 +36,26 @@
                         :query (slice/subslice [u8] target (+ at 1) (slice/slice-len target))
                         :body body))))
 
+(defn owned-copy [(bytes (slice u8))] (-> (Result (slice u8) i64))
+  (let [(mut memory) (primitive/zeroed (Option (slice u8)))]
+    (match (alloc/alloc-bytes (alloc/malloc-allocator) (slice/slice-len bytes) 1)
+      (None [] (Err 1))
+      (Some [copy]
+           (do
+             (mem/mem-copy [u8]
+                           (slice/slice-data copy)
+                           (slice/slice-data bytes)
+                           (slice/slice-len bytes))
+             (Ok copy))))))
+
 (defn request-from-http [(parsed http/Request)] (-> core/Request)
-  (split-target (slice/slice-copy [u8] (alloc/malloc-allocator) (http/method parsed))
-                (slice/slice-copy [u8] (alloc/malloc-allocator) (http/target parsed))
-                (http/body parsed)))
+  (match (owned-copy (http/method parsed))
+    (Err [_] (split-target "" "" (http/body parsed)))
+    (Ok [method]
+        (match (owned-copy (http/target parsed))
+          (Err [_] (split-target "" "" (http/body parsed)))
+          (Ok [target]
+              (split-target method target (http/body parsed)))))))
 
 (defn write-all! [(connection (ptr socket/TcpConnection)) (bytes (slice u8))] (-> i64)
   (let [(mut at) 0
@@ -96,34 +111,33 @@
 (defn read-request! [(connection (ptr socket/TcpConnection))] (-> (Result http/Request i64))
   (let [buffer (primitive/alloc-stack (array u8 16384))
         (mut received) 0
-        (mut consumed) 0
         (mut error) 0
         (mut complete) false
         (mut parsed) (primitive/zeroed http/Request)]
     (loop (if (or (not (= (load error) 0)) (load complete)) (break)
-           (if (< (load consumed) (load received))
-               (match (http/parse-request (alloc/malloc-allocator)
-                                          (slice/slice-new [u8]
-                                                           (primitive/index buffer (load consumed))
-                                                           (- (load received) (load consumed))))
-                 (Ok [request]
+           (match (socket/tcp-read connection
+                                   (primitive/cast (ptr i8)
+                                                   (primitive/index buffer (load received)))
+                                   (- REQUEST_BUFFER_BYTES (load received)))
+             (Err [e] (set! error 1))
+             (Ok [count]
+                 (if (<= count 0)
+                     (set! error 1)
                      (do
-                       (set! parsed request)
-                       (set! consumed (+ (load consumed) (http/consumed request)))
-                       (set! complete true)))
-                 (Err [failure]
-                      (if (= (http/error-code failure) INCOMPLETE_REQUEST)
-                          (set! consumed (load received))
-                          (set! error (http/error-code failure)))))
-               (match (socket/tcp-read connection
-                                       (primitive/cast (ptr i8)
-                                                       (primitive/index buffer (load received)))
-                                       (- REQUEST_BUFFER_BYTES (load received)))
-                 (Err [e] (set! error 1))
-                 (Ok [count]
-                     (if (<= count 0)
-                         (set! error 1)
-                         (set! received (+ (load received) count))))))))
+                       (set! received (+ (load received) count))
+                       (fmt/print-line (io/stderr) "READ")
+                       (fmt/print-i (io/stderr) (load received))
+                       (fmt/print-nl (io/stderr))
+                       (match (http/parse-request
+                                (alloc/malloc-allocator)
+                                (slice/slice-new [u8] (primitive/cast (ptr u8) buffer) (load received)))
+                         (Ok [request]
+                             (do
+                               (set! parsed request)
+                               (set! complete true)))
+                         (Err [failure]
+                              (when (= (http/error-code failure) 14)
+                                (http/request-free (load parsed)))))))))))
     (cond (not (= (load error) 0)) (Err (load error))
           (load complete) (Ok (load parsed))
           :else (Err 1))))
