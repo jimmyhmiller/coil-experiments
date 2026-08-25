@@ -104,7 +104,7 @@
                        (p (mut wasm/Parser)) (stack (mut Code))
                        (forms-builder CodeBuilder) (allow-else bool)
                        (region-base Code) (region-result-tag i64)
-                       (locals Code) (function-names Code)
+                       (locals Code) (globals Code) (function-names Code)
                        (function-indices (al/ArrayList i64))
                        (types (al/ArrayList wasm/FuncType))] (-> i64)
   (let [(mut ended) false
@@ -126,7 +126,7 @@
                           block-forms (primitive/code-list-new)
                           block-stop (compile-region! a context (mut p) (mut block-stack)
                                                       block-forms false base result-tag
-                                                      locals function-names
+                                                      locals globals function-names
                                                       function-indices types)]
                       (if (!= block-stop 0x0b)
                           (primitive/error "WebAssembly validation: malformed block")
@@ -155,7 +155,7 @@
                                 then-forms (primitive/code-list-new)
                                 then-stop (compile-region! a context (mut p) (mut then-stack)
                                                            then-forms true base result-tag
-                                                           locals function-names
+                                                           locals globals function-names
                                                            function-indices types)
                                 then-code (finish-region a base (mut then-stack) then-forms result-tag)
                                 (mut else-stack) base
@@ -165,7 +165,7 @@
                                                       (compile-region! a context (mut p)
                                                                        (mut else-stack) else-forms
                                                                        false base result-tag
-                                                                       locals function-names
+                                                                       locals globals function-names
                                                                        function-indices types)]
                                                 (if (!= else-stop 0x0b)
                                                     (primitive/error "WebAssembly validation: malformed if")
@@ -206,7 +206,7 @@
                                     continue-stop
                                       (compile-region! a context (mut p) (mut continue-stack)
                                                        continue-forms false region-base
-                                                       region-result-tag locals function-names
+                                                       region-result-tag locals globals function-names
                                                        function-indices types)
                                     continue-code
                                       (if (!= continue-stop 0x0b)
@@ -328,6 +328,34 @@
                                       (let [load-id (primitive/datum->syntax context "load")]
                                         (store! stack `(~tag (~load-id ~cell) ~(load stack)))
                                         0)
+                                      0))))))
+                  (= opcode 0x23)
+                    (let [index (wasm/parser-u32! (mut p))]
+                      (if (>= index (primitive/code-count globals))
+                          (primitive/error "WebAssembly validation: global index out of bounds")
+                          (let [global (primitive/code-nth globals index)
+                                tag (primitive/code-int (primitive/code-nth global 0))
+                                accessor (primitive/code-nth global 2)
+                                load-id (primitive/datum->syntax context "load")]
+                            (store! stack `(~tag (~load-id (~accessor)) ~(load stack)))
+                            0)))
+                  (= opcode 0x24)
+                    (let [index (wasm/parser-u32! (mut p))]
+                      (if (>= index (primitive/code-count globals))
+                          (primitive/error "WebAssembly validation: global index out of bounds")
+                          (let [global (primitive/code-nth globals index)
+                                tag (primitive/code-int (primitive/code-nth global 0))
+                                mutable (primitive/code-int (primitive/code-nth global 1))
+                                accessor (primitive/code-nth global 2)
+                                value (pop-node! (mut stack))]
+                            (if (= mutable 0)
+                                (primitive/error "WebAssembly validation: global.set of immutable global")
+                                (if (!= (node-kind value) tag)
+                                    (primitive/error "WebAssembly validation: global.set type mismatch")
+                                    (let [store-id (primitive/datum->syntax context "store!")]
+                                      (primitive/code-list-push!
+                                        forms-builder
+                                        `(~store-id (~accessor) ~(primitive/code-nth value 1)))
                                       0))))))
                   (= opcode 0x10)
                     (let [index (wasm/parser-u32! (mut p))]
@@ -729,7 +757,7 @@
 
 (defn compile-expression [(a (dyn alloc/Allocator)) (context Code)
                           (signature wasm/FuncType) (body wasm/FuncBody)
-                          (locals Code) (function-names Code)
+                          (locals Code) (globals Code) (function-names Code)
                           (function-indices (al/ArrayList i64))
                           (types (al/ArrayList wasm/FuncType))] (-> Code)
   (let [b body
@@ -740,7 +768,7 @@
                        0
                        (kind-tag (al/al-get (.results signature) 0)))
         stop (compile-region! a context (mut p) (mut stack) forms-builder false `() result-tag
-                              locals function-names function-indices types)]
+                              locals globals function-names function-indices types)]
     (if (!= stop 0x0b)
         (primitive/error "WebAssembly function expression ended unexpectedly")
         0)
@@ -765,7 +793,7 @@
 
 (defn function-form [(a (dyn alloc/Allocator)) (context Code) (name Code)
                      (signature wasm/FuncType) (body wasm/FuncBody)
-                     (function-names Code) (function-indices (al/ArrayList i64))
+                     (globals Code) (function-names Code) (function-indices (al/ArrayList i64))
                      (types (al/ArrayList wasm/FuncType))] (-> Code)
   (let [sig signature
         b body
@@ -809,12 +837,69 @@
               (store! j (+ (load j) 1)))))
       (let [binding-vector (primitive/code-list-done binding-code)
             body-code (compile-expression a context sig b local-code
-                                          function-names function-indices types)
+                                          globals function-names function-indices types)
             result-type (if (= (al/al-len (.results sig)) 0)
                             `void
                             (type-code context (al/al-get (.results sig) 0)))]
         `(defn ~name [~@param-code] (-> ~result-type)
            (let [~@binding-vector] ~body-code))))))
+
+(defn global-initializer [(context Code) (global wasm/Global)] (-> Code)
+  (let [g global
+        bits (.initializer-bits g)
+        cast-id (primitive/datum->syntax context "primitive/cast")]
+    (match (.kind g)
+      (wasm/I32 [] `(~cast-id i32 ~bits))
+      (wasm/I64 [] `~bits)
+      (wasm/F32 []
+        (let [from (primitive/datum->syntax context "wasmrt/f32-from-bits")]
+          `(~from (~cast-id i32 ~bits))))
+      (wasm/F64 []
+        (let [from (primitive/datum->syntax context "wasmrt/f64-from-bits")]
+          `(~from ~bits))))))
+
+(defn global-accessor-form [(context Code) (name Code) (global wasm/Global)] (-> Code)
+  (let [g global
+        type (type-code context (.kind g))
+        initializer (global-initializer context g)
+        cell (primitive/fresh-identifier "wasm-global-cell")
+        initialized (primitive/fresh-identifier "wasm-global-initialized")
+        alloc-static-id (primitive/datum->syntax context "primitive/alloc-static")
+        load-id (primitive/datum->syntax context "load")
+        store-id (primitive/datum->syntax context "store!")]
+    `(defn ~name [] (-> (ptr ~type))
+       (let [~cell (~alloc-static-id ~type)
+             ~initialized (~alloc-static-id i32)]
+         (if (= (~load-id ~initialized) 0)
+             (do (~store-id ~cell ~initializer)
+                 (~store-id ~initialized 1))
+             0)
+         ~cell))))
+
+(defn emit-globals! [(context Code) (forms CodeBuilder)
+                     (globals (al/ArrayList wasm/Global))] (-> Code)
+  (let [entries (primitive/code-list-new)
+        (mut i) 0]
+    (loop
+      (if (>= (load i) (al/al-len globals))
+          (break)
+          (let [global (al/al-get globals (load i))
+                accessor (primitive/fresh-identifier "wasm-global")]
+            (primitive/code-list-push! forms
+                                       (global-accessor-form context accessor global))
+            (primitive/code-list-push!
+              entries
+              `(~(kind-tag (.kind global)) ~(if (.mutable global) 1 0) ~accessor))
+            (store! i (+ (load i) 1)))))
+    (primitive/code-list-done entries)))
+
+(defn compile-globals [(a (dyn alloc/Allocator)) (context Code)
+                       (payload (slice u8)) (forms CodeBuilder)] (-> Code)
+  (if (= (slice-len payload) 0)
+      `()
+      (match (wasm/global-section a payload)
+        (wasm/DecodeError [_ message] (primitive/error message))
+        (wasm/Decoded [globals] (emit-globals! context forms globals)))))
 
 (defn export-wrapper-form [(context Code) (export-name (slice u8)) (callee Code)
                            (signature wasm/FuncType)] (-> Code)
@@ -844,6 +929,7 @@
           (~callee ~@argument-code))))))
 
 (defn emit-export-wrappers! [(context Code) (forms CodeBuilder) (names Code)
+                             (globals Code)
                              (indices (al/ArrayList i64))
                              (types (al/ArrayList wasm/FuncType))
                              (exports (al/ArrayList wasm/Export))] (-> i64)
@@ -864,14 +950,37 @@
                         (primitive/code-list-push! forms (primitive/code-nth wrapper 0))
                         (primitive/code-list-push! forms (primitive/code-nth wrapper 1))
                         0)))
-                0)
+                (if (= (.kind e) 3)
+                    (let [global-index (.index e)]
+                      (if (>= global-index (primitive/code-count globals))
+                          (primitive/error "WebAssembly validation: exported global index out of bounds")
+                          (let [global (primitive/code-nth globals global-index)
+                                tag (primitive/code-int (primitive/code-nth global 0))
+                                accessor (primitive/code-nth global 2)
+                                name-text (cond (= (.name e) "and") "wasm-and"
+                                                (= (.name e) "or") "wasm-or"
+                                                :else (.name e))
+                                name (primitive/datum->syntax context name-text)
+                                load-id (primitive/datum->syntax context "load")
+                                type (cond (= tag 1) `i32
+                                           (= tag 2) `i64
+                                           (= tag 3) `f32
+                                           (= tag 4) `f64
+                                           :else (primitive/error "invalid global type tag"))]
+                            (primitive/code-list-push! forms `(export ~name))
+                            (primitive/code-list-push!
+                              forms
+                              `(defn ~name [] (-> ~type) (~load-id (~accessor))))
+                            0)))
+                    0))
             (store! i (+ (load i) 1)))))
     0))
 
 (defn compile-defined-functions [(a (dyn alloc/Allocator)) (context Code)
                                  (sections wasm/Sections)] (-> Code)
   (let [s sections
-        forms (primitive/code-list-new)]
+        forms (primitive/code-list-new)
+        globals (compile-globals a context (.globals s) forms)]
     (if (= (slice-len (.functions s)) 0)
         (primitive/code-list-done forms)
         (match (wasm/type-section a (.types s))
@@ -914,12 +1023,12 @@
                                                        (primitive/code-nth names (load i))
                                                        (al/al-get types type-index)
                                                        (al/al-get bodies (load i))
-                                                       names indices types)))
+                                                       globals names indices types)))
                                   (store! i (+ (load i) 1)))))
                           (if (= (slice-len (.exports s)) 0)
                               0
                               (match (wasm/export-section a (.exports s))
                                 (wasm/DecodeError [_ message] (primitive/error message))
                                 (wasm/Decoded [exports]
-                                  (emit-export-wrappers! context forms names indices types exports))))))
+                                  (emit-export-wrappers! context forms names globals indices types exports))))))
                       (primitive/code-list-done forms)))))))))))
