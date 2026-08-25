@@ -196,8 +196,38 @@ static void update_modifiers(unsigned long flags)
 
 static void post_mouse(void);
 
+/* The cursor is hidden and decoupled from the pointer only while this window has
+   the keyboard. Doing it once at start-up would leave the machine without a
+   cursor whenever Doom is not the app in front. `hide` and `unhide` are counted,
+   so each transition is taken exactly once. */
+static int grabbed;
+
+static void follow_focus(void)
+{
+    /* A BOOL is returned in the low byte, so only the low byte is read. */
+    int key = (int) (SEND0(long, window, SEL_("isKeyWindow")) & 1);
+
+    if (key && !grabbed)
+    {
+        CGAssociateMouseAndMouseCursorPosition(0);
+        SEND0(id, CLS("NSCursor"), SEL_("hide"));
+        grabbed = 1;
+    }
+    else if (!key && grabbed)
+    {
+        SEND0(id, CLS("NSCursor"), SEL_("unhide"));
+        CGAssociateMouseAndMouseCursorPosition(1);
+        grabbed = 0;
+        /* Motion gathered while leaving would arrive as a jump on return. */
+        mouse_dx = 0.0;
+        mouse_dy = 0.0;
+        mouse_buttons = 0;
+    }
+}
+
 static void pump_events(void)
 {
+    follow_focus();
     for (;;)
     {
         id event = SEND4(id, app, SEL_("nextEventMatchingMask:untilDate:inMode:dequeue:"),
@@ -316,11 +346,9 @@ void DG_Init(void)
     run_loop_mode = SEND1(id, CLS("NSString"), SEL_("stringWithUTF8String:"),
                           const char *, "kCFRunLoopDefaultMode");
 
-    /* Report motion continuously, and decouple the cursor so it neither drifts
-       out of the window nor bounds against the edge of the screen. */
+    /* Report motion continuously. The cursor itself is hidden and decoupled by
+       follow_focus, only while the window has the keyboard. */
     SEND1(id, window, SEL_("setAcceptsMouseMovedEvents:"), long, 1);
-    CGAssociateMouseAndMouseCursorPosition(0);
-    SEND0(id, CLS("NSCursor"), SEL_("hide"));
 }
 
 void DG_DrawFrame(void)
