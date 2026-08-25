@@ -50,6 +50,7 @@ scripts/wasm-spec.sh test-start
 scripts/wasm-spec.sh test-basic-instructions
 scripts/wasm-spec.sh test-evaluation-order
 scripts/wasm-spec.sh test-functions
+scripts/wasm-spec.sh test-globals
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -124,6 +125,11 @@ returns, 38 validation failures, 16 malformed-text rejections, and 14 runtime
 traps. This covers recursion, forward calls, function/table index validation,
 deep stack use, and trap unwinding. The cumulative official assertion total is
 7,920.
+
+`test-globals` passes the complete official MVP `globals` file: 45 returns, 23
+validation failures, four malformed-binary rejections, and one runtime trap.
+Mutable cells, immutable values, initialization, exports, and global index/type
+validation are covered. The cumulative official assertion total is 7,993.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and
