@@ -81,6 +81,10 @@
    ;; The locals of the function being emitted whose address is taken, and so
    ;; need storage rather than a binding.
    (addressed (hm/HashMap (slice u8) bool))
+   ;; The ones the function assigns to, and the parameters it does neither to,
+   ;; which are the argument itself and need nothing of their own.
+   (assigned (hm/HashMap (slice u8) bool))
+   (direct (hm/HashMap (slice u8) bool))
    ;; What each object with static storage is defined to hold, filled in from
    ;; the start-up stores whose values are constants.
    (images (hm/HashMap (slice u8) (ptr Image)))
@@ -565,6 +569,10 @@
       0
       (do
         (if (= (nd/nd-kind n) nd/ND-ADDR) (note-addressed! (mut e) (nd/nd-lhs n)) 0)
+        (if (or (= (nd/nd-kind n) nd/ND-ASSIGN)
+                (or (= (nd/nd-kind n) nd/ND-COMPOUND) (= (nd/nd-kind n) nd/ND-MEMZERO)))
+            (note-assigned! (mut e) (nd/nd-lhs n))
+            0)
         (find-addressed! (mut e) (nd/nd-lhs n))
         (find-addressed! (mut e) (nd/nd-rhs n))
         (find-addressed! (mut e) (nd/nd-test n))
@@ -584,6 +592,24 @@
               (do (find-addressed! (mut e) (al/al-get [(ptr nd/Node)] list (load i)))
                   (store! i (+ (load i) 1)))))
     0))
+
+;; A C parameter that the body never assigns to is the argument: there is
+;; nothing to copy it into, and nothing to load it from. C's parameters are
+;; ordinary locals, so many of them are assigned; most are not.
+(defn note-assigned! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
+  (if (and (!= (primitive/cast i64 n) 0) (= (nd/nd-kind n) nd/ND-VAR))
+      (let [o (nd/nd-obj n)]
+        (if (and (!= (primitive/cast i64 o) 0) (nd/obj-local? o))
+            (do (hm/hm-put! [(slice u8) bool] (mut (field e assigned)) (obj-key (mut e) o) true) 0)
+            0))
+      0))
+
+(defn direct-param? [(e (mut Emitter)) (o (ptr nd/Obj))] (-> bool)
+  (and (bound-local? (mut e) o)
+       (not (hm/hm-contains? (load (field e assigned)) (obj-key (mut e) o)))))
+
+(defn direct-value? [(e (mut Emitter)) (o (ptr nd/Obj))] (-> bool)
+  (hm/hm-contains? (load (field e direct)) (obj-key (mut e) o)))
 
 (defn note-addressed! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
   (if (and (!= (primitive/cast i64 n) 0) (= (nd/nd-kind n) nd/ND-VAR))
@@ -961,6 +987,10 @@
            (or (= k nd/ND-ADD) (or (= k nd/ND-SUB) (= k nd/ND-MUL))) true
            (or (= k nd/ND-DIV) (or (= k nd/ND-MOD) (= k nd/ND-SHL))) true
            (or (= k nd/ND-SHR) (or (= k nd/ND-BITAND) (or (= k nd/ND-BITOR) (= k nd/ND-BITXOR)))) true
+           ;; A comparison and the logical operators now say what type their
+           ;; `int` is, so a cast to that type adds nothing.
+           (or (= k nd/ND-EQ) (or (= k nd/ND-NE) (or (= k nd/ND-LT) (= k nd/ND-LE)))) true
+           (or (= k nd/ND-NOT) (or (= k nd/ND-LOGAND) (= k nd/ND-LOGOR))) true
            (= k nd/ND-CALL) (!= (ct/ty-kind (nd/nd-type n)) ct/TY-VOID)
            (= k nd/ND-MEMBER) (< (nd/nd-member-bit-width n) 0)
            (or (= k nd/ND-ASSIGN) (= k nd/ND-COMPOUND))
@@ -1296,6 +1326,8 @@
                       (put! (mut e) (callee-name (mut e) (nd/nd-obj n)))
                       (put! (mut e) ")"))
                 (= (ct/ty-kind vt) ct/TY-ARRAY) (emit-addr! (mut e) n)
+                (direct-value? (mut e) (nd/nd-obj n))
+                  (put! (mut e) (slot-of (mut e) (nd/nd-obj n)))
                 :else
                   (do (put! (mut e) "(load ") (emit-addr! (mut e) n) (put! (mut e) ")"))))
           (= k nd/ND-MEMBER)
@@ -2198,14 +2230,42 @@
                   (hm/hm-put! [(slice u8) bool] (mut (field e names-taken)) unique true)
                   unique)))))))
 
+;; A parameter the body only reads is the argument itself. Its name is the
+;; variable's, because that is what the body calls it, and it gets neither a
+;; binding of its own nor a copy into one.
+(defn claim-direct-params! [(e (mut Emitter)) (f (ptr nd/Obj))] (-> i64)
+  (let [params (nd/obj-params f)
+        count (al/al-len [(ptr nd/Obj)] params)
+        (mut i) 0]
+    (loop (if (>= (load i) count)
+              (break)
+              (let [o (al/al-get [(ptr nd/Obj)] params (load i))]
+                (if (and (direct-param? (mut e) o) (> (slice-len (nd/obj-name o)) 0))
+                    (do (bind-slot! (mut e) o (local-name! (mut e) o))
+                        (hm/hm-put! [(slice u8) bool]
+                                    (mut (field e direct))
+                                    (obj-key (mut e) o)
+                                    true)
+                        0)
+                    0)
+                (store! i (+ (load i) 1)))))
+    0))
+
 (defn emit-locals! [(e (mut Emitter)) (f (ptr nd/Obj))] (-> i64)
   (let [locals (nd/obj-locals f)
         count (al/al-len [(ptr nd/Obj)] locals)
         (mut i) 0]
     (loop (if (>= (load i) count)
               (break)
-              (let [o (al/al-get [(ptr nd/Obj)] locals (load i))
-                    slot (local-name! (mut e) o)]
+              (let [o (al/al-get [(ptr nd/Obj)] locals (load i))]
+                (if (direct-value? (mut e) o)
+                    0
+                    (emit-local! (mut e) o))
+                (store! i (+ (load i) 1))))))
+  0)
+
+(defn emit-local! [(e (mut Emitter)) (o (ptr nd/Obj))] (-> i64)
+  (let [slot (local-name! (mut e) o)]
                 (bind-slot! (mut e) o slot)
                 (if (bound-local? (mut e) o)
                     (do (put! (mut e) " (mut ")
@@ -2217,8 +2277,7 @@
                         (put! (mut e) slot)
                         (put! (mut e) " (alloc-stack ")
                         (emit-type! (mut e) (nd/obj-type o))
-                        (put! (mut e) ")")))
-                (store! i (+ (load i) 1))))))
+                        (put! (mut e) ")"))))
   0)
 
 ;; Parameters arrive as values and are copied into their slots, so the body can
@@ -2273,12 +2332,16 @@
 ;; The incoming value of a parameter, which the body immediately copies into the
 ;; local of the same name. `a_` keeps the two apart.
 (defn param-name [(e (mut Emitter)) (o (ptr nd/Obj)) (index i64)] (-> (slice u8))
-  (if (= (slice-len (nd/obj-name o)) 0)
+  (cond
+    ;; A parameter the body only reads is named after the variable: there is no
+    ;; second thing to tell it apart from.
+    (direct-value? (mut e) o) (slot-of (mut e) o)
+    (= (slice-len (nd/obj-name o)) 0)
       (let [(mut b) (str/sb-new (load (field e a)))]
         (str/sb-push-str! (mut b) "a")
         (str/sb-push-i64! (mut b) index)
         (str/sb-str (load (mut b))))
-      (ident (mut e) "a_" (nd/obj-name o))))
+    :else (ident (mut e) "a_" (nd/obj-name o))))
 
 (defn emit-param-copies! [(e (mut Emitter)) (f (ptr nd/Obj))] (-> i64)
   (let [params (nd/obj-params f)
@@ -2287,11 +2350,13 @@
     (loop (if (>= (load i) count)
               (break)
               (let [o (al/al-get [(ptr nd/Obj)] params (load i))]
-                (put! (mut e) " (set! ")
-                (put! (mut e) (slot-of (mut e) o))
-                (put! (mut e) " ")
-                (put! (mut e) (param-name (mut e) o (load i)))
-                (put! (mut e) ")")
+                (if (direct-value? (mut e) o)
+                    0
+                    (do (put! (mut e) " (set! ")
+                        (put! (mut e) (slot-of (mut e) o))
+                        (put! (mut e) " ")
+                        (put! (mut e) (param-name (mut e) o (load i)))
+                        (put! (mut e) ")")))
                 (store! i (+ (load i) 1))))))
   0)
 
@@ -2321,7 +2386,12 @@
           (hm/hm-new [(slice u8) bool] (load (field e a)) (str/str-keyops)))
   (store! (field e addressed)
           (hm/hm-new [(slice u8) bool] (load (field e a)) (str/str-keyops)))
+  (store! (field e assigned)
+          (hm/hm-new [(slice u8) bool] (load (field e a)) (str/str-keyops)))
+  (store! (field e direct)
+          (hm/hm-new [(slice u8) bool] (load (field e a)) (str/str-keyops)))
   (find-addressed! (mut e) (nd/obj-body f))
+  (claim-direct-params! (mut e) f)
   (let [ty (nd/obj-type f)
         params (nd/obj-params f)
         count (al/al-len [(ptr nd/Obj)] params)
@@ -3085,6 +3155,8 @@
                         :record-taken (hm/hm-new [(slice u8) bool] a (str/str-keyops))
                         :names-taken (hm/hm-new [(slice u8) bool] a (str/str-keyops))
                         :addressed (hm/hm-new [(slice u8) bool] a (str/str-keyops))
+                        :assigned (hm/hm-new [(slice u8) bool] a (str/str-keyops))
+                        :direct (hm/hm-new [(slice u8) bool] a (str/str-keyops))
                         :images (hm/hm-new [(slice u8) (ptr Image)] a (str/str-keyops))
                         :scratch (alloc/box! a i64 0)
                         :va-areas (hm/hm-new [(slice u8) (slice u8)] a (str/str-keyops))
