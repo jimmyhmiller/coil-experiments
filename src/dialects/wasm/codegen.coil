@@ -1,0 +1,272 @@
+(module experiments.wasm.codegen)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.slice" :use [slice-len])
+(import "experiments.wasm.decoder" :as wasm)
+
+(defn kind-tag [(kind wasm/ValType)] (-> i64)
+  (match kind
+    (wasm/I32 [] 1)
+    (wasm/I64 [] 2)
+    (wasm/F32 [] 3)
+    (wasm/F64 [] 4)))
+
+(defn type-code [(context Code) (kind wasm/ValType)] (-> Code)
+  (match kind
+    (wasm/I32 [] `i32)
+    (wasm/I64 [] `i64)
+    (wasm/F32 [] `f32)
+    (wasm/F64 [] `f64)))
+
+;; Compile-time operand stacks are persistent Code triples `(tag expr tail)`.
+;; Code has no runtime layout, so it must not be put in an ordinary struct or
+;; ArrayList element.
+(defn pop-node! [(stack (mut Code))] (-> Code)
+  (if (!= (primitive/code-count (load stack)) 3)
+      (primitive/error "WebAssembly validation: operand stack underflow")
+      (let [node (load stack)]
+        (store! stack (primitive/code-nth node 2))
+        node)))
+
+(defn push-node! [(stack (mut Code)) (kind wasm/ValType) (expression Code)] (-> i64)
+  (do (store! stack `(~(kind-tag kind) ~expression ~(load stack))) 0))
+
+(defn node-kind [(node Code)] (-> i64)
+  (if (primitive/code-list? node)
+      (primitive/code-int (primitive/code-nth node 0))
+      (primitive/error "WebAssembly codegen internal error: operand node is not a list")))
+
+(defn node-expression [(node Code)] (-> Code)
+  (primitive/code-nth node 1))
+
+(defn integer-binop! [(stack (mut Code)) (kind wasm/ValType) (operator Code)]
+                      (-> i64)
+  (let [right (pop-node! (mut stack))
+        left (pop-node! (mut stack))
+        right-expression (primitive/code-nth right 1)
+        left-expression (primitive/code-nth left 1)]
+    (if (or (!= (node-kind right) (kind-tag kind))
+            (!= (node-kind left) (kind-tag kind)))
+        (primitive/error "WebAssembly validation: integer operator type mismatch")
+        (push-node! (mut stack) kind
+                    `(~operator ~left-expression ~right-expression)))))
+
+(defn compile-expression [(a (dyn alloc/Allocator)) (context Code)
+                          (signature wasm/FuncType) (body wasm/FuncBody)
+                          (locals Code)] (-> Code)
+  (let [b body
+        (mut p) (wasm/parser (.expression b))
+        (mut stack) `()
+        forms-builder (primitive/code-list-new)
+        (mut ended) false]
+    (loop
+      (if (or (.failed p) (load ended))
+          (break)
+          (let [opcode (wasm/parser-byte! (mut p))]
+            (cond (= opcode 0x0b)
+                    (store! ended true)
+                  (= opcode 0x20)
+                    (let [index (wasm/parser-u32! (mut p))]
+                      (if (>= index (primitive/code-count locals))
+                          (primitive/error "WebAssembly validation: local index out of bounds")
+                          (let [local (primitive/code-nth locals index)]
+                            (if (not (primitive/code-list? local))
+                                (primitive/error "WebAssembly codegen internal error: local entry is not a list")
+                                (do
+                                  (store! stack
+                                          `(~(primitive/code-int (primitive/code-nth local 0))
+                                            ~(primitive/code-nth local 1)
+                                            ~(load stack)))
+                                  0)))))
+                  (= opcode 0x01)
+                    0
+                  (= opcode 0x1a)
+                    (let [dropped (pop-node! (mut stack))]
+                      (primitive/code-list-push! forms-builder
+                                                 (primitive/code-nth dropped 1))
+                      0)
+                  (= opcode 0x41)
+                    (let [value (wasm/parser-signed! (mut p) 32)]
+                      (let [literal `~value
+                            cast-id (primitive/datum->syntax context "primitive/cast")
+                            i32-id `i32]
+                        (push-node! (mut stack) (wasm/I32)
+                                    `(~cast-id ~i32-id ~literal))))
+                  (= opcode 0x42)
+                    (let [value (wasm/parser-signed! (mut p) 64)]
+                      (push-node! (mut stack) (wasm/I64) `~value))
+                  (= opcode 0x6a)
+                    (integer-binop! (mut stack) (wasm/I32)
+                                    (primitive/datum->syntax context "primitive/iadd"))
+                  (= opcode 0x6b)
+                    (integer-binop! (mut stack) (wasm/I32)
+                                    (primitive/datum->syntax context "primitive/isub"))
+                  (= opcode 0x6c)
+                    (integer-binop! (mut stack) (wasm/I32)
+                                    (primitive/datum->syntax context "primitive/imul"))
+                  (= opcode 0x7c)
+                    (integer-binop! (mut stack) (wasm/I64)
+                                    (primitive/datum->syntax context "primitive/iadd"))
+                  (= opcode 0x7d)
+                    (integer-binop! (mut stack) (wasm/I64)
+                                    (primitive/datum->syntax context "primitive/isub"))
+                  (= opcode 0x7e)
+                    (integer-binop! (mut stack) (wasm/I64)
+                                    (primitive/datum->syntax context "primitive/imul"))
+                  :else
+                    (primitive/error "WebAssembly codegen: unsupported MVP opcode")))))
+    (if (.failed p) (primitive/error (.message p)) 0)
+    (if (or (not (load ended)) (!= (wasm/remaining (.cursor p)) 0))
+        (primitive/error "WebAssembly function expression lacks a final end opcode")
+        0)
+    (let [sig signature
+          result-count (al/al-len (.results sig))
+          forms (primitive/code-list-done forms-builder)]
+      (if (= result-count 0)
+          (if (= (primitive/code-count (load stack)) 0)
+              `(do ~@forms)
+              (primitive/error "WebAssembly validation: void function leaves operands"))
+          (let [value (pop-node! (mut stack))
+                wanted (al/al-get (.results sig) 0)]
+            (if (!= (primitive/code-count (load stack)) 0)
+                (primitive/error "WebAssembly validation: result stack height mismatch")
+                (if (!= (node-kind value) (kind-tag wanted))
+                    (primitive/error "WebAssembly validation: function result type mismatch")
+                    (let [result (primitive/code-nth value 1)]
+                      `(do ~@forms ~result)))))))))
+
+(defn function-form [(a (dyn alloc/Allocator)) (context Code) (name Code)
+                     (signature wasm/FuncType) (body wasm/FuncBody)] (-> Code)
+  (let [sig signature
+        b body
+        params (primitive/code-list-new)
+        locals (primitive/code-list-new)
+        (mut i) 0]
+    (loop
+      (if (>= (load i) (al/al-len (.params sig)))
+          (break)
+          (let [kind (al/al-get (.params sig) (load i))
+                id (primitive/fresh-identifier "wasm-param")]
+            (primitive/code-list-push! params `(~id ~(type-code context kind)))
+            (primitive/code-list-push! locals `(~(kind-tag kind) ~id))
+            (store! i (+ (load i) 1)))))
+    (store! i 0)
+    (loop
+      (if (>= (load i) (al/al-len (.locals b)))
+          (break)
+          (let [kind (al/al-get (.locals b) (load i))]
+            (primitive/code-list-push! locals `(~(kind-tag kind) 0))
+            (store! i (+ (load i) 1)))))
+    (let [param-code (primitive/code-list-done params)
+          local-code (primitive/code-list-done locals)
+          body-code (compile-expression a context sig b local-code)
+          result-type (if (= (al/al-len (.results sig)) 0)
+                          `void
+                          (type-code context (al/al-get (.results sig) 0)))]
+      `(defn ~name [~@param-code] (-> ~result-type) ~body-code))))
+
+(defn export-wrapper-form [(context Code) (export-name (slice u8)) (callee Code)
+                           (signature wasm/FuncType)] (-> Code)
+  (let [sig signature
+        name (primitive/datum->syntax context export-name)
+        params (primitive/code-list-new)
+        arguments (primitive/code-list-new)
+        (mut i) 0]
+    (loop
+      (if (>= (load i) (al/al-len (.params sig)))
+          (break)
+          (let [kind (al/al-get (.params sig) (load i))
+                id (primitive/fresh-identifier "wasm-export-param")]
+            (primitive/code-list-push! params `(~id ~(type-code context kind)))
+            (primitive/code-list-push! arguments id)
+            (store! i (+ (load i) 1)))))
+    (let [param-code (primitive/code-list-done params)
+          argument-code (primitive/code-list-done arguments)
+          result-type (if (= (al/al-len (.results sig)) 0)
+                          `void
+                          (type-code context (al/al-get (.results sig) 0)))]
+      `((export ~name)
+        (defn ~name [~@param-code] (-> ~result-type)
+          (~callee ~@argument-code))))))
+
+(defn emit-export-wrappers! [(context Code) (forms CodeBuilder) (names Code)
+                             (indices (al/ArrayList i64))
+                             (types (al/ArrayList wasm/FuncType))
+                             (exports (al/ArrayList wasm/Export))] (-> i64)
+  (let [(mut i) 0]
+    (loop
+      (if (>= (load i) (al/al-len exports))
+          (break)
+          (let [e (al/al-get exports (load i))]
+            (if (= (.kind e) 0)
+                (let [function-index (.index e)]
+                  (if (>= function-index (primitive/code-count names))
+                      (primitive/error "WebAssembly validation: exported function index out of bounds")
+                      (let [type-index (al/al-get indices function-index)
+                            wrapper (export-wrapper-form
+                                      context (.name e)
+                                      (primitive/code-nth names function-index)
+                                      (al/al-get types type-index))]
+                        (primitive/code-list-push! forms (primitive/code-nth wrapper 0))
+                        (primitive/code-list-push! forms (primitive/code-nth wrapper 1))
+                        0)))
+                0)
+            (store! i (+ (load i) 1)))))
+    0))
+
+(defn compile-defined-functions [(a (dyn alloc/Allocator)) (context Code)
+                                 (sections wasm/Sections)] (-> Code)
+  (let [s sections
+        forms (primitive/code-list-new)]
+    (if (= (slice-len (.functions s)) 0)
+        (primitive/code-list-done forms)
+        (match (wasm/type-section a (.types s))
+          (wasm/DecodeError [_ message] (primitive/error message))
+          (wasm/Decoded [types]
+            (match (wasm/index-section a (.functions s))
+              (wasm/DecodeError [_ message] (primitive/error message))
+              (wasm/Decoded [indices]
+                (match (wasm/code-section a (.codes s))
+                  (wasm/DecodeError [_ message] (primitive/error message))
+                  (wasm/Decoded [bodies]
+                    (do
+                      (if (!= (slice-len (.imports s)) 0)
+                          (primitive/error "WebAssembly codegen: imports are not implemented yet")
+                          0)
+                      (if (!= (al/al-len indices) (al/al-len bodies))
+                          (primitive/error "WebAssembly validation: function/code count mismatch")
+                          0)
+                      (let [names-builder (primitive/code-list-new)
+                            (mut i) 0]
+                        (loop
+                          (if (>= (load i) (al/al-len indices))
+                              (break)
+                              (do
+                                (primitive/code-list-push!
+                                  names-builder
+                                  (primitive/fresh-identifier "wasm-function"))
+                                (store! i (+ (load i) 1)))))
+                        (let [names (primitive/code-list-done names-builder)]
+                          (store! i 0)
+                          (loop
+                            (if (>= (load i) (al/al-len indices))
+                                (break)
+                                (let [type-index (al/al-get indices (load i))]
+                                  (if (>= type-index (al/al-len types))
+                                      (primitive/error "WebAssembly validation: type index out of bounds")
+                                      (primitive/code-list-push!
+                                        forms
+                                        (function-form a context
+                                                       (primitive/code-nth names (load i))
+                                                       (al/al-get types type-index)
+                                                       (al/al-get bodies (load i)))))
+                                  (store! i (+ (load i) 1)))))
+                          (if (= (slice-len (.exports s)) 0)
+                              0
+                              (match (wasm/export-section a (.exports s))
+                                (wasm/DecodeError [_ message] (primitive/error message))
+                                (wasm/Decoded [exports]
+                                  (emit-export-wrappers! context forms names indices types exports))))))
+                      (primitive/code-list-done forms)))))))))))

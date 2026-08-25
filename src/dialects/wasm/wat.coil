@@ -1,0 +1,193 @@
+(module experiments.wasm.wat)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+
+(defn sym=? [(code Code) (name (slice u8))] (-> bool)
+  (and (primitive/code-sym? code) (= (primitive/code-sym code) name)))
+
+(defn list-head=? [(code Code) (name (slice u8))] (-> bool)
+  (and (primitive/code-list? code)
+       (> (primitive/code-count code) 0)
+       (sym=? (primitive/code-nth code 0) name)))
+
+(defn type-tag [(type Code)] (-> i64)
+  (cond (sym=? type "i32") 1
+        (sym=? type "i64") 2
+        (sym=? type "f32") 3
+        (sym=? type "f64") 4
+        :else (primitive/error "WAT reader: unknown MVP value type")))
+
+(defn pop-node! [(a (dyn alloc/Allocator)) (stack (mut Code))] (-> Code)
+  (if (!= (primitive/code-count (load stack)) 3)
+      (primitive/error "WAT validation: operand stack underflow")
+      (let [node (load stack)]
+        (store! stack (primitive/code-nth node 2))
+        node)))
+
+(defn binary! [(a (dyn alloc/Allocator)) (context Code) (stack (mut Code))
+               (tag i64) (operator (slice u8))]
+              (-> i64)
+  (let [right (pop-node! a (mut stack))
+        left (pop-node! a (mut stack))]
+    (if (or (!= (primitive/code-int (primitive/code-nth right 0)) tag)
+            (!= (primitive/code-int (primitive/code-nth left 0)) tag))
+        (primitive/error "WAT validation: numeric operator type mismatch")
+        (let [op (primitive/datum->syntax context operator)
+              l (primitive/code-nth left 1)
+              r (primitive/code-nth right 1)]
+          (store! stack `(~tag (~op ~l ~r) ~(load stack)))
+          0))))
+
+(defn compile-flat-instructions [(a (dyn alloc/Allocator)) (context Code)
+                                 (func Code) (locals Code)
+                                 (result-tag i64)] (-> Code)
+  (let [(mut stack) `()
+        (mut i) 1
+        n (primitive/code-count func)]
+    (loop
+      (if (>= (load i) n)
+          (break)
+          (let [item (primitive/code-nth func (load i))]
+            (cond (primitive/code-list? item)
+                    0
+                  (sym=? item "local.get")
+                    (do
+                      (if (>= (+ (load i) 1) n)
+                          (primitive/error "WAT reader: local.get lacks an index")
+                          0)
+                      (let [index-code (primitive/code-nth func (+ (load i) 1))]
+                        (if (not (primitive/code-int? index-code))
+                            (primitive/error "WAT reader: named locals are not implemented yet")
+                            (let [index (primitive/code-int index-code)]
+                              (if (>= index (primitive/code-count locals))
+                                  (primitive/error "WAT validation: local index out of bounds")
+                                  (let [local (primitive/code-nth locals index)
+                                        tag (primitive/code-int (primitive/code-nth local 0))
+                                        value (primitive/code-nth local 1)]
+                                    (store! stack `(~tag ~value ~(load stack))))))))
+                      (store! i (+ (load i) 1))
+                      0)
+                  (sym=? item "i32.add")
+                    (binary! a context (mut stack) 1 "primitive/iadd")
+                  (sym=? item "i32.sub")
+                    (binary! a context (mut stack) 1 "primitive/isub")
+                  (sym=? item "i32.mul")
+                    (binary! a context (mut stack) 1 "primitive/imul")
+                  (sym=? item "i64.add")
+                    (binary! a context (mut stack) 2 "primitive/iadd")
+                  (sym=? item "i64.sub")
+                    (binary! a context (mut stack) 2 "primitive/isub")
+                  (sym=? item "i64.mul")
+                    (binary! a context (mut stack) 2 "primitive/imul")
+                  :else
+                    (primitive/error "WAT reader: unsupported flat MVP instruction"))
+            (store! i (+ (load i) 1)))))
+    (if (= result-tag 0)
+        (if (= (primitive/code-count (load stack)) 0)
+            `(do)
+            (primitive/error "WAT validation: void function leaves operands"))
+        (let [value (pop-node! a (mut stack))]
+          (if (or (!= (primitive/code-int (primitive/code-nth value 0)) result-tag)
+                  (!= (primitive/code-count (load stack)) 0))
+              (primitive/error "WAT validation: function result mismatch")
+              (primitive/code-nth value 1))))))
+
+(defn function-forms [(a (dyn alloc/Allocator)) (context Code) (func Code)] (-> Code)
+  (let [internal-name (primitive/fresh-identifier "wat-function")
+        params (primitive/code-list-new)
+        locals (primitive/code-list-new)
+        (mut export-name) ""
+        (mut result-type) `void
+        (mut result-tag) 0
+        (mut i) 1
+        n (primitive/code-count func)]
+    (loop
+      (if (>= (load i) n)
+          (break)
+          (let [item (primitive/code-nth func (load i))]
+            (cond (list-head=? item "export")
+                    (if (= (primitive/code-count item) 2)
+                        (store! export-name (primitive/code-str (primitive/code-nth item 1)))
+                        (primitive/error "WAT reader: malformed inline export"))
+                  (list-head=? item "param")
+                    (let [(mut j) 1
+                          pn (primitive/code-count item)]
+                      (loop
+                        (if (>= (load j) pn)
+                            (break)
+                            (let [type (primitive/code-nth item (load j))
+                                  id (primitive/fresh-identifier "wat-param")]
+                              (primitive/code-list-push! params `(~id ~type))
+                              (primitive/code-list-push! locals `(~(type-tag type) ~id))
+                              (store! j (+ (load j) 1))))))
+                  (list-head=? item "result")
+                    (if (= (primitive/code-count item) 2)
+                        (do (store! result-type (primitive/code-nth item 1))
+                            (store! result-tag (type-tag (primitive/code-nth item 1)))
+                            0)
+                        (primitive/error "WAT reader: MVP functions have at most one result"))
+                  :else 0)
+            (store! i (+ (load i) 1)))))
+    (let [param-code (primitive/code-list-done params)
+          local-code (primitive/code-list-done locals)
+          body (compile-flat-instructions a context func local-code (load result-tag))
+          internal `(defn ~internal-name [~@param-code] (-> ~(load result-type)) ~body)]
+      (if (= (load export-name) "")
+          `(~internal)
+          (let [public-name (primitive/datum->syntax context (load export-name))
+                wrapper-params (primitive/code-list-new)
+                arguments (primitive/code-list-new)
+                (mut j) 0]
+            (loop
+              (if (>= (load j) (primitive/code-count param-code))
+                  (break)
+                  (let [parameter (primitive/code-nth param-code (load j))
+                        id (primitive/fresh-identifier "wat-export-param")
+                        type (primitive/code-nth parameter 1)]
+                    (primitive/code-list-push! wrapper-params `(~id ~type))
+                    (primitive/code-list-push! arguments id)
+                    (store! j (+ (load j) 1)))))
+            (let [wp (primitive/code-list-done wrapper-params)
+                  args (primitive/code-list-done arguments)]
+              `(~internal
+                (export ~public-name)
+                (defn ~public-name [~@wp] (-> ~(load result-type))
+                  (~internal-name ~@args)))))))))
+
+(defn module-form [(a (dyn alloc/Allocator)) (source Code)] (-> Code)
+  (cond (list-head=? source "module") source
+        (and (primitive/code-list? source)
+             (= (primitive/code-count source) 1)
+             (list-head=? (primitive/code-nth source 0) "module"))
+          (primitive/code-nth source 0)
+        (and (list-head=? source "do")
+             (= (primitive/code-count source) 2)
+             (list-head=? (primitive/code-nth source 1) "module"))
+          (primitive/code-nth source 1)
+        :else source))
+
+(defn compile-wat [(a (dyn alloc/Allocator)) (context Code) (source Code)] (-> Code)
+  (let [module (module-form a source)]
+    (if (not (list-head=? module "module"))
+      (primitive/error "WAT reader: expected one (module ...) form")
+      (let [forms (primitive/code-list-new)
+            (mut i) 1
+            n (primitive/code-count module)]
+        (loop
+          (if (>= (load i) n)
+              (break)
+              (let [field (primitive/code-nth module (load i))]
+                (if (list-head=? field "func")
+                    (let [compiled (function-forms a context field)
+                          (mut j) 0]
+                      (loop
+                        (if (>= (load j) (primitive/code-count compiled))
+                            (break)
+                            (do
+                              (primitive/code-list-push! forms
+                                                         (primitive/code-nth compiled (load j)))
+                              (store! j (+ (load j) 1))))))
+                    (primitive/error "WAT reader: unsupported MVP module field"))
+                (store! i (+ (load i) 1)))))
+        (primitive/code-list-done forms)))))

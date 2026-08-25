@@ -2,6 +2,8 @@
 
 (import "coil.slice" :as slice)
 (import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
 
 ;; The decoder is deliberately independent of the reader and code generator.
 ;; It is used both at compile time and by focused decoder tests. No host Wasm
@@ -14,6 +16,25 @@
 (defsum Decode [T]
   (Decoded [(value T)])
   (DecodeError [(at i64) (message (slice u8))]))
+
+(defsum ValType
+  (I32)
+  (I64)
+  (F32)
+  (F64))
+
+(defstruct FuncType
+  [(params (al/ArrayList ValType))
+   (results (al/ArrayList ValType))])
+
+(defstruct FuncBody
+  [(locals (al/ArrayList ValType))
+   (expression (slice u8))])
+
+(defstruct Export
+  [(name (slice u8))
+   (kind i64)
+   (index i64)])
 
 (defn cursor [(bytes (slice u8))] (-> Cursor)
   (Cursor :bytes bytes :at 0 :limit (slice/slice-len bytes)))
@@ -30,9 +51,8 @@
         (Decoded value))))
 
 ;; Decode the u32 form of unsigned LEB128. The fifth byte may carry only its
-;; low four bits, and encodings with redundant terminal zero groups are rejected.
-;; WebAssembly requires the representation to fit the target bit width; accepting
-;; arbitrary host-sized LEB values would misclassify malformed modules as valid.
+;; low four bits. Padded encodings are accepted, as required by the Wasm binary
+;; grammar, provided they fit the five-byte/32-bit bound.
 (defn u32! [(c (mut Cursor))] (-> (Decode i64))
   (let [(mut result) 0
         (mut shift) 0
@@ -76,6 +96,266 @@
           (Decoded 0)
           (DecodeError (- (.at c) 1) message)))))
 
+(defstruct Parser
+  [(cursor Cursor)
+   (failed bool)
+   (failure-at i64)
+   (message (slice u8))])
+
+(defn parser [(bytes (slice u8))] (-> Parser)
+  (Parser :cursor (cursor bytes) :failed false :failure-at 0 :message ""))
+
+(defn parser-fail! [(p (mut Parser)) (at i64) (message (slice u8))] (-> i64)
+  (if (.failed p)
+      0
+      (do (set! (.failed p) true)
+          (set! (.failure-at p) at)
+          (set! (.message p) message)
+          0)))
+
+(defn parser-u32! [(p (mut Parser))] (-> i64)
+  (if (.failed p)
+      0
+      (match (u32! (mut (.cursor p)))
+        (DecodeError [at message]
+          (do (parser-fail! (mut p) at message) 0))
+        (Decoded [value] value))))
+
+;; Signed LEB128 for i32/i64 immediates. The final byte is checked against the
+;; unused-bit rule for the requested width, including the 5-byte s32 and
+;; 10-byte s64 edge cases exercised by binary-leb128.wast.
+(defn parser-signed! [(p (mut Parser)) (bits i64)] (-> i64)
+  (let [max-bytes (primitive/udiv (+ bits 6) 7)
+        (mut result) 0
+        (mut shift) 0
+        (mut count) 0
+        (mut final) 0
+        (mut done) false]
+    (loop
+      (if (or (.failed p) (load done))
+          (break)
+          (let [at (.at (.cursor p))
+                b (parser-byte! (mut p))
+                payload (& b 0x7f)]
+            (store! final payload)
+            (if (>= (load shift) 63)
+                (store! result (| (load result) (<< (& payload 1) 63)))
+                (store! result (| (load result) (<< payload (load shift)))))
+            (store! count (+ (load count) 1))
+            (if (= (& b 0x80) 0)
+                (store! done true)
+                (if (>= (load count) max-bytes)
+                    (parser-fail! (mut p) at "malformed signed LEB128")
+                    (store! shift (+ (load shift) 7)))))))
+    (if (and (not (.failed p)) (load done))
+        (let [used (- bits (* 7 (- max-bytes 1)))]
+          (if (= (load count) max-bytes)
+              (let [unused-mask (& 0x7f (^ (- (<< 1 used) 1) 0x7f))
+                    signed-mask (| unused-mask (<< 1 (- used 1)))
+                    high (& (load final) signed-mask)]
+                (if (and (!= high 0) (!= high signed-mask))
+                    (parser-fail! (mut p) (- (.at (.cursor p)) 1)
+                                  "signed LEB128 does not fit target width")
+                    0))
+              0)
+          (let [actual-shift (* 7 (load count))]
+            (if (and (< actual-shift bits) (!= (& (load final) 0x40) 0))
+                (store! result (| (load result) (<< -1 actual-shift)))
+                0)))
+        0)
+    (load result)))
+
+(defn parser-byte! [(p (mut Parser))] (-> i64)
+  (if (.failed p)
+      0
+      (match (byte! (mut (.cursor p)))
+        (DecodeError [at message]
+          (do (parser-fail! (mut p) at message) 0))
+        (Decoded [value] (primitive/cast i64 value)))))
+
+(defn parser-valtype! [(p (mut Parser))] (-> ValType)
+  (let [at (.at (.cursor p))
+        tag (parser-byte! (mut p))]
+    (cond (= tag 0x7f) (I32)
+          (= tag 0x7e) (I64)
+          (= tag 0x7d) (F32)
+          (= tag 0x7c) (F64)
+          :else (do (parser-fail! (mut p) at "unknown WebAssembly MVP value type")
+                    (I32)))))
+
+(defn valtype-vector! [(a (dyn alloc/Allocator)) (p (mut Parser))]
+                      (-> (al/ArrayList ValType))
+  (let [count (parser-u32! (mut p))
+        (mut values) (al/al-new [ValType] a)
+        (mut i) 0]
+    (loop
+      (if (or (.failed p) (>= (load i) count))
+          (break)
+          (do
+            (al/al-push! [ValType] (mut values) (parser-valtype! (mut p)))
+            (store! i (+ (load i) 1)))))
+    (load values)))
+
+;; Decode the complete MVP type section. This is syntax decoding only; module
+;; validation (index bounds, function/code agreement, and instruction typing)
+;; is performed by the validator/code generator.
+(defn type-section [(a (dyn alloc/Allocator)) (payload (slice u8))]
+                   (-> (Decode (al/ArrayList FuncType)))
+  (let [(mut p) (parser payload)
+        count (parser-u32! (mut p))
+        (mut types) (al/al-new [FuncType] a)
+        (mut i) 0]
+    (loop
+      (if (or (.failed p) (>= (load i) count))
+          (break)
+          (do
+            (if (!= (parser-byte! (mut p)) 0x60)
+                (parser-fail! (mut p) (- (.at (.cursor p)) 1)
+                              "WebAssembly function type is missing 0x60 tag")
+                0)
+            (let [params (valtype-vector! a (mut p))
+                  results (valtype-vector! a (mut p))]
+              (if (> (al/al-len results) 1)
+                  (parser-fail! (mut p) (.at (.cursor p))
+                                "WebAssembly MVP function type has multiple results")
+                  0)
+              (if (.failed p)
+                  0
+                  (al/al-push! [FuncType] (mut types)
+                               (FuncType :params params :results results))))
+            (store! i (+ (load i) 1)))))
+    (if (and (not (.failed p)) (!= (remaining (.cursor p)) 0))
+        (parser-fail! (mut p) (.at (.cursor p))
+                      "trailing bytes in WebAssembly type section")
+        0)
+    (if (.failed p)
+        (DecodeError (.failure-at p) (.message p))
+        (Decoded (load types)))))
+
+(defn index-section [(a (dyn alloc/Allocator)) (payload (slice u8))]
+                    (-> (Decode (al/ArrayList i64)))
+  (let [(mut p) (parser payload)
+        count (parser-u32! (mut p))
+        (mut values) (al/al-new [i64] a)
+        (mut i) 0]
+    (loop
+      (if (or (.failed p) (>= (load i) count))
+          (break)
+          (do (al/al-push! [i64] (mut values) (parser-u32! (mut p)))
+              (store! i (+ (load i) 1)))))
+    (if (and (not (.failed p)) (!= (remaining (.cursor p)) 0))
+        (parser-fail! (mut p) (.at (.cursor p))
+                      "trailing bytes in WebAssembly index section")
+        0)
+    (if (.failed p)
+        (DecodeError (.failure-at p) (.message p))
+        (Decoded (load values)))))
+
+(defn local-vector! [(a (dyn alloc/Allocator)) (p (mut Parser))]
+                    (-> (al/ArrayList ValType))
+  (let [group-count (parser-u32! (mut p))
+        (mut locals) (al/al-new [ValType] a)
+        (mut group) 0]
+    (loop
+      (if (or (.failed p) (>= (load group) group-count))
+          (break)
+          (let [count (parser-u32! (mut p))
+                kind (parser-valtype! (mut p))
+                (mut i) 0]
+            (if (> count 1000000)
+                (parser-fail! (mut p) (.at (.cursor p))
+                              "WebAssembly function exceeds implementation local limit")
+                0)
+            (loop
+              (if (or (.failed p) (>= (load i) count))
+                  (break)
+                  (do (al/al-push! [ValType] (mut locals) kind)
+                      (store! i (+ (load i) 1)))))
+            (store! group (+ (load group) 1)))))
+    (load locals)))
+
+(defn code-section [(a (dyn alloc/Allocator)) (payload (slice u8))]
+                   (-> (Decode (al/ArrayList FuncBody)))
+  (let [(mut p) (parser payload)
+        count (parser-u32! (mut p))
+        (mut bodies) (al/al-new [FuncBody] a)
+        (mut i) 0]
+    (loop
+      (if (or (.failed p) (>= (load i) count))
+          (break)
+          (let [size (parser-u32! (mut p))
+                start (.at (.cursor p))]
+            (if (> size (remaining (.cursor p)))
+                (parser-fail! (mut p) start
+                              "WebAssembly function body extends past code section")
+                0)
+            (if (.failed p)
+                0
+                (let [body-bytes (slice/subslice payload start (+ start size))
+                      (mut body-parser) (parser body-bytes)
+                      locals (local-vector! a (mut body-parser))
+                      expression-start (.at (.cursor body-parser))]
+                  (if (or (.failed body-parser)
+                          (= expression-start (slice/slice-len body-bytes)))
+                      (parser-fail! (mut p) start "malformed WebAssembly function body")
+                      (do
+                        (al/al-push!
+                          [FuncBody]
+                          (mut bodies)
+                          (FuncBody
+                            :locals locals
+                            :expression (slice/subslice body-bytes expression-start
+                                                        (slice/slice-len body-bytes))))
+                        (set! (.at (.cursor p)) (+ start size))))))
+            (store! i (+ (load i) 1)))))
+    (if (and (not (.failed p)) (!= (remaining (.cursor p)) 0))
+        (parser-fail! (mut p) (.at (.cursor p))
+                      "trailing bytes in WebAssembly code section")
+        0)
+    (if (.failed p)
+        (DecodeError (.failure-at p) (.message p))
+        (Decoded (load bodies)))))
+
+(defn parser-name! [(p (mut Parser))] (-> (slice u8))
+  (let [length (parser-u32! (mut p))
+        start (.at (.cursor p))]
+    (if (> length (remaining (.cursor p)))
+        (do (parser-fail! (mut p) start
+                          "WebAssembly name extends past end of section")
+            (slice/subslice (.bytes (.cursor p)) start start))
+        (let [name (slice/subslice (.bytes (.cursor p)) start (+ start length))]
+          (set! (.at (.cursor p)) (+ start length))
+          name))))
+
+(defn export-section [(a (dyn alloc/Allocator)) (payload (slice u8))]
+                     (-> (Decode (al/ArrayList Export)))
+  (let [(mut p) (parser payload)
+        count (parser-u32! (mut p))
+        (mut exports) (al/al-new [Export] a)
+        (mut i) 0]
+    (loop
+      (if (or (.failed p) (>= (load i) count))
+          (break)
+          (let [name (parser-name! (mut p))
+                kind (parser-byte! (mut p))
+                index (parser-u32! (mut p))]
+            (if (> kind 3)
+                (parser-fail! (mut p) (- (.at (.cursor p)) 1)
+                              "unknown WebAssembly export kind")
+                0)
+            (if (.failed p)
+                0
+                (al/al-push! [Export] (mut exports)
+                             (Export :name name :kind kind :index index)))
+            (store! i (+ (load i) 1)))))
+    (if (and (not (.failed p)) (!= (remaining (.cursor p)) 0))
+        (parser-fail! (mut p) (.at (.cursor p))
+                      "trailing bytes in WebAssembly export section")
+        0)
+    (if (.failed p)
+        (DecodeError (.failure-at p) (.message p))
+        (Decoded (load exports)))))
+
 (defn header! [(c (mut Cursor))] (-> (Decode i64))
   (if (< (remaining c) 8)
       (DecodeError (.at c) "unexpected end of WebAssembly binary")
@@ -94,11 +374,49 @@
               :else
                 (do (set! (.at c) (+ base 8)) (Decoded 0))))))
 
+;; Raw payloads for each standard MVP section. Keeping zero-copy slices here
+;; separates the binary envelope from the section grammars and lets validation
+;; report offsets against the original source bytes.
+(defstruct Sections
+  [(types (slice u8))
+   (imports (slice u8))
+   (functions (slice u8))
+   (tables (slice u8))
+   (memories (slice u8))
+   (globals (slice u8))
+   (exports (slice u8))
+   (start (slice u8))
+   (elements (slice u8))
+   (codes (slice u8))
+   (data (slice u8))])
+
+(defn empty-sections [(bytes (slice u8))] (-> Sections)
+  (let [empty (slice/subslice bytes 0 0)]
+    (Sections :types empty :imports empty :functions empty :tables empty
+              :memories empty :globals empty :exports empty :start empty
+              :elements empty :codes empty :data empty)))
+
+(defn put-section! [(sections (mut Sections)) (id i64) (payload (slice u8))]
+                    (-> i64)
+  (cond (= id 1) (do (set! (.types sections) payload) 0)
+        (= id 2) (do (set! (.imports sections) payload) 0)
+        (= id 3) (do (set! (.functions sections) payload) 0)
+        (= id 4) (do (set! (.tables sections) payload) 0)
+        (= id 5) (do (set! (.memories sections) payload) 0)
+        (= id 6) (do (set! (.globals sections) payload) 0)
+        (= id 7) (do (set! (.exports sections) payload) 0)
+        (= id 8) (do (set! (.start sections) payload) 0)
+        (= id 9) (do (set! (.elements sections) payload) 0)
+        (= id 10) (do (set! (.codes sections) payload) 0)
+        (= id 11) (do (set! (.data sections) payload) 0)
+        :else 0))
+
 ;; Scan the section envelope and enforce the core binary invariants that apply
 ;; before section-specific decoding: known section ids, strictly increasing
 ;; non-custom sections, unique non-custom sections, and payload bounds.
-(defn section-envelope! [(c (mut Cursor))] (-> (Decode i64))
+(defn sections! [(c (mut Cursor))] (-> (Decode Sections))
   (let [(mut previous) 0
+        (mut sections) (empty-sections (.bytes c))
         (mut failed) false
         (mut failure-at) 0
         (mut failure) ""]
@@ -133,14 +451,30 @@
                                     0)
                                 (do
                                   (if (!= id 0) (store! previous id) 0)
+                                  (if (!= id 0)
+                                      (put-section!
+                                        (mut sections)
+                                        id
+                                        (slice/subslice (.bytes c) (.at c) (+ (.at c) size)))
+                                      0)
                                   (set! (.at c) (+ (.at c) size))
                                   0))))))))))
     (if (load failed)
         (DecodeError (load failure-at) (load failure))
-        (Decoded 0))))
+        (Decoded (load sections)))))
 
-(defn module-envelope [(bytes (slice u8))] (-> (Decode i64))
+(defn section-envelope! [(c (mut Cursor))] (-> (Decode i64))
+  (match (sections! (mut c))
+    (DecodeError [at message] (DecodeError at message))
+    (Decoded [_] (Decoded 0))))
+
+(defn module-sections [(bytes (slice u8))] (-> (Decode Sections))
   (let [(mut c) (cursor bytes)]
     (match (header! (mut c))
       (DecodeError [at msg] (DecodeError at msg))
-      (Decoded [_] (section-envelope! (mut c))))))
+      (Decoded [_] (sections! (mut c))))))
+
+(defn module-envelope [(bytes (slice u8))] (-> (Decode i64))
+  (match (module-sections bytes)
+    (DecodeError [at msg] (DecodeError at msg))
+    (Decoded [_] (Decoded 0))))

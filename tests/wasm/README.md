@@ -1,10 +1,12 @@
 # WebAssembly conformance tests
 
 The normative target is the official WebAssembly 1.0 core test suite from
-`WebAssembly/spec`, tag `v1.0.0` (`d910f03bd6d6477656fc5070b5098e8f909305d3`).
-That suite defines the MVP profile claimed by this reader. Proposal suites and
-features incorporated in Wasm 2.0/3.0 are tracked separately and are not part of
-the initial compliance denominator.
+`WebAssembly/spec`, maintained tag `wg-1.0`, pinned to
+`977f97014c962f7bd1291fcc6d28b41a924882bf`. Its 73 WAST files define the MVP
+profile claimed by this reader. The similarly named `v1.0.0` tag is deliberately
+not used: it points at a later multi-version documentation commit whose
+`test/core` includes post-MVP feature tests. Proposal suites and features
+incorporated in Wasm 2.0/3.0 are not part of this initial denominator.
 
 Focused decoder tests are ordinary Coil tests:
 
@@ -18,8 +20,28 @@ Raw binaries use the standard reader-provider path:
 coil run module.wasm --use experiments.wasm.lang
 ```
 
-The conformance runner will fetch the pinned upstream suite into an ignored
-cache, convert WAST scripts with `wast2json`, and execute every assertion against
-the Coil implementation. WABT is test tooling only; production decoding,
-validation, compilation, and execution remain Coil-native.
+Imported WASM modules use the ordinary project reader mapping and expose
+function exports as typed Coil functions:
 
+```toml
+[readers]
+".wasm" = "experiments.wasm.lang"
+```
+
+```coil
+(import "my.wasm.module" :as wasm)
+(wasm/add 20 22)
+```
+
+Fetch, verify, inventory, and prepare the suite with:
+
+```sh
+scripts/wasm-spec.sh inventory
+scripts/wasm-spec.sh prepare
+```
+
+The harness also builds WABT 1.0.12 at pinned commit
+`cf261f2bd561297e0da7008ddde8c09ba5ea35a2`. This is the last converter release
+that accepts the MVP suite's historical canonical/arithmetic NaN assertions;
+modern WABT rejects that syntax. WABT is test tooling only. Production decoding,
+validation, compilation, and execution remain Coil-native.
