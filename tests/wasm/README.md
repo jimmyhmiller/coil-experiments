@@ -45,6 +45,7 @@ scripts/wasm-spec.sh test-memory
 scripts/wasm-spec.sh test-tables
 scripts/wasm-spec.sh test-control
 scripts/wasm-spec.sh test-loops
+scripts/wasm-spec.sh test-structured-control
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -87,6 +88,13 @@ and 12 validation failures. This includes loops in operand positions, deep
 nesting, branches to inner and outer labels, stateful continuation, and
 polymorphic unreachable instruction sequences. Together, the harnesses above
 currently execute 6,337 official assertions.
+
+`test-structured-control` passes the complete official MVP `block`, `br`,
+`br_if`, `br_table`, and `if` files: 425 returns, 249 validation failures, 12
+malformed-text rejections, and one runtime trap. Large branch tables are lowered
+to balanced unsigned decision trees, avoiding parser-depth growth while keeping
+each target as a lexical Coil transfer. The cumulative official total is 7,024
+assertions.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and

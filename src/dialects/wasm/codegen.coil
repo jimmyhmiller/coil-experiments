@@ -168,7 +168,7 @@
   (let [body-forms (primitive/code-list-done forms)]
     (if (= result-tag 0)
         (if (primitive/code-eq base (load stack))
-            `(do ~@body-forms)
+            `(do ~@body-forms 0)
             (primitive/error "WebAssembly validation: void block changes stack height"))
         (let [value (pop-node! (mut stack))]
           (if (or (!= (node-kind value) result-tag)
@@ -199,6 +199,19 @@
     `(~if-id (~ne-id (~cast-id i32 1) (~cast-id i32 0))
              ~transfer
              ~(zero-expression context (if (= result-tag 0) 2 result-tag)))))
+
+(defn balanced-table-dispatch [(context Code) (selector Code) (cases Code)
+                               (default Code) (low i64) (high i64)] (-> Code)
+  (if (>= low high)
+      default
+      (if (= (+ low 1) high)
+          (primitive/code-nth cases low)
+          (let [mid (+ low (/ (- high low) 2))
+                lt-id (primitive/datum->syntax context "wasmrt/i32-lt-u")
+                cast-id (primitive/datum->syntax context "primitive/cast")]
+            `(if (~lt-id ~selector (~cast-id i32 ~mid))
+                 ~(balanced-table-dispatch context selector cases default low mid)
+                 ~(balanced-table-dispatch context selector cases default mid high))))))
 
 (defn integer-binop! [(stack (mut Code)) (kind wasm/ValType) (operator Code)]
                       (-> i64)
@@ -487,11 +500,15 @@
                       (if (!= (node-kind condition) 1)
                           (primitive/error "WebAssembly validation: if condition must be i32")
                           (let [base (load stack)
+                                label (wasm-label a (.at (.cursor p)))
+                                child-names `(~label ~@label-names)
+                                child-tags `(~result-tag ~@label-tags)
+                                child-loops `(0 ~@label-loops)
                                 (mut then-stack) base
                                 then-forms (primitive/code-list-new)
                                 then-stop (compile-region! a context (mut p) (mut then-stack)
                                                            then-forms true base result-tag
-                                                           region-label label-names label-tags label-loops
+                                                           label child-names child-tags child-loops
                                                            function-result-tag
                                                            locals globals memory table function-names
                                                            function-indices types)
@@ -511,7 +528,7 @@
                                               (compile-region! a context (mut p)
                                                                (mut else-stack) else-forms
                                                                false base result-tag
-                                                               region-label label-names label-tags label-loops
+                                                               label child-names child-tags child-loops
                                                                function-result-tag
                                                                locals globals memory table function-names
                                                                function-indices types)]
@@ -525,12 +542,16 @@
                                                 (finish-region a base (mut else-stack)
                                                                else-forms result-tag))))
                                       (if (= result-tag 0)
-                                          `(do)
+                                          `(do 0)
                                           (primitive/error "WebAssembly validation: result if requires else")))
                                 if-id (primitive/datum->syntax context "if")
                                 ne-id (primitive/datum->syntax context "primitive/icmp-ne")
                                 c (primitive/code-nth condition 1)
-                                expression `(~if-id (~ne-id ~c 0) ~then-code ~else-code)
+                                conditional `(~if-id (~ne-id ~c 0) ~then-code ~else-code)
+                                break-value (if (= result-tag 0)
+                                                `(do ~conditional 0)
+                                                conditional)
+                                expression `(loop ~label (break ~label ~break-value))
                                 returns (or then-returns (load else-returns))
                                 effective-tag (if returns function-result-tag result-tag)]
                             (if returns (store! stack `()) 0)
@@ -553,8 +574,34 @@
                                   (store! ended true))
                                 0))))
                   (= opcode 0x0f)
-                    (let [delimiter (skip-unreachable-region! context (mut p))]
-                      (store! stop-opcode (+ 0x100 delimiter))
+                    (let [branch-value
+                            (if (= function-result-tag 0)
+                                `0
+                                (if (primitive/code-eq region-base (load stack))
+                                    (primitive/error "WebAssembly validation: return operand is below current control frame")
+                                    (let [node (pop-node! (mut stack))]
+                                      (if (!= (node-kind node) function-result-tag)
+                                          (primitive/error "WebAssembly validation: return type mismatch")
+                                          (primitive/code-nth node 1)))))
+                          transfer `(break :wasm-function ~branch-value)
+                          expression (typed-transfer context transfer function-result-tag)
+                          delimiter (skip-unreachable-region! context (mut p))]
+                      (store! stack region-base)
+                      (if (= region-result-tag 0)
+                          (do
+                            (primitive/code-list-push! forms-builder expression)
+                            0)
+                          (cond (= region-result-tag 1)
+                                  (push-node! (mut stack) (wasm/I32) expression)
+                                (= region-result-tag 2)
+                                  (push-node! (mut stack) (wasm/I64) expression)
+                                (= region-result-tag 3)
+                                  (push-node! (mut stack) (wasm/F32) expression)
+                                (= region-result-tag 4)
+                                  (push-node! (mut stack) (wasm/F64) expression)
+                                :else
+                                  (primitive/error "WebAssembly codegen internal error: invalid return region result")))
+                      (store! stop-opcode delimiter)
                       (store! ended true))
                   (= opcode 0x0d)
                     (let [depth (wasm/parser-u32! (mut p))
@@ -588,7 +635,7 @@
                                     c (primitive/code-nth condition 1)
                                     expression `(~if-id (~ne-id ~c 0)
                                                        ~transfer
-                                                       0)]
+                                                       ~(if target-loop `(do) `0))]
                                 (primitive/code-list-push! forms-builder expression)
                                 0))))
                   (= opcode 0x0c)
@@ -688,39 +735,46 @@
                                   default-loop (= (primitive/code-int
                                                     (primitive/code-nth label-loops
                                                                         default-depth)) 1)
-                                  (mut dispatch)
+                                  default-dispatch
                                     (typed-transfer
                                       context
                                       (if default-loop
                                           `(continue ~default-label)
                                           `(~return-id ~default-label ~branch-value))
                                       target-tag)
-                                  (mut case-index) count
+                                  cases-builder (primitive/code-list-new)
+                                  (mut case-index) 0
                                   delimiter (skip-unreachable-region! context (mut p))]
                               (loop
-                                (if (= (load case-index) 0)
+                                (if (>= (load case-index) count)
                                     (break)
-                                    (do
-                                      (store! case-index (- (load case-index) 1))
-                                      (let [depth (primitive/code-int
-                                                    (primitive/code-nth depths
-                                                                        (load case-index)))
-                                            label (primitive/code-nth label-names depth)
-                                            target-loop (= (primitive/code-int
-                                                             (primitive/code-nth label-loops
-                                                                                 depth)) 1)
-                                            transfer (if target-loop
-                                                         `(continue ~label)
-                                                         `(~return-id ~label ~branch-value))]
-                                        (store! dispatch
-                                                `(if (= ~selector-id
-                                                        (~cast-id i32 ~(load case-index)))
-                                                     ~(typed-transfer context transfer target-tag)
-                                                     ~(load dispatch)))))))
+                                    (let [depth (primitive/code-int
+                                                  (primitive/code-nth depths
+                                                                      (load case-index)))
+                                          label (primitive/code-nth label-names depth)
+                                          target-loop (= (primitive/code-int
+                                                           (primitive/code-nth label-loops
+                                                                               depth)) 1)
+                                          transfer (if target-loop
+                                                       `(continue ~label)
+                                                       `(~return-id ~label ~branch-value))]
+                                      (primitive/code-list-push!
+                                        cases-builder
+                                        (typed-transfer context transfer target-tag))
+                                      (store! case-index (+ (load case-index) 1)))))
                               (store! stack region-base)
-                              (let [transfer
-                                      `(let [~selector-id ~selector-expression]
-                                         ~(load dispatch))
+                              (let [cases (primitive/code-list-done cases-builder)
+                                    tree (balanced-table-dispatch
+                                           context selector-id cases default-dispatch 0 count)
+                                    lt-id (primitive/datum->syntax context "wasmrt/i32-lt-u")
+                                    dispatch (if (= count 0)
+                                                 default-dispatch
+                                                 `(if (~lt-id ~selector-id
+                                                              (~cast-id i32 ~count))
+                                                      ~tree
+                                                      ~default-dispatch))
+                                    transfer `(let [~selector-id ~selector-expression]
+                                                ~dispatch)
                                     expression
                                       transfer]
                               (if (= region-result-tag 0)
@@ -1339,7 +1393,8 @@
           scope-id (primitive/datum->syntax context "loop")
           break-id (primitive/datum->syntax context "break")]
       (if (= result-count 0)
-          body-code
+          `(do (~scope-id ~function-label
+                  (~break-id ~function-label (do ~body-code 0))))
           `(~scope-id ~function-label (~break-id ~function-label ~body-code))))))
 
 (defn function-form [(a (dyn alloc/Allocator)) (context Code) (name Code)
