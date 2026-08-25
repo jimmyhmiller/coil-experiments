@@ -41,6 +41,7 @@ scripts/wasm-spec.sh prepare
 scripts/wasm-spec.sh test-integers
 scripts/wasm-spec.sh test-floats
 scripts/wasm-spec.sh test-conversions
+scripts/wasm-spec.sh test-memory
 ```
 
 `test-integers` compiles each official `i32` and `i64` module through the reader
@@ -56,6 +57,10 @@ payload, and infinity behavior is checked without a host text conversion.
 `test-conversions` executes 334 mixed-scalar conversion results and verifies 67
 overflow/invalid-conversion traps as actual process traps. Compiler diagnostics
 do not count as passing trap assertions.
+
+`test-memory` checks state persistence, all representative load/store widths,
+growth, zero-filled new pages, active data initialization, 68 official byte-order
+assertions, and all 36 official `memory_size` assertions across four modules.
 
 An individual exported integer function can be checked through the same reader
 entry path:

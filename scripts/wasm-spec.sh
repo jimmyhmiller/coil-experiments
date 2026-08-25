@@ -230,6 +230,70 @@ test_conversions() {
   echo "conversions assert_trap: $trap_count checks passed"
 }
 
+test_memory() {
+  command -v jq >/dev/null 2>&1 || {
+    echo "error: jq is required to run prepared spec assertions" >&2
+    exit 1
+  }
+  coil_bin=${COIL:-coil}
+  "$coil_bin" run "$root/tests/wasm/memory.wasm" --use experiments.wasm.lang -- \
+    --assert-scalar-batch \
+    data i32 67305985 0 \
+    size i32 1 0 \
+    store-load i32 2018915346 2 i32 3 i32 2018915346 \
+    narrow i32 22136 2 i32 20 i32 305419896 \
+    grow i32 1 1 i32 1 \
+    size i32 2 0 \
+    data i32 67305985 0
+  echo "focused memory state/load/store/grow/data checks passed"
+
+  json="$prepared/endianness/script.json"
+  wasm="$prepared/endianness/script.0.wasm"
+  args_file=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-endianness.XXXXXX")
+  trap 'rm -f "$args_file"' EXIT HUP INT TERM
+  jq -r '
+    .commands[] | select(.type == "assert_return"
+                         and .action.type == "invoke"
+                         and (.expected | length) == 1)
+    | .action.field,
+      .expected[0].type,
+      .expected[0].value,
+      (.action.args | length | tostring),
+      (.action.args[] | .type, .value)
+  ' "$json" > "$args_file"
+  xargs "$coil_bin" run "$wasm" --use experiments.wasm.lang -- \
+    --assert-scalar-batch < "$args_file"
+  rm -f "$args_file"
+  trap - EXIT HUP INT TERM
+  echo "endianness: 68 official assertions passed"
+
+  json="$prepared/memory_size/script.json"
+  dir=${json%/*}
+  for file in $(jq -r '.commands[] | select(.type == "module") | .filename' "$json"); do
+    args_file=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-memory-size.XXXXXX")
+    trap 'rm -f "$args_file"' EXIT HUP INT TERM
+    jq -r --arg file "$file" '
+      reduce .commands[] as $command
+        ({current:"", selected:[]};
+         if $command.type == "module" then .current = $command.filename
+         elif ($command.type == "assert_return" and .current == $file)
+           then .selected += [$command]
+         else . end)
+      | .selected[]
+      | .action.field,
+        (if (.expected | length) == 0 then "void" else .expected[0].type end),
+        (if (.expected | length) == 0 then "0" else .expected[0].value end),
+        (.action.args | length | tostring),
+        (.action.args[] | .type, .value)
+    ' "$json" > "$args_file"
+    xargs "$coil_bin" run "$dir/$file" --use experiments.wasm.lang -- \
+      --assert-scalar-batch < "$args_file"
+    rm -f "$args_file"
+    trap - EXIT HUP INT TERM
+  done
+  echo "memory_size: 36 official assertions passed"
+}
+
 case "${1:-inventory}" in
   fetch) fetch_suite ;;
   fetch-wabt) fetch_wabt ;;
@@ -238,8 +302,9 @@ case "${1:-inventory}" in
   test-integers) test_integers ;;
   test-floats) test_floats ;;
   test-conversions) test_conversions ;;
+  test-memory) test_memory ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory]" >&2
     exit 2
     ;;
 esac
