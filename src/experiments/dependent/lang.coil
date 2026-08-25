@@ -1,0 +1,1495 @@
+(module experiments.dependent.lang)
+
+(import "coil.primitive" :as primitive)
+;; A deliberately small trusted core for an embedded dependently typed language.
+;; Terms and types are syntax values; this module checks and normalizes them at
+;; Coil comptime, then emits ordinary Coil declarations.  The host compiler never
+;; has to mistake effectful Coil comptime execution for definitional equality.
+;;
+;; Core syntax:
+;;   Type | Nat | 0 | 1 | ...
+;;   (Pi x A B)              dependent function
+;;   (IPi x A B)             erased/implicit dependent function
+;;   (Sigma x A B)           dependent pair
+;;   (fn x A body)           lambda with an inferable domain
+;;   (ifn x A body)          erased/implicit lambda
+;;   (auto-app f x)          infer one leading erased argument from x
+;;   (app f x)               application
+;;   (pair a b) | (fst p) | (snd p)
+;;   (Eq A x y) | refl
+;;   (succ n) | (plus n m)
+;;   (nat-elim motive zero-case step-case n)
+;;   (J A x motive base y equality)
+;;   (Vec A n) | (vnil A) | (vcons A n head tail)
+;;   (vec-elim A motive nil-case cons-case n vector)
+;;   Empty | Unit | unit | (empty-elim motive impossible)
+;;   (W A B) | (sup A B shape children)
+;;   (w-elim A B motive step tree)
+;;   (nat-match n motive zero k ih successor-body)
+;;   (vec-match A n xs motive nil k x tail ih cons-body)
+;;   (Fin n) | (fzero n) | (fsucc n i) | (vget A n vector index)
+;;   Bool | true | false | (bool-elim motive true-case false-case value)
+;;   (transport A x y family equality value-at-x)
+;;   (Record [(field A) (dependent-field B[field]) ...])
+;;   (record value ...)
+;;   (Not P) | (Dec P) | (yes P proof) | (no P refutation)
+;;   (dec-elim P motive yes-case no-case decision)
+;;   (let x value body) | (ann value type)
+;;
+;; A `(dependent ...)` block contains claims, definitions, checks, and emitters:
+;;   (claim name type)
+;;   (define name term)
+;;   (def name [(x A) (implicit y B) ...] result-type body)
+;;   (foreign-nat-fn dependent-name coil-name)
+;;   (data Name [(Ctor [(field Type) ...]) ...])
+;;   (ctor Ctor arg ...) | (dcase value motive [(Ctor [binders] body) ...])
+;;   (check term type)
+;;   (emit-nat COIL-NAME term)
+
+(defn dsym? [(c Code) (name (slice u8))] (-> bool)
+  (and (primitive/code-sym? c) (= (primitive/code-sym c) name)))
+
+(defn dcount [(c Code)] (-> i64)
+  (if (or (primitive/code-list? c) (primitive/code-vector? c))
+      (primitive/code-count c)
+      0))
+
+(defn dlist? [(c Code) (head (slice u8)) (arity i64)] (-> bool)
+  (and (= (dcount c) (primitive/iadd arity 1))
+       (dsym? (primitive/code-nth c 0) head)))
+
+(defn dnode1 [(head Code) (a Code)] (-> Code) `(~head ~a))
+(defn dnode2 [(head Code) (a Code) (b Code)] (-> Code) `(~head ~a ~b))
+(defn dnode3 [(head Code) (a Code) (b Code) (c Code)] (-> Code) `(~head ~a ~b ~c))
+
+(defn dfail [(at Code) (message (slice u8))] (-> Code)
+  (do
+    (primitive/report at message)
+    at))
+
+;; Environments are themselves immutable Code lists. Each entry is
+;; `(name type value defined-flag)`, newest first. Keeping Code out of ordinary
+;; structs respects Coil's phase boundary and lets lexical extension be a cheap
+;; persistent value inside one metaprogram invocation.
+(defn ctx-new [] (-> Code) `())
+
+(defn ctx-find [(ctx Code) (name (slice u8))] (-> Code)
+  (let [n (primitive/code-count ctx)
+        (mut i) 0
+        (mut found) `()]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [entry (primitive/code-nth ctx (load i))]
+                (if (= (primitive/code-sym (primitive/code-nth entry 0)) name)
+                    (do (set! found entry) (break))
+                    (set! i (primitive/iadd (load i) 1))))))
+    (load found)))
+
+(defn ctx-push [(ctx Code) (name Code) (ty Code) (value Code) (defined bool)] (-> Code)
+  `((~name ~ty ~value ~(if defined 1 0)) ~@ctx))
+
+(defn ctx-push-data [(ctx Code) (name Code) (ty Code) (params Code) (constructors Code)] (-> Code)
+  `((~name ~ty __dep_undefined 0 (data-meta ~params ~constructors)) ~@ctx))
+
+(defn ctx-data-meta [(ctx Code) (name (slice u8))] (-> Code)
+  (let [entry (ctx-find ctx name)]
+    (if (= (dcount entry) 5) (primitive/code-nth entry 4) `())))
+
+(defn ctx-data-params [(ctx Code) (name (slice u8))] (-> Code)
+  (let [meta (ctx-data-meta ctx name)]
+    (if (dlist? meta "data-meta" 2) (primitive/code-nth meta 1) `[])))
+
+(defn ctx-data-constructors [(ctx Code) (name (slice u8))] (-> Code)
+  (let [meta (ctx-data-meta ctx name)]
+    (if (dlist? meta "data-meta" 2) (primitive/code-nth meta 2) `[])))
+
+(defn ctx-type [(ctx Code) (name (slice u8))] (-> Code)
+  (let [entry (ctx-find ctx name)]
+    (if (= (primitive/code-count entry) 0)
+        (dfail 'name "dependent: unbound variable")
+        (primitive/code-nth entry 1))))
+
+(defn ctx-value [(ctx Code) (name (slice u8))] (-> Code)
+  (let [entry (ctx-find ctx name)]
+    (if (or (= (primitive/code-count entry) 0)
+            (= (primitive/code-int (primitive/code-nth entry 3)) 0))
+        '__dep_undefined
+        (primitive/code-nth entry 2))))
+
+;; Capture-avoiding for the core's intended input: binder identities are compared
+;; as syntax identifiers. Macro hygiene therefore distinguishes binders that print
+;; alike; when a binder shadows the requested identifier, substitution stops.
+(defn dsubst [(term Code) (name Code) (replacement Code)] (-> Code)
+  (if (and (primitive/code-sym? term) (primitive/free-identifier=? term name))
+      replacement
+      (let [n (dcount term)]
+        (if (= n 0)
+            term
+            (let [h (primitive/code-nth term 0)]
+              (cond
+                (and (or (dsym? h "Pi")
+                         (or (dsym? h "IPi")
+                             (or (dsym? h "Sigma")
+                                 (or (dsym? h "fn") (dsym? h "ifn")))))
+                     (= n 4))
+                  (let [binder (primitive/code-nth term 1)
+                        dom (dsubst (primitive/code-nth term 2) name replacement)
+                        body (if (primitive/free-identifier=? binder name)
+                                 (primitive/code-nth term 3)
+                                 (dsubst (primitive/code-nth term 3) name replacement))]
+                    (dnode3 h binder dom body))
+                (and (dsym? h "let") (= n 4))
+                  (let [binder (primitive/code-nth term 1)
+                        value (dsubst (primitive/code-nth term 2) name replacement)
+                        body (if (primitive/free-identifier=? binder name)
+                                 (primitive/code-nth term 3)
+                                 (dsubst (primitive/code-nth term 3) name replacement))]
+                    (dnode3 h binder value body))
+                :else
+                  (let [out (primitive/code-list-new)
+                        (mut i) 0]
+                    (loop (if (>= (load i) n)
+                              (break)
+                              (do
+                                (primitive/code-list-push! out
+                                  (dsubst (primitive/code-nth term (load i)) name replacement))
+                                (set! i (primitive/iadd (load i) 1)))))
+                    (primitive/code-list-done out))))))))
+
+(defn dnormalize-fuel [(ctx Code) (term Code) (fuel i64)] (-> Code)
+  (if (<= fuel 0)
+      (dfail term "dependent: normalization exceeded its reduction limit (possible nontermination)")
+      (let [next (primitive/isub fuel 1)]
+        (if (primitive/code-sym? term)
+            (let [v (ctx-value ctx (primitive/code-sym term))]
+              (if (dsym? v "__dep_undefined")
+                  term
+                  (if (primitive/code-eq v term) term (dnormalize-fuel ctx v next))))
+            (cond
+              (primitive/code-int? term) term
+              (dlist? term "app" 2)
+                (let [f (dnormalize-fuel ctx (primitive/code-nth term 1) next)
+                      x (dnormalize-fuel ctx (primitive/code-nth term 2) next)]
+                  (if (dlist? f "fn" 3)
+                      (dnormalize-fuel ctx
+                        (dsubst (primitive/code-nth f 3) (primitive/code-nth f 1) x)
+                        next)
+                      `(app ~f ~x)))
+              (dlist? term "iapp" 2)
+                (let [f (dnormalize-fuel ctx (primitive/code-nth term 1) next)
+                      x (dnormalize-fuel ctx (primitive/code-nth term 2) next)]
+                  (if (dlist? f "ifn" 3)
+                      (dnormalize-fuel ctx
+                        (dsubst (primitive/code-nth f 3) (primitive/code-nth f 1) x)
+                        next)
+                      `(iapp ~f ~x)))
+              (dlist? term "auto-app" 2)
+                (dnormalize-fuel ctx
+                  (dauto-expand ctx (primitive/code-nth term 1) (primitive/code-nth term 2))
+                  next)
+              (dlist? term "let" 3)
+                (dnormalize-fuel ctx
+                  (dsubst (primitive/code-nth term 3)
+                          (primitive/code-nth term 1)
+                          (dnormalize-fuel ctx (primitive/code-nth term 2) next))
+                  next)
+              (dlist? term "ann" 2)
+                (dnormalize-fuel ctx (primitive/code-nth term 1) next)
+              (dlist? term "succ" 1)
+                (let [v (dnormalize-fuel ctx (primitive/code-nth term 1) next)]
+                  (if (primitive/code-int? v)
+                      `~(primitive/iadd (primitive/code-int v) 1)
+                      `(succ ~v)))
+              (dlist? term "plus" 2)
+                (let [a (dnormalize-fuel ctx (primitive/code-nth term 1) next)
+                      b (dnormalize-fuel ctx (primitive/code-nth term 2) next)]
+                  (cond
+                    (and (primitive/code-int? a) (primitive/code-int? b))
+                      `~(primitive/iadd (primitive/code-int a) (primitive/code-int b))
+                    (and (primitive/code-int? a) (= (primitive/code-int a) 0)) b
+                    (and (primitive/code-int? b) (= (primitive/code-int b) 0)) a
+                    :else `(plus ~a ~b)))
+              (dlist? term "nat-elim" 4)
+                (let [motive (primitive/code-nth term 1)
+                      zcase (primitive/code-nth term 2)
+                      step (primitive/code-nth term 3)
+                      n (dnormalize-fuel ctx (primitive/code-nth term 4) next)]
+                  (if (primitive/code-int? n)
+                      (if (= (primitive/code-int n) 0)
+                          (dnormalize-fuel ctx zcase next)
+                          (let [pred `~(primitive/isub (primitive/code-int n) 1)
+                                rec `(nat-elim ~motive ~zcase ~step ~pred)]
+                            (dnormalize-fuel ctx `(app (app ~step ~pred) ~rec) next)))
+                      `(nat-elim ~motive ~zcase ~step ~n)))
+              (dlist? term "bool-elim" 4)
+                (let [motive (primitive/code-nth term 1)
+                      tcase (primitive/code-nth term 2)
+                      fcase (primitive/code-nth term 3)
+                      value (dnormalize-fuel ctx (primitive/code-nth term 4) next)]
+                  (cond
+                    (dsym? value "true") (dnormalize-fuel ctx tcase next)
+                    (dsym? value "false") (dnormalize-fuel ctx fcase next)
+                    :else `(bool-elim ~motive ~tcase ~fcase ~value)))
+              (dlist? term "nat-match" 6)
+                (dnormalize-fuel ctx
+                  (dnat-match-expand term)
+                  next)
+              (dlist? term "J" 6)
+                (let [proof (dnormalize-fuel ctx (primitive/code-nth term 6) next)]
+                  (if (dsym? proof "refl")
+                      (dnormalize-fuel ctx (primitive/code-nth term 4) next)
+                      `(J ~(primitive/code-nth term 1)
+                          ~(primitive/code-nth term 2)
+                          ~(primitive/code-nth term 3)
+                          ~(primitive/code-nth term 4)
+                          ~(primitive/code-nth term 5)
+                          ~proof)))
+              (dlist? term "transport" 6)
+                (dnormalize-fuel ctx (dtransport-expand term) next)
+              (dlist? term "Record" 1)
+                (dnormalize-fuel ctx (drecord-type-expand (primitive/code-nth term 1) 0) next)
+              (and (> (dcount term) 0) (dsym? (primitive/code-nth term 0) "record"))
+                (dnormalize-fuel ctx (drecord-value-expand term 1) next)
+              (dlist? term "Not" 1)
+                (let [proof (primitive/fresh-identifier "contradiction")]
+                  (dnormalize-fuel ctx `(Pi ~proof ~(primitive/code-nth term 1) Empty) next))
+              (dlist? term "Dec" 1)
+                `(Dec ~(dnormalize-fuel ctx (primitive/code-nth term 1) next))
+              (dlist? term "yes" 2)
+                `(yes ~(dnormalize-fuel ctx (primitive/code-nth term 1) next)
+                      ~(dnormalize-fuel ctx (primitive/code-nth term 2) next))
+              (dlist? term "no" 2)
+                `(no ~(dnormalize-fuel ctx (primitive/code-nth term 1) next)
+                     ~(dnormalize-fuel ctx (primitive/code-nth term 2) next))
+              (dlist? term "dec-elim" 5)
+                (let [p (primitive/code-nth term 1)
+                      motive (primitive/code-nth term 2)
+                      ycase (primitive/code-nth term 3)
+                      ncase (primitive/code-nth term 4)
+                      decision (dnormalize-fuel ctx (primitive/code-nth term 5) next)]
+                  (cond
+                    (dlist? decision "yes" 2)
+                      (dnormalize-fuel ctx `(app ~ycase ~(primitive/code-nth decision 2)) next)
+                    (dlist? decision "no" 2)
+                      (dnormalize-fuel ctx `(app ~ncase ~(primitive/code-nth decision 2)) next)
+                    :else `(dec-elim ~p ~motive ~ycase ~ncase ~decision)))
+              (and (> (dcount term) 1) (dsym? (primitive/code-nth term 0) "ctor"))
+                (let [out (primitive/code-list-new)
+                      (mut i) 1]
+                  (loop (if (>= (load i) (dcount term))
+                            (break)
+                            (do
+                              (primitive/code-list-push! out
+                                (if (= (load i) 1)
+                                    (primitive/code-nth term (load i))
+                                    (dnormalize-fuel ctx (primitive/code-nth term (load i)) next)))
+                              (set! i (primitive/iadd (load i) 1)))))
+                  `(ctor ~@(primitive/code-list-done out)))
+              (dlist? term "dcase" 3)
+                (let [scrutinee (dnormalize-fuel ctx (primitive/code-nth term 1) next)
+                      branches (primitive/code-nth term 3)
+                      sty (dnormalize ctx (dinfer ctx (primitive/code-nth term 1)))
+                      data-head (dtype-head sty)
+                      data-name (if (primitive/code-sym? data-head) (primitive/code-sym data-head) "")
+                      param-count (primitive/code-count (ctx-data-params ctx data-name))]
+                  (if (and (> (dcount scrutinee) 1)
+                           (dsym? (primitive/code-nth scrutinee 0) "ctor"))
+                      (let [ctor-name (primitive/code-nth scrutinee 1)
+                            (mut found) `()
+                            (mut bi) 0]
+                        (loop (if (>= (load bi) (primitive/code-count branches))
+                                  (break)
+                                  (let [branch (primitive/code-nth branches (load bi))]
+                                    (if (= (primitive/code-sym (primitive/code-nth branch 0))
+                                           (primitive/code-sym ctor-name))
+                                        (do (set! found branch) (break))
+                                        (set! bi (primitive/iadd (load bi) 1))))))
+                        (if (= (dcount (load found)) 3)
+                            (let [binders (primitive/code-nth (load found) 1)
+                                  (mut body) (primitive/code-nth (load found) 2)
+                                  (mut ai) 0]
+                              (loop (if (>= (load ai) (primitive/code-count binders))
+                                        (break)
+                                        (do
+                                          (set! body
+                                            (dsubst (load body)
+                                              (primitive/code-nth binders (load ai))
+                                              (primitive/code-nth scrutinee
+                                                (primitive/iadd (load ai)
+                                                  (primitive/iadd param-count 2)))))
+                                          (set! ai (primitive/iadd (load ai) 1)))))
+                              (dnormalize-fuel ctx (load body) next))
+                            (dfail term "dependent: constructor has no dcase branch")))
+                      `(dcase ~scrutinee ~(primitive/code-nth term 2) ~branches)))
+              (dlist? term "vec-elim" 6)
+                (let [a (primitive/code-nth term 1)
+                      motive (primitive/code-nth term 2)
+                      nilcase (primitive/code-nth term 3)
+                      conscase (primitive/code-nth term 4)
+                      n (dnormalize-fuel ctx (primitive/code-nth term 5) next)
+                      xs (dnormalize-fuel ctx (primitive/code-nth term 6) next)]
+                  (cond
+                    (dlist? xs "vnil" 1) (dnormalize-fuel ctx nilcase next)
+                    (dlist? xs "vcons" 4)
+                      (let [pn (primitive/code-nth xs 2)
+                            x (primitive/code-nth xs 3)
+                            tail (primitive/code-nth xs 4)
+                            rec `(vec-elim ~a ~motive ~nilcase ~conscase ~pn ~tail)]
+                        (dnormalize-fuel ctx
+                          `(app (app (app (app ~conscase ~pn) ~x) ~tail) ~rec)
+                          next))
+                    :else `(vec-elim ~a ~motive ~nilcase ~conscase ~n ~xs)))
+              (dlist? term "vec-match" 10)
+                (dnormalize-fuel ctx
+                  (dvec-match-expand term)
+                  next)
+              (dlist? term "empty-elim" 2)
+                `(empty-elim ~(dnormalize-fuel ctx (primitive/code-nth term 1) next)
+                             ~(dnormalize-fuel ctx (primitive/code-nth term 2) next))
+              (dlist? term "W" 2)
+                `(W ~(dnormalize-fuel ctx (primitive/code-nth term 1) next)
+                    ~(dnormalize-fuel ctx (primitive/code-nth term 2) next))
+              (dlist? term "sup" 4)
+                `(sup ~(dnormalize-fuel ctx (primitive/code-nth term 1) next)
+                      ~(dnormalize-fuel ctx (primitive/code-nth term 2) next)
+                      ~(dnormalize-fuel ctx (primitive/code-nth term 3) next)
+                      ~(dnormalize-fuel ctx (primitive/code-nth term 4) next))
+              (dlist? term "w-elim" 5)
+                (let [a (primitive/code-nth term 1)
+                      b (primitive/code-nth term 2)
+                      motive (primitive/code-nth term 3)
+                      step (primitive/code-nth term 4)
+                      tree (dnormalize-fuel ctx (primitive/code-nth term 5) next)]
+                  (if (dlist? tree "sup" 4)
+                      (let [shape (primitive/code-nth tree 3)
+                            children (primitive/code-nth tree 4)
+                            pos (primitive/fresh-identifier "position")
+                            rec `(fn ~pos (app ~b ~shape)
+                                   (w-elim ~a ~b ~motive ~step (app ~children ~pos)))]
+                        (dnormalize-fuel ctx `(app (app (app ~step ~shape) ~children) ~rec) next))
+                      `(w-elim ~a ~b ~motive ~step ~tree)))
+              (dlist? term "fst" 1)
+                (let [p (dnormalize-fuel ctx (primitive/code-nth term 1) next)]
+                  (if (dlist? p "pair" 2)
+                      (dnormalize-fuel ctx (primitive/code-nth p 1) next)
+                      `(fst ~p)))
+              (dlist? term "snd" 1)
+                (let [p (dnormalize-fuel ctx (primitive/code-nth term 1) next)]
+                  (if (dlist? p "pair" 2)
+                      (dnormalize-fuel ctx (primitive/code-nth p 2) next)
+                      `(snd ~p)))
+              (dlist? term "Pi" 3)
+                (let [x (primitive/code-nth term 1)
+                      a (dnormalize-fuel ctx (primitive/code-nth term 2) next)]
+                  `(Pi ~x ~a
+                     ~(dnormalize-fuel (ctx-push ctx x a 'undefined false)
+                                        (primitive/code-nth term 3) next)))
+              (dlist? term "IPi" 3)
+                (let [x (primitive/code-nth term 1)
+                      a (dnormalize-fuel ctx (primitive/code-nth term 2) next)]
+                  `(IPi ~x ~a
+                     ~(dnormalize-fuel (ctx-push ctx x a 'undefined false)
+                                        (primitive/code-nth term 3) next)))
+              (dlist? term "Sigma" 3)
+                (let [x (primitive/code-nth term 1)
+                      a (dnormalize-fuel ctx (primitive/code-nth term 2) next)]
+                  `(Sigma ~x ~a
+                     ~(dnormalize-fuel (ctx-push ctx x a 'undefined false)
+                                        (primitive/code-nth term 3) next)))
+              (dlist? term "Eq" 3)
+                `(Eq ~(dnormalize-fuel ctx (primitive/code-nth term 1) next)
+                     ~(dnormalize-fuel ctx (primitive/code-nth term 2) next)
+                     ~(dnormalize-fuel ctx (primitive/code-nth term 3) next))
+              (dlist? term "Vec" 2)
+                `(Vec ~(dnormalize-fuel ctx (primitive/code-nth term 1) next)
+                      ~(dnormalize-fuel ctx (primitive/code-nth term 2) next))
+              (dlist? term "vnil" 1)
+                `(vnil ~(dnormalize-fuel ctx (primitive/code-nth term 1) next))
+              (dlist? term "vcons" 4)
+                `(vcons ~(dnormalize-fuel ctx (primitive/code-nth term 1) next)
+                        ~(dnormalize-fuel ctx (primitive/code-nth term 2) next)
+                        ~(dnormalize-fuel ctx (primitive/code-nth term 3) next)
+                        ~(dnormalize-fuel ctx (primitive/code-nth term 4) next))
+              (dlist? term "Fin" 1)
+                `(Fin ~(dnormalize-fuel ctx (primitive/code-nth term 1) next))
+              (dlist? term "fzero" 1)
+                `(fzero ~(dnormalize-fuel ctx (primitive/code-nth term 1) next))
+              (dlist? term "fsucc" 2)
+                `(fsucc ~(dnormalize-fuel ctx (primitive/code-nth term 1) next)
+                        ~(dnormalize-fuel ctx (primitive/code-nth term 2) next))
+              (dlist? term "vget" 4)
+                (let [a (primitive/code-nth term 1)
+                      n (dnormalize-fuel ctx (primitive/code-nth term 2) next)
+                      xs (dnormalize-fuel ctx (primitive/code-nth term 3) next)
+                      index (dnormalize-fuel ctx (primitive/code-nth term 4) next)]
+                  (if (dlist? xs "vcons" 4)
+                      (cond
+                        (dlist? index "fzero" 1)
+                          (dnormalize-fuel ctx (primitive/code-nth xs 3) next)
+                        (dlist? index "fsucc" 2)
+                          (dnormalize-fuel ctx
+                            `(vget ~a ~(primitive/code-nth xs 2)
+                                   ~(primitive/code-nth xs 4)
+                                   ~(primitive/code-nth index 2))
+                            next)
+                        :else `(vget ~a ~n ~xs ~index))
+                      `(vget ~a ~n ~xs ~index)))
+              :else term)))))
+
+(defn dnormalize [(ctx Code) (term Code)] (-> Code)
+  (dnormalize-fuel ctx term 2048))
+
+(defn ddefeq? [(ctx Code) (a Code) (b Code)] (-> bool)
+  (let [na (dnormalize ctx a)
+        nb (dnormalize ctx b)]
+    (if (or (primitive/code-eq na nb)
+            (and (dsym? na "Type")
+                 (and (dlist? nb "U" 1) (= (primitive/code-int (primitive/code-nth nb 1)) 0)))
+            (and (dsym? nb "Type")
+                 (and (dlist? na "U" 1) (= (primitive/code-int (primitive/code-nth na 1)) 0))))
+        true
+        ;; Binder spelling and syntax identity are irrelevant to definitional
+        ;; equality. Open both binders with one fresh neutral before comparing
+        ;; their codomains (the usual alpha-equivalence rule).
+        (if (or (and (dlist? na "Pi" 3) (dlist? nb "Pi" 3))
+                (or (and (dlist? na "IPi" 3) (dlist? nb "IPi" 3))
+                    (and (dlist? na "Sigma" 3) (dlist? nb "Sigma" 3))))
+            (let [fresh (primitive/fresh-identifier "alpha")]
+              (and (ddefeq? ctx (primitive/code-nth na 2) (primitive/code-nth nb 2))
+                   (ddefeq? ctx
+                     (dsubst (primitive/code-nth na 3) (primitive/code-nth na 1) fresh)
+                     (dsubst (primitive/code-nth nb 3) (primitive/code-nth nb 1) fresh))))
+            false))))
+
+(defn duniverse-code [(level i64)] (-> Code)
+  (if (= level 0) 'Type `(U ~level)))
+
+(defn duniverse-value-level [(term Code)] (-> i64)
+  (cond
+    (dsym? term "Type") 0
+    (and (dlist? term "U" 1) (primitive/code-int? (primitive/code-nth term 1)))
+      (primitive/code-int (primitive/code-nth term 1))
+    :else -1))
+
+(defn duniverse-level [(ctx Code) (term Code)] (-> i64)
+  (let [ty (dnormalize ctx (dinfer ctx term))]
+    (cond
+      (dsym? ty "Type") 0
+      (and (dlist? ty "U" 1) (primitive/code-int? (primitive/code-nth ty 1)))
+        (primitive/code-int (primitive/code-nth ty 1))
+      :else (do (dfail term "dependent: expected a universe") 0))))
+
+(defn densure-type [(ctx Code) (term Code)] (-> i64)
+  (do (duniverse-level ctx term) 0))
+
+(defn dsolve-implicit [(ctx Code) (pattern Code) (binder Code) (actual Code)] (-> Code)
+  (cond
+    (and (primitive/code-sym? pattern) (primitive/free-identifier=? pattern binder)) actual
+    (and (> (dcount pattern) 0)
+         (= (dcount pattern) (dcount actual))
+         (primitive/code-eq (primitive/code-nth pattern 0) (primitive/code-nth actual 0)))
+      (let [(mut found) '__dep_unsolved
+            (mut i) 1
+            n (dcount pattern)]
+        (loop (if (>= (load i) n)
+                  (break)
+                  (let [candidate (dsolve-implicit ctx
+                                    (primitive/code-nth pattern (load i))
+                                    binder
+                                    (primitive/code-nth actual (load i)))]
+                    (if (not (dsym? candidate "__dep_unsolved"))
+                        (if (dsym? (load found) "__dep_unsolved")
+                            (set! found candidate)
+                            (if (not (ddefeq? ctx (load found) candidate))
+                                (do (dfail actual "dependent: inconsistent solutions for implicit argument")
+                                    (set! found '__dep_unsolved))
+                                0))
+                        0)
+                    (set! i (primitive/iadd (load i) 1)))))
+        (load found))
+    :else '__dep_unsolved))
+
+(defn dexplicit-domain [(fty Code)] (-> Code)
+  (cond
+    (dlist? fty "Pi" 3) (primitive/code-nth fty 2)
+    (dlist? fty "IPi" 3) (dexplicit-domain (primitive/code-nth fty 3))
+    :else '__dep_unsolved))
+
+(defn dauto-insert [(ctx Code) (f Code) (fty Code) (arg Code) (actual Code)] (-> Code)
+  (if (dlist? fty "IPi" 3)
+      (let [implicit (primitive/code-nth fty 1)
+            pattern (dnormalize ctx (dexplicit-domain fty))
+            solution (dsolve-implicit ctx pattern implicit actual)]
+        (if (dsym? solution "__dep_unsolved")
+            (dfail arg "dependent: cannot infer implicit argument from the explicit argument type; use iapp")
+            (let [next-f `(iapp ~f ~solution)
+                  next-ty (dnormalize ctx
+                            (dsubst (primitive/code-nth fty 3) implicit solution))]
+              (dauto-insert ctx next-f next-ty arg actual))))
+      (if (dlist? fty "Pi" 3)
+          `(app ~f ~arg)
+          (dfail f "dependent: auto-app needs an explicit Pi after its implicit binders"))))
+
+;; Infer every leading erased argument that occurs in the following explicit
+;; domain, then elaborate to nested iapp plus one ordinary app.
+(defn dauto-expand [(ctx Code) (f Code) (arg Code)] (-> Code)
+  (let [fty (dnormalize ctx (dinfer ctx f))
+        actual (dnormalize ctx (dinfer ctx arg))]
+    (if (dlist? fty "IPi" 3)
+        (dauto-insert ctx f fty arg actual)
+        (dfail f "dependent: auto-app target has no leading implicit binder"))))
+
+(defn dnat-match-expand [(term Code)] (-> Code)
+  (let [n (primitive/code-nth term 1)
+        motive (primitive/code-nth term 2)
+        zero (primitive/code-nth term 3)
+        k (primitive/code-nth term 4)
+        ih (primitive/code-nth term 5)
+        body (primitive/code-nth term 6)]
+    `(nat-elim ~motive ~zero
+       (fn ~k Nat (fn ~ih (app ~motive ~k) ~body))
+       ~n)))
+
+(defn dvec-match-expand [(term Code)] (-> Code)
+  (let [a (primitive/code-nth term 1)
+        n (primitive/code-nth term 2)
+        xs (primitive/code-nth term 3)
+        motive (primitive/code-nth term 4)
+        nilcase (primitive/code-nth term 5)
+        k (primitive/code-nth term 6)
+        x (primitive/code-nth term 7)
+        tail (primitive/code-nth term 8)
+        ih (primitive/code-nth term 9)
+        body (primitive/code-nth term 10)]
+    `(vec-elim ~a ~motive ~nilcase
+       (fn ~k Nat
+         (fn ~x ~a
+           (fn ~tail (Vec ~a ~k)
+             (fn ~ih (app (app ~motive ~k) ~tail) ~body))))
+       ~n ~xs)))
+
+(defn dtransport-expand [(term Code)] (-> Code)
+  (let [a (primitive/code-nth term 1)
+        x (primitive/code-nth term 2)
+        y (primitive/code-nth term 3)
+        family (primitive/code-nth term 4)
+        proof (primitive/code-nth term 5)
+        value (primitive/code-nth term 6)
+        yy (primitive/fresh-identifier "transport-target")
+        equality (primitive/fresh-identifier "transport-equality")]
+    `(J ~a ~x
+        (fn ~yy ~a
+          (fn ~equality (Eq ~a ~x ~yy) (app ~family ~yy)))
+        ~value ~y ~proof)))
+
+(defn drecord-type-expand [(fields Code) (i i64)] (-> Code)
+  (if (>= i (primitive/code-count fields))
+      'Unit
+      (let [field (primitive/code-nth fields i)]
+        (if (= (dcount field) 2)
+            `(Sigma ~(primitive/code-nth field 0) ~(primitive/code-nth field 1)
+               ~(drecord-type-expand fields (primitive/iadd i 1)))
+            (dfail field "dependent: record field must be (name Type)")))))
+
+(defn drecord-value-expand [(term Code) (i i64)] (-> Code)
+  (if (>= i (primitive/code-count term))
+      'unit
+      `(pair ~(primitive/code-nth term i)
+             ~(drecord-value-expand term (primitive/iadd i 1)))))
+
+(defn dctor-type [(fields Code) (result Code) (i i64)] (-> Code)
+  (if (>= i (primitive/code-count fields))
+      result
+      (let [field (primitive/code-nth fields i)]
+        (if (= (dcount field) 2)
+            `(Pi ~(primitive/code-nth field 0) ~(primitive/code-nth field 1)
+                 ~(dctor-type fields result (primitive/iadd i 1)))
+            (dfail field "dependent: constructor field must be (name Type)")))))
+
+(defn dapply-param-names [(head Code) (params Code) (i i64)] (-> Code)
+  (if (>= i (primitive/code-count params))
+      head
+      (let [param (primitive/code-nth params i)
+            name (if (= (dcount param) 2)
+                     (primitive/code-nth param 0)
+                     (primitive/code-nth param 1))]
+        (dapply-param-names `(app ~head ~name) params (primitive/iadd i 1)))))
+
+(defn dtype-head [(ty Code)] (-> Code)
+  (if (dlist? ty "app" 2) (dtype-head (primitive/code-nth ty 1)) ty))
+
+(defn dtype-args-into [(ty Code) (out CodeBuilder)] (-> i64)
+  (if (dlist? ty "app" 2)
+      (do
+        (dtype-args-into (primitive/code-nth ty 1) out)
+        (primitive/code-list-push! out (primitive/code-nth ty 2))
+        0)
+      0))
+
+(defn dtype-args [(ty Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (dtype-args-into ty out)
+    (primitive/code-list-done out)))
+
+(defn dinstantiate-params [(term Code) (params Code) (args Code)] (-> Code)
+  (let [(mut result) term
+        (mut i) 0]
+    (loop (if (>= (load i) (primitive/code-count params))
+              (break)
+              (let [param (primitive/code-nth params (load i))
+                    name (if (= (dcount param) 2)
+                             (primitive/code-nth param 0)
+                             (primitive/code-nth param 1))]
+                (set! result (dsubst (load result) name (primitive/code-nth args (load i))))
+                (set! i (primitive/iadd (load i) 1)))))
+    (load result)))
+
+(defn dmentions-name? [(term Code) (name (slice u8))] (-> bool)
+  (if (and (primitive/code-sym? term) (= (primitive/code-sym term) name))
+      true
+      (let [n (dcount term)
+            (mut i) 0
+            (mut found) false]
+        (loop (if (>= (load i) n)
+                  (break)
+                  (if (dmentions-name? (primitive/code-nth term (load i)) name)
+                      (do (set! found true) (break))
+                      (set! i (primitive/iadd (load i) 1)))))
+        (load found))))
+
+(defn dstrict-positive? [(term Code) (name (slice u8))] (-> bool)
+  (if (or (dlist? term "Pi" 3) (dlist? term "IPi" 3))
+      (and (not (dmentions-name? (primitive/code-nth term 2) name))
+           (dstrict-positive? (primitive/code-nth term 3) name))
+      (let [n (dcount term)
+            (mut i) 1
+            (mut valid) true]
+        (loop (if (>= (load i) n)
+                  (break)
+                  (if (not (dstrict-positive? (primitive/code-nth term (load i)) name))
+                      (do (set! valid false) (break))
+                      (set! i (primitive/iadd (load i) 1)))))
+        (load valid))))
+
+(defn process-data [(ctx Code) (form Code)] (-> Code)
+  (let [name (primitive/code-nth form 1)
+        parameterized (= (dcount form) 4)
+        params (if parameterized (primitive/code-nth form 2) `[])
+        constructors (if parameterized (primitive/code-nth form 3) (primitive/code-nth form 2))
+        data-ty (dparams-type params 'Type 0)
+        result-ty (dapply-param-names name params 0)
+        (mut result) (ctx-push-data ctx name data-ty params constructors)
+        (mut i) 0]
+    (if (> (dcount (ctx-find ctx (primitive/code-sym name))) 0)
+        (dfail name "dependent: duplicate declaration name")
+        name)
+    (loop (if (>= (load i) (primitive/code-count constructors))
+              (break)
+              (let [variant (primitive/code-nth constructors (load i))]
+                (if (= (dcount variant) 2)
+                    (let [ctor-name (primitive/code-nth variant 0)
+                          fields (primitive/code-nth variant 1)
+                          ty (dparams-type params (dctor-type fields result-ty 0) 0)]
+                      (if (> (dcount (ctx-find (load result) (primitive/code-sym ctor-name))) 0)
+                          (dfail ctor-name "dependent: duplicate constructor or declaration name")
+                          ctor-name)
+                      (let [(mut fi) 0]
+                        (loop (if (>= (load fi) (primitive/code-count fields))
+                                  (break)
+                                  (let [field-type (primitive/code-nth
+                                                     (primitive/code-nth fields (load fi)) 1)]
+                                    (if (not (dstrict-positive? field-type (primitive/code-sym name)))
+                                        (dfail field-type "dependent: recursive data occurrence is not strictly positive")
+                                        'Type)
+                                    (set! fi (primitive/iadd (load fi) 1))))))
+                      (densure-type (load result) ty)
+                      (set! result (ctx-push (load result) ctor-name ty `(constructor ~ctor-name) true)))
+                    (do
+                      (dfail variant "dependent: constructor must be (Name [(field Type) ...])")
+                      0))
+                (set! i (primitive/iadd (load i) 1)))))
+    (load result)))
+
+(defn dcheck [(ctx Code) (term Code) (expected Code)] (-> i64)
+  (let [want (dnormalize ctx expected)]
+    (cond
+      (and (> (dcount term) 0) (dsym? (primitive/code-nth term 0) "record"))
+        (dcheck ctx (drecord-value-expand term 1) want)
+      (dlist? term "fn" 3)
+        (if (dlist? want "Pi" 3)
+            (let [x (primitive/code-nth term 1)
+                  annotated (primitive/code-nth term 2)
+                  domain (primitive/code-nth want 2)
+                  expected-x (primitive/code-nth want 1)
+                  codomain (primitive/code-nth want 3)]
+              (if (ddefeq? ctx annotated domain)
+                  (do
+                    (dcheck (ctx-push ctx x domain 'undefined false)
+                            (primitive/code-nth term 3)
+                            (dsubst codomain expected-x x))
+                    0)
+                  (do (dfail annotated "dependent: lambda annotation disagrees with expected Pi domain") 1)))
+            (do (dfail term "dependent: lambda requires an expected Pi type") 1))
+      (dlist? term "ifn" 3)
+        (if (dlist? want "IPi" 3)
+            (let [x (primitive/code-nth term 1)
+                  annotated (primitive/code-nth term 2)
+                  domain (primitive/code-nth want 2)
+                  expected-x (primitive/code-nth want 1)
+                  codomain (primitive/code-nth want 3)]
+              (if (ddefeq? ctx annotated domain)
+                  (do
+                    (dcheck (ctx-push ctx x domain 'undefined false)
+                            (primitive/code-nth term 3)
+                            (dsubst codomain expected-x x))
+                    0)
+                  (do (dfail annotated "dependent: implicit lambda annotation disagrees with expected IPi domain") 1)))
+            (do (dfail term "dependent: implicit lambda requires an expected IPi type") 1))
+      (dsym? term "refl")
+        (if (dlist? want "Eq" 3)
+            (if (ddefeq? ctx (primitive/code-nth want 2) (primitive/code-nth want 3))
+                0
+                (do (dfail term "dependent: refl requires definitionally equal endpoints") 1))
+            (do (dfail term "dependent: refl can only check against an equality type") 1))
+      (dlist? term "pair" 2)
+        (if (dlist? want "Sigma" 3)
+            (let [binder (primitive/code-nth want 1)
+                  first-ty (primitive/code-nth want 2)
+                  second-ty (primitive/code-nth want 3)
+                  first (primitive/code-nth term 1)
+                  second (primitive/code-nth term 2)]
+              (dcheck ctx first first-ty)
+              (dcheck ctx second (dsubst second-ty binder first))
+              0)
+            (do (dfail term "dependent: pair requires an expected Sigma type") 1))
+      :else
+        (let [got (dinfer ctx term)]
+          (if (or (ddefeq? ctx got want)
+                  (let [got-level (duniverse-value-level (dnormalize ctx got))
+                        want-level (duniverse-value-level want)]
+                    (and (>= got-level 0)
+                         (and (>= want-level 0) (<= got-level want-level)))))
+              0
+              (do (dfail term "dependent: type mismatch") 1))))))
+
+(defn dinfer [(ctx Code) (term Code)] (-> Code)
+  (cond
+    (dsym? term "Type") `(U 1)
+    (dlist? term "U" 1)
+      (let [level (primitive/code-nth term 1)]
+        (if (and (primitive/code-int? level) (>= (primitive/code-int level) 0))
+            `(U ~(primitive/iadd (primitive/code-int level) 1))
+            (dfail term "dependent: universe levels must be natural literals")))
+    (dsym? term "Nat") 'Type
+    (dsym? term "Bool") 'Type
+    (dsym? term "true") 'Bool
+    (dsym? term "false") 'Bool
+    (dsym? term "Empty") 'Type
+    (dsym? term "Unit") 'Type
+    (dsym? term "unit") 'Unit
+    (primitive/code-int? term)
+      (if (>= (primitive/code-int term) 0)
+          'Nat
+          (dfail term "dependent: natural literals cannot be negative"))
+    (primitive/code-sym? term) (ctx-type ctx (primitive/code-sym term))
+    (dlist? term "Pi" 3)
+      (let [x (primitive/code-nth term 1)
+            a (primitive/code-nth term 2)
+            b (primitive/code-nth term 3)]
+        (let [la (duniverse-level ctx a)
+              lb (duniverse-level (ctx-push ctx x a 'undefined false) b)]
+          (duniverse-code (if (> la lb) la lb))))
+    (dlist? term "IPi" 3)
+      (let [x (primitive/code-nth term 1)
+            a (primitive/code-nth term 2)
+            b (primitive/code-nth term 3)]
+        (let [la (duniverse-level ctx a)
+              lb (duniverse-level (ctx-push ctx x a 'undefined false) b)]
+          (duniverse-code (if (> la lb) la lb))))
+    (dlist? term "Sigma" 3)
+      (let [x (primitive/code-nth term 1)
+            a (primitive/code-nth term 2)
+            b (primitive/code-nth term 3)]
+        (let [la (duniverse-level ctx a)
+              lb (duniverse-level (ctx-push ctx x a 'undefined false) b)]
+          (duniverse-code (if (> la lb) la lb))))
+    (dlist? term "fn" 3)
+      (let [x (primitive/code-nth term 1)
+            a (primitive/code-nth term 2)
+            body (primitive/code-nth term 3)]
+        (densure-type ctx a)
+        (let [b (dinfer (ctx-push ctx x a 'undefined false) body)]
+          `(Pi ~x ~a ~b)))
+    (dlist? term "ifn" 3)
+      (let [x (primitive/code-nth term 1)
+            a (primitive/code-nth term 2)
+            body (primitive/code-nth term 3)]
+        (densure-type ctx a)
+        (let [b (dinfer (ctx-push ctx x a 'undefined false) body)]
+          `(IPi ~x ~a ~b)))
+    (dlist? term "app" 2)
+      (let [fty (dnormalize ctx (dinfer ctx (primitive/code-nth term 1)))]
+        (if (dlist? fty "Pi" 3)
+            (let [x (primitive/code-nth fty 1)
+                  a (primitive/code-nth fty 2)
+                  b (primitive/code-nth fty 3)
+                  arg (primitive/code-nth term 2)]
+              (dcheck ctx arg a)
+              (dsubst b x arg))
+            (dfail term "dependent: application target is not a Pi type")))
+    (dlist? term "iapp" 2)
+      (let [fty (dnormalize ctx (dinfer ctx (primitive/code-nth term 1)))]
+        (if (dlist? fty "IPi" 3)
+            (let [x (primitive/code-nth fty 1)
+                  a (primitive/code-nth fty 2)
+                  b (primitive/code-nth fty 3)
+                  arg (primitive/code-nth term 2)]
+              (dcheck ctx arg a)
+              (dsubst b x arg))
+            (dfail term "dependent: implicit application target is not an IPi type")))
+    (dlist? term "auto-app" 2)
+      (dinfer ctx (dauto-expand ctx (primitive/code-nth term 1) (primitive/code-nth term 2)))
+    (dlist? term "fst" 1)
+      (let [pty (dnormalize ctx (dinfer ctx (primitive/code-nth term 1)))]
+        (if (dlist? pty "Sigma" 3)
+            (primitive/code-nth pty 2)
+            (dfail term "dependent: fst target is not a Sigma pair")))
+    (dlist? term "snd" 1)
+      (let [p (primitive/code-nth term 1)
+            pty (dnormalize ctx (dinfer ctx p))]
+        (if (dlist? pty "Sigma" 3)
+            (dsubst (primitive/code-nth pty 3) (primitive/code-nth pty 1) `(fst ~p))
+            (dfail term "dependent: snd target is not a Sigma pair")))
+    (dlist? term "Eq" 3)
+      (let [a (primitive/code-nth term 1)]
+        (let [level (duniverse-level ctx a)]
+        (dcheck ctx (primitive/code-nth term 2) a)
+        (dcheck ctx (primitive/code-nth term 3) a)
+        (duniverse-code level)))
+    (dlist? term "succ" 1)
+      (do (dcheck ctx (primitive/code-nth term 1) 'Nat) 'Nat)
+    (dlist? term "plus" 2)
+      (do
+        (dcheck ctx (primitive/code-nth term 1) 'Nat)
+        (dcheck ctx (primitive/code-nth term 2) 'Nat)
+        'Nat)
+    (dlist? term "nat-elim" 4)
+      (let [motive (primitive/code-nth term 1)
+            zcase (primitive/code-nth term 2)
+            step (primitive/code-nth term 3)
+            n (primitive/code-nth term 4)
+            k (primitive/fresh-identifier "k")
+            ih (primitive/fresh-identifier "ih")]
+        (dcheck ctx motive `(Pi ~k Nat Type))
+        (dcheck ctx zcase `(app ~motive 0))
+        (dcheck ctx step
+          `(Pi ~k Nat
+             (Pi ~ih (app ~motive ~k)
+               (app ~motive (succ ~k)))))
+        (dcheck ctx n 'Nat)
+        `(app ~motive ~n))
+    (dlist? term "bool-elim" 4)
+      (let [motive (primitive/code-nth term 1)
+            tcase (primitive/code-nth term 2)
+            fcase (primitive/code-nth term 3)
+            value (primitive/code-nth term 4)
+            b (primitive/fresh-identifier "boolean")]
+        (dcheck ctx motive `(Pi ~b Bool Type))
+        (dcheck ctx tcase `(app ~motive true))
+        (dcheck ctx fcase `(app ~motive false))
+        (dcheck ctx value 'Bool)
+        `(app ~motive ~value))
+    (dlist? term "nat-match" 6)
+      (dinfer ctx (dnat-match-expand term))
+    (dlist? term "J" 6)
+      (let [a (primitive/code-nth term 1)
+            x (primitive/code-nth term 2)
+            motive (primitive/code-nth term 3)
+            base (primitive/code-nth term 4)
+            y (primitive/code-nth term 5)
+            proof (primitive/code-nth term 6)
+            yy (primitive/fresh-identifier "y")
+            pp (primitive/fresh-identifier "proof")]
+        (densure-type ctx a)
+        (dcheck ctx x a)
+        (dcheck ctx motive `(Pi ~yy ~a (Pi ~pp (Eq ~a ~x ~yy) Type)))
+        (dcheck ctx base `(app (app ~motive ~x) refl))
+        (dcheck ctx y a)
+        (dcheck ctx proof `(Eq ~a ~x ~y))
+        `(app (app ~motive ~y) ~proof))
+    (dlist? term "transport" 6)
+      (dinfer ctx (dtransport-expand term))
+    (dlist? term "Record" 1)
+      (dinfer ctx (drecord-type-expand (primitive/code-nth term 1) 0))
+    (dlist? term "Not" 1)
+      (dinfer ctx
+        (let [proof (primitive/fresh-identifier "contradiction")]
+          `(Pi ~proof ~(primitive/code-nth term 1) Empty)))
+    (dlist? term "Dec" 1)
+      (do (densure-type ctx (primitive/code-nth term 1)) 'Type)
+    (dlist? term "yes" 2)
+      (let [p (primitive/code-nth term 1)]
+        (densure-type ctx p)
+        (dcheck ctx (primitive/code-nth term 2) p)
+        `(Dec ~p))
+    (dlist? term "no" 2)
+      (let [p (primitive/code-nth term 1)]
+        (densure-type ctx p)
+        (dcheck ctx (primitive/code-nth term 2) `(Not ~p))
+        `(Dec ~p))
+    (dlist? term "dec-elim" 5)
+      (let [p (primitive/code-nth term 1)
+            motive (primitive/code-nth term 2)
+            ycase (primitive/code-nth term 3)
+            ncase (primitive/code-nth term 4)
+            decision (primitive/code-nth term 5)
+            d (primitive/fresh-identifier "decision")
+            proof (primitive/fresh-identifier "proof")
+            refute (primitive/fresh-identifier "refute")]
+        (densure-type ctx p)
+        (dcheck ctx motive `(Pi ~d (Dec ~p) Type))
+        (dcheck ctx ycase `(Pi ~proof ~p (app ~motive (yes ~p ~proof))))
+        (dcheck ctx ncase `(Pi ~refute (Not ~p) (app ~motive (no ~p ~refute))))
+        (dcheck ctx decision `(Dec ~p))
+        `(app ~motive ~decision))
+    (and (> (dcount term) 1) (dsym? (primitive/code-nth term 0) "ctor"))
+      (let [fty (ctx-type ctx (primitive/code-sym (primitive/code-nth term 1)))
+            (mut current) fty
+            (mut i) 2]
+        (loop (if (>= (load i) (dcount term))
+                  (break)
+                  (let [pi (dnormalize ctx (load current))]
+                    (if (dlist? pi "Pi" 3)
+                        (do
+                          (dcheck ctx (primitive/code-nth term (load i)) (primitive/code-nth pi 2))
+                          (set! current
+                            (dsubst (primitive/code-nth pi 3)
+                                    (primitive/code-nth pi 1)
+                                    (primitive/code-nth term (load i)))))
+                        (do (dfail term "dependent: too many constructor arguments") (break)))
+                    (set! i (primitive/iadd (load i) 1)))))
+        (if (dlist? (dnormalize ctx (load current)) "Pi" 3)
+            (dfail term "dependent: constructor is missing arguments")
+            (load current)))
+    (dlist? term "dcase" 3)
+      (let [scrutinee (primitive/code-nth term 1)
+            motive (primitive/code-nth term 2)
+            branches (primitive/code-nth term 3)
+            scrutinee-ty (dnormalize ctx (dinfer ctx scrutinee))
+            data-head (dtype-head scrutinee-ty)
+            data-name (if (primitive/code-sym? data-head) (primitive/code-sym data-head) "")
+            data-args (dtype-args scrutinee-ty)
+            params (ctx-data-params ctx data-name)
+            constructors (ctx-data-constructors ctx data-name)
+            subject (primitive/fresh-identifier "subject")]
+        (if (= (primitive/code-count constructors) 0)
+            (dfail term "dependent: dcase scrutinee is not a declared data type")
+            'Type)
+        (dcheck ctx motive `(Pi ~subject ~scrutinee-ty Type))
+        (if (!= (primitive/code-count params) (primitive/code-count data-args))
+            (dfail scrutinee "dependent: data type argument count does not match its declaration")
+            'Type)
+        (if (!= (primitive/code-count branches) (primitive/code-count constructors))
+            (dfail branches "dependent: dcase must contain exactly one branch per constructor")
+            'Type)
+        (let [(mut vi) 0]
+          (loop (if (>= (load vi) (primitive/code-count constructors))
+                    (break)
+                    (let [variant (primitive/code-nth constructors (load vi))
+                          ctor-name (primitive/code-nth variant 0)
+                          fields (primitive/code-nth variant 1)
+                          (mut found) `()
+                          (mut bi) 0]
+                      (loop (if (>= (load bi) (primitive/code-count branches))
+                                (break)
+                                (let [candidate (primitive/code-nth branches (load bi))]
+                                  (if (and (= (dcount candidate) 3)
+                                           (= (primitive/code-sym (primitive/code-nth candidate 0))
+                                              (primitive/code-sym ctor-name)))
+                                      (do (set! found candidate) (break))
+                                      (set! bi (primitive/iadd (load bi) 1))))))
+                      (if (= (dcount (load found)) 0)
+                          (do (dfail branches "dependent: missing constructor branch") 0)
+                          (let [binders (primitive/code-nth (load found) 1)
+                                (mut branch-ctx) ctx
+                                ctor-form (primitive/code-list-new)
+                                (mut fi) 0]
+                            (primitive/code-list-push! ctor-form 'ctor)
+                            (primitive/code-list-push! ctor-form ctor-name)
+                            (let [(mut pi) 0]
+                              (loop (if (>= (load pi) (primitive/code-count data-args))
+                                        (break)
+                                        (do
+                                          (primitive/code-list-push! ctor-form
+                                            (primitive/code-nth data-args (load pi)))
+                                          (set! pi (primitive/iadd (load pi) 1))))))
+                            (if (!= (primitive/code-count binders) (primitive/code-count fields))
+                                (dfail (load found) "dependent: branch binder count does not match constructor")
+                                'Type)
+                            (loop (if (>= (load fi) (primitive/code-count fields))
+                                      (break)
+                                      (let [field (primitive/code-nth fields (load fi))
+                                            binder (primitive/code-nth binders (load fi))
+                                            (mut field-ty) (dinstantiate-params
+                                                             (primitive/code-nth field 1)
+                                                             params data-args)
+                                            (mut prior) 0]
+                                        (loop (if (>= (load prior) (load fi))
+                                                  (break)
+                                                  (do
+                                                    (set! field-ty
+                                                      (dsubst (load field-ty)
+                                                        (primitive/code-nth (primitive/code-nth fields (load prior)) 0)
+                                                        (primitive/code-nth binders (load prior))))
+                                                    (set! prior (primitive/iadd (load prior) 1)))))
+                                        (set! branch-ctx
+                                          (ctx-push (load branch-ctx) binder (load field-ty) 'undefined false))
+                                        (primitive/code-list-push! ctor-form binder)
+                                        (set! fi (primitive/iadd (load fi) 1)))))
+                            (dcheck (load branch-ctx)
+                              (primitive/code-nth (load found) 2)
+                              `(app ~motive ~(primitive/code-list-done ctor-form)))))
+                      (set! vi (primitive/iadd (load vi) 1)))))
+        `(app ~motive ~scrutinee)))
+    (dlist? term "Vec" 2)
+      (do
+        (densure-type ctx (primitive/code-nth term 1))
+        (dcheck ctx (primitive/code-nth term 2) 'Nat)
+        (duniverse-code (duniverse-level ctx (primitive/code-nth term 1))))
+    (dlist? term "vnil" 1)
+      (let [a (primitive/code-nth term 1)]
+        (densure-type ctx a)
+        `(Vec ~a 0))
+    (dlist? term "vcons" 4)
+      (let [a (primitive/code-nth term 1)
+            n (primitive/code-nth term 2)
+            x (primitive/code-nth term 3)
+            xs (primitive/code-nth term 4)]
+        (densure-type ctx a)
+        (dcheck ctx n 'Nat)
+        (dcheck ctx x a)
+        (dcheck ctx xs `(Vec ~a ~n))
+        `(Vec ~a (succ ~n)))
+    (dlist? term "Fin" 1)
+      (do (dcheck ctx (primitive/code-nth term 1) 'Nat) 'Type)
+    (dlist? term "fzero" 1)
+      (let [n (primitive/code-nth term 1)]
+        (dcheck ctx n 'Nat)
+        `(Fin (succ ~n)))
+    (dlist? term "fsucc" 2)
+      (let [n (primitive/code-nth term 1)
+            i (primitive/code-nth term 2)]
+        (dcheck ctx n 'Nat)
+        (dcheck ctx i `(Fin ~n))
+        `(Fin (succ ~n)))
+    (dlist? term "vget" 4)
+      (let [a (primitive/code-nth term 1)
+            n (primitive/code-nth term 2)
+            xs (primitive/code-nth term 3)
+            index (primitive/code-nth term 4)]
+        (densure-type ctx a)
+        (dcheck ctx n 'Nat)
+        (dcheck ctx xs `(Vec ~a ~n))
+        (dcheck ctx index `(Fin ~n))
+        a)
+    (dlist? term "vec-elim" 6)
+      (let [a (primitive/code-nth term 1)
+            motive (primitive/code-nth term 2)
+            nilcase (primitive/code-nth term 3)
+            conscase (primitive/code-nth term 4)
+            n (primitive/code-nth term 5)
+            xs (primitive/code-nth term 6)
+            k (primitive/fresh-identifier "length")
+            v (primitive/fresh-identifier "vector")
+            x (primitive/fresh-identifier "head")
+            tail (primitive/fresh-identifier "tail")
+            ih (primitive/fresh-identifier "ih")]
+        (densure-type ctx a)
+        (dcheck ctx motive `(Pi ~k Nat (Pi ~v (Vec ~a ~k) Type)))
+        (dcheck ctx nilcase `(app (app ~motive 0) (vnil ~a)))
+        (dcheck ctx conscase
+          `(Pi ~k Nat
+             (Pi ~x ~a
+               (Pi ~tail (Vec ~a ~k)
+                 (Pi ~ih (app (app ~motive ~k) ~tail)
+                   (app (app ~motive (succ ~k)) (vcons ~a ~k ~x ~tail)))))))
+        (dcheck ctx n 'Nat)
+        (dcheck ctx xs `(Vec ~a ~n))
+        `(app (app ~motive ~n) ~xs))
+    (dlist? term "vec-match" 10)
+      (dinfer ctx (dvec-match-expand term))
+    (dlist? term "empty-elim" 2)
+      (let [motive (primitive/code-nth term 1)
+            impossible (primitive/code-nth term 2)]
+        (densure-type ctx motive)
+        (dcheck ctx impossible 'Empty)
+        motive)
+    (dlist? term "W" 2)
+      (let [a (primitive/code-nth term 1)
+            b (primitive/code-nth term 2)
+            shape (primitive/fresh-identifier "shape")]
+        (let [la (duniverse-level ctx a)]
+          (dcheck ctx b `(Pi ~shape ~a Type))
+          (duniverse-code la)))
+    (dlist? term "sup" 4)
+      (let [a (primitive/code-nth term 1)
+            b (primitive/code-nth term 2)
+            shape (primitive/code-nth term 3)
+            children (primitive/code-nth term 4)
+            s (primitive/fresh-identifier "shape")
+            position (primitive/fresh-identifier "position")]
+        (densure-type ctx a)
+        (dcheck ctx b `(Pi ~s ~a Type))
+        (dcheck ctx shape a)
+        (dcheck ctx children `(Pi ~position (app ~b ~shape) (W ~a ~b)))
+        `(W ~a ~b))
+    (dlist? term "w-elim" 5)
+      (let [a (primitive/code-nth term 1)
+            b (primitive/code-nth term 2)
+            motive (primitive/code-nth term 3)
+            step (primitive/code-nth term 4)
+            tree (primitive/code-nth term 5)
+            shape (primitive/fresh-identifier "shape")
+            node (primitive/fresh-identifier "node")
+            children (primitive/fresh-identifier "children")
+            position (primitive/fresh-identifier "position")
+            ih (primitive/fresh-identifier "ih")]
+        (densure-type ctx a)
+        (dcheck ctx b `(Pi ~shape ~a Type))
+        (dcheck ctx motive `(Pi ~node (W ~a ~b) Type))
+        (dcheck ctx step
+          `(Pi ~shape ~a
+             (Pi ~children (Pi ~position (app ~b ~shape) (W ~a ~b))
+               (Pi ~ih
+                 (Pi ~position (app ~b ~shape)
+                   (app ~motive (app ~children ~position)))
+                 (app ~motive (sup ~a ~b ~shape ~children))))))
+        (dcheck ctx tree `(W ~a ~b))
+        `(app ~motive ~tree))
+    (dlist? term "let" 3)
+      (let [x (primitive/code-nth term 1)
+            value (primitive/code-nth term 2)
+            body (primitive/code-nth term 3)
+            ty (dinfer ctx value)]
+        (let [result (dinfer (ctx-push ctx x ty value true) body)]
+          (dsubst result x value)))
+    (dlist? term "ann" 2)
+      (let [value (primitive/code-nth term 1)
+            ty (primitive/code-nth term 2)]
+        (densure-type ctx ty)
+        (dcheck ctx value ty)
+        ty)
+    :else (dfail term "dependent: cannot infer this term; add an annotation")))
+
+(defn process-claim [(ctx Code) (form Code)] (-> Code)
+  (let [name (primitive/code-nth form 1)
+        ty (primitive/code-nth form 2)]
+    (if (> (dcount (ctx-find ctx (primitive/code-sym name))) 0)
+        (dfail name "dependent: duplicate declaration name")
+        name)
+    (densure-type ctx ty)
+    (ctx-push ctx name ty 'undefined false)))
+
+(defn process-define [(ctx Code) (form Code)] (-> Code)
+  (let [name (primitive/code-nth form 1)
+        value (primitive/code-nth form 2)
+        entry (ctx-find ctx (primitive/code-sym name))]
+    (if (= (primitive/code-count entry) 0)
+        (dfail name "dependent: definition requires a preceding claim")
+        (do
+          (dcheck ctx value (primitive/code-nth entry 1))
+          (ctx-push ctx name (primitive/code-nth entry 1) value true)))))
+
+(defn dparams-type [(params Code) (result Code) (i i64)] (-> Code)
+  (if (>= i (primitive/code-count params))
+      result
+      (let [param (primitive/code-nth params i)]
+        (cond
+          (= (dcount param) 2)
+            `(Pi ~(primitive/code-nth param 0) ~(primitive/code-nth param 1)
+                 ~(dparams-type params result (primitive/iadd i 1)))
+          (and (= (dcount param) 3) (dsym? (primitive/code-nth param 0) "implicit"))
+            `(IPi ~(primitive/code-nth param 1) ~(primitive/code-nth param 2)
+                  ~(dparams-type params result (primitive/iadd i 1)))
+          :else (dfail param "dependent: parameter must be (name Type) or (implicit name Type)")))))
+
+(defn dparams-value [(params Code) (body Code) (i i64)] (-> Code)
+  (if (>= i (primitive/code-count params))
+      body
+      (let [param (primitive/code-nth params i)]
+        (cond
+          (= (dcount param) 2)
+            `(fn ~(primitive/code-nth param 0) ~(primitive/code-nth param 1)
+                 ~(dparams-value params body (primitive/iadd i 1)))
+          (and (= (dcount param) 3) (dsym? (primitive/code-nth param 0) "implicit"))
+            `(ifn ~(primitive/code-nth param 1) ~(primitive/code-nth param 2)
+                  ~(dparams-value params body (primitive/iadd i 1)))
+          :else (dfail param "dependent: parameter must be (name Type) or (implicit name Type)")))))
+
+(defn dident-in? [(items Code) (name Code)] (-> bool)
+  (let [(mut i) 0
+        (mut found) false]
+    (loop (if (>= (load i) (dcount items))
+              (break)
+              (if (and (primitive/code-sym? (primitive/code-nth items (load i)))
+                       (primitive/free-identifier=? (primitive/code-nth items (load i)) name))
+                  (do (set! found true) (break))
+                  (set! i (primitive/iadd (load i) 1)))))
+    (load found)))
+
+(defn dcode-concat [(left Code) (right Code)] (-> Code)
+  (let [out (primitive/code-list-new)
+        (mut i) 0]
+    (loop (if (>= (load i) (dcount left))
+              (break)
+              (do
+                (primitive/code-list-push! out (primitive/code-nth left (load i)))
+                (set! i (primitive/iadd (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (dcount right))
+              (break)
+              (do
+                (primitive/code-list-push! out (primitive/code-nth right (load i)))
+                (set! i (primitive/iadd (load i) 1)))))
+    (primitive/code-list-done out)))
+
+(defn derased-self-callee? [(callee Code) (self Code)] (-> bool)
+  (if (and (primitive/code-sym? callee) (primitive/free-identifier=? callee self))
+      true
+      (if (dlist? callee "iapp" 2)
+          (derased-self-callee? (primitive/code-nth callee 1) self)
+          false)))
+
+(defn dtermination-ok? [(term Code) (self Code) (smaller Code)] (-> bool)
+  (cond
+    (and (primitive/code-sym? term) (primitive/free-identifier=? term self)) false
+    (dlist? term "app" 2)
+      (let [callee (primitive/code-nth term 1)
+            arg (primitive/code-nth term 2)]
+        (if (derased-self-callee? callee self)
+            (and (primitive/code-sym? arg) (dident-in? smaller arg))
+            (and (dtermination-ok? callee self smaller)
+                 (dtermination-ok? arg self smaller))))
+    (dlist? term "nat-match" 6)
+      (and (dtermination-ok? (primitive/code-nth term 1) self smaller)
+           (and (dtermination-ok? (primitive/code-nth term 2) self smaller)
+                (and (dtermination-ok? (primitive/code-nth term 3) self smaller)
+                     (dtermination-ok? (primitive/code-nth term 6) self
+                       (dcode-concat `(~(primitive/code-nth term 4)) smaller)))))
+    (dlist? term "dcase" 3)
+      (let [branches (primitive/code-nth term 3)
+            (mut valid) (and (dtermination-ok? (primitive/code-nth term 1) self smaller)
+                             (dtermination-ok? (primitive/code-nth term 2) self smaller))
+            (mut i) 0]
+        (loop (if (or (not (load valid)) (>= (load i) (primitive/code-count branches)))
+                  (break)
+                  (let [branch (primitive/code-nth branches (load i))]
+                    (if (not (dtermination-ok? (primitive/code-nth branch 2) self
+                               (dcode-concat (primitive/code-nth branch 1) smaller)))
+                        (set! valid false)
+                        0)
+                    (set! i (primitive/iadd (load i) 1)))))
+        (load valid))
+    :else
+      (let [n (dcount term)
+            (mut i) 0
+            (mut valid) true]
+        (loop (if (or (not (load valid)) (>= (load i) n))
+                  (break)
+                  (do
+                    (if (not (dtermination-ok? (primitive/code-nth term (load i)) self smaller))
+                        (set! valid false)
+                        0)
+                    (set! i (primitive/iadd (load i) 1)))))
+        (load valid))))
+
+(defn process-def [(ctx Code) (form Code)] (-> Code)
+  (let [name (primitive/code-nth form 1)
+        params (primitive/code-nth form 2)
+        result (primitive/code-nth form 3)
+        body (primitive/code-nth form 4)
+        claim `(claim ~name ~(dparams-type params result 0))
+        value `(define ~name ~(dparams-value params body 0))]
+    (if (not (dtermination-ok? body name `()))
+        (dfail body "dependent: recursive def call is not on a structurally smaller pattern binder")
+        body)
+    (process-define (process-claim ctx claim) value)))
+
+(defn process-foreign-nat-fn [(ctx Code) (form Code)] (-> Code)
+  (let [name (primitive/code-nth form 1)
+        coil-name (primitive/code-nth form 2)
+        arg (primitive/fresh-identifier "argument")]
+    (ctx-push ctx name `(Pi ~arg Nat Nat) `(foreign-nat-fn ~coil-name) true)))
+
+(defn process-emit-nat [(ctx Code) (form Code)] (-> Code)
+  (let [name (primitive/syntax->datum (primitive/code-nth form 1))
+        term (primitive/code-nth form 2)]
+    (dcheck ctx term 'Nat)
+    (let [value (dnormalize ctx term)]
+      (if (primitive/code-int? value)
+          `(const ~name i64 ~(primitive/code-int value))
+          (do
+            (dfail term "dependent: emit-nat requires a closed normalizing Nat term")
+            ;; Keep the transformed program syntactically valid so the located
+            ;; metaprogram diagnostics are what the user sees.
+            `(const ~name i64 0))))))
+
+(defn process-emit-nat-pair [(ctx Code) (form Code)] (-> Code)
+  (let [name (primitive/syntax->datum (primitive/code-nth form 1))
+        pair-type (primitive/syntax->datum
+                    (primitive/code-symbol (primitive/code-nth form 1) "--dependent-pair"))
+        term (primitive/code-nth form 2)
+        ty (primitive/code-nth form 3)]
+    (dcheck ctx ty 'Type)
+    (dcheck ctx term ty)
+    (let [value (dnormalize ctx term)]
+      (if (and (dlist? ty "Sigma" 3)
+               (ddefeq? ctx (primitive/code-nth ty 2) 'Nat)
+               (ddefeq? ctx (primitive/code-nth ty 3) 'Nat)
+               (dlist? value "pair" 2)
+               (primitive/code-int? (primitive/code-nth value 1))
+               (primitive/code-int? (primitive/code-nth value 2)))
+          `(do
+             (defstruct ~pair-type [(index i64) (value i64)])
+             (const ~name ~pair-type
+               (~pair-type
+                 :index ~(primitive/code-int (primitive/code-nth value 1))
+                 :value ~(primitive/code-int (primitive/code-nth value 2)))))
+          (dfail term "dependent: emit-nat-pair expects a closed (Sigma n Nat Nat) pair")))))
+
+;; Erase a checked Nat computation to ordinary Coil i64 syntax. Global
+;; dependent definitions are unfolded by normalization; free lambda variables
+;; remain as the hygienic identifiers that become generated Coil parameters.
+(defn derase-nat [(ctx Code) (term Code)] (-> Code)
+  (let [n (dnormalize ctx term)]
+    (cond
+      (primitive/code-int? n) `~(primitive/code-int n)
+      (primitive/code-sym? n) n
+      (dlist? n "succ" 1) `(+ ~(derase-nat ctx (primitive/code-nth n 1)) 1)
+      (dlist? n "plus" 2)
+        `(+ ~(derase-nat ctx (primitive/code-nth n 1))
+            ~(derase-nat ctx (primitive/code-nth n 2)))
+      (dlist? n "app" 2)
+        (let [callee (primitive/code-nth n 1)]
+          (if (dlist? callee "foreign-nat-fn" 1)
+              `(~(primitive/code-nth callee 1)
+                ~(derase-nat ctx (primitive/code-nth n 2)))
+              (dfail term "dependent: unapplied dependent function survived Nat erasure")))
+      (dlist? n "let" 3)
+        `(let [~(primitive/code-nth n 1) ~(derase-nat ctx (primitive/code-nth n 2))]
+           ~(derase-nat ctx (primitive/code-nth n 3)))
+      :else (dfail term "dependent: this Nat term has no ordinary Coil lowering yet"))))
+
+(defn process-emit-nat-fn [(ctx Code) (form Code)] (-> Code)
+  (let [name (primitive/syntax->datum (primitive/code-nth form 1))
+        term (primitive/code-nth form 2)
+        ty (dnormalize ctx (dinfer ctx term))
+        value (dnormalize ctx term)]
+    (if (and (dlist? ty "Pi" 3)
+             (ddefeq? ctx (primitive/code-nth ty 2) 'Nat)
+             (ddefeq? ctx (primitive/code-nth ty 3) 'Nat)
+             (dlist? value "fn" 3))
+        (let [arg (primitive/code-nth value 1)
+              body (primitive/code-nth value 3)]
+          `(defn ~name [(~arg i64)] (-> i64) ~(derase-nat ctx body)))
+        (dfail term "dependent: emit-nat-fn expects a function of type (Pi n Nat Nat)"))))
+
+(defn derase-nat-pair [(ctx Code) (term Code) (pair-type Code)] (-> Code)
+  (let [value (dnormalize ctx term)]
+    (if (dlist? value "pair" 2)
+        `(~pair-type
+          :index ~(derase-nat ctx (primitive/code-nth value 1))
+          :value ~(derase-nat ctx (primitive/code-nth value 2)))
+        (dfail term "dependent: Sigma lowering expected a pair introduction"))))
+
+(defn process-emit-nat-pair-fn [(ctx Code) (form Code)] (-> Code)
+  (let [name (primitive/syntax->datum (primitive/code-nth form 1))
+        pair-type (primitive/syntax->datum
+                    (primitive/code-symbol (primitive/code-nth form 1) "--dependent-result"))
+        term (primitive/code-nth form 2)
+        ty (dnormalize ctx (dinfer ctx term))
+        value (dnormalize ctx term)]
+    (if (and (dlist? ty "Pi" 3)
+             (ddefeq? ctx (primitive/code-nth ty 2) 'Nat)
+             (dlist? (primitive/code-nth ty 3) "Sigma" 3)
+             (ddefeq? ctx (primitive/code-nth (primitive/code-nth ty 3) 2) 'Nat)
+             (ddefeq? ctx (primitive/code-nth (primitive/code-nth ty 3) 3) 'Nat)
+             (dlist? value "fn" 3))
+        (let [arg (primitive/code-nth value 1)
+              body (primitive/code-nth value 3)]
+          `(do
+             (defstruct ~pair-type [(index i64) (value i64)])
+             (defn ~name [(~arg i64)] (-> ~pair-type)
+               ~(derase-nat-pair ctx body pair-type))))
+        (dfail term "dependent: emit-nat-pair-fn expects Nat -> (Sigma n Nat Nat)"))))
+
+(defn process-emit-nat-vector [(ctx Code) (form Code)] (-> Code)
+  (let [name (primitive/syntax->datum (primitive/code-nth form 1))
+        term (primitive/code-nth form 2)
+        ty (dnormalize ctx (dinfer ctx term))
+        value (dnormalize ctx term)]
+    (if (and (dlist? ty "Vec" 2)
+             (ddefeq? ctx (primitive/code-nth ty 1) 'Nat)
+             (primitive/code-int? (primitive/code-nth ty 2))
+             (> (primitive/code-int (primitive/code-nth ty 2)) 0))
+        (let [items (primitive/code-list-new)
+              (mut current) value
+              (mut count) 0]
+          (loop (if (dlist? (load current) "vnil" 1)
+                    (break)
+                    (if (dlist? (load current) "vcons" 4)
+                        (do
+                          (primitive/code-list-push! items
+                            (derase-nat ctx (primitive/code-nth (load current) 3)))
+                          (set! current (dnormalize ctx (primitive/code-nth (load current) 4)))
+                          (set! count (primitive/iadd (load count) 1)))
+                        (do
+                          (dfail term "dependent: vector lowering requires a closed constructor spine")
+                          (break)))))
+          (if (= (load count) (primitive/code-int (primitive/code-nth ty 2)))
+              `(const ~name (array i64 ~(load count)) [~@(primitive/code-list-done items)])
+              (do
+                (dfail term "dependent: normalized vector spine disagrees with its length index")
+                `(const ~name i64 0))))
+        (do
+          (dfail term "dependent: emit-nat-vector expects a nonempty closed (Vec Nat N)")
+          `(const ~name i64 0)))))
+
+;; The one public elaborator. It performs all checking within one invocation so
+;; claims and definitions form a coherent dependent module, then returns only
+;; ordinary Coil declarations.
+(defn dependent [& (forms Code)] (-> Code)
+  (let [(mut ctx) (ctx-new)
+        out (primitive/code-list-new)
+        n (primitive/code-count forms)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [form (primitive/code-nth forms (load i))]
+                (cond
+                  (dlist? form "claim" 2) (do (store! ctx (process-claim (load ctx) form)) 0)
+                  (dlist? form "define" 2) (do (store! ctx (process-define (load ctx) form)) 0)
+                  (dlist? form "def" 4) (do (store! ctx (process-def (load ctx) form)) 0)
+                  (dlist? form "foreign-nat-fn" 2)
+                    (do (store! ctx (process-foreign-nat-fn (load ctx) form)) 0)
+                  (dlist? form "data" 2)
+                    (do (store! ctx (process-data (load ctx) form)) 0)
+                  (dlist? form "data" 3)
+                    (do (store! ctx (process-data (load ctx) form)) 0)
+                  (dlist? form "check" 2)
+                    (do (dcheck (load ctx) (primitive/code-nth form 1) (primitive/code-nth form 2)) 0)
+                  (dlist? form "emit-nat" 2)
+                    (do (primitive/code-list-push! out (process-emit-nat (load ctx) form)) 0)
+                  (dlist? form "emit-nat-fn" 2)
+                    (do (primitive/code-list-push! out (process-emit-nat-fn (load ctx) form)) 0)
+                  (dlist? form "emit-nat-pair" 3)
+                    (do (primitive/code-list-push! out (process-emit-nat-pair (load ctx) form)) 0)
+                  (dlist? form "emit-nat-pair-fn" 2)
+                    (do (primitive/code-list-push! out (process-emit-nat-pair-fn (load ctx) form)) 0)
+                  (dlist? form "emit-nat-vector" 2)
+                    (do (primitive/code-list-push! out (process-emit-nat-vector (load ctx) form)) 0)
+                  :else (do (dfail form "dependent: expected claim, define, def, check, or emitter") 0))
+                (set! i (primitive/iadd (load i) 1)))))
+    `(do ~@(primitive/code-list-done out))))
+
+(export dependent)

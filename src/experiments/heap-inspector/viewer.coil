@@ -1,0 +1,156 @@
+(module experiments.heap-inspector.viewer)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.fs" :as fs)
+(import "coil.slice" :use *)
+(import "coil.result" :use *)
+(import "coil.socket" :as socket)
+(import "coil.thread" :as thread)
+(import "experiments.heap-inspector.runtime" :use *)
+
+(extern printf :cc c [(ptr i8) ...] (-> i32))
+(extern getenv :cc c [(ptr i8)] (-> (ptr i8)))
+(extern strlen :cc c [(ptr i8)] (-> i64))
+(extern sscanf :cc c [(ptr i8) (ptr i8) ...] (-> i32))
+
+(defstruct ViewerState
+  [(listener socket/TcpListener)
+   (connection socket/TcpConnection)
+   (thread thread/Thread)
+   (started bool)
+   (port i64)
+   (asset-root (slice u8))])
+
+(defn viewer-state [] (-> (ptr ViewerState))
+  (primitive/alloc-static ViewerState))
+
+(defn cstr-slice [(p (ptr i8))] (-> (slice u8))
+  (slice-new (primitive/cast (ptr u8) p) (strlen p)))
+
+(defn request-prefix? [(buf (ptr i8)) (n i64) (needle (ptr i8))] (-> bool)
+  (let [needed (strlen needle) (mut i) 0 (mut same) true]
+    (if (< n needed)
+        false
+        (do
+          (loop (if (>= (load i) needed)
+                    (break)
+                    (if (= (load (primitive/index buf (load i))) (load (primitive/index needle (load i))))
+                        (set! i (+ (load i) 1))
+                        (do (set! same false) (break)))))
+          (load same)))))
+
+(defn send-all! [(connection (ptr socket/TcpConnection)) (bytes (slice u8))] (-> i64)
+  (let [(mut at) 0 (mut failed) false]
+    (loop (if (or (load failed) (>= (load at) (slice-len bytes)))
+              (break)
+              (match (socket/tcp-write connection
+                                       (primitive/cast (ptr i8) (primitive/index (slice-data bytes) (load at)))
+                                       (- (slice-len bytes) (load at)))
+                (Err [e] (set! failed true))
+                (Ok [n] (if (<= n 0) (set! failed true) (set! at (+ (load at) n)))))))
+    (if (load failed) 1 0)))
+
+(defn asset-path [(state (ptr ViewerState)) (name (slice u8))] (-> (slice u8))
+  (let [root (.asset-root state)
+        n (+ (+ (slice-len root) 1) (slice-len name))
+        memory (match (alloc/alloc [u8] (alloc/malloc-allocator) n)
+                 (None [] (alloc/alloc-slice-new (primitive/cast (ptr u8) 0) 0))
+                 (Some [s] s))]
+    (if (= (alloc/alloc-slice-len memory) n)
+        (do
+          (for [i 0 (slice-len root)]
+            (set! (primitive/index (alloc/alloc-slice-data memory) i) (slice-get root i)))
+          (set! (primitive/index (alloc/alloc-slice-data memory) (slice-len root))
+                (primitive/cast u8 #\/))
+          (for [i 0 (slice-len name)]
+            (set! (primitive/index (alloc/alloc-slice-data memory) (+ (+ (slice-len root) 1) i))
+                  (slice-get name i))))
+        0)
+    memory))
+
+(defn serve-asset! [(state (ptr ViewerState)) (name (slice u8)) (content-type (slice u8))] (-> i64)
+  (let [a (alloc/malloc-allocator) path (asset-path state name)]
+    (match (fs/read-file a path)
+      (Err [e]
+        (do (send-all! (field state connection)
+                       "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nnot found")
+            (alloc/free [u8] a path)
+            1))
+      (Ok [body]
+        (do
+          (send-all! (field state connection) "HTTP/1.1 200 OK\r\nContent-Type: ")
+          (send-all! (field state connection) content-type)
+          (send-all! (field state connection) "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")
+          (send-all! (field state connection) body)
+          (alloc/free [u8] a body)
+          (alloc/free [u8] a path)
+          0)))))
+
+(defn serve-one! [(state (ptr ViewerState))] (-> i64)
+  (let [request (primitive/alloc-stack (array i8 4096))]
+    (match (socket/tcp-read (field state connection) (primitive/index request 0) 4096)
+      (Err [e] 1)
+      (Ok [n]
+        (let [memory-id (primitive/alloc-stack i64)
+              memory-offset (primitive/alloc-stack i64)
+              allocation-id (primitive/alloc-stack i64)]
+        (cond
+          (= (sscanf (primitive/index request 0) c"GET /api/memory/%ld/%ld" memory-id memory-offset) 2)
+            (do (send-all! (field state connection)
+                           "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")
+                (send-all! (field state connection) (inspector-memory (load memory-id) (load memory-offset))))
+          (= (sscanf (primitive/index request 0) c"GET /api/allocation/%ld" allocation-id) 1)
+            (do (send-all! (field state connection)
+                           "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")
+                (send-all! (field state connection) (inspector-allocation-snapshot (load allocation-id))))
+          (request-prefix? (primitive/index request 0) n c"GET /api/snapshot")
+            (do (send-all! (field state connection)
+                           "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")
+                (send-all! (field state connection) (inspector-snapshot)))
+          (request-prefix? (primitive/index request 0) n c"GET /app.js")
+            (serve-asset! state "app.js" "application/javascript; charset=utf-8")
+          (request-prefix? (primitive/index request 0) n c"GET /style.css")
+            (serve-asset! state "style.css" "text/css; charset=utf-8")
+          :else (serve-asset! state "index.html" "text/html; charset=utf-8")))))))
+
+(defn viewer-thread [(arg (ptr i8))] (-> (ptr i8))
+  (let [state (primitive/cast (ptr ViewerState) arg) (mut running) true]
+    (loop (if (not (load running))
+              (break)
+              (match (socket/tcp-accept (field state listener) (field state connection))
+                (Err [e] (set! running false))
+                (Ok [c]
+                  (do (serve-one! state)
+                      (socket/tcp-connection-close! (field state connection))
+                      0)))))
+    (primitive/cast (ptr i8) 0)))
+
+(defn configured-asset-root [] (-> (slice u8))
+  (let [p (getenv c"COIL_HEAP_INSPECTOR_VIEWER")]
+    (if (= (primitive/cast i64 p) 0)
+        "src/experiments/heap-inspector/viewer"
+        (cstr-slice p))))
+
+(defn inspector-start-viewer! [(port i64)] (-> bool)
+  (let [state (viewer-state)]
+    (if (.started state)
+        true
+        (do
+          (set! (.asset-root state) (configured-asset-root))
+          (match (socket/tcp-listen (alloc/malloc-allocator) (field state listener) "127.0.0.1" port true 8)
+            (Err [e] false)
+            (Ok [listener]
+              (do
+                (set! (.port state) port)
+                (if (!= (primitive/cast i64
+                                         (thread/thread-spawn (field state thread)
+                                                              (primitive/fnptr-of viewer-thread)
+                                                              (primitive/cast (ptr i8) state)))
+                        0)
+                    false
+                    (do (set! (.started state) true)
+                        (printf c"heap inspector: http://127.0.0.1:%ld\n" port)
+                        true)))))))))
+
+(defn inspector-boot! [] (-> i64)
+  (if (inspector-start-viewer! 7391) 0 (do (printf c"heap inspector: failed to bind 127.0.0.1:7391\n") 1)))

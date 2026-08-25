@@ -42,6 +42,15 @@ python3 scripts/c-doom-native.py          # Doom, 81 translation units
 python3 scripts/c-doom-native.py --play   # the windowed game, with sound
 ```
 
+### `src/dialects/rust/` — a round-trippable Rust-like reader
+A reader metaprogram and converter for writing Coil with Rust-like declarations,
+blocks, expressions, traits, imports, and control flow. Native `coil { ... }`
+escapes make every Coil form representable, while the canonical converter proves
+each structured form round-trips to the identical Coil syntax tree before using
+the nicer spelling. The integration gate converts, builds, and runs a full copy
+of the Coil compiler through one `--use experiments.rust.lang`. See
+[`src/dialects/rust/README.md`](src/dialects/rust/README.md).
+
 ### `src/apps/` — applications
 - `chip8/` — CHIP-8 emulator with an AppKit GUI
 - `clox/` — the Crafting Interpreters bytecode VM, at rough parity with `-O2` C
@@ -74,6 +83,7 @@ them.
 ```sh
 python3 scripts/scheme-progress.py --compiler "$(command -v coil)"
 python3 tests/scheme/run.py --list
+python3 scripts/coilrs-test.py --compiler "$(command -v coil)"
 ```
 
 ## Building

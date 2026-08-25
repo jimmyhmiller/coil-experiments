@@ -1,0 +1,98 @@
+(module experiments.rust.reader)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.str" :as str)
+(import "coil.slice" :use [slice-data slice-len])
+
+(extern popen :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+(extern pclose :cc c [(ptr i8)] (-> i32))
+(extern fread :cc c [(ptr i8) i64 i64 (ptr i8)] (-> i64))
+(extern fopen :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+(extern fwrite :cc c [(ptr i8) i64 i64 (ptr i8)] (-> i64))
+(extern fclose :cc c [(ptr i8)] (-> i32))
+(extern getpid :cc c [] (-> i32))
+(extern unlink :cc c [(ptr i8)] (-> i32))
+
+(defn stage-source [(a (dyn alloc/Allocator))
+                    (path (slice u8))
+                    (source (slice u8))] (-> bool)
+  (let [file (fopen (str/str->cstr a path) c"wb")]
+    (if (= (primitive/cast i64 file) 0)
+        false
+        (let [written (fwrite (primitive/cast (ptr i8) (slice-data source))
+                              1
+                              (slice-len source)
+                              file)
+              closed (fclose file)]
+          (and (= written (slice-len source)) (= closed 0))))))
+
+(defn shell-safe? [(path (slice u8))] (-> bool)
+  (let [(mut i) 0 (mut safe) true]
+    (loop
+      (if (>= (load i) (slice-len path))
+          (break)
+          (do
+            (if (= (str/char-at path (load i)) (primitive/cast u8 #\'))
+                (store! safe false)
+                0)
+            (store! i (+ (load i) 1)))))
+    (load safe)))
+
+(defn read-command-output [(a (dyn alloc/Allocator))
+                           (command (slice u8))] (-> Code)
+  (let [command-cstr (str/str->cstr a command)
+        pipe (popen command-cstr c"r")]
+    (if (= (primitive/cast i64 pipe) 0)
+        (primitive/error "CoilRS reader: could not start the frontend")
+        (let [(mut output) (str/sb-new a)
+              chunk (primitive/alloc-stack (array u8 4096))
+              (mut done) false]
+          (loop
+            (if (load done)
+                (break)
+                (let [n (fread (primitive/cast (ptr i8) chunk) 1 4096 pipe)]
+                  (if (= n 0)
+                      (store! done true)
+                      (let [(mut i) 0]
+                        (loop
+                          (if (>= (load i) n)
+                              (break)
+                              (do
+                                (str/sb-push-byte!
+                                  (mut output)
+                                  (load (primitive/index chunk (load i))))
+                                (store! i (+ (load i) 1))))))))))
+          (let [status (pclose pipe)
+                generated (str/sb-finish! (mut output))]
+            (if (= status 0)
+                (primitive/code-read
+                  (primitive/code-nth `(source ~generated) 1)
+                  `(reader-config))
+                (primitive/error "CoilRS reader: frontend rejected the source")))))))
+
+;; The frontend emits ordinary Coil text. Parsing that text through code-read
+;; keeps the rest of the compiler completely unaware of the alternate syntax.
+(defn read-coilrs [(context Code)] (-> Code)
+  (let [a (alloc/malloc-allocator)
+        path (primitive/code-str (primitive/code-nth context 1))
+        source (primitive/code-str (primitive/code-nth context 2))]
+    (if (not (shell-safe? path))
+        (primitive/error "CoilRS reader: paths containing a single quote are unsupported")
+        (let [(mut temporary-builder) (str/sb-new a)
+              _a (str/sb-push-str! (mut temporary-builder) "/tmp/coilrs-reader-")
+              _b (str/sb-push-i64! (mut temporary-builder) (primitive/cast i64 (getpid)))
+              _c (str/sb-push-str! (mut temporary-builder) ".coilrs")
+              temporary (str/sb-finish! (mut temporary-builder))]
+          (if (not (stage-source a temporary source))
+              (primitive/error "CoilRS reader: could not stage source bytes")
+              (let [(mut command) (str/sb-new a)
+                    _d (str/sb-push-str! (mut command)
+                          "python3 src/dialects/rust/coilrs.py to-coil --materialize-entry '")
+                    _e (str/sb-push-str! (mut command) path)
+                    _f (str/sb-push-str! (mut command) "' '")
+                    _g (str/sb-push-str! (mut command) temporary)
+                    _h (str/sb-push-str! (mut command) "'")
+                    result (read-command-output a (str/sb-finish! (mut command)))
+                    _cleanup (unlink (str/str->cstr a temporary))]
+                result))))))

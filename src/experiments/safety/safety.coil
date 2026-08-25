@@ -1,0 +1,830 @@
+(module experiments.safety.safety)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "experiments.safety.arithmetic" :use *)
+(import "experiments.safety.runtime"
+        :use
+        [bounds-check
+         cast-check-f64
+         cast-check-signed
+         cast-check-unsigned
+         checked-al-elem
+         checked-al-get
+         checked-al-set!
+         checked-slice-get
+         checked-slice-set!
+         checked-subslice
+         dynamic-object-check
+         indirect-target-check
+         pointer-cast-check
+         pointer-check
+         safety-abort])
+(import "experiments.safety.unsafe" :use *)
+
+;; A whole-program safety transform. `primitive/index` intentionally also works
+;; on raw pointers, whose allocation length is unknowable. We therefore insert
+;; checks only when the checked AST proves that its base is ptr(array T N).
+;; Slices retain their standard-library checks. Indexing a raw pointer whose type
+;; carries no length is rejected unless it is explicitly wrapped in `unsafe`.
+
+(defn last-start [(s (slice u8))] (-> i64)
+  (let [(mut i) 0
+        (mut at) 0]
+    (loop (if (>= (load i) (slice-len s))
+              (break)
+              (do
+                (let [c (primitive/cast i64 (slice-get s (load i)))]
+                  (if (or (= c 47) (= c 46)) (set! at (+ (load i) 1)) 0))
+                (set! i (+ (load i) 1)))))
+    (load at)))
+
+(defn last-name [(c Code)] (-> (slice u8))
+  (let [s (primitive/code-str c)]
+    (subslice s (last-start s) (slice-len s))))
+
+(defn same? [(a (slice u8)) (b (slice u8))] (-> bool)
+  (if (!= (slice-len a) (slice-len b))
+      false
+      (let [(mut i) 0
+            (mut yes) true]
+        (loop (if (or (>= (load i) (slice-len a)) (not (load yes)))
+                  (break)
+                  (do
+                    (if (= (slice-get a (load i)) (slice-get b (load i)))
+                        0
+                        (set! yes false))
+                    (set! i (+ (load i) 1)))))
+        (load yes))))
+
+(defn named? [(c Code) (wanted (slice u8))] (-> bool)
+  (and (primitive/code-sym? c) (same? (last-name c) wanted)))
+
+(defn division-name? [(c Code)] (-> bool)
+  (if (not (primitive/code-sym? c))
+      false
+      (let [s (primitive/code-str c)
+            n (slice-len s)]
+        (and (> n 0) (= (slice-get s (- n 1)) (primitive/cast u8 47))))))
+
+(defn unsafe-call? [(e Code)] (-> bool)
+  (and (= (len e) 2)
+       (named? (get e 0) "unsafe")))
+
+(defn array-length [(T Code)] (-> i64)
+  (let [A (if (and (primitive/code-list? T)
+                   (= (len T) 2)
+                   (named? (get T 0) "ptr"))
+              (get T 1)
+              T)]
+    (if (and (primitive/code-list? A)
+             (= (len A) 3)
+             (named? (get A 0) "array")
+             (primitive/code-int? (get A 2)))
+        (primitive/code-int (get A 2))
+        -1)))
+
+(defn pointer-type? [(T Code)] (-> bool)
+  (and (primitive/code-list? T)
+       (= (len T) 2)
+       (named? (get T 0) "ptr")))
+
+(defn checked-pointer? [(e Code)] (-> bool)
+  (and (primitive/code-list? e)
+       (= (len e) 3)
+       (named? (get e 0) "cast")
+       (let [value (get e 2)]
+         (and (primitive/code-list? value)
+              (> (len value) 0)
+              (named? (get value 0) "pointer-check")))))
+
+(defn check-pointer [(e Code)] (-> Code)
+  (let [p (rewrite e)
+        T (primitive/type-of e)]
+    (if (and (pointer-type? T)
+             (and (primitive/code-list? e)
+                  (and (= (len e) 3)
+                       (and (named? (get e 0) "cast")
+                            (and (primitive/code-int? (get e 2))
+                                 (= (primitive/code-int (get e 2)) 0))))))
+        (primitive/error "safety: statically known null pointer dereference")
+        (if (or (not (pointer-type? T)) (checked-pointer? e))
+            p
+            `(cast ~T
+                   (pointer-check (cast i64 ~p)
+                                  (alignof ~(get T 1))))))))
+
+(defn integer-bits [(T Code)] (-> i64)
+  (cond (or (primitive/code-eq T `i8) (primitive/code-eq T `:i8)) 8
+        (or (primitive/code-eq T `u8) (primitive/code-eq T `:u8)) 8
+        (or (primitive/code-eq T `i16) (primitive/code-eq T `:i16)) 16
+        (or (primitive/code-eq T `u16) (primitive/code-eq T `:u16)) 16
+        (or (primitive/code-eq T `i32) (primitive/code-eq T `:i32)) 32
+        (or (primitive/code-eq T `u32) (primitive/code-eq T `:u32)) 32
+        (or (primitive/code-eq T `i64) (primitive/code-eq T `:i64)) 64
+        (or (primitive/code-eq T `u64) (primitive/code-eq T `:u64)) 64
+        :else 0))
+
+(defn decimal-digit? [(c u8)] (-> bool)
+  (and (>= c (primitive/cast u8 48)) (<= c (primitive/cast u8 57))))
+
+(defn integer-type? [(T Code)] (-> bool)
+  (if (not (primitive/code-sym? T))
+      false
+      (let [name (last-name T)
+            n (slice-len name)
+            (mut i) 1
+            (mut yes) (> n 1)]
+        (if (and (load yes)
+                 (or (= (slice-get name 0) (primitive/cast u8 105))
+                     (= (slice-get name 0) (primitive/cast u8 117))))
+            (loop (if (>= (load i) n)
+                      (break)
+                      (if (decimal-digit? (slice-get name (load i)))
+                          (set! i (+ (load i) 1))
+                          (do (set! yes false) (break)))))
+            (set! yes false))
+        (load yes))))
+
+(defn signed-integer? [(T Code)] (-> bool)
+  (or (primitive/code-eq T `i8)
+      (or (primitive/code-eq T `:i8)
+          (or (primitive/code-eq T `i16)
+              (or (primitive/code-eq T `:i16)
+                  (or (primitive/code-eq T `i32)
+                      (or (primitive/code-eq T `:i32)
+                          (or (primitive/code-eq T `i64)
+                              (primitive/code-eq T `:i64)))))))))
+
+(defn pow2 [(bits i64)] (-> i64)
+  (let [(mut value) 1
+        (mut i) 0]
+    (loop (if (>= (load i) bits)
+              (break)
+              (do
+                (set! value (* (load value) 2))
+                (set! i (+ (load i) 1)))))
+    (load value)))
+
+(defn checked-cast? [(e Code)] (-> bool)
+  (if (not (and (primitive/code-list? e) (= (len e) 3)))
+      false
+      (let [value (get e 2)]
+        (and (primitive/code-list? value)
+             (> (len value) 0)
+             (or (named? (get value 0) "cast-check-signed")
+                 (or (named? (get value 0) "cast-check-unsigned")
+                     (or (named? (get value 0) "cast-check-f64")
+                         (or (named? (get value 0) "pointer-cast-check")
+                             (named? (get value 0) "pointer-check")))))))))
+
+(defn f64-type? [(T Code)] (-> bool)
+  (or (primitive/code-eq T `f64) (primitive/code-eq T `:f64)))
+
+(defn float-type? [(T Code)] (-> bool)
+  (or (f64-type? T)
+      (or (primitive/code-eq T `f32) (primitive/code-eq T `:f32))))
+
+(defn float-limit [(bits i64)] (-> Code)
+  (cond (= bits 7) `128.0
+        (= bits 8) `256.0
+        (= bits 15) `32768.0
+        (= bits 16) `65536.0
+        (= bits 31) `2147483648.0
+        (= bits 32) `4294967296.0
+        (= bits 63) `9223372036854775808.0
+        (= bits 64) `18446744073709551616.0
+        :else `0.0))
+
+(defn cast-call? [(e Code)] (-> bool)
+  (and (= (len e) 3)
+       (and (named? (get e 0) "cast") (not (checked-cast? e)))))
+
+(defn arithmetic-op [(e Code)] (-> i64)
+  (if (!= (len e) 3)
+      -1
+      (cond (or (named? (get e 0) "+") (named? (get e 0) "iadd")) 0
+            (or (named? (get e 0) "-") (named? (get e 0) "isub")) 1
+            (or (named? (get e 0) "*") (named? (get e 0) "imul")) 2
+            (or (division-name? (get e 0))
+                (or (named? (get e 0) "idiv") (named? (get e 0) "udiv"))) 3
+            (or (named? (get e 0) "%")
+                (or (named? (get e 0) "irem") (named? (get e 0) "urem"))) 4
+            (or (named? (get e 0) "<<") (named? (get e 0) "ishl")) 5
+            (or (named? (get e 0) ">>") (named? (get e 0) "ishr")) 6
+            :else -1)))
+
+(defn integer-kind [(T Code)] (-> i64)
+  (cond (or (primitive/code-eq T `i8) (primitive/code-eq T `:i8)) 0
+        (or (primitive/code-eq T `i16) (primitive/code-eq T `:i16)) 1
+        (or (primitive/code-eq T `i32) (primitive/code-eq T `:i32)) 2
+        (or (primitive/code-eq T `i64) (primitive/code-eq T `:i64)) 3
+        (or (primitive/code-eq T `u8) (primitive/code-eq T `:u8)) 4
+        (or (primitive/code-eq T `u16) (primitive/code-eq T `:u16)) 5
+        (or (primitive/code-eq T `u32) (primitive/code-eq T `:u32)) 6
+        (or (primitive/code-eq T `u64) (primitive/code-eq T `:u64)) 7
+        :else -1))
+
+(defn expression-integer-kind [(e Code)] (-> i64)
+  (if (and (primitive/code-list? e)
+           (= (len e) 3)
+           (named? (get e 0) "cast"))
+      (integer-kind (get e 1))
+      (integer-kind (primitive/type-of e))))
+
+(defn checked-arithmetic-name [(op i64) (kind i64)] (-> Code)
+  (cond (= op 0)
+          (cond (= kind 0) `checked-add-i8
+                (= kind 1) `checked-add-i16
+                (= kind 2) `checked-add-i32
+                (= kind 3) `checked-add-i64
+                (= kind 4) `checked-add-u8
+                (= kind 5) `checked-add-u16
+                (= kind 6) `checked-add-u32
+                :else `checked-add-u64)
+        (= op 1)
+          (cond (= kind 0) `checked-sub-i8
+                (= kind 1) `checked-sub-i16
+                (= kind 2) `checked-sub-i32
+                (= kind 3) `checked-sub-i64
+                (= kind 4) `checked-sub-u8
+                (= kind 5) `checked-sub-u16
+                (= kind 6) `checked-sub-u32
+                :else `checked-sub-u64)
+        (= op 2)
+          (cond (= kind 0) `checked-mul-i8
+                (= kind 1) `checked-mul-i16
+                (= kind 2) `checked-mul-i32
+                (= kind 3) `checked-mul-i64
+                (= kind 4) `checked-mul-u8
+                (= kind 5) `checked-mul-u16
+                (= kind 6) `checked-mul-u32
+                :else `checked-mul-u64)
+        (= op 3)
+          (cond (= kind 0) `checked-div-i8
+                (= kind 1) `checked-div-i16
+                (= kind 2) `checked-div-i32
+                (= kind 3) `checked-div-i64
+                (= kind 4) `checked-div-u8
+                (= kind 5) `checked-div-u16
+                (= kind 6) `checked-div-u32
+                :else `checked-div-u64)
+        (= op 4)
+          (cond (= kind 0) `checked-rem-i8
+                (= kind 1) `checked-rem-i16
+                (= kind 2) `checked-rem-i32
+                (= kind 3) `checked-rem-i64
+                (= kind 4) `checked-rem-u8
+                (= kind 5) `checked-rem-u16
+                (= kind 6) `checked-rem-u32
+                :else `checked-rem-u64)
+        (= op 5)
+          (cond (= kind 0) `checked-shl-i8
+                (= kind 1) `checked-shl-i16
+                (= kind 2) `checked-shl-i32
+                (= kind 3) `checked-shl-i64
+                (= kind 4) `checked-shl-u8
+                (= kind 5) `checked-shl-u16
+                (= kind 6) `checked-shl-u32
+                :else `checked-shl-u64)
+        :else
+          (cond (= kind 0) `checked-shift-right-i8
+                (= kind 1) `checked-shift-right-i16
+                (= kind 2) `checked-shift-right-i32
+                (= kind 3) `checked-shift-right-i64
+                (= kind 4) `checked-shift-right-u8
+                (= kind 5) `checked-shift-right-u16
+                (= kind 6) `checked-shift-right-u32
+                :else `checked-shift-right-u64)))
+
+(defn checked-negation-name [(kind i64)] (-> Code)
+  (cond (= kind 0) `checked-neg-i8
+        (= kind 1) `checked-neg-i16
+        (= kind 2) `checked-neg-i32
+        :else `checked-neg-i64))
+
+(defn rewrite-arithmetic [(e Code)] (-> Code)
+  (let [op (arithmetic-op e)
+        left-kind (expression-integer-kind (get e 1))
+        right-kind (expression-integer-kind (get e 2))
+        kind
+          (if (and (= op 1)
+                   (primitive/code-int? (get e 1))
+                   (= (primitive/code-int (get e 1)) 0)
+                   (>= right-kind 0))
+              right-kind
+              (if (>= left-kind 0) left-kind right-kind))]
+    (if (< op 0)
+        (rewrite-list e)
+        (if (< kind 0)
+            (if (or (integer-type? (primitive/type-of (get e 1)))
+                    (integer-type? (primitive/type-of (get e 2))))
+                (primitive/error
+                  "safety: arithmetic on a nonstandard integer width requires unsafe")
+                (rewrite-list e))
+        (if (and (= op 1)
+                 (< kind 4)
+                 (primitive/code-int? (get e 1))
+                 (= (primitive/code-int (get e 1)) 0))
+            `(~(checked-negation-name kind) ~(rewrite (get e 2)))
+            (if (>= op 5)
+                `(~(checked-arithmetic-name op kind) ~(rewrite (get e 1))
+                    (cast i64 ~(rewrite (get e 2))))
+                `(~(checked-arithmetic-name op kind) ~(rewrite (get e 1))
+                    ~(rewrite (get e 2)))))))))
+
+(defn collection-op [(e Code)] (-> i64)
+  (if (< (len e) 3)
+      -1
+      (cond (named? (get e 0) "slice-get") 0
+            (named? (get e 0) "slice-set!") 1
+            (named? (get e 0) "subslice") 2
+            (named? (get e 0) "al-get") 3
+            (named? (get e 0) "al-set!") 4
+            (named? (get e 0) "al-elem") 5
+            :else -1)))
+
+(defn call-argument-start [(e Code)] (-> i64)
+  (if (and (> (len e) 1)
+           (primitive/code-vector? (get e 1)))
+      2
+      1))
+
+(defn rewrite-collection [(e Code)] (-> Code)
+  (let [op (collection-op e)
+        at (call-argument-start e)]
+    (cond (= op 0)
+            (if (= at 2)
+                `(checked-slice-get ~(get e 1)
+                                    ~(rewrite (get e at))
+                                    ~(rewrite (get e (+ at 1))))
+                `(checked-slice-get ~(rewrite (get e at))
+                                    ~(rewrite (get e (+ at 1)))))
+          (= op 1)
+            (if (= at 2)
+                `(checked-slice-set! ~(get e 1)
+                                     ~(rewrite (get e at))
+                                     ~(rewrite (get e (+ at 1)))
+                                     ~(rewrite (get e (+ at 2))))
+                `(checked-slice-set! ~(rewrite (get e at))
+                                     ~(rewrite (get e (+ at 1)))
+                                     ~(rewrite (get e (+ at 2)))))
+          (= op 2)
+            (if (= at 2)
+                `(checked-subslice ~(get e 1)
+                                   ~(rewrite (get e at))
+                                   ~(rewrite (get e (+ at 1)))
+                                   ~(rewrite (get e (+ at 2))))
+                `(checked-subslice ~(rewrite (get e at))
+                                   ~(rewrite (get e (+ at 1)))
+                                   ~(rewrite (get e (+ at 2)))))
+          (= op 3)
+            (if (= at 2)
+                `(checked-al-get ~(get e 1)
+                                 ~(rewrite (get e at))
+                                 ~(rewrite (get e (+ at 1))))
+                `(checked-al-get ~(rewrite (get e at))
+                                 ~(rewrite (get e (+ at 1)))))
+          (= op 4)
+            (if (= at 2)
+                `(checked-al-set! ~(get e 1)
+                                  ~(rewrite (get e at))
+                                  ~(rewrite (get e (+ at 1)))
+                                  ~(rewrite (get e (+ at 2))))
+                `(checked-al-set! ~(rewrite (get e at))
+                                  ~(rewrite (get e (+ at 1)))
+                                  ~(rewrite (get e (+ at 2)))))
+          :else
+            (if (= at 2)
+                `(checked-al-elem ~(get e 1)
+                                  ~(rewrite (get e at))
+                                  ~(rewrite (get e (+ at 1))))
+                `(checked-al-elem ~(rewrite (get e at))
+                                  ~(rewrite (get e (+ at 1))))))))
+
+(defn indirect-call? [(e Code)] (-> bool)
+  (and (> (len e) 1)
+       (named? (get e 0) "call-ptr")))
+
+(defn statically-zero? [(e Code)] (-> bool)
+  (if (primitive/code-int? e)
+      (= (primitive/code-int e) 0)
+      (and (primitive/code-list? e)
+           (= (len e) 3)
+           (named? (get e 0) "cast")
+           (statically-zero? (get e 2)))))
+
+(defn rewrite-indirect-call [(e Code)] (-> Code)
+  (let [target (get e 1)
+        target-name (primitive/fresh-identifier "safety_target")
+        (mut out) (primitive/code-list-new)
+        (mut i) 2]
+    (if (statically-zero? target)
+        (primitive/error "safety: statically known null indirect call target")
+        (do
+          (push! (mut out) (get e 0))
+          (push! (mut out) target-name)
+          (loop (if (>= (load i) (len e))
+                    (break)
+                    (do
+                      (push! (mut out) (rewrite (get e (load i))))
+                      (set! i (+ (load i) 1)))))
+          (let [call (primitive/code-list-done (load out))]
+            `(let [~target-name ~(rewrite target)]
+               (indirect-target-check (unsafe (primitive/llvm-ir i64
+                                                                [~target-name]
+                                                                "%r = ptrtoint $t0 $0 to i64\nret i64 %r")))
+               (unsafe ~call)))))))
+
+(defn dynamic-type? [(T Code)] (-> bool)
+  (and (primitive/code-list? T)
+       (= (len T) 2)
+       (named? (get T 0) "dyn")))
+
+(defn dynamic-call? [(e Code)] (-> bool)
+  (and (> (len e) 1)
+       (dynamic-type? (primitive/type-of (get e 1)))))
+
+(defn rewrite-dynamic-call [(e Code)] (-> Code)
+  (let [receiver (get e 1)
+        receiver-name (primitive/fresh-identifier "safety_receiver")
+        (mut out) (primitive/code-list-new)
+        (mut i) 0]
+    (loop (if (>= (load i) (len e))
+              (break)
+              (do
+                (push! (mut out)
+                       (if (= (load i) 1)
+                           receiver-name
+                           (if (= (load i) 0)
+                               (get e 0)
+                               (rewrite (get e (load i))))))
+                (set! i (+ (load i) 1)))))
+    (let [call (primitive/code-list-done (load out))]
+      `(let [~receiver-name ~(rewrite receiver)]
+         (dynamic-object-check (unsafe (primitive/llvm-ir i64
+                                                         [~receiver-name]
+                                                         "%p = extractvalue $t0 $0, 0\n%r = ptrtoint ptr %p to i64\nret i64 %r"))
+                               (unsafe (primitive/llvm-ir i64
+                                                         [~receiver-name]
+                                                         "%p = extractvalue $t0 $0, 1\n%r = ptrtoint ptr %p to i64\nret i64 %r")))
+         (unsafe ~call)))))
+
+(defn defn-return-index [(form Code)] (-> i64)
+  (let [(mut i) 2
+        (mut found) -1]
+    (loop (if (or (>= (load i) (len form)) (>= (load found) 0))
+              (break)
+              (do
+                (let [part (get form (load i))]
+                  (if (and (primitive/code-list? part)
+                           (> (len part) 0)
+                           (named? (get part 0) "->"))
+                      (set! found (load i))
+                      0))
+                (set! i (+ (load i) 1)))))
+    (load found)))
+
+(defn rewrite-cast [(e Code)] (-> Code)
+  (let [dst (get e 1)
+        value (get e 2)
+        src (primitive/type-of value)
+        sbits (integer-bits src)
+        dbits (integer-bits dst)]
+    (if (or (and (integer-type? src) (= sbits 0))
+            (and (integer-type? dst) (= dbits 0)))
+        (primitive/error
+          "safety: conversion involving a nonstandard integer width requires unsafe")
+        (if (pointer-type? dst)
+        (if (and (primitive/code-int? value) (= (primitive/code-int value) 0))
+            ;; Coil code commonly uses a null pointer value as a nullable
+            ;; sentinel. Constructing or comparing that value is harmless;
+            ;; check-pointer and the indirect-call rewrite reject its unsafe
+            ;; uses at the operation that could actually produce UB.
+            `(~(get e 0) ~dst ~value)
+            `(~(get e 0) ~dst
+                         (pointer-cast-check (~(get e 0) i64 ~(rewrite value)))))
+        (if (and (float-type? src) (> dbits 0))
+            (let [magnitude (float-limit (if (signed-integer? dst) (- dbits 1) dbits))]
+              `(~(get e 0) ~dst
+                               (cast-check-f64 (~(get e 0) f64 ~(rewrite value))
+                                               ~(if (signed-integer? dst) `(primitive/fsub 0.0 ~magnitude) `0.0)
+                                               ~magnitude)))
+            (if (or (= sbits 0) (= dbits 0))
+                `(~(get e 0) ~dst ~(rewrite value))
+                (if (signed-integer? src)
+                    (if (signed-integer? dst)
+                        (if (>= dbits sbits)
+                            `(~(get e 0) ~dst ~(rewrite value))
+                            (let [half (pow2 (- dbits 1))]
+                              `(~(get e 0) ~dst
+                                               (cast-check-signed (~(get e 0) i64 ~(rewrite value))
+                                                                  ~(- 0 half)
+                                                                  ~(- half 1)))))
+                        ;; Any signed source fits u64 after the negative-value check.
+                        (if (= dbits 64)
+                            `(~(get e 0) ~dst
+                                             (cast-check-signed (~(get e 0) i64 ~(rewrite value))
+                                                                0
+                                                                9223372036854775807))
+                            `(~(get e 0) ~dst
+                                             (cast-check-signed (~(get e 0) i64 ~(rewrite value))
+                                                                0
+                                                                ~(- (pow2 dbits) 1)))))
+                    (if (or (and (not (signed-integer? dst)) (>= dbits sbits))
+                            (and (signed-integer? dst) (>= (- dbits 1) sbits)))
+                        `(~(get e 0) ~dst ~(rewrite value))
+                        (let [limit-bits (if (signed-integer? dst) (- dbits 1) dbits)]
+                          `(~(get e 0) ~dst
+                                           (cast-check-unsigned (~(get e 0) u64 ~(rewrite value))
+                                                                ~(primitive/cast u64
+                                                                                 (- (pow2 limit-bits) 1)))))))))))))
+
+(defn index-call? [(e Code)] (-> bool)
+  (and (= (len e) 3)
+       (and (named? (get e 0) "index")
+            (let [i (get e 2)]
+              (not (and (primitive/code-list? i)
+                        (> (len i) 0)
+                        (named? (get i 0) "bounds-check")))))))
+
+(defn pointer-operation? [(e Code)] (-> bool)
+  (and (> (len e) 1)
+       (or (named? (get e 0) "load")
+           (or (named? (get e 0) "store!")
+               (or (named? (get e 0) "field")
+                   (or (named? (get e 0) "volatile-load")
+                       (or (named? (get e 0) "volatile-store!")
+                           (or (named? (get e 0) "bit-get")
+                               (named? (get e 0) "bit-set!")))))))))
+
+;; These primitives carry a promise that cannot be established from Coil's
+;; typed AST. They are legal only beneath the explicit `(unsafe ...)` escape,
+;; which rewrite deliberately treats as an opaque expression.
+(defn unverifiable-primitive? [(e Code)] (-> bool)
+  (and (> (len e) 0)
+       (or (named? (get e 0) "alias-load")
+           (or (named? (get e 0) "alias-store!")
+               (or (named? (get e 0) "llvm-ir")
+                   (or (named? (get e 0) "free")
+                       (or (named? (get e 0) "write-register!")
+                           (or (named? (get e 0) "csr-read")
+                                   (or (named? (get e 0) "csr-write!")
+                                   (or (named? (get e 0) "wfi!")
+                                       (or (named? (get e 0) "mret!")
+                                           false)))))))))))
+
+(defn reject-unverifiable-primitive [(e Code)] (-> Code)
+  (primitive/error
+    "safety: unverifiable primitive requires an explicit unsafe wrapper"))
+
+(defn rewrite-pointer-operation [(e Code)] (-> Code)
+  (let [(mut out) (primitive/code-list-new)
+        pointer-at (if (named? (get e 0) "volatile-load") 2 1)
+        (mut i) 0]
+    (loop (if (>= (load i) (len e))
+              (break)
+              (do
+                (push! (mut out)
+                       (if (= (load i) pointer-at)
+                           (check-pointer (get e (load i)))
+                           (if (= (load i) 0)
+                               (get e 0)
+                               (rewrite (get e (load i))))))
+                (set! i (+ (load i) 1)))))
+    (primitive/code-list-done (load out))))
+
+(defn make-dyn-call? [(e Code)] (-> bool)
+  (and (> (len e) 1) (named? (get e 0) "make-dyn")))
+
+(defn rewrite-make-dyn [(e Code)] (-> Code)
+  (let [(mut out) (primitive/code-list-new)
+        pointer-at (- (len e) 1)
+        (mut i) 0]
+    (loop (if (>= (load i) (len e))
+              (break)
+              (do
+                (push! (mut out)
+                       (if (= (load i) pointer-at)
+                           (check-pointer (get e (load i)))
+                           (if (= (load i) 0)
+                               (get e 0)
+                               (rewrite (get e (load i))))))
+                (set! i (+ (load i) 1)))))
+    (primitive/code-list-done (load out))))
+
+(defn rewrite-index [(e Code)] (-> Code)
+  (let [index (rewrite (get e 2))
+        length (array-length (primitive/type-of (get e 1)))]
+    (if (< length 0)
+        (primitive/error
+          (primitive/code-str
+            "safety: indexing a pointer without a statically known length requires unsafe: "
+            e))
+        (if (and (primitive/code-int? (get e 2))
+                 (or (< (primitive/code-int (get e 2)) 0)
+                     (>= (primitive/code-int (get e 2)) length)))
+            (primitive/error "safety: statically known array index is out of bounds")
+            (let [base-name (primitive/fresh-identifier "safety_base")
+                  index-name (primitive/fresh-identifier "safety_index")]
+              `(let [~base-name ~(check-pointer (get e 1))
+                     ~index-name ~index]
+                 (primitive/index ~base-name (bounds-check ~index-name ~length))))))))
+
+(defn rewrite-list [(e Code)] (-> Code)
+  (let [(mut out) (primitive/code-list-new)
+        (mut i) 0]
+    (loop (if (>= (load i) (len e))
+              (break)
+              (do
+                (push! (mut out) (rewrite (get e (load i))))
+                (set! i (+ (load i) 1)))))
+    (let [done (primitive/code-list-done (load out))]
+      (if (primitive/code-vector? e) `[~@done] done))))
+
+(defn pointer-return-type? [(return-form Code)] (-> bool)
+  (and (primitive/code-list? return-form)
+       (= (len return-form) 2)
+       (named? (get return-form 0) "->")
+       (pointer-type? (get return-form 1))))
+
+(defn stack-binding? [(bindings Code) (wanted Code)] (-> bool)
+  (if (not (primitive/code-vector? bindings))
+      false
+      (let [(mut i) 0
+            (mut found) false]
+        (loop (if (or (>= (+ (load i) 1) (len bindings)) (load found))
+                  (break)
+                  (do
+                    (if (and (primitive/code-eq (get bindings (load i)) wanted)
+                             (stack-derived? (get bindings (+ (load i) 1))))
+                        (set! found true)
+                        0)
+                    (set! i (+ (load i) 2)))))
+        (load found))))
+
+(defn stack-derived? [(e Code)] (-> bool)
+  (if (not (primitive/code-list? e))
+      false
+      (if (= (len e) 0)
+          false
+          (cond (named? (get e 0) "alloc-stack") true
+                (named? (get e 0) "do") (stack-derived? (get e (- (len e) 1)))
+                (and (named? (get e 0) "let")
+                     (> (len e) 2))
+                  (let [result (get e (- (len e) 1))]
+                    (or (stack-derived? result)
+                        (and (primitive/code-sym? result)
+                             (stack-binding? (get e 1) result))))
+                (and (named? (get e 0) "if")
+                     (= (len e) 4))
+                  (or (stack-derived? (get e 2))
+                      (stack-derived? (get e 3)))
+                (and (named? (get e 0) "cast")
+                     (= (len e) 3))
+                  (stack-derived? (get e 2))
+                (and (or (named? (get e 0) "index")
+                         (named? (get e 0) "field"))
+                     (> (len e) 1))
+                  (stack-derived? (get e 1))
+                :else false))))
+
+(defn contains-stack-allocation? [(e Code)] (-> bool)
+  (if (not (or (primitive/code-list? e) (primitive/code-vector? e)))
+      false
+      (if (= (len e) 0)
+          false
+          (if (and (primitive/code-list? e) (unsafe-call? e))
+              false
+              (if (and (primitive/code-list? e) (named? (get e 0) "alloc-stack"))
+                  true
+                  (let [(mut i) 0
+                        (mut found) false]
+                    (loop (if (or (>= (load i) (len e)) (load found))
+                              (break)
+                              (do
+                                (if (contains-stack-allocation? (get e (load i)))
+                                    (set! found true)
+                                    0)
+                                (set! i (+ (load i) 1)))))
+                    (load found)))))))
+
+(defn validate-stack-return [(form Code)] (-> Code)
+  (if (not (and (primitive/code-list? form)
+                (>= (len form) 5)
+                (named? (get form 0) "defn")))
+      form
+      (let [return-index (defn-return-index form)]
+        (if (and (> return-index 0)
+                 (pointer-return-type? (get form return-index))
+                 (stack-derived? (get form (- (len form) 1))))
+            (primitive/error
+              (primitive/code-str
+                "safety: function returns a pointer derived from stack storage: "
+                (get form 1)))
+            form))))
+
+;; Declaration identity (especially trait/impl names and type syntax) must
+;; survive a transformer byte-for-byte. Rebuild only executable bodies and
+;; retain every header node from the checked program.
+(defn rewrite-function-form [(form Code)] (-> Code)
+  (let [return-index (defn-return-index form)]
+    (if (< return-index 0)
+        form
+        (let [(mut out) (primitive/code-list-new)
+              (mut i) 0]
+          (loop (if (>= (load i) (len form))
+                    (break)
+                    (do
+                      (push! (mut out)
+                             (if (<= (load i) return-index)
+                                 (get form (load i))
+                                 (rewrite (get form (load i)))))
+                      (set! i (+ (load i) 1)))))
+          (primitive/code-list-like form
+                                    (primitive/code-list-done (load out)))))))
+
+(defn rewrite-impl-form [(form Code)] (-> Code)
+  (let [(mut out) (primitive/code-list-new)
+        (mut i) 0]
+    (loop (if (>= (load i) (len form))
+              (break)
+              (do
+                (push! (mut out)
+                       (if (< (load i) 3)
+                           (get form (load i))
+                           (rewrite-function-form (get form (load i)))))
+                (set! i (+ (load i) 1)))))
+    (primitive/code-list-like form (primitive/code-list-done (load out)))))
+
+(defn rewrite-top-level [(form Code)] (-> Code)
+  (if (not (and (primitive/code-list? form) (> (len form) 0)))
+      form
+      (cond (named? (get form 0) "defn")
+              (rewrite-function-form (validate-stack-return form))
+            (named? (get form 0) "impl") (rewrite-impl-form form)
+            :else form)))
+
+(defn rewrite [(e Code)] (-> Code)
+  (if (not (primitive/code-list? e))
+      e
+      (if (= (len e) 0)
+          e
+          (cond (unsafe-call? e) e
+                (unverifiable-primitive? e) (reject-unverifiable-primitive e)
+                (cast-call? e) (rewrite-cast e)
+                (>= (arithmetic-op e) 0) (rewrite-arithmetic e)
+                (>= (collection-op e) 0) (rewrite-collection e)
+                (indirect-call? e) (rewrite-indirect-call e)
+                (make-dyn-call? e) (rewrite-make-dyn e)
+                (dynamic-call? e) (rewrite-dynamic-call e)
+                (pointer-operation? e) (rewrite-pointer-operation e)
+                (index-call? e) (rewrite-index e)
+                :else (rewrite-list e)))))
+
+(defn own? [(m Code)] (-> bool)
+  (let [name (get m 0)]
+    (or (primitive/code-eq name `experiments.safety.runtime)
+        (or (primitive/code-eq name `experiments.safety.arithmetic)
+            (or (primitive/code-eq name `experiments.safety.unsafe)
+                (primitive/code-eq name `experiments.safety.safety))))))
+
+(defn any-user? [(m Code)] (-> bool)
+  (let [(mut i) 1
+        (mut found) false]
+    (loop (if (>= (load i) (len m))
+              (break)
+              (if (primitive/code-from-user? (get m (load i)))
+                  (do (set! found true) (break))
+                  (set! i (+ (load i) 1)))))
+    (load found)))
+
+(defn rewrite-module [(m Code)] (-> Code)
+  (if (or (<= (len m) 1) (or (own? m) (not (any-user? m))))
+      m
+      (let [(mut out) (primitive/code-list-new)
+            (mut i) 0]
+        (loop (if (>= (load i) (len m))
+                  (break)
+                  (do
+                    (push! (mut out)
+                           (if (= (load i) 0)
+                               (get m 0)
+                               (rewrite-top-level (get m (load i)))))
+                    (set! i (+ (load i) 1)))))
+        (primitive/code-list-done (load out)))))
+
+(defn rewrite-modules [(mods Code)] (-> Code)
+  (let [(mut out) (primitive/code-list-new)
+        (mut i) 0]
+    (loop (if (>= (load i) (len mods))
+              (break)
+              (do
+                (push! (mut out)
+                       (rewrite-module (get mods (load i))))
+                (set! i (+ (load i) 1)))))
+    (primitive/code-list-done (load out))))
+
+(defn safety-transform [(mods Code)] (-> Code)
+  `(do ~@(rewrite-modules mods)))
+
+(transform-once safety-transform)
