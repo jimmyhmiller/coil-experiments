@@ -47,6 +47,7 @@ scripts/wasm-spec.sh test-control
 scripts/wasm-spec.sh test-loops
 scripts/wasm-spec.sh test-structured-control
 scripts/wasm-spec.sh test-start
+scripts/wasm-spec.sh test-basic-instructions
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -103,6 +104,11 @@ once before direct CLI access or an exported function/global, including starts
 that call imported `spectest` functions. The three successful import-only/start
 modules and the suite's ordered actions are also instantiated. The cumulative
 official assertion total is 7,034.
+
+`test-basic-instructions` passes the complete official MVP `nop`, `break-drop`,
+`switch`, `local_get`, `local_set`, `local_tee`, `call`, `select`, and
+`unreachable` files: 357 returns, 129 validation failures, and 64 runtime traps.
+The cumulative official assertion total is 7,584.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and
