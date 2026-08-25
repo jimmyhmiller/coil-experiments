@@ -113,14 +113,70 @@ test_integers() {
   run_integer_suite i64
 }
 
+run_float_batch() {
+  kind=$1
+  assertion=$2
+  mode=$3
+  json="$prepared/$kind/script.json"
+  wasm="$prepared/$kind/script.0.wasm"
+  coil_bin=${COIL:-coil}
+  count=$(jq -r --arg t "$assertion" '[.commands[] | select(.type == $t)] | length' "$json")
+  offset=0
+  while [ "$offset" -lt "$count" ]; do
+    args_file=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-$kind.XXXXXX")
+    trap 'rm -f "$args_file"' EXIT HUP INT TERM
+    if [ "$assertion" = "assert_return" ]; then
+      jq -r --arg kind "$kind" --argjson lo "$offset" --argjson hi "$((offset + 200))" '
+        [.commands[]
+         | select(.type == "assert_return"
+                  and .action.type == "invoke"
+                  and (.expected | length) == 1
+                  and .expected[0].type == $kind
+                  and ([.action.args[].type] | all(. == $kind)))][$lo:$hi][]
+        | .action.field,
+          .expected[0].value,
+          (.action.args | length | tostring),
+          (.action.args[].value)
+      ' "$json" > "$args_file"
+    else
+      jq -r --arg t "$assertion" --argjson lo "$offset" --argjson hi "$((offset + 200))" '
+        [.commands[] | select(.type == $t)][$lo:$hi][]
+        | .action.field,
+          (.action.args | length | tostring),
+          (.action.args[].value)
+      ' "$json" > "$args_file"
+    fi
+    xargs "$coil_bin" run "$wasm" --use experiments.wasm.lang -- "$mode" < "$args_file"
+    rm -f "$args_file"
+    trap - EXIT HUP INT TERM
+    offset=$((offset + 200))
+  done
+  echo "$kind $assertion: $count checks passed"
+}
+
+test_floats() {
+  command -v jq >/dev/null 2>&1 || {
+    echo "error: jq is required to run prepared spec assertions" >&2
+    exit 1
+  }
+  for kind in f32 f64; do
+    run_float_batch "$kind" assert_return "--assert-$kind-batch"
+    run_float_batch "$kind" assert_return_canonical_nan \
+      "--assert-$kind-canonical-nan-batch"
+    run_float_batch "$kind" assert_return_arithmetic_nan \
+      "--assert-$kind-arithmetic-nan-batch"
+  done
+}
+
 case "${1:-inventory}" in
   fetch) fetch_suite ;;
   fetch-wabt) fetch_wabt ;;
   prepare) prepare_suite ;;
   inventory) inventory ;;
   test-integers) test_integers ;;
+  test-floats) test_floats ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats]" >&2
     exit 2
     ;;
 esac

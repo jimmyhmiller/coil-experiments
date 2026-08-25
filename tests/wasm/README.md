@@ -39,12 +39,18 @@ Fetch, verify, inventory, and prepare the suite with:
 scripts/wasm-spec.sh inventory
 scripts/wasm-spec.sh prepare
 scripts/wasm-spec.sh test-integers
+scripts/wasm-spec.sh test-floats
 ```
 
 `test-integers` compiles each official `i32` and `i64` module through the reader
 and executes all homogeneous, single-result integer `assert_return` commands in
 one generated Coil entry point per module. It currently covers 350 `i32` and 205
 `i64` assertions. This is a semantic test—not merely a module compile check.
+
+`test-floats` executes all 3,178 ordinary `f32`/`f64` return assertions plus
+1,822 canonical- and arithmetic-NaN assertions. Floating inputs and results are
+transported as their exact IEEE-754 bit patterns so signed zero, subnormal, NaN
+payload, and infinity behavior is checked without a host text conversion.
 
 An individual exported integer function can be checked through the same reader
 entry path:
