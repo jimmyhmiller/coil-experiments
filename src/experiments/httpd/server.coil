@@ -11,6 +11,7 @@
 
 (const REQUEST_BUFFER_BYTES 16384)
 (const INCOMPLETE_REQUEST 14)
+(const PARSE_PAUSED 21)
 
 (defstruct Server
   [(listener socket/TcpListener)
@@ -80,14 +81,24 @@
     (str/sb-free! (mut sb))
     0))
 
-;; Complete a request before returning its borrowed byte view. The stdlib parser
-;; reports invalid EOF for a truncated request, so we feed more bytes instead of
-;; treating the first TCP segment as the whole message.
-(defn read-request! [(connection (ptr socket/TcpConnection))] (-> (Result (slice u8) i64))
+(defn respond! [(connection (ptr socket/TcpConnection))
+                (app (mut core/App))
+                (request http/Request)] (-> i64)
+  (let [core-request (request-from-http request)
+        status (send-response!
+                 connection
+                 (core/handle-request app core-request))]
+    (http/request-free request)
+    status))
+
+;; Parse incrementally until llhttp completes one request. The parser owns the
+;; decoded body and reports how much of a pipelined stream was consumed.
+(defn read-request! [(connection (ptr socket/TcpConnection))] (-> (Result http/Request i64))
   (let [buffer (primitive/alloc-stack (array u8 16384))
         (mut received) 0
         (mut error) 0
-        (mut complete) false]
+        (mut complete) false
+        (mut parsed) (primitive/zeroed http/Request)]
     (loop (if (or (not (= (load error) 0))
                   (or (load complete)
                       (>= (load received) REQUEST_BUFFER_BYTES)))
@@ -97,12 +108,10 @@
                                            (slice/slice-new [u8]
                                                             (primitive/index buffer 0)
                                                             (load received)))
-                  (Ok [parsed]
+                  (Ok [request]
                       (do
-                        (http/request-free parsed)
-                        (if (> (load received) 0)
-                            (set! complete true)
-                            0)))
+                        (set! parsed request)
+                        (set! complete true)))
                   (Err [failure]
                        (if (= (http/error-code failure) INCOMPLETE_REQUEST)
                            0
@@ -122,10 +131,7 @@
                                 (set! complete (> (load received) 0)))
                               (set! received (+ (load received) count)))))))))
     (cond (not (= (load error) 0)) (Err (load error))
-          (load complete)
-            (Ok (slice/slice-new [u8]
-                                 (primitive/index buffer 0)
-                                 (load received)))
+          (load complete) (Ok (load parsed))
           :else (Err 1))))
 
 (defn serve-one! [(server (mut Server))] (-> i64)
@@ -141,21 +147,11 @@
                                      (core/response-status 400 "bad request\n"))
                      (socket/tcp-connection-close! connection)
                      1))
-              (Ok [source]
-                  (match (http/parse-request (alloc/malloc-allocator) source)
-                    (Err [e]
-                         (do
-                           (send-response! connection
-                                           (core/response-status 400 "bad request\n"))
-                           (socket/tcp-connection-close! connection)
-                           1))
-                    (Ok [parsed]
-                        (let [request (request-from-http parsed)]
-                          (send-response! connection
-                                          (core/handle-request (mut (field server app)) request))
-                          (http/request-free parsed)
-                          (socket/tcp-connection-close! connection)
-                          0))))))))))
+              (Ok [parsed]
+                  (do
+                    (respond! connection (mut (field server app)) parsed)
+                    (socket/tcp-connection-close! connection)
+                    0))))))))
 
 (defn serve! [(server (mut Server))] (-> i64)
   (let [(mut failures) 0]
