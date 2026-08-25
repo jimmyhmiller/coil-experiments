@@ -356,8 +356,52 @@ test_control() {
     --use experiments.wasm.lang -- --assert-scalar-batch \
     top i32 41 0 \
     from-block i64 42 0 \
-    from-loop f32 1110179840 0
+    from-loop f32 1110179840 0 \
+    from-if-then i32 3 2 i32 1 i32 9 \
+    from-if-then i32 9 2 i32 0 i32 9 \
+    from-if-else i32 9 2 i32 1 i32 9 \
+    from-if-else i32 4 2 i32 0 i32 9
   echo "focused top-level, block, and loop return checks passed"
+
+  command -v jq >/dev/null 2>&1 || {
+    echo "error: jq is required to run prepared spec assertions" >&2
+    exit 1
+  }
+  json="$prepared/return/script.json"
+  dir=${json%/*}
+  wasm="$dir/script.0.wasm"
+  args_file=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-return.XXXXXX")
+  invalid_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-return-invalid.XXXXXX")
+  trap 'rm -f "$args_file" "$invalid_out"' EXIT HUP INT TERM
+  jq -r '
+    .commands[] | select(.type == "assert_return")
+    | .action.field,
+      (if (.expected | length) == 0 then "void" else .expected[0].type end),
+      (if (.expected | length) == 0 then "0" else .expected[0].value end),
+      (.action.args | length | tostring),
+      (.action.args[] | .type, .value)
+  ' "$json" > "$args_file"
+  xargs "$coil_bin" run "$wasm" --use experiments.wasm.lang -- \
+    --assert-scalar-batch < "$args_file"
+  echo "return assert_return: 63 checks passed"
+
+  invalid_count=0
+  for file in $(jq -r '.commands[] | select(.type == "assert_invalid") | .filename' "$json"); do
+    if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+         > "$invalid_out" 2>&1; then
+      echo "error: expected WebAssembly validation failure from $file" >&2
+      exit 1
+    fi
+    if ! grep -q 'WebAssembly validation:' "$invalid_out"; then
+      echo "error: $file failed without a WebAssembly validation diagnostic" >&2
+      cat "$invalid_out" >&2
+      exit 1
+    fi
+    invalid_count=$((invalid_count + 1))
+  done
+  rm -f "$args_file" "$invalid_out"
+  trap - EXIT HUP INT TERM
+  echo "return assert_invalid: $invalid_count checks passed"
 }
 
 case "${1:-inventory}" in

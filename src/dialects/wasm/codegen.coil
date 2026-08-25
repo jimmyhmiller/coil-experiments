@@ -133,14 +133,17 @@
               (primitive/error "WebAssembly validation: block result type mismatch")
               `(do ~@body-forms ~(primitive/code-nth value 1)))))))
 
-(defn finish-return [(stack (mut Code)) (forms CodeBuilder) (result-tag i64)] (-> Code)
+(defn finish-return [(base Code) (stack (mut Code)) (forms CodeBuilder) (result-tag i64)]
+                    (-> Code)
   (let [body-forms (primitive/code-list-done forms)]
     (if (= result-tag 0)
         `(do ~@body-forms)
-        (let [value (pop-node! (mut stack))]
-          (if (!= (node-kind value) result-tag)
-              (primitive/error "WebAssembly validation: return type mismatch")
-              `(do ~@body-forms ~(primitive/code-nth value 1)))))))
+        (if (primitive/code-eq base (load stack))
+            (primitive/error "WebAssembly validation: return operand is below current control frame")
+            (let [value (pop-node! (mut stack))]
+              (if (!= (node-kind value) result-tag)
+                  (primitive/error "WebAssembly validation: return type mismatch")
+                  `(do ~@body-forms ~(primitive/code-nth value 1))))))))
 
 (defn integer-binop! [(stack (mut Code)) (kind wasm/ValType) (operator Code)]
                       (-> i64)
@@ -349,8 +352,8 @@
                                                       function-result-tag
                                                       locals globals memory table function-names
                                                       function-indices types)]
-                      (if (= block-stop 0x0f)
-                          (let [expression (finish-return (mut block-stack) block-forms
+                      (if (>= block-stop 0x100)
+                          (let [expression (finish-return base (mut block-stack) block-forms
                                                           function-result-tag)]
                             (store! stack `())
                             (cond (= function-result-tag 0)
@@ -365,8 +368,8 @@
                                     (push-node! (mut stack) (wasm/F64) expression)
                                   :else
                                     (primitive/error "WebAssembly codegen internal error: invalid return result"))
-                            (skip-unreachable-region! context (mut p))
-                            (store! stop-opcode 0x0f)
+                            (let [delimiter (skip-unreachable-region! context (mut p))]
+                              (store! stop-opcode (+ 0x100 delimiter)))
                             (store! ended true))
                           (if (!= block-stop 0x0b)
                               (primitive/error "WebAssembly validation: malformed block")
@@ -400,44 +403,65 @@
                                                            function-result-tag
                                                            locals globals memory table function-names
                                                            function-indices types)
-                                then-code (finish-region a base (mut then-stack) then-forms result-tag)
+                                then-returns (>= then-stop 0x100)
+                                then-boundary (if then-returns (- then-stop 0x100) then-stop)
+                                then-code (if then-returns
+                                              (finish-return base (mut then-stack) then-forms
+                                                             function-result-tag)
+                                              (finish-region a base (mut then-stack)
+                                                             then-forms result-tag))
                                 (mut else-stack) base
                                 else-forms (primitive/code-list-new)
-                                else-code (if (= then-stop 0x05)
-                                              (let [else-stop
-                                                      (compile-region! a context (mut p)
-                                                                       (mut else-stack) else-forms
-                                                                       false base result-tag
-                                                                       function-result-tag
-                                                                       locals globals memory table function-names
-                                                                       function-indices types)]
-                                                (if (!= else-stop 0x0b)
-                                                    (primitive/error "WebAssembly validation: malformed if")
-                                                    (finish-region a base (mut else-stack)
-                                                                   else-forms result-tag)))
-                                              (if (= result-tag 0)
-                                                  `(do)
-                                                  (primitive/error "WebAssembly validation: result if requires else")))
+                                (mut else-returns) false
+                                else-code
+                                  (if (= then-boundary 0x05)
+                                      (let [else-stop
+                                              (compile-region! a context (mut p)
+                                                               (mut else-stack) else-forms
+                                                               false base result-tag
+                                                               function-result-tag
+                                                               locals globals memory table function-names
+                                                               function-indices types)]
+                                        (if (>= else-stop 0x100)
+                                            (do
+                                              (store! else-returns true)
+                                              (finish-return base (mut else-stack) else-forms
+                                                             function-result-tag))
+                                            (if (!= else-stop 0x0b)
+                                                (primitive/error "WebAssembly validation: malformed if")
+                                                (finish-region a base (mut else-stack)
+                                                               else-forms result-tag))))
+                                      (if (= result-tag 0)
+                                          `(do)
+                                          (primitive/error "WebAssembly validation: result if requires else")))
                                 if-id (primitive/datum->syntax context "if")
                                 ne-id (primitive/datum->syntax context "primitive/icmp-ne")
                                 c (primitive/code-nth condition 1)
-                                expression `(~if-id (~ne-id ~c 0) ~then-code ~else-code)]
-                            (if (= result-tag 0)
+                                expression `(~if-id (~ne-id ~c 0) ~then-code ~else-code)
+                                returns (or then-returns (load else-returns))
+                                effective-tag (if returns function-result-tag result-tag)]
+                            (if returns (store! stack `()) 0)
+                            (if (= effective-tag 0)
                                 (do (primitive/code-list-push! forms-builder expression) 0)
-                                (cond (= result-tag 1)
+                                (cond (= effective-tag 1)
                                         (push-node! (mut stack) (wasm/I32) expression)
-                                      (= result-tag 2)
+                                      (= effective-tag 2)
                                         (push-node! (mut stack) (wasm/I64) expression)
-                                      (= result-tag 3)
+                                      (= effective-tag 3)
                                         (push-node! (mut stack) (wasm/F32) expression)
-                                      (= result-tag 4)
+                                      (= effective-tag 4)
                                         (push-node! (mut stack) (wasm/F64) expression)
                                       :else
-                                        (primitive/error "WebAssembly codegen internal error: invalid block result"))))))
+                                        (primitive/error "WebAssembly codegen internal error: invalid if result")))
+                            (if returns
+                                (do
+                                  (skip-unreachable-region! context (mut p))
+                                  (store! stop-opcode 0x10f)
+                                  (store! ended true))
+                                0))))
                   (= opcode 0x0f)
-                    (do
-                      (skip-unreachable-region! context (mut p))
-                      (store! stop-opcode 0x0f)
+                    (let [delimiter (skip-unreachable-region! context (mut p))]
+                      (store! stop-opcode (+ 0x100 delimiter))
                       (store! ended true))
                   (= opcode 0x0d)
                     (let [depth (wasm/parser-u32! (mut p))
@@ -1113,7 +1137,7 @@
         stop (compile-region! a context (mut p) (mut stack) forms-builder false `() result-tag
                               result-tag
                               locals globals memory table function-names function-indices types)]
-    (if (and (!= stop 0x0b) (!= stop 0x0f))
+    (if (and (!= stop 0x0b) (< stop 0x100))
         (primitive/error "WebAssembly function expression ended unexpectedly")
         0)
     (if (!= (wasm/remaining (.cursor p)) 0)
@@ -1123,12 +1147,12 @@
           result-count (al/al-len (.results sig))
           forms (primitive/code-list-done forms-builder)]
       (if (= result-count 0)
-          (if (= (primitive/code-count (load stack)) 0)
+          (if (or (>= stop 0x100) (= (primitive/code-count (load stack)) 0))
               `(do ~@forms)
               (primitive/error "WebAssembly validation: void function leaves operands"))
           (let [value (pop-node! (mut stack))
                 wanted (al/al-get (.results sig) 0)]
-            (if (!= (primitive/code-count (load stack)) 0)
+            (if (and (< stop 0x100) (!= (primitive/code-count (load stack)) 0))
                 (primitive/error "WebAssembly validation: result stack height mismatch")
                 (if (!= (node-kind value) (kind-tag wanted))
                     (primitive/error "WebAssembly validation: function result type mismatch")

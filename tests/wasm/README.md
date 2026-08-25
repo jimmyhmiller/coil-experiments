@@ -66,12 +66,13 @@ assertions, and all 36 official `memory_size` assertions across four modules.
 
 `test-tables` checks focused table initialization and indirect dispatch, then
 executes every runnable assertion in the official MVP `call_indirect` file: 103
-returns and 13 process traps. Together, the semantic harnesses above currently
-execute 6,176 official assertions.
+returns and 13 process traps.
 
 `test-control` exercises function returns before unreachable instructions and
-returns propagated through nested blocks and loops. It is focused coverage; the
-official control-flow files remain the next conformance milestone.
+returns propagated through nested blocks, loops, and conditionals. It also
+passes the complete official MVP `return` file: 63 returns and 20 validation
+failures. Together, the harnesses above currently execute 6,259 official
+assertions.
 
 An individual exported integer function can be checked through the same reader
 entry path:
