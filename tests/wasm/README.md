@@ -40,6 +40,7 @@ scripts/wasm-spec.sh inventory
 scripts/wasm-spec.sh prepare
 scripts/wasm-spec.sh test-integers
 scripts/wasm-spec.sh test-floats
+scripts/wasm-spec.sh test-conversions
 ```
 
 `test-integers` compiles each official `i32` and `i64` module through the reader
@@ -51,6 +52,10 @@ one generated Coil entry point per module. It currently covers 350 `i32` and 205
 1,822 canonical- and arithmetic-NaN assertions. Floating inputs and results are
 transported as their exact IEEE-754 bit patterns so signed zero, subnormal, NaN
 payload, and infinity behavior is checked without a host text conversion.
+
+`test-conversions` executes 334 mixed-scalar conversion results and verifies 67
+overflow/invalid-conversion traps as actual process traps. Compiler diagnostics
+do not count as passing trap assertions.
 
 An individual exported integer function can be checked through the same reader
 entry path:

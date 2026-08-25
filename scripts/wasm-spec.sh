@@ -168,6 +168,68 @@ test_floats() {
   done
 }
 
+test_conversions() {
+  command -v jq >/dev/null 2>&1 || {
+    echo "error: jq is required to run prepared spec assertions" >&2
+    exit 1
+  }
+  coil_bin=${COIL:-coil}
+  json="$prepared/conversions/script.json"
+  wasm="$prepared/conversions/script.0.wasm"
+  count=$(jq '[.commands[] | select(.type == "assert_return"
+                                     and .action.type == "invoke"
+                                     and (.expected | length) == 1)] | length' "$json")
+  offset=0
+  while [ "$offset" -lt "$count" ]; do
+    args_file=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-conversions.XXXXXX")
+    trap 'rm -f "$args_file"' EXIT HUP INT TERM
+    jq -r --argjson lo "$offset" --argjson hi "$((offset + 150))" '
+      [.commands[] | select(.type == "assert_return"
+                             and .action.type == "invoke"
+                             and (.expected | length) == 1)][$lo:$hi][]
+      | .action.field,
+        .expected[0].type,
+        .expected[0].value,
+        (.action.args | length | tostring),
+        (.action.args[] | .type, .value)
+    ' "$json" > "$args_file"
+    xargs "$coil_bin" run "$wasm" --use experiments.wasm.lang -- \
+      --assert-scalar-batch < "$args_file"
+    rm -f "$args_file"
+    trap - EXIT HUP INT TERM
+    offset=$((offset + 150))
+  done
+  echo "conversions assert_return: $count checks passed"
+
+  trap_count=0
+  trap_args=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-conversion-traps.XXXXXX")
+  trap_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-conversion-output.XXXXXX")
+  trap 'rm -f "$trap_args" "$trap_out"' EXIT HUP INT TERM
+  jq -r '
+    .commands[] | select(.type == "assert_trap")
+    | ([.action.field, (.action.args | length | tostring)]
+       + [.action.args[] | .type, .value])
+    | join(" ")
+  ' "$json" > "$trap_args"
+  while IFS= read -r line; do
+    set -- $line
+    if "$coil_bin" run "$wasm" --use experiments.wasm.lang -- \
+         --invoke-scalar "$@" > "$trap_out" 2>&1; then
+      echo "error: expected WebAssembly trap from conversion export $1" >&2
+      exit 1
+    fi
+    if ! grep -q 'program terminated by signal 6' "$trap_out"; then
+      echo "error: conversion export $1 failed without the expected runtime trap" >&2
+      cat "$trap_out" >&2
+      exit 1
+    fi
+    trap_count=$((trap_count + 1))
+  done < "$trap_args"
+  rm -f "$trap_args" "$trap_out"
+  trap - EXIT HUP INT TERM
+  echo "conversions assert_trap: $trap_count checks passed"
+}
+
 case "${1:-inventory}" in
   fetch) fetch_suite ;;
   fetch-wabt) fetch_wabt ;;
@@ -175,8 +237,9 @@ case "${1:-inventory}" in
   inventory) inventory ;;
   test-integers) test_integers ;;
   test-floats) test_floats ;;
+  test-conversions) test_conversions ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions]" >&2
     exit 2
     ;;
 esac
