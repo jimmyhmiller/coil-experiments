@@ -34,6 +34,10 @@ executable. The pinned integration gate builds Doom Generic as 81 translation
 units and verifies its exact 1,000-frame framebuffer hash. See
 [`src/dialects/c/README.md`](src/dialects/c/README.md).
 
+### `src/dialects/forth/` — a compiled Forth slice
+A compile-time reader turns a compact, statically checked Forth language into
+ordinary Coil definitions and native control flow.
+
 ### `src/apps/` — applications
 - `chip8/` — CHIP-8 emulator with an AppKit GUI
 - `clox/` — the Crafting Interpreters bytecode VM, at rough parity with `-O2` C
