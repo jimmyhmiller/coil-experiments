@@ -1,142 +1,61 @@
-# Coil cannot say what is in a static
+# Saying what is in a static — done
 
-There is no way to give a static its contents. `primitive/alloc-static` allocates
-zeroed storage and takes no initial value, and nothing else produces initialised,
-writable, aligned storage. The only initialised data Coil can put in a binary is
-a string literal, which is read-only and byte-aligned.
+This was a report that Coil had no way to give a static its contents:
+`primitive/alloc-static` allocated zeroed storage and took no initial value, so
+the C frontend had to reproduce every initialised table with stores that ran
+before `main`.
 
-Every route was tried; all three are below. Measured on `coil` at
-`/Users/jimmyhmiller/.cargo/bin/coil`, macOS arm64.
+`(primitive/alloc-static TYPE INITIAL)` now exists, and this frontend uses it.
+The report is kept here as the record of what was asked for and what it bought.
 
-## What this costs
+## What was asked for
 
-A C program's initialised tables are bytes in the object file. Doom's `info.c`
-compiled by Clang:
+Writable, type-aligned storage whose contents are in the binary — not a
+read-only string literal, because Doom's dehacked support patches `states[]` and
+`mobjinfo[]` at run time.
 
-```text
-Section (__DATA, __data): 52396      52 KB of table
-Section (__TEXT, __text): 0          no code at all
-```
+## What arrived
 
-Nothing runs to build them; the loader maps them. The C frontend in
-`src/dialects/c/` cannot do that, so it emits **36,171 stores** that run before
-`main` — **44% of the entire generated module** — to reproduce at start-up what a
-C compiler writes down once.
+`(primitive/alloc-static TYPE INITIAL)` on the LLVM/object-file backend, taking
+numeric constants, null pointers, C strings, structs, and arrays; narrow
+aggregate fields laid out correctly; function-pointer relocations preserved;
+runtime-dependent initialisers rejected rather than silently deferred. The
+direct AArch64, x86-64, Wasm, and bytecode backends reject an initialised static
+explicitly. The one-argument form is unchanged.
 
-Those tables are not `const`, and that matters: Doom's dehacked support patches
-`states[]` and `mobjinfo[]` at run time, so whatever holds them has to be
-writable.
+## What it bought
 
-## Route 1 — `alloc-static` has no initialiser
-
-```lisp
-(defn c_g_states [] (-> (ptr (array i64 15))) (primitive/alloc-static (array i64 15)))
-```
-
-Zeroed, and there is no second argument. This is the shape the frontend uses,
-and the reason for the 36,171 stores.
-
-## Route 2 — a string literal is read-only and byte-aligned
-
-`c"…"` does put exact bytes in the image — verified, they land in `__const`, and
-a four-`i32` table read back correctly. But it is not storage:
+`src/dialects/c/emit.coil` folds every start-up store whose value is a constant
+into the object's image, and defines the object holding it. The shape emitted is
+the same storage type the frontend already used — a record is still a blob of
+its alignment's unit, so nothing downstream had to change:
 
 ```lisp
-(defn blob [] (-> (ptr (array i32 3)))
-  (primitive/cast (ptr (array i32 3)) c"\xb;\0\0\0\x16;\0\0\0\x21;\0\0\0"))
-
-(let [p (primitive/cast (ptr i32) (blob))]
-  (set! (primitive/index p 1) (primitive/cast i32 999)))
+(defn c_g_mobjinfo [] (-> (ptr (array (array i32 23) 137)))
+  (primitive/alloc-static (array (array i32 23) 137) [[-1 149 100 150 ...] ...]))
 ```
 
-```text
--O0 : before : 11 22 33
-      address: 4298968859
-      [exit 138 — SIGBUS]
+A store whose value is an address — a string, another object, a function — has
+no constant to fold into and stays a statement, so `states[].action` and
+`sprnames[]` still run at start-up. That is a per-leaf decision, not a per-object
+one: `states[]` keeps 448 stores out of the thousands it used to run.
 
--O3 : before : 11 22 33
-      after  : 11 22 33      the write is dropped, the reads fold, no crash
-```
+Measured on Doom Generic, 81 translation units:
 
-Two separate problems:
-
-- **Read-only.** A table with any address in it cannot be baked, because an
-  address is not known until link time — that is what C solves with relocations
-  (`ARM64_RELOC_UNSIGNED _A_Explode`, 586 of them in `info.c`). Patching them in
-  at start-up is the obvious substitute, and it bus-errors.
-- **Byte-aligned.** `4298968859` is odd. A table of `i64` laid out there is
-  misaligned.
-
-The `-O3` behaviour is worth a look on its own: the same invalid write is
-silently discarded rather than trapping, and the reads are folded from the
-literal, so the program prints stale values instead of failing.
-
-## Route 3 — a `const` of aggregate type silently drops fields
-
-```lisp
-(defstruct S3 [(a i32) (b i32) (c i32)])
-(const K (load (S3 :a 1 :b 2 :c 3)))
-```
-
-reads back `1 2 0`. No diagnostic.
-
-| struct | expected | actual |
+| | before | after |
 | --- | --- | --- |
-| `[(a i32)]` | `1` | `0` |
-| `[(a i32) (b i32)]` | `1 2` | `1 0` |
-| `[(a i32) (b i32) (c i32)]` | `1 2 3` | `1 2 0` |
-| `[(a i32) … (e i32)]` | `1 2 3 4 5` | `1 2 3 4 0` |
-| `[(a u8) (b u8) (c u8)]` | `1 2 3` | `0 0 0` |
-| `[(a i64)]` | `1` | `1` |
-| `[(a i64) (b i64) (c i64)]` | `1 2 3` | `1 2 3` |
+| start-up stores | 36,171 | 1,305 |
+| `c_init_statics` share of the module | 44% | 4.5% |
+| generated module | 6.6 MB | 4.1 MB |
 
-With `i32` fields the last field is zero at any count; with `u8` fields every
-field is; with `i64` fields it is correct, including values needing the high half
-of the word. Building the same struct at run time is correct, so it is the
-`const` materialisation.
+The framebuffer hash is unchanged: `734a03fe31906bc3`, the same hash a
+Clang-built Doom produces.
 
-A silent zero is the worst of the available outcomes. The language notes already
-say comptime results must be materializable literals — the restriction exists,
-it just is not enforced.
+## What is still out of reach
 
-## And a macro cannot work around it
-
-A metaprogram can compute the bytes, but it cannot hand back a literal: there is
-no constructor for a string `Code` node. `datum->syntax` produces a *symbol*, so
-a computed byte string comes out as an identifier —
-
-```text
-error: in 'bake.table': unbound variable '      !   '
-```
-
-— and `code-read`, which is documented as being for `:phase read` metaprograms
-that delegate to the built-in reader, rejects a computed string:
-
-```text
-error: code-read: expects string Code and reader-config Code
-```
-
-So the readable form and the baked form cannot be the same form. A macro can make
-the source say what the C said, but it has to expand to stores.
-
-## What would fix it
-
-An initial value on a static:
-
-```lisp
-(primitive/alloc-static (array i64 15) <initial>)
-```
-
-writable, aligned to the type, and laid into the binary. That is the whole ask.
-It would delete 44% of the generated C module, and it is the same primitive any
-program with a table of constants wants.
-
-Failing that, in rough order of usefulness:
-
-1. **Fix route 3** so a `const` can hold an aggregate — then a static could at
-   least be initialised by one copy rather than field by field. Or reject it, so
-   it stops being silently wrong.
-2. **Make a string literal's alignment declarable**, and say what writing to one
-   does — trap at every optimisation level, or be allowed.
-3. **A constructor for a string `Code` node**, so a metaprogram can produce
-   literal data.
+An address is not a constant this compiler can write down, so an initialiser
+holding one keeps its store. Reaching those would mean giving each eight-byte
+slot of a blob its own type — a `defstruct` per record shape, with a `fnptr` or
+`(ptr i8)` field where the relocation goes — rather than the uniform
+`(array i64 N)` a record is lowered to today. It is possible; it is not obviously
+worth a 4,835-field struct for `states[]`.

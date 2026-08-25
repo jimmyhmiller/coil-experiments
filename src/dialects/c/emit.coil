@@ -29,6 +29,25 @@
 
 (export Emitter EmitResult emit-program)
 
+;; ------------------------------------------ static initialisers, laid down
+
+;; C initialises an object with static storage before the program runs, not by
+;; running it. Every store whose value is known here is written into the
+;; object's image, and that image is what the object is defined to hold. Only
+;; the stores this compiler has no constant to spell -- the ones whose value is
+;; an address the linker decides -- are left to run at start-up.
+(defstruct Image
+  [(bytes (slice u8))
+   (folded i64)])
+
+;; An expression either has a value here or it does not, and a value is either
+;; an integer or a floating one. Nothing else can be laid into an image.
+(defstruct Value
+  [(ok i64)
+   (flo i64)
+   (i i64)
+   (f f64)])
+
 (defstruct Emitter
   [(a (dyn alloc/Allocator))
    (out str/StrBuf)
@@ -50,6 +69,12 @@
    ;; and only the complete one describes the storage.
    (storage (hm/HashMap (slice u8) i64))
    (storage-size (hm/HashMap (slice u8) i64))
+   ;; What each object with static storage is defined to hold, filled in from
+   ;; the start-up stores whose values are constants.
+   (images (hm/HashMap (slice u8) (ptr Image)))
+   ;; Eight bytes to read an f64's bits through. Coil converts between an f64
+   ;; and an i64 by value, so the bits are only reachable through memory.
+   (scratch (ptr i64))
    ;; The outgoing argument area each call to a variadic function of this
    ;; program's own writes into, by call site. They are allocated once at the
    ;; top of the function, never inside a loop.
@@ -1865,6 +1890,434 @@
     (put! (mut e) (subslice digits (primitive/irem v 16) (+ (primitive/irem v 16) 1))))
   0)
 
+(defn no-value [] (-> Value) (Value :ok 0 :flo 0 :i 0 :f 0.0))
+(defn int-value [(v i64)] (-> Value) (Value :ok 1 :flo 0 :i v :f 0.0))
+(defn float-value [(v f64)] (-> Value) (Value :ok 1 :flo 1 :i 0 :f v))
+
+(defn value-float [(v Value)] (-> f64)
+  (if (= (.flo v) 0) (primitive/cast f64 (.i v)) (.f v)))
+
+(defn value-int [(v Value)] (-> i64)
+  (if (= (.flo v) 0) (.i v) (primitive/cast i64 (.f v))))
+
+;; The value an integer of this width and signedness would hold.
+(defn narrow-to [(x i64) (size i64) (unsigned bool)] (-> i64)
+  (cond
+    (= size 1) (let [m (primitive/iand x 255)]
+                 (if (or unsigned (< m 128)) m (- m 256)))
+    (= size 2) (let [m (primitive/iand x 65535)]
+                 (if (or unsigned (< m 32768)) m (- m 65536)))
+    (= size 4) (let [m (primitive/iand x 4294967295)]
+                 (if (or unsigned (< m 2147483648)) m (- m 4294967296)))
+    :else x))
+
+;; An unsigned operand as the i64 whose ordering and division agree with C's.
+;; A 64-bit one above the signed range has no such i64, and folds no further.
+(defn as-operand [(v Value) (t (ptr ct/Type))] (-> Value)
+  (if (or (= (primitive/cast i64 t) 0) (not (ct/ty-unsigned? t)))
+      (int-value (.i v))
+      (let [size (ct/ty-size t)]
+        (cond
+          (= size 1) (int-value (primitive/iand (.i v) 255))
+          (= size 2) (int-value (primitive/iand (.i v) 65535))
+          (= size 4) (int-value (primitive/iand (.i v) 4294967295))
+          (< (.i v) 0) (no-value)
+          :else (int-value (.i v))))))
+
+(defn convert-value [(v Value) (t (ptr ct/Type))] (-> Value)
+  (cond
+    (= (primitive/cast i64 t) 0) (no-value)
+    (= (ct/ty-kind t) ct/TY-BOOL)
+      (int-value (if (= (.flo v) 0)
+                     (if (= (.i v) 0) 0 1)
+                     (if (primitive/fcmp-eq (.f v) 0.0) 0 1)))
+    (ct/floating? t)
+      (let [f (value-float v)]
+        (if (= (ct/ty-kind t) ct/TY-FLOAT)
+            (float-value (primitive/cast f64 (primitive/cast f32 f)))
+            (float-value f)))
+    (ct/integer? t) (int-value (narrow-to (value-int v) (ct/ty-size t) (ct/ty-unsigned? t)))
+    ;; A pointer written as a number -- a null one, or an absolute address -- is
+    ;; that number. A pointer written as `&x` never gets this far.
+    (= (ct/ty-kind t) ct/TY-PTR) (if (= (.flo v) 0) (int-value (.i v)) (no-value))
+    :else (no-value)))
+
+;; Folds the expressions C allows in a static initialiser and this compiler can
+;; write down. An address is not one of them: `&x` and a function's name mean a
+;; number only the linker knows, so they fold to nothing and stay statements.
+(defn eval-value [(n (ptr nd/Node))] (-> Value)
+  (if (= (primitive/cast i64 n) 0)
+      (no-value)
+      (let [k (nd/nd-kind n)
+            ty (nd/nd-type n)]
+        (cond
+          (= k nd/ND-NUM)
+            (if (and (!= (primitive/cast i64 ty) 0) (ct/floating? ty))
+                (float-value (nd/nd-fvalue n))
+                (int-value (nd/nd-value n)))
+          (= k nd/ND-CAST) (let [v (eval-value (nd/nd-lhs n))]
+                             (if (= (.ok v) 0) (no-value) (convert-value v ty)))
+          (= k nd/ND-NEG)
+            (let [v (eval-value (nd/nd-lhs n))]
+              (cond
+                (= (.ok v) 0) (no-value)
+                (= (.flo v) 1) (float-value (primitive/fsub 0.0 (.f v)))
+                :else (int-value (- 0 (.i v)))))
+          (= k nd/ND-BITNOT)
+            (let [v (eval-value (nd/nd-lhs n))]
+              (if (or (= (.ok v) 0) (= (.flo v) 1))
+                  (no-value)
+                  (int-value (primitive/inot (.i v)))))
+          (= k nd/ND-NOT)
+            (let [v (eval-value (nd/nd-lhs n))]
+              (cond
+                (= (.ok v) 0) (no-value)
+                (= (.flo v) 1) (int-value (if (primitive/fcmp-eq (.f v) 0.0) 1 0))
+                :else (int-value (if (= (.i v) 0) 1 0))))
+          (= k nd/ND-COND)
+            (let [c (eval-value (nd/nd-test n))]
+              (cond
+                (= (.ok c) 0) (no-value)
+                (= (.flo c) 1) (if (primitive/fcmp-eq (.f c) 0.0)
+                                   (eval-value (nd/nd-else n))
+                                   (eval-value (nd/nd-then n)))
+                :else (if (= (.i c) 0)
+                          (eval-value (nd/nd-else n))
+                          (eval-value (nd/nd-then n)))))
+          :else (eval-binop-value k n)))))
+
+(defn eval-binop-value [(k i64) (n (ptr nd/Node))] (-> Value)
+  (let [l (eval-value (nd/nd-lhs n))
+        r (eval-value (nd/nd-rhs n))]
+    (if (or (= (.ok l) 0) (= (.ok r) 0))
+        (no-value)
+        (if (or (= (.flo l) 1) (= (.flo r) 1))
+            (eval-float-binop k (value-float l) (value-float r))
+            (eval-int-binop k n (.i l) (.i r))))))
+
+(defn eval-float-binop [(k i64) (x f64) (y f64)] (-> Value)
+  (cond
+    (= k nd/ND-ADD) (float-value (primitive/fadd x y))
+    (= k nd/ND-SUB) (float-value (primitive/fsub x y))
+    (= k nd/ND-MUL) (float-value (primitive/fmul x y))
+    (= k nd/ND-DIV) (if (primitive/fcmp-eq y 0.0) (no-value) (float-value (primitive/fdiv x y)))
+    (= k nd/ND-EQ) (int-value (if (primitive/fcmp-eq x y) 1 0))
+    (= k nd/ND-NE) (int-value (if (primitive/fcmp-ne x y) 1 0))
+    (= k nd/ND-LT) (int-value (if (primitive/fcmp-lt x y) 1 0))
+    (= k nd/ND-LE) (int-value (if (primitive/fcmp-le x y) 1 0))
+    (= k nd/ND-LOGAND) (int-value (if (and (not (primitive/fcmp-eq x 0.0))
+                                           (not (primitive/fcmp-eq y 0.0))) 1 0))
+    (= k nd/ND-LOGOR) (int-value (if (or (not (primitive/fcmp-eq x 0.0))
+                                         (not (primitive/fcmp-eq y 0.0))) 1 0))
+    :else (no-value)))
+
+;; The operands of a division, a comparison, or a right shift mean different
+;; numbers depending on the signedness C gave them, so each is read back through
+;; its own type before the operation runs.
+(defn eval-int-binop [(k i64) (n (ptr nd/Node)) (x i64) (y i64)] (-> Value)
+  (let [u (as-operand (int-value x) (nd/nd-type (nd/nd-lhs n)))
+        w (as-operand (int-value y) (nd/nd-type (nd/nd-rhs n)))]
+    (cond
+      (= k nd/ND-ADD) (int-value (+ x y))
+      (= k nd/ND-SUB) (int-value (- x y))
+      (= k nd/ND-MUL) (int-value (* x y))
+      (= k nd/ND-BITAND) (int-value (primitive/iand x y))
+      (= k nd/ND-BITOR) (int-value (primitive/ior x y))
+      (= k nd/ND-BITXOR) (int-value (primitive/ixor x y))
+      (= k nd/ND-SHL) (if (or (< y 0) (>= y 64)) (no-value) (int-value (primitive/ishl x y)))
+      (= k nd/ND-SHR)
+        (if (or (or (< y 0) (>= y 64)) (= (.ok u) 0))
+            (no-value)
+            (int-value (primitive/ishr (.i u) y)))
+      (= k nd/ND-DIV)
+        (if (or (or (= (.ok u) 0) (= (.ok w) 0)) (= (.i w) 0))
+            (no-value)
+            (int-value (primitive/idiv (.i u) (.i w))))
+      (= k nd/ND-MOD)
+        (if (or (or (= (.ok u) 0) (= (.ok w) 0)) (= (.i w) 0))
+            (no-value)
+            (int-value (primitive/irem (.i u) (.i w))))
+      (= k nd/ND-EQ) (int-value (if (= x y) 1 0))
+      (= k nd/ND-NE) (int-value (if (!= x y) 1 0))
+      (= k nd/ND-LT)
+        (if (or (= (.ok u) 0) (= (.ok w) 0)) (no-value) (int-value (if (< (.i u) (.i w)) 1 0)))
+      (= k nd/ND-LE)
+        (if (or (= (.ok u) 0) (= (.ok w) 0)) (no-value) (int-value (if (<= (.i u) (.i w)) 1 0)))
+      (= k nd/ND-LOGAND) (int-value (if (and (!= x 0) (!= y 0)) 1 0))
+      (= k nd/ND-LOGOR) (int-value (if (or (!= x 0) (!= y 0)) 1 0))
+      :else (no-value))))
+
+;; Coil converts between an f64 and an i64 by value; the bits are reached the
+;; only way that keeps them, through memory.
+(defn f64-bits [(e (mut Emitter)) (v f64)] (-> i64)
+  (let [p (load (field e scratch))]
+    (primitive/store! (primitive/cast (ptr f64) p) v)
+    (primitive/load p)))
+
+(defn f64-of-bits [(e (mut Emitter)) (bits i64)] (-> f64)
+  (let [p (load (field e scratch))]
+    (primitive/store! p bits)
+    (primitive/load (primitive/cast (ptr f64) p))))
+
+(defn f32-bits [(e (mut Emitter)) (v f64)] (-> i64)
+  (let [p (load (field e scratch))]
+    (primitive/store! p 0)
+    (primitive/store! (primitive/cast (ptr f32) p) (primitive/cast f32 v))
+    (primitive/iand (primitive/load p) 4294967295)))
+
+(defn f32-of-bits [(e (mut Emitter)) (bits i64)] (-> f64)
+  (let [p (load (field e scratch))]
+    (primitive/store! p bits)
+    (primitive/cast f64 (primitive/load (primitive/cast (ptr f32) p)))))
+
+;; Neither infinity nor a NaN has a literal Coil reads back, so an initialiser
+;; holding one keeps its store.
+(defn finite? [(v f64)] (-> bool)
+  (and (primitive/fcmp-eq v v)
+       (or (primitive/fcmp-eq v 0.0)
+           (not (primitive/fcmp-eq (primitive/fmul v 2.0) v)))))
+
+;; Seventeen significant digits in exponential form round-trip an f64 exactly,
+;; and the form always carries a point and an exponent, so Coil reads it back as
+;; the same value rather than as an integer.
+(defn put-float-lit! [(e (mut Emitter)) (v f64)] (-> i64)
+  (let [buf (primitive/alloc-stack (array u8 48))
+        text (primitive/cast (ptr i8) buf)]
+    (snprintf text 48 c"%.17e" v)
+    (put! (mut e) (str/cstr->str text))))
+
+(defn image-get [(im (ptr Image)) (offset i64) (size i64)] (-> i64)
+  (let [bytes (load (field im bytes))
+        (mut v) 0
+        (mut k) 0]
+    (loop (if (>= (load k) size)
+              (break)
+              (do (store! v (primitive/ior (load v)
+                                           (primitive/ishl
+                                             (primitive/cast i64 (slice-get bytes (+ offset (load k))))
+                                             (* (load k) 8))))
+                  (store! k (+ (load k) 1)))))
+    (load v)))
+
+(defn image-put! [(im (ptr Image)) (offset i64) (size i64) (bits i64)] (-> i64)
+  (let [bytes (load (field im bytes))
+        (mut k) 0]
+    (loop (if (>= (load k) size)
+              (break)
+              (do (slice-set! bytes
+                              (+ offset (load k))
+                              (primitive/cast u8 (primitive/iand (primitive/ishr bits (* (load k) 8)) 255)))
+                  (store! k (+ (load k) 1)))))
+    0))
+
+;; The value at an offset as the literal its storage type spells.
+(defn image-word [(im (ptr Image)) (offset i64) (size i64) (unsigned bool)] (-> i64)
+  (let [raw (image-get im offset size)]
+    (if (or unsigned (= size 8)) raw (narrow-to raw size false))))
+
+(defn nil-image [] (-> (ptr Image)) (primitive/cast (ptr Image) 0))
+
+;; Whether an object's image can be spelled as a Coil literal at all: every leaf
+;; of its storage has to be a number. A pointer's value is an address, and there
+;; is no constant for one.
+(defn bakeable? [(t (ptr ct/Type))] (-> bool)
+  (if (= (primitive/cast i64 t) 0)
+      false
+      (let [k (ct/ty-kind t)]
+        (cond
+          (<= (ct/ty-size t) 0) false
+          (ct/record? t) true
+          (= k ct/TY-INT128) true
+          (= k ct/TY-FLOAT16) true
+          (= k ct/TY-ARRAY) (and (>= (ct/ty-array-len t) 1) (bakeable? (ct/ty-base t)))
+          (ct/integer? t) true
+          (ct/floating? t) (or (= (ct/ty-size t) 4) (= (ct/ty-size t) 8))
+          :else false))))
+
+(defn image-of [(e (mut Emitter)) (name (slice u8))] (-> (ptr Image))
+  (match (hm/hm-get (load (field e images)) name)
+    (Some [im] im)
+    (None [] (nil-image))))
+
+(defn image-for! [(e (mut Emitter)) (name (slice u8)) (size i64)] (-> (ptr Image))
+  (let [have (image-of (mut e) name)]
+    (if (!= (primitive/cast i64 have) 0)
+        have
+        (let [a (load (field e a))]
+          (match (alloc/alloc-bytes a size 16)
+            (Some [bytes]
+              (let [(mut k) 0
+                    im (alloc/box! a Image (load (Image :bytes bytes :folded 0)))]
+                (loop (if (>= (load k) size)
+                          (break)
+                          (do (slice-set! bytes (load k) (primitive/cast u8 0))
+                              (store! k (+ (load k) 1)))))
+                (hm/hm-put! [(slice u8) (ptr Image)] (mut (field e images)) name im)
+                im))
+            (None [] (nil-image)))))))
+
+;; One leaf of an initialiser: written into the image if its value is known
+;; here, left as a statement if it is not.
+(defn fold-leaf! [(e (mut Emitter))
+                  (im (ptr Image))
+                  (target (ptr nd/Node))
+                  (rhs (ptr nd/Node))] (-> i64)
+  (let [ty (nd/nd-type target)
+        offset (nd/nd-member-offset target)
+        width (nd/nd-member-bit-width target)
+        v (eval-value rhs)]
+    (cond
+      (= (.ok v) 0) 0
+      (= (primitive/cast i64 ty) 0) 0
+      (ct/floating? ty)
+        (let [size (ct/ty-size ty)
+              f (value-float v)]
+          (cond
+            (or (>= width 0) (not (finite? f))) 0
+            (= size 8) (do (image-put! im offset 8 (f64-bits (mut e) f)) 1)
+            (= size 4) (do (image-put! im offset 4 (f32-bits (mut e) f)) 1)
+            :else 0))
+      (= (ct/ty-kind ty) ct/TY-PTR)
+        (if (or (>= width 0) (= (.flo v) 1))
+            0
+            (do (image-put! im offset (ct/ty-size ty) (.i v)) 1))
+      (ct/integer? ty)
+        (let [size (ct/ty-size ty)
+              x (value-int v)]
+          (cond
+            (or (< size 1) (> size 8)) 0
+            (< width 0) (do (image-put! im offset size x) 1)
+            (or (= width 0) (>= width 64)) 0
+            :else
+              (let [bit (nd/nd-member-bit-offset target)
+                    mask (primitive/ishl (- (primitive/ishl 1 width) 1) bit)
+                    old (image-get im offset size)]
+                (image-put! im
+                            offset
+                            size
+                            (primitive/ior (primitive/iand old (primitive/inot mask))
+                                           (primitive/iand (primitive/ishl x bit) mask)))
+                1)))
+      :else 0)))
+
+;; A statement of the start-up block is a store into a static object exactly
+;; when the initialiser that produced it wrote one leaf. Anything else -- and
+;; any store whose value is not a constant -- is left alone.
+(defn fold-store! [(e (mut Emitter))
+                   (globals (al/ArrayList (ptr nd/Obj)))
+                   (s (ptr nd/Node))] (-> i64)
+  (if (!= (nd/nd-kind s) nd/ND-EXPR-STMT)
+      0
+      (let [assign (nd/nd-lhs s)]
+        (if (or (= (primitive/cast i64 assign) 0) (!= (nd/nd-kind assign) nd/ND-ASSIGN))
+            0
+            (let [target (nd/nd-lhs assign)]
+              (if (or (= (primitive/cast i64 target) 0) (!= (nd/nd-kind target) nd/ND-MEMBER))
+                  0
+                  (let [var (nd/nd-lhs target)]
+                    (if (or (= (primitive/cast i64 var) 0) (!= (nd/nd-kind var) nd/ND-VAR))
+                        0
+                        (fold-into-image! (mut e)
+                                          globals
+                                          (nd/nd-obj var)
+                                          target
+                                          (nd/nd-rhs assign))))))))))
+
+(defn fold-into-image! [(e (mut Emitter))
+                        (globals (al/ArrayList (ptr nd/Obj)))
+                        (o (ptr nd/Obj))
+                        (target (ptr nd/Node))
+                        (rhs (ptr nd/Node))] (-> i64)
+  (if (or (= (primitive/cast i64 o) 0) (nd/obj-local? o))
+      0
+      (let [name (nd/obj-name o)
+            index (storage-index (mut e) name)]
+        (if (or (not (hm/hm-contains? (load (field e defined-data)) name))
+                (or (< index 0) (>= index (al/al-len [(ptr nd/Obj)] globals))))
+            0
+            (let [storage (nd/obj-type (al/al-get [(ptr nd/Obj)] globals index))]
+              (if (not (bakeable? storage))
+                  0
+                  (let [im (image-for! (mut e) name (ct/ty-size storage))]
+                    (if (= (primitive/cast i64 im) 0)
+                        0
+                        (let [done (fold-leaf! (mut e) im target rhs)]
+                          (store! (field im folded) (+ (load (field im folded)) done))
+                          done)))))))))
+
+;; Runs before anything is written out: the start-up block minus every store
+;; that has become part of an object's image.
+(defn fold-statics! [(e (mut Emitter))
+                     (globals (al/ArrayList (ptr nd/Obj)))
+                     (init (ptr nd/Node))] (-> (ptr nd/Node))
+  (if (or (= (primitive/cast i64 init) 0) (!= (nd/nd-kind init) nd/ND-BLOCK))
+      init
+      (let [a (load (field e a))
+            kept (nd/node-new a nd/ND-BLOCK (nd/nd-token init))
+            body (nd/nd-body init)
+            count (al/al-len [(ptr nd/Node)] body)
+            (mut i) 0]
+        (loop (if (>= (load i) count)
+                  (break)
+                  (let [s (al/al-get [(ptr nd/Node)] body (load i))]
+                    ;; Each translation unit's start-up statements arrive as a
+                    ;; block of their own, so the stores are one level down.
+                    (if (and (!= (primitive/cast i64 s) 0) (= (nd/nd-kind s) nd/ND-BLOCK))
+                        (let [inner (fold-statics! (mut e) globals s)]
+                          (if (> (al/al-len [(ptr nd/Node)] (nd/nd-body inner)) 0)
+                              (nd/push-body! kept inner)
+                              0))
+                        (if (= (fold-store! (mut e) globals s) 0)
+                            (nd/push-body! kept s)
+                            0))
+                    (store! i (+ (load i) 1)))))
+        kept)))
+
+;; The image as a literal of the object's storage type -- the same shape
+;; `emit-type!` spells for that type, read back out of the bytes.
+(defn put-image! [(e (mut Emitter)) (im (ptr Image)) (t (ptr ct/Type)) (offset i64)] (-> i64)
+  (let [k (ct/ty-kind t)]
+    (cond
+      (ct/record? t)
+        (let [size (ct/ty-size t)
+              align (ct/ty-align t)
+              unit (cond (>= align 8) 8 (= align 4) 4 (= align 2) 2 :else 1)]
+          (put-words! (mut e) im offset (primitive/idiv size unit) unit (= unit 1)))
+      (= k ct/TY-INT128) (put-words! (mut e) im offset 2 8 false)
+      (= k ct/TY-FLOAT16) (put-words! (mut e) im offset 2 1 true)
+      (= k ct/TY-ARRAY)
+        (let [base (ct/ty-base t)
+              esize (ct/ty-size base)
+              len (ct/ty-array-len t)
+              (mut j) 0]
+          (put! (mut e) "[")
+          (loop (if (>= (load j) len)
+                    (break)
+                    (do (if (> (load j) 0) (put! (mut e) " ") 0)
+                        (put-image! (mut e) im base (+ offset (* (load j) esize)))
+                        (store! j (+ (load j) 1)))))
+          (put! (mut e) "]"))
+      (ct/floating? t)
+        (if (= (ct/ty-size t) 4)
+            (put-float-lit! (mut e) (f32-of-bits (mut e) (image-get im offset 4)))
+            (put-float-lit! (mut e) (f64-of-bits (mut e) (image-get im offset 8))))
+      :else (put-int! (mut e) (image-word im offset (ct/ty-size t) (ct/ty-unsigned? t))))))
+
+(defn put-words! [(e (mut Emitter))
+                  (im (ptr Image))
+                  (offset i64)
+                  (count i64)
+                  (unit i64)
+                  (unsigned bool)] (-> i64)
+  (let [(mut j) 0]
+    (put! (mut e) "[")
+    (loop (if (>= (load j) count)
+              (break)
+              (do (if (> (load j) 0) (put! (mut e) " ") 0)
+                  (put-int! (mut e) (image-word im (+ offset (* (load j) unit)) unit unsigned))
+                  (store! j (+ (load j) 1)))))
+    (put! (mut e) "]")))
+
 (defn emit-global! [(e (mut Emitter)) (o (ptr nd/Obj))] (-> i64)
   (if (hm/hm-contains? (load (field e emitted)) (nd/obj-name o))
       0
@@ -1881,9 +2334,14 @@
                 (put! (mut e) ") ")
                 (put-coil-string! (mut e) (nd/obj-string-data o))
                 (put! (mut e) ")"))
-            (do (put! (mut e) "(primitive/alloc-static ")
-                (emit-type! (mut e) (nd/obj-type o))
-                (put! (mut e) ")")))
+            (let [im (image-of (mut e) (nd/obj-name o))]
+              (put! (mut e) "(primitive/alloc-static ")
+              (emit-type! (mut e) (nd/obj-type o))
+              (if (= (primitive/cast i64 im) 0)
+                  0
+                  (do (put! (mut e) " ")
+                      (put-image! (mut e) im (nd/obj-type o) 0)))
+              (put! (mut e) ")")))
         (put! (mut e) ")\n")
         0)))
 
@@ -2104,6 +2562,8 @@
                         :defined-data (hm/hm-new [(slice u8) bool] a (str/str-keyops))
                         :storage (hm/hm-new [(slice u8) i64] a (str/str-keyops))
                         :storage-size (hm/hm-new [(slice u8) i64] a (str/str-keyops))
+                        :images (hm/hm-new [(slice u8) (ptr Image)] a (str/str-keyops))
+                        :scratch (alloc/box! a i64 0)
                         :va-areas (hm/hm-new [(slice u8) (slice u8)] a (str/str-keyops))
                         :target-addrs (al/al-new [(slice u8)] a)
                         :serial 0
@@ -2114,6 +2574,7 @@
                         :file ""
                         :line 0))
         count (al/al-len [(ptr nd/Obj)] globals)
+        (mut start-up) init
         (mut i) 0]
     ;; What has a definition, and under which of the two kinds.
     (loop (if (>= (load i) count)
@@ -2145,6 +2606,8 @@
                 (if (nd/obj-definition? o) (collect-uses! (mut e) (nd/obj-body o)) 0)
                 (store! i (+ (load i) 1)))))
     (collect-uses! (mut e) init)
+    ;; Everything a static initialiser can say now, said now.
+    (store! start-up (fold-statics! (mut e) globals init))
 
     (put! (mut e) "(module c_program)\n")
     (put! (mut e) "(import \"coil.primitive\" :as primitive)\n")
@@ -2203,7 +2666,7 @@
     ;; Everything with static storage is initialised once, in source order,
     ;; before the program's own `main` runs.
     (put! (mut e) "(defn c_init_statics [] (-> i64) (do ")
-    (emit-stmt! (mut e) init)
+    (emit-stmt! (mut e) (load start-up))
     (emit-at-start! (mut e) globals)
     (put! (mut e) " 0))\n")
     ;; Coil's entry point calls the program's, with the arguments it asked for.

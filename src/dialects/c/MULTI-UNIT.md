@@ -200,8 +200,16 @@ unit by unit:
   (do (c_init_statics) (primitive/cast i32 (c_fn_main argc argv))))
 ```
 
+Most of what a C program initialises never reaches that function. An object with
+static storage is *defined* to hold its value — the bytes are in the binary, and
+the loader maps them — exactly as a C compiler writes them down. What is left in
+`c_init_statics` is the initialisers no constant can spell: the ones whose value
+is an address the linker decides. Doom's 36,171 start-up stores come to 1,305
+this way, and `c_init_statics` falls from 44% of the generated module to 4.5%.
+
 C's static initialisers are not restricted to constants here — `int *p = &x;`
-works — because they are ordinary stores that run before anything else. Then the
+works — because whatever is left is an ordinary store that runs before anything
+else. Then the
 `constructor` functions run, in priority order and then declaration order, and
 the `destructor` functions are handed to `atexit`, which runs its list backwards:
 registering them forwards is what makes them run in reverse, `beta-` before

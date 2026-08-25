@@ -52,6 +52,13 @@ member access all fall out of that rather than being special-cased, and an
 update — `x op= y`, `x++` — computes its target's address once, so `*p++ += 1`
 steps the pointer once.
 
+An object with static storage is defined to hold its value rather than being
+written at start-up. Every leaf of an initialiser that folds to a number is laid
+into the object's image and the object is emitted holding it, so the bytes are in
+the binary and the loader maps them, the same as a C compiler. Only the leaves
+whose value is an address the linker decides — a string, another object, a
+function — are left as stores that run before `main`.
+
 A function containing a label is lowered through a control-flow graph and a
 dispatch loop, because no arrangement of Coil's structured forms expresses a
 `goto` that leaves a loop, enters one, or jumps backwards past a declaration.
