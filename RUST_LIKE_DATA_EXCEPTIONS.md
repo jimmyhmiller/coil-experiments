@@ -10,6 +10,8 @@ valid Coil programs. Every other `.coil` file, including all other files under
 - `tests/balance/cases/stray-close-column0.coil`
 - `tests/balance/cases/stray-close-inline.coil`
 - `tests/balance/cases/two-damaged-forms.coil`
+- `tests/balance/cases/typed-inline-ambiguous.coil`
+- `tests/balance/cases/typed-inline.coil`
 - `tests/balance/cases/typecheck-timeout.coil`
 - `tests/compiler/features/terminated_hex_escape_c_byte_rejected.coil`
 - `tests/compiler/features/terminated_hex_escape_empty_rejected.coil`

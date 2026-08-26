@@ -26,10 +26,13 @@ gate below passes.
    - `coil_expr { ... }`
    - Native Coil source hidden inside strings
    - Any differently named construct serving the same purpose
-6. Structural syntax such as `form!(...)`, `atom!(...)`, and vectors is allowed
-   only because it represents the syntax tree recursively as Rust-like data. It
-   must not contain verbatim native Coil fragments.
-7. No construct may be silently dropped, approximated, reordered, renamed, or
+6. Converted output must never contain generic syntax-tree constructors such as
+   `form!(...)`, `atom!(...)`, `item form!(...)`, or renamed equivalents. These
+   are AST serialization, not Rust-like source syntax.
+7. Backtick-escaped identifiers may be emitted only when a name cannot be
+   represented by ordinary Rust-like identifier or path syntax. They must not
+   be used as the default spelling for names.
+8. No construct may be silently dropped, approximated, reordered, renamed, or
    semantically altered merely to make conversion succeed.
 
 ## Required language behavior
@@ -81,8 +84,8 @@ The reader must support every construct documented in
 - Checkers
 - Transforms
 - Quote, quasiquote, unquote, and splice
-- Arbitrary user-defined and future Coil forms through recursive structural
-  syntax
+- A readable Rust-like macro-call syntax for arbitrary user-defined and future
+  Coil forms
 
 Every documented example must be executable syntax, not aspirational
 documentation.
@@ -95,7 +98,8 @@ The Coil-to-CoilRS converter must:
 2. Accept every valid native Coil syntax tree.
 3. Produce valid Rust-like source.
 4. Prefer dedicated readable syntax for every supported documented construct.
-5. Use recursive structural syntax for genuinely open-ended forms.
+5. Use readable Rust-like macro-call syntax for genuinely open-ended forms;
+   never expose parser AST constructors.
 6. Never emit a native-source escape.
 7. Produce deterministic output.
 8. Preserve exact form ordering and syntax-tree structure.
@@ -148,7 +152,7 @@ A programmer must be able to:
 - Edit the converted Rust-like program.
 - Compile that Rust-like program directly.
 - Convert it back to a structurally identical native Coil program.
-- Mix pleasant constructs and recursive structural constructs in the same file.
+- Mix dedicated constructs and readable open-ended macro calls in the same file.
 
 This must work through the normal Coil reader-provider mechanism, not through a
 separate wrapper pretending to be a reader.
@@ -162,14 +166,16 @@ coil run tests/rust/structured.coilrs --use experiments.rust-like.lang
 coil run tests/rust/surface.coilrs --use experiments.rust-like.lang
 coil run tests/rust/advanced.coilrs --use experiments.rust-like.lang
 coil run tests/rust/ffi.coilrs --use experiments.rust-like.lang
-coil run tests/rust/structural.coilrs --use experiments.rust-like.lang
 coil run tests/rust/embedded.coil
 ```
 
 The test corpus must include at least one executable or syntax-tree assertion
 for every documented construct.
 
-Having one simple fixture pass does not establish language completeness.
+Having one simple fixture pass does not establish language completeness. The
+entire converted compiler must also contain zero occurrences of `form!(`,
+`atom!(`, or `item form!`, and must not default to backtick-escaping ordinary
+identifiers.
 
 ## Repository-wide verification
 

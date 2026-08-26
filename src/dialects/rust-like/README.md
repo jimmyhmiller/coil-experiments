@@ -1,577 +1,419 @@
-# CoilRS: a Rust-like surface syntax for Coil
+# CoilRS language reference
 
-The Coil-native reader, converter, import bridge, tree converter, and self-host
-integration gate are implemented. Pleasant declarations and expressions share
-one exact recursive structural representation with open-ended Coil forms.
+CoilRS is a reader syntax for Coil. The reader turns CoilRS text into the same
+`Code` trees that the native Coil reader produces. Macros, checkers, transforms,
+type checking, and code generation run after that conversion.
 
-The implementation includes lossless structural syntax, tree
-conversion/materialization, and dedicated syntax for the constructs in this
-document. The structural notation recursively represents lists, vectors, atoms,
-and quote forms; it never embeds verbatim native Coil. This is the compatibility
-representation for macros, future forms, and deliberately unusual syntax.
+The reader has no native-source escape and no AST serialization syntax. The
+converter emits CoilRS for each native list, vector, and atom. It uses an
+escaped macro call for a form that has no dedicated spelling.
 
-CoilRS is a different spelling of Coil, not a new language and not a Rust
-frontend. The reader turns a `.coilrs` file into ordinary Coil `Code`; after that,
-the normal loader, macro expander, checker, metaprograms, and backends run
-unchanged. In particular, CoilRS does not add Rust ownership, borrowing,
-lifetimes, implicit returns, or method-call dispatch.
+## Current status and limitations
 
-The design has two goals:
+The Coil-native reader, converter, fixtures, and exact syntax-tree audits pass.
+The full-checkout audit currently converts 634 valid `.coil` sources and copies
+23 explicitly listed malformed diagnostic fixtures as data. The converted
+`src/compiler/main_a64.coilrs` builds a compiler, that compiler runs, and its
+version output identifies the converted checkout's `src/stdlib` directory. The
+monitored end-to-end gate most recently peaked at 4.097 GiB of aggregate RSS.
 
-1. Ordinary Coil should look comfortably Rust-like.
-2. Every Coil program must be representable, including forms invented by user
-   macros after this reader was written.
+This is not yet a completely self-hosting, native-free checkout:
 
-The second goal is guaranteed by recursive structural syntax:
+- The tree converter emits a `.coilrs` file plus a native `.coil` loader stub
+  for each converted module. The stub passes the CoilRS text to
+  `rust-like-items`, so imported modules still enter through native loader files.
+- The generated compiler can run, but asking it to compile another CoilRS file
+  against the converted checkout currently exposes a bootstrap cycle: loading
+  the converted prelude needs the Rust-like reader, while compiling that reader
+  needs the prelude.
+- Generated CoilRS is structurally exact and substantially more readable than
+  AST constructors, but compiler code remains mechanical in places, with
+  low-level primitive calls, explicit `do` blocks, and open-ended macro calls.
+- Structural CoilRS-to-Coil restoration is tested through the reader, but there
+  is not yet a polished command that pretty-prints the restored tree as native
+  Coil source.
 
-```rust
-item form!(atom!("some-new-macro"), atom!("x"), [atom!("a"), atom!("b")]);
-```
+Accordingly, the reader and exact round-trip representation are usable, and the
+compiler conversion is a working build demonstration, but the larger
+native-stub-free/self-hosting goal remains unfinished.
 
-A converter may use pleasant CoilRS syntax for forms it knows and structural
-nodes for everything else. Consequently conversion is total and this round trip is
-required to preserve the native Coil syntax tree:
-
-```text
-Coil source -> Coil Code -> canonical CoilRS -> CoilRS reader -> Coil Code
-```
-
-Whitespace, comments, delimiter choice, and numeric spelling are not syntax-tree
-data and are not promised to survive. Identifier identity, literal values, form
-shape, ordering, and quoted syntax are. The canonical renderer must be
-deterministic and idempotent.
-
-## A complete example
+## Complete program
 
 ```rust
 module example::points;
 
 use coil::io::{stdout, print-int, print-str};
-use coil::alloc as alloc;
 
-#[derive(Eq, Hash)]
 struct Point {
     x: i64,
     y: i64,
 }
 
-impl Point {
-    fn sum(p: Point) -> i64 {
-        p.x + p.y
-    }
+fn sum(p: Point) -> i64 {
+    p.x + p.y
 }
 
 fn main() -> i64 {
     let mut total = 0;
-    for i in 0..10 {
-        let p = Point { x: i, y: i * 2 };
-        total = total + sum(p);
-    }
-    print-int(stdout(), load(total));
+    let p = Point { x: 19, y: 23 };
+    total = sum(p);
+    print-int(stdout(), *total);
     print-str(stdout(), "\n");
     0
 }
 ```
 
-It lowers to the same forms one would write in ordinary Coil, including explicit
-`(mut total)`, `(load total)`, `store!`, `for`, constructors, and calls. Braces
-sequence expressions and yield their final expression. A trailing semicolon
-discards an expression's value for sequencing purposes; it does not change Coil's
-type rules.
+`tests/rust/complete.coilrs` and `tests/rust/structured.coilrs` execute this
+set of constructs.
 
-## Lexical syntax
+## Names and paths
 
-Line comments are `// ...`; nested block comments are `/* ... */`. `/// ...` is
-accepted as a line comment, but comments are not part of Coil `Code` and are not
-preserved by syntax-tree conversion. The canonical renderer uses four-space
-indentation.
-
-CoilRS accepts Coil's integer and floating literals, including radix prefixes and
-underscores. It accepts `true`, `false`, strings, C strings (`c"..."`), character
-literals (`'x'`, `'\n'`, `'\u{03bb}'`), and keywords (`:else`, `:hot`). Character
-literals lower to Coil's `#\...` form.
-
-Ordinary identifiers may contain ASCII letters, digits, `_`, `-`, `?`, and `!`,
-but may not begin with a digit. Thus existing names such as `empty?`, `push!`, and
-`return-from` need no renaming. A backtick identifier allows every other Coil
-symbol spelling:
+Coil names may contain `-`, `?`, and a trailing `!`:
 
 ```rust
-let `+` = add_function;
-`strange name`(1);
+empty-list?()
+al-push!(mut values, value)
+primitive::alloc-stack(i64)
 ```
 
-`a::b::name` lowers to Coil's qualified symbol `a.b/name`: all but the final
-segment form the module alias/name, and the final segment is the member. A module
-declaration maps every `::` to `.`, so `module my::app::main;` becomes
-`(module my.app.main)`. This intentionally leaves `/` available only inside a
-backtick identifier or an `atom!(...)` structural node.
-
-Reserved words may be used as names when backtick-quoted. No identifier is
-case-folded.
-
-## Modules, imports, and exports
+`::` maps to `/` in a Coil symbol. A module declaration maps `::` to `.`.
+Backticks quote names that conflict with CoilRS grammar or contain other
+characters:
 
 ```rust
-module my::app;
-
-use coil::io::*;
-use coil::io::{print, println};
-use coil::io as io;
-use coil::io::{print as io_print};
-use coil::io::* except { print };
-pub use coil::io::*;                 // adds :reexport
-
-export { main, helper };
+`match`(value, arms)
+`free-identifier=?`(left, right)
+:build::id
+:`free-identifier=?`
 ```
 
-These lower to `module`, `import`, and `export`. For less common combinations,
-an import accepts clauses after `with`:
+The converter only adds backticks when the grammar requires them.
+
+## Literals
+
+CoilRS accepts Coil integers and floats, booleans, strings, C strings,
+characters, keywords, and vectors:
 
 ```rust
-use "coil.io" with {
-    as: io,
-    use: *,
-    exclude: [print],
-    rename: [[println, writeln]],
-    reexport: true,
-};
+0
+-9223372036854775808
+3.5
+true
+"text\n"
+c"bytes\0"
+'x'
+'\n'
+:ready
+[1, 2, 3]
 ```
 
-The quoted module spelling is exact. The structured spelling covers every native
-`import` clause without assigning new meaning to one particular combination.
+Comments use `//` and `/* ... */`. Delimiters inside strings and comments do
+not end the surrounding construct.
 
 ## Types
 
-Built-in scalar and named types retain their Coil names: `i8`, `u64`, `f32`,
-`bool`, `void`, `Code`, `Point`. Type application uses angle brackets:
+Type application uses angle brackets. A type vector uses square brackets.
 
 ```rust
-Option<i64>                 // (Option i64)
-ptr<u8>                     // (ptr u8)
-mut<Point>                  // (mut Point), a Coil mutable place/reference type
-slice<u8>                   // (slice u8)
-array<u8, 64>               // (array u8 64)
-vec<f32, 4>                 // (vec f32 4)
-dyn<Writer>                 // (dyn Writer)
-fnptr<c, [i64, i64], i64>   // (fnptr c [i64 i64] i64)
+i64
+ptr<i64>
+mut<ArrayList<u8>>
+slice<u8>
+dyn<Allocator>
+Result<i64, Error>
+[i64, bool]
+fnptr<c, [i64], i64>
 ```
 
-The optional Rust-looking aliases `*const T`, `*mut T`, and `&mut T` are not in
-version 1: they would falsely imply distinctions or guarantees Coil does not
-have. Canonical output always uses the explicit constructors above.
+## Modules and imports
 
-Generic parameter packs keep Coil's ellipsis: `Args...`. Bounds use `T: Eq +
-Hash`. A declaration can therefore spell parameters as `<T, U: Show, Args...>`.
+```rust
+module my::program;
+
+use coil::io::*;
+use coil::io::{stdout, print-int};
+use coil::alloc as alloc;
+use coil::str::* except { sb-new };
+pub use coil::slice::{slice-len as len};
+```
+
+The converter uses an order-preserving form when a native import contains an
+option order that the compact syntax cannot express:
+
+```rust
+use "coil.alloc" with {
+    as: alloc,
+    use: *,
+};
+```
+
+The `with` fields are `as`, `use`, `exclude`, `rename`, and `reexport`. Their
+order becomes the option order in the native `import` form.
 
 ## Declarations
 
-### Constants and functions
+Constants, aliases, structs, and sums use these forms:
 
 ```rust
-const ANSWER = 42;
-const MASK: u64 = 0xff;
+const LIMIT: i64 = 10;
+alias Field = primitive::field;
 
-fn add(x: i64, y: i64) -> i64 {
-    x + y
+struct Pair<T> {
+    left: T,
+    right: T,
 }
 
-fn show_all<T: Show, Args...>(x: T, args...: Args...) -> i64 {
-    form!(atom!("consume"), atom!("x"), atom!("args..."))
+enum Option<T> {
+    Some { value: T },
+    None,
 }
 ```
 
-These lower to `const` and `defn`. A parameter may be written `x: mut<T>` when
-the native signature expects `(x (mut T))`. Variadic C parameters use `...` in an
-`extern` declaration; Coil type/value packs retain their native `...` spelling.
-
-Coil annotations use Rust attributes. Their contents are CoilRS expressions:
+Functions support generic bounds, parameter packs, attributes, and more than
+one body form:
 
 ```rust
 #[inline(Always)]
+fn identity<T: Copy + Eq>(value: T) -> T {
+    trace(value);
+    value
+}
+
+fn consume<Args...>(args...: Args...) -> i64 { 0 }
+```
+
+Traits, trait implementations, and inherent implementations share the function
+syntax:
+
+```rust
+trait Show<Self> {
+    fn show(value: Self) -> i64;
+}
+
+impl Show for Widget {
+    fn show(value: Widget) -> i64 { value.code }
+}
+
+impl Widget {
+    fn code(value: Widget) -> i64 { value.code }
+}
+```
+
+`derive` and other annotations use attributes:
+
+```rust
+#[derive(Eq, Hash)]
+struct Key { value: i64 }
+
 #[http::route(Get("/users"))]
 fn users() -> i64 { 0 }
 ```
 
-This lowers to annotation pairs between the `defn` name and parameter vector.
-Unknown attributes are preserved because Coil annotation keys are open.
-
-### Structs and sum types
-
-```rust
-struct Point {
-    x: i64,
-    y: i64,
-}
-
-enum Shape {
-    Empty,
-    Circle { radius: f64 },
-    Rect { width: i64, height: i64 },
-}
-
-let p = Point { x: 10, y: 20 };
-let s = Shape::Rect { width: 10, height: 20 };
-```
-
-These lower to `defstruct`, `defsum`, and named Coil constructors. The canonical
-renderer always includes field names and preserves source evaluation order.
-
-### Traits and implementations
-
-```rust
-trait Show<Self> {
-    fn show(x: Self) -> i64;
-}
-
-impl Show for Point {
-    fn show(p: Point) -> i64 { p.x + p.y }
-}
-
-impl<T: Eq> Eq for Box<T> {
-    fn eq(a: Box<T>, b: Box<T>) -> bool { a.value == b.value }
-}
-
-impl Point {
-    fn origin() -> Point { Point { x: 0, y: 0 } }
-    fn sum(p: Point) -> i64 { p.x + p.y }
-}
-```
-
-These lower to `deftrait`, trait `impl`, generic `impl`, and inherent `impl`.
-Receiver dispatch remains Coil's: `sum(p)` is an ordinary call whose owner is
-inferred from argument zero. Receiverless inherent functions do not become
-surrounding-module functions, so CoilRS does not invent a `Point::origin()` call
-that Coil cannot resolve. `p.sum()` is deliberately not syntax in version 1
-because it would obscure this distinction and collide with field access.
-
-Derives use `#[derive(...)]` on a struct or enum and lower to a following native
-`derive` form. Configured derives use expression syntax:
-
-```rust
-#[derive(Serialize(rename_all(:camelCase)), Deserialize(rename_all(:camelCase)))]
-struct User { user_id: i64 }
-```
-
-### Foreign declarations and generated declarations
+## Foreign declarations and exports
 
 ```rust
 extern "c" {
-    fn write(fd: i64, data: ptr<i8>, len: i64) -> i64;
+    fn puts(text: ptr<i8>) -> i32;
     fn printf(format: ptr<i8>, ...) -> i32;
 }
 
-cimport "sys/ioctl.h" { ioctl };
-export_c { run as "run" };
-```
-
-These lower to `extern`, `cimport`, and `export-c`. Calling conventions other
-than `c` are accepted as string or identifier values and emitted as their native
-keyword/value. Open-ended foreign-declaration annotations use structural items.
-
-Metaprogram declarations whose surface is deliberately open-ended
-(`defannotation`, `defderive`, `register-derive`, and reader-provider
-registration) use structural items. For example:
-
-```rust
-item form!(atom!("reader-provider"), string!("my.reader"), atom!("read-mine"));
-item form!(atom!("defannotation"), atom!(":http/route"), atom!("Route"));
+cimport "stdio.h" { printf };
+export { main, helper };
+export_c { main as "entry" };
 ```
 
 ## Bindings, places, and assignment
 
-```rust
-let x = expression;
-let mut y = expression;
-let mut alias = mut y;       // aliases y's place
-let mut copy = load(y);      // fresh cell containing y's current value
-
-y = expression;             // (store! y expression)
-*pointer = expression;       // (store! pointer expression)
-let value = *pointer;        // (load pointer)
-object.field = value;        // (set! (.field object) value)
-let value = object.field;    // (.field object)
-```
-
-`mut place` is a prefix expression lowering to `(mut place)` and `load(place)` is
-ordinary call syntax. Canonical output uses `load(place)` when a native `(load
-place)` must remain explicit. `=` is assignment; equality is `==`, lowering to
-Coil `=`. Compound assignments lower without inventing primitive semantics:
+`let` creates immutable or mutable stack bindings. `*` loads a pointer. A plain
+field access lowers to a Coil accessor. Assignment selects `set!` for an
+accessor and `store!` for a loaded pointer place.
 
 ```rust
-x += y;  // (store! x (+ (load x) y))
-x -= y;  // analogous; also *=, /=, %=, &=, |=, ^=, <<=, >>=
+let value = 1;
+let mut total = 0;
+let element = values[index];
+let field_value = record.field;
+*pointer = value;
+record.field = value;
+total += value;
+total -= value;
+total *= value;
+total /= value;
 ```
 
-Compound assignment currently requires a simple named place such as `x`. Use an
-explicit `load`/`store!` sequence for projected places whose address
-must be evaluated exactly once.
+The converter keeps low-level place operations visible when their tree differs
+from an accessor, for example `field(record, name)` and `set!(place, value)`.
+These are ordinary Coil macro calls, not native-source or AST escapes.
 
-Indexing and fields are surface sugar:
-
-```rust
-p.field             // (.field p)
-p[index]             // (get p index), trait-level indexing
-place(p, index)      // explicit project/library place operation
-```
-
-Low-level `primitive::index`, `field`, `load`, and `store!` remain available as
-ordinary calls or structural expressions.
-
-## Expressions and operators
-
-Calls, constructors, literals, and blocks are expressions. Array literals use
-`[a, b, c]`. There is no tuple literal because Coil has no tuple type.
+## Calls and construction
 
 ```rust
 f(a, b)
-generic::<T, U>(x)
-if condition { then_value } else { else_value }
+f::<T, U>(a, b)
+Point { x: 1, y: 2 }
+Maybe::Some { value: 42 }
+(function_factory())(argument)
 ```
 
-Operator lowering is purely syntactic:
+The generic-call spelling lowers to a call whose first argument is a native
+type vector. Named construction lowers to alternating keyword/value arguments.
 
-| CoilRS | Coil |
-|---|---|
-| `a + b`, `a - b`, `a * b`, `a / b`, `a % b` | `(+ a b)`, `(- a b)`, etc. |
-| `a == b`, `a != b`, `a < b`, `a <= b`, `a > b`, `a >= b` | `(= a b)`, `(!= a b)`, etc. |
-| `a & b`, `a \| b`, `a ^ b`, `a << b`, `a >> b` | `(& a b)`, `(\| a b)`, etc. |
-| `a && b`, `a \|\| b`, `!a` | `(and a b)`, `(or a b)`, `(not a)` |
-| `-a` | `(- 0 a)` in canonical v1 |
+## Operators
 
-Precedence follows Rust for the operators above. Operators still resolve to
-Coil's traits or forms; the reader performs no type-directed selection. Metal
-operations such as `primitive::iadd` are ordinary qualified calls.
-
-Explicit type application is `callee::<T, U>(args...)` and lowers to Coil's
-generic call shape `(callee [T U] args...)`. A type argument list in a non-call
-position is a type, not an expression.
-
-Coil keywords are named arguments rather than Rust fields when they occur in an
-ordinary call:
+CoilRS implements precedence for unary, arithmetic, shift, comparison,
+equality, bitwise, and Boolean operators:
 
 ```rust
-configure(:mode, :fast)      // (configure :mode :fast)
+!flag
+-value
+*pointer
+left * right + extra
+value << 2
+left < right && ready
+bits & mask | extra
 ```
 
-## Control flow
+Parentheses override precedence.
 
-All control constructs are expressions and preserve Coil's result typing.
+## Conditions and blocks
 
 ```rust
-if test { a } else { b }
+if condition { yes() } else { no() }
+when condition { action(); 0 }
+unless condition { action(); 0 }
 
+{
+    let value = compute();
+    use_value(value)
+}
+```
+
+Semicolons separate sibling forms. The final expression supplies the block
+value.
+
+## Loops and exits
+
+```rust
+loop { break; }
+while condition { step(); }
+for i in 0..count { visit(i); }
+loop { break 42; }
+loop { break :outer, 42; }
+while condition { continue; }
+
+block :done {
+    return_from :done, result;
+    fallback
+}
+```
+
+## Pattern and clause forms
+
+```rust
 match value {
-    Some[value] => value,
-    None => 0,
+    Some[x] => use_value(x),
+    None[] => 0,
 }
-
-loop {
-    if done { break result; }
-    continue;
-}
-
-while condition { body; }
-for i in 0..10 { body; }
-```
-
-`match` variant payloads lower to Coil's vector patterns. `_` remains `_`.
-Named payload patterns are reserved for a later extension; v1 uses positional
-brackets when field-name intent would be ambiguous:
-
-```rust
-match result {
-    Ok[value] => value,
-    Err[error] => handle(error),
-}
-```
-
-The remaining core control forms are:
-
-```rust
-when condition { body; }
-unless condition { body; }
 
 cond {
-    test1 => value1,
-    test2 => value2,
-    else => fallback,
+    first => one(),
+    else => zero(),
 }
 
 case value {
-    0 => zero,
-    1 => one,
-    else => fallback,
-}
-
-block :name {
-    return_from :name, value;
-}
-
-try { expression }          // (try expression), not exception handling
-```
-
-`break;`, `break value;`, and `continue;` map directly. Coil has no general
-`return`; CoilRS does not invent one. `return_from` maps to `return-from`.
-Self-tail recursion remains the normal way to express early function structure
-without a block.
-
-## Compile-time and metaprogramming
-
-```rust
-let n = comptime { fact(5) };
-
-meta {
-    generate_declarations()
-}
-
-checker my_lint;
-checker raw_depth before_expand;
-transform my_lowering;
-transform_once one_pass;
-```
-
-These lower to `comptime`, `meta`, `checker`, `transform`, and
-`transform-once`. `before_expand` lowers to `:phase before-expand`.
-
-Quote, quasiquote, unquote, and splice are structural nodes. This preserves the
-exact Coil syntax-object shape without embedding native source text:
-
-```rust
-fn when_macro(c: Code, body: Code) -> Code {
-    quasiquote(form!(
-        atom!("if"),
-        unquote(atom!("c")),
-        form!(atom!("do"), splice(atom!("body"))),
-        int!(0)
-    ))
+    1 => one(),
+    else => zero(),
 }
 ```
 
-Because a function with `Code` parameters and a `Code` result is already how Coil
-defines a macro, no `macro` keyword is introduced. Reflection and `primitive::code_*`
-operations are ordinary functions.
+A match arm may use a block with several forms. The converter uses an escaped
+macro call for a malformed match tree that lacks its binding vector, preserving
+that tree for compiler diagnostic fixtures.
 
-Registration forms and arbitrary generated top-level forms use structural
-items:
-
-```rust
-item form!(atom!("reader-provider"), string!("my.reader"), atom!("read-mine"));
-item form!(atom!("defannotation"), atom!(":http/route"), atom!("Route"));
-```
-
-## Tests and documentation
+## Compile-time and metaprogram forms
 
 ```rust
-/// Returns the sum of two values.
-fn add(x: i64, y: i64) -> i64 { x + y }
-
-#[test]
-fn addition() -> i64 {
-    assert-eq(add(20, 22), 42);
-    0
-}
-
+let answer = comptime { 40 + 2 };
+try { operation() }
+meta { generate() }
+quote(value)
+quasiquote(template(unquote(value), splice(rest)))
 ```
 
-`#[test] fn` lowers to `deftest`. Named-suite membership is project configuration,
-not a Coil source declaration, and remains in `Coil.toml` under `[test.suites.*]`.
-Assertions and property-test vocabulary are ordinary calls and therefore need no
-reader support.
+`unquote(value)` and `splice(value)` may also appear as standalone forms when a
+macro needs those exact trees.
 
-## Recursive structural syntax
-
-Structural syntax represents `Code` as Rust-like data; it never contains native
-Coil source. It is valid in expressions, and `item NODE;` places one node at the
-top level:
+## Reader pipeline registrations
 
 ```rust
-item form!(atom!("some-new-declaration"), atom!("Name"), [atom!("a"), atom!("b")]);
-form!(atom!("some-new-macro"), atom!("x"), int!(42))
+checker validate;
+checker early before_expand;
+transform lower;
+transform_once normalize;
 ```
 
-The complete structural vocabulary is:
+`before_expand` lowers to the native `:phase before-expand` option.
+
+## Open-ended forms
+
+Coil macros can introduce new list shapes without changing this reader. Use a
+normal macro call in expression position or prefix a top-level form with
+`item`:
 
 ```rust
-form!(NODE, ...)       // list
-[NODE, ...]            // vector
-atom!("spelling")      // exact atom spelling and kind inferred by Coil's reader
-symbol!("spelling")    // explicit symbolic atom alias
-string!("text")        // string atom
-int!(42)               // integer atom
-float!(3.5)             // floating atom
-quote(NODE)
-quasiquote(NODE)
-unquote(NODE)
-splice(NODE)
+custom-form!(value, option)
+item defprimitive(code-count, :code-count);
 ```
 
-Because list and vector children are structural nodes recursively, this notation
-represents future macros, unusual symbols, quote templates, and every source
-syntax tree accepted by Coil without hiding native text in a string.
+If the macro name conflicts with CoilRS syntax, escape the name:
 
-## Canonical conversion and round-trip policy
+```rust
+item `match`(value, arm);
+```
 
-The project should expose both directions:
+## Conversion and round trips
+
+Convert one native source by loading the converter reader provider:
 
 ```sh
-coil run input.coilrs --use experiments.rust-like.lang
-coil run experiments.rust-like.lang input.coilrs > output.coil
-coil run input.coil --use experiments.rust-like.convert > output.coilrs
+coil run program.coil --use experiments.rust-like.convert > program.coilrs
 ```
 
-The repository implementation is currently invoked directly:
+Read or build CoilRS through the Rust-like provider:
 
 ```sh
-coil run input.coil --use experiments.rust-like.convert > output.coilrs
-coil run experiments.rust-like.lang output.coilrs > output.coil
-coil run experiments.rust-like.tree -- COIL_CHECKOUT CONVERTED
-cd CONVERTED
-coil build src/compiler/main_a64.coilrs --use experiments.rust-like.lang -o coilrs-compiler
+coil run program.coilrs --use experiments.rust-like.lang
+coil build program.coilrs --use experiments.rust-like.lang -o program
 ```
 
-Tree conversion writes `.coilrs` sources and small `.coil` namespace-index
-stubs. Each stub invokes the Coil-native `rust-like-items` macro over its module
-text because reader providers replace the entry read while textual imports retain
-the default reader. Compilation does not rewrite or materialize files.
+Convert a checkout into a separate directory:
 
-The canonical Coil converter is itself a Coil reader provider. Its universal
-structural notation uses Rust-macro-shaped `form!(...)` and `atom!(...)` nodes;
-it never embeds native source. Dedicated surface renderings may replace a
-structural node only when they preserve the same parsed form.
+```sh
+coil run experiments.rust-like.tree -- /path/to/coil /tmp/coil-rust-like
+```
 
-The exact CLI packaging may differ, but the following behavior is required:
+The tree converter writes `.coilrs` files, native loader stubs, and the
+`rust-like` reader package. It also writes a root `Coil.toml`. Build the compiler
+inside that checkout at the path the compiler recognizes as a checkout build:
 
-- The reader accepts every construct documented above.
-- `to-coil` prints ordinary Coil accepted by the default reader.
-- Native-to-CoilRS conversion uses dedicated syntax only when it reproduces the
-  exact native form shape; otherwise it emits recursive structural nodes.
-- Reading canonical CoilRS and printing it again is idempotent.
-- Native Coil -> canonical CoilRS -> native Coil preserves parsed `Code` modulo
-  source locations and hygiene metadata that cannot originate in source text.
-- CoilRS -> native Coil -> canonical CoilRS preserves semantics and becomes stable
-  after the first canonicalization.
-- Comments, including doc comments, are not part of `Code` and therefore are not
-  preserved by syntax-tree conversion. A separate token-preserving tool would be
-  required for comment retention.
+```sh
+cd /tmp/coil-rust-like
+mkdir -p build/bin
+coil build src/compiler/main_a64.coilrs \
+    --use experiments.rust-like.lang \
+    -o build/bin/coil
+build/bin/coil --version
+```
 
-The conformance corpus covers the constructs in this file and runs the converter
-over every valid `.coil` program in a clean compiler checkout. Forms without
-dedicated surface sugar pass through recursive structural syntax; unsupported
-surface sugar is never grounds for a failed conversion.
+The version output reports `stdlib: checkout: .../src/stdlib`. The compiler then
+loads the converted checkout's standard library. The command
+`scripts/rust-like-test.sh --compiler-copy ../coil` checks exact `Code` equality
+across the checkout and runs this compiler gate.
 
-## Deliberate non-features
+## Implementation files
 
-- No ownership, moves, lifetimes, borrow checker, or automatic destructors.
-- No implicit dereference, autoref, method-call syntax, or overloaded field/index
-  assignment beyond the explicit lowerings above.
-- No implicit final `return`; a block simply yields its last expression as Coil
-  `do` does.
-- No Rust tuple, reference, closure, async, or `?` semantics unless a future Coil
-  library/dialect defines them and the syntax lowers transparently to that API.
-- No attempt to reserve all future Coil forms. Recursive structural syntax is the
-  compatibility boundary.
-
-Those omissions keep CoilRS honest: it is readable Rust-like notation for Coil's
-actual semantics, with an exact route back to Coil whenever surface sugar would
-hide or distort them.
+- `reader.coil` parses CoilRS into `Code`.
+- `converter.coil` converts native Coil text to CoilRS.
+- `tree.coil` converts directory trees and installs the reader package.
+- `rust.coil` registers `experiments.rust-like.lang`.
+- `convert.coil` registers `experiments.rust-like.convert`.
