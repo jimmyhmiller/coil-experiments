@@ -62,6 +62,8 @@ of the Coil compiler through one `--use experiments.rust.lang`. See
 ### `src/experiments/` — research
 - `gc-dialect/` — explicit-root garbage collection as a dialect
 - `transparent-gc/` — the follow-on transform that inserts the roots
+- `httpd/` — a small HTTP server library: routes, middleware, real sockets;
+  see [`src/experiments/httpd/README.md`](src/experiments/httpd/README.md)
 - `httptap/` — HTTP interception as a whole-program transform, three sinks
 - `coop/` — shared FIFO scheduler for lightweight resumable computations
 - `async/` — generated activation records; `await` parks the current computation
