@@ -1798,6 +1798,53 @@ test_names() {
   echo "names valid modules: $module_count instantiations passed"
 }
 
+test_traps_file() {
+  coil_bin=${COIL:-coil}
+  json="$prepared/traps/script.json"
+  dir=${json%/*}
+  args_file=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-traps.XXXXXX")
+  failure_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-trap-failure.XXXXXX")
+  trap 'rm -f "$args_file" "$failure_out"' EXIT HUP INT TERM
+  jq -r '
+    .commands
+    | reduce .[] as $command
+        ({current: "", selected: []};
+         if $command.type == "module" then .current = $command.filename
+         elif $command.type == "assert_trap"
+         then .selected += [{file: .current, action: $command.action}]
+         else . end)
+    | .selected[]
+    | ([.file, .action.field, (.action.args | length | tostring)]
+       + [.action.args[] | .type, .value])
+    | join(" ")
+  ' "$json" > "$args_file"
+  trap_count=0
+  while IFS= read -r line; do
+    set -- $line
+    file=$1
+    shift
+    if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang -- \
+         --invoke-scalar "$@" > "$failure_out" 2>&1; then
+      echo "error: expected trap from traps/$file export $1" >&2
+      exit 1
+    fi
+    if ! grep -q 'program terminated by signal 6' "$failure_out"; then
+      cat "$failure_out" >&2
+      exit 1
+    fi
+    trap_count=$((trap_count + 1))
+  done < "$args_file"
+  module_count=$(jq '[.commands[] | select(.type == "module")] | length' "$json")
+  if [ "$trap_count" -ne 32 ] || [ "$module_count" -ne 4 ]; then
+    echo "error: traps inventory changed: traps=$trap_count modules=$module_count" >&2
+    exit 1
+  fi
+  rm -f "$args_file" "$failure_out"
+  trap - EXIT HUP INT TERM
+  echo "traps assert_trap: $trap_count checks passed"
+  echo "traps valid modules: $module_count modules exercised"
+}
+
 test_wat() {
   coil_bin=${COIL:-coil}
   "$coil_bin" run "$root/tests/wasm/wat_features.wat" \
@@ -1845,9 +1892,10 @@ case "${1:-inventory}" in
   test-integer-expressions) test_integer_expressions ;;
   test-literals) test_literals ;;
   test-names) test_names ;;
+  test-traps-file) test_traps_file ;;
   test-wat) test_wat ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-encoding|test-exports|test-float-extensions|test-integer-expressions|test-literals|test-names|test-wat]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-encoding|test-exports|test-float-extensions|test-integer-expressions|test-literals|test-names|test-traps-file|test-wat]" >&2
     exit 2
     ;;
 esac

@@ -63,6 +63,7 @@ scripts/wasm-spec.sh test-float-extensions
 scripts/wasm-spec.sh test-integer-expressions
 scripts/wasm-spec.sh test-literals
 scripts/wasm-spec.sh test-names
+scripts/wasm-spec.sh test-traps-file
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -220,6 +221,10 @@ four modules, including the empty name, Unicode names, control bytes, spaces,
 quotes, backticks, and punctuation. Unsafe UTF-8 byte strings use a collision-free
 hex-encoded Coil identifier while ordinary identifiers retain readable names.
 The cumulative official assertion total is 16,460.
+
+`test-traps-file` passes the complete pinned MVP `traps` file: all 32 runtime
+trap assertions across its four modules. The cumulative official assertion total
+is 16,492.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and
