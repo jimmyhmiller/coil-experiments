@@ -1075,6 +1075,59 @@ test_memory_instructions() {
   echo "memory instructions assert_trap: $trap_total checks passed"
 }
 
+test_types() {
+  coil_bin=${COIL:-coil}
+  command -v jq >/dev/null 2>&1 || {
+    echo "error: jq is required to run prepared spec assertions" >&2
+    exit 1
+  }
+  json="$prepared/type/script.json"
+  dir=${json%/*}
+  failure_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-type-failure.XXXXXX")
+  trap 'rm -f "$failure_out"' EXIT HUP INT TERM
+
+  "$coil_bin" run "$dir/script.0.wasm" --use experiments.wasm.lang
+
+  invalid_count=0
+  for file in $(jq -r '.commands[] | select(.type == "assert_invalid") | .filename' "$json"); do
+    if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+         > "$failure_out" 2>&1; then
+      echo "error: expected type validation failure from $file" >&2
+      exit 1
+    fi
+    if ! grep -q 'WebAssembly validation:' "$failure_out"; then
+      echo "error: $file failed without a validation diagnostic" >&2
+      cat "$failure_out" >&2
+      exit 1
+    fi
+    invalid_count=$((invalid_count + 1))
+  done
+
+  malformed_count=0
+  for file in $(jq -r '.commands[] | select(.type == "assert_malformed") | .filename' "$json"); do
+    if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+         > "$failure_out" 2>&1; then
+      echo "error: expected malformed type rejection from $file" >&2
+      exit 1
+    fi
+    if ! grep -q 'WAT reader:' "$failure_out"; then
+      echo "error: $file failed without a WAT reader diagnostic" >&2
+      cat "$failure_out" >&2
+      exit 1
+    fi
+    malformed_count=$((malformed_count + 1))
+  done
+
+  if [ "$invalid_count" -ne 2 ] || [ "$malformed_count" -ne 2 ]; then
+    echo "error: type assertion inventory changed: invalid=$invalid_count malformed=$malformed_count" >&2
+    exit 1
+  fi
+  rm -f "$failure_out"
+  trap - EXIT HUP INT TERM
+  echo "types assert_invalid: $invalid_count checks passed"
+  echo "types assert_malformed: $malformed_count checks passed"
+}
+
 test_wat() {
   coil_bin=${COIL:-coil}
   "$coil_bin" run "$root/tests/wasm/wat_features.wat" \
@@ -1111,9 +1164,10 @@ case "${1:-inventory}" in
   test-functions) test_functions ;;
   test-globals) test_globals ;;
   test-memory-instructions) test_memory_instructions ;;
+  test-types) test_types ;;
   test-wat) test_wat ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-wat]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-wat]" >&2
     exit 2
     ;;
 esac

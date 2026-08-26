@@ -52,6 +52,7 @@ scripts/wasm-spec.sh test-evaluation-order
 scripts/wasm-spec.sh test-functions
 scripts/wasm-spec.sh test-globals
 scripts/wasm-spec.sh test-memory-instructions
+scripts/wasm-spec.sh test-types
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -139,6 +140,10 @@ validation failures, 67 malformed-module rejections, and 206 runtime traps.
 The state-reset actions in
 `memory_redundancy` execute in source order in the same module instance. The
 cumulative official assertion total is 8,853.
+
+`test-types` passes the complete official MVP `type` file: two validation
+failures and two malformed-text rejections. It also compiles the file's valid
+type-declaration module. The cumulative official assertion total is 8,857.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and
