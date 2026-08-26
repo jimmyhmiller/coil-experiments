@@ -56,6 +56,7 @@ scripts/wasm-spec.sh test-types
 scripts/wasm-spec.sh test-data-segments
 scripts/wasm-spec.sh test-elements
 scripts/wasm-spec.sh test-imports
+scripts/wasm-spec.sh test-linking
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -172,6 +173,13 @@ module commands instantiate, and all 16
 malformed text assertions are rejected. This completes all 109 assertions and
 every module command in the pinned official MVP `imports` file. The cumulative
 official assertion total is 9,017.
+
+`test-linking` currently covers the first registered-function chain in the
+official MVP `linking` file. Independently compiled modules import, call, and
+re-export a registered module's function, including an export name containing a
+space. All four actions pass. The cumulative official assertion total is 9,021;
+the remaining global, table, memory, start, trap, and unlinkable linking cases
+remain explicitly outside this partial milestone.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and
