@@ -67,6 +67,7 @@ scripts/wasm-spec.sh test-traps-file
 scripts/wasm-spec.sh test-float-misc
 scripts/wasm-spec.sh test-float-expressions
 scripts/wasm-spec.sh test-float-literals
+scripts/wasm-spec.sh test-float-memory
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -240,6 +241,10 @@ all 96 module commands. The cumulative official assertion total is 17,726.
 `test-float-literals` passes the complete pinned MVP `float_literals` file: 83
 exact returns, 76 malformed literal encodings, and both valid module commands.
 The cumulative official assertion total is 17,885.
+
+`test-float-memory` passes the complete pinned MVP `float_memory` file: 60
+exact returns, 24 ordered mutating actions, and all six module commands. The
+cumulative official assertion total is 17,945.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and

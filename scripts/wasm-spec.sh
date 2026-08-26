@@ -2018,6 +2018,47 @@ test_float_literals() {
   echo "float literals valid modules: $module_count instantiations passed"
 }
 
+test_float_memory() {
+  coil_bin=${COIL:-coil}
+  json="$prepared/float_memory/script.json"
+  dir=${json%/*}
+  args_file=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-float-memory.XXXXXX")
+  trap 'rm -f "$args_file"' EXIT HUP INT TERM
+  module_count=0
+  for file in $(jq -r '.commands[] | select(.type == "module") | .filename' "$json"); do
+    jq -r --arg file "$file" '
+      .commands
+      | reduce .[] as $command
+          ({current: "", selected: []};
+           if $command.type == "module" then .current = $command.filename
+           elif (.current == $file and
+                 ($command.type == "action" or $command.type == "assert_return"))
+           then .selected += [$command]
+           else . end)
+      | .selected[]
+      | .action.field,
+        (if .type == "action" then "void" else .expected[0].type end),
+        (if .type == "action" then "0" else .expected[0].value end),
+        (.action.args | length | tostring),
+        (.action.args[] | .type, .value)
+    ' "$json" > "$args_file"
+    xargs "$coil_bin" run "$dir/$file" --use experiments.wasm.lang -- \
+      --assert-scalar-batch < "$args_file"
+    module_count=$((module_count + 1))
+  done
+  return_count=$(jq '[.commands[] | select(.type == "assert_return")] | length' "$json")
+  action_count=$(jq '[.commands[] | select(.type == "action")] | length' "$json")
+  if [ "$return_count" -ne 60 ] || [ "$action_count" -ne 24 ] || \
+     [ "$module_count" -ne 6 ]; then
+    echo "error: float_memory inventory changed: returns=$return_count actions=$action_count modules=$module_count" >&2
+    exit 1
+  fi
+  rm -f "$args_file"
+  trap - EXIT HUP INT TERM
+  echo "float memory assert_return: $return_count checks passed"
+  echo "float memory actions: $action_count actions and $module_count modules passed"
+}
+
 test_wat() {
   coil_bin=${COIL:-coil}
   "$coil_bin" run "$root/tests/wasm/wat_features.wat" \
@@ -2069,9 +2110,10 @@ case "${1:-inventory}" in
   test-float-misc) test_float_misc ;;
   test-float-expressions) test_float_expressions ;;
   test-float-literals) test_float_literals ;;
+  test-float-memory) test_float_memory ;;
   test-wat) test_wat ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-encoding|test-exports|test-float-extensions|test-integer-expressions|test-literals|test-names|test-traps-file|test-float-misc|test-float-expressions|test-float-literals|test-wat]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-encoding|test-exports|test-float-extensions|test-integer-expressions|test-literals|test-names|test-traps-file|test-float-misc|test-float-expressions|test-float-literals|test-float-memory|test-wat]" >&2
     exit 2
     ;;
 esac
