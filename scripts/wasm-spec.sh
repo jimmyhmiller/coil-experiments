@@ -1478,6 +1478,8 @@ test_linking() {
   trap - EXIT HUP INT TERM
   echo "linking assert_unlinkable: $unlinkable_count checks passed"
   echo "linking assert_uninstantiable: 1 check passed"
+  (cd "$root/tests/wasm/linking-start-recovery" && "$coil_bin" run)
+  echo "linking post-failed-start assert_return: 2 checks passed"
 }
 
 test_wat() {

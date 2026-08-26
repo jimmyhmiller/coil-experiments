@@ -178,11 +178,11 @@ official assertion total is 9,017.
 memory chains in the official MVP `linking` file. Independently compiled modules
 import, call, mutate, and re-export shared resources, including an export name
 containing a space. The harness preserves action order within each chain and
-passes 60 returns, all 19 traps, the trapped-start instantiation, and all 12
-unlinkable assertions. The cumulative official assertion total is 9,109. The
-two post-failed-start shared-resource returns remain explicitly outside this
-partial milestone; they require recoverable native traps so the host can inspect
-the imported memory and table after start failure.
+passes all 62 returns, all 19 traps, the trapped-start instantiation, and all 12
+unlinkable assertions. A Coil-native recoverable trap boundary retains imported
+memory and table mutations when a start function traps. This completes all 94
+assertions and every module command in the pinned official MVP `linking` file.
+The cumulative official assertion total is 9,111.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and
