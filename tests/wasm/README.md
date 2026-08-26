@@ -61,6 +61,7 @@ scripts/wasm-spec.sh test-encoding
 scripts/wasm-spec.sh test-exports
 scripts/wasm-spec.sh test-float-extensions
 scripts/wasm-spec.sh test-integer-expressions
+scripts/wasm-spec.sh test-literals
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -208,6 +209,10 @@ integer comparison results. The cumulative official assertion total is 15,512.
 `test-integer-expressions` passes the complete pinned MVP `int_exprs` file: 75
 mixed-width returns and 14 runtime traps across all 19 modules. The cumulative
 official assertion total is 15,601.
+
+`test-literals` passes the complete pinned MVP `int_literals` and `const` files:
+330 returns, 50 malformed text modules, and all 339 valid module commands. The
+cumulative official assertion total is 15,981.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and

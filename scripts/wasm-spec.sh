@@ -1694,6 +1694,71 @@ test_integer_expressions() {
   echo "integer expressions assert_trap: $trap_count checks passed"
 }
 
+test_literals() {
+  coil_bin=${COIL:-coil}
+  args_file=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-literals.XXXXXX")
+  failure_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-literal-failure.XXXXXX")
+  trap 'rm -f "$args_file" "$failure_out"' EXIT HUP INT TERM
+  return_total=0
+  malformed_total=0
+  module_total=0
+  for suite in int_literals const; do
+    json="$prepared/$suite/script.json"
+    dir=${json%/*}
+    for file in $(jq -r '.commands[] | select(.type == "module") | .filename' "$json"); do
+      jq -r --arg file "$file" '
+        .commands
+        | reduce .[] as $command
+            ({current: "", selected: []};
+             if $command.type == "module" then .current = $command.filename
+             elif ($command.type == "assert_return" and .current == $file)
+             then .selected += [$command]
+             else . end)
+        | .selected[]
+        | .action.field,
+          .expected[0].type,
+          .expected[0].value,
+          (.action.args | length | tostring),
+          (.action.args[] | .type, .value)
+      ' "$json" > "$args_file"
+      if [ -s "$args_file" ]; then
+        if ! xargs "$coil_bin" run "$dir/$file" --use experiments.wasm.lang -- \
+             --assert-scalar-batch < "$args_file"; then
+          echo "error: literal assertions failed in $suite/$file" >&2
+          exit 1
+        fi
+      else
+        if ! "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+             > "$failure_out" 2>&1; then
+          echo "error: valid literal module $suite/$file failed" >&2
+          cat "$failure_out" >&2
+          exit 1
+        fi
+      fi
+      module_total=$((module_total + 1))
+    done
+    return_total=$((return_total + $(jq '[.commands[] | select(.type == "assert_return")] | length' "$json")))
+    for file in $(jq -r '.commands[] | select(.type == "assert_malformed") | .filename' "$json"); do
+      if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+           > "$failure_out" 2>&1; then
+        echo "error: expected malformed literal rejection from $suite/$file" >&2
+        exit 1
+      fi
+      malformed_total=$((malformed_total + 1))
+    done
+  done
+  if [ "$return_total" -ne 330 ] || [ "$malformed_total" -ne 50 ] || \
+     [ "$module_total" -ne 339 ]; then
+    echo "error: literal inventory changed: returns=$return_total malformed=$malformed_total modules=$module_total" >&2
+    exit 1
+  fi
+  rm -f "$args_file" "$failure_out"
+  trap - EXIT HUP INT TERM
+  echo "literals assert_return: $return_total checks passed"
+  echo "literals assert_malformed: $malformed_total checks passed"
+  echo "literals valid modules: $module_total instantiations passed"
+}
+
 test_wat() {
   coil_bin=${COIL:-coil}
   "$coil_bin" run "$root/tests/wasm/wat_features.wat" \
@@ -1739,9 +1804,10 @@ case "${1:-inventory}" in
   test-exports) test_exports ;;
   test-float-extensions) test_float_extensions ;;
   test-integer-expressions) test_integer_expressions ;;
+  test-literals) test_literals ;;
   test-wat) test_wat ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-encoding|test-exports|test-float-extensions|test-integer-expressions|test-wat]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-encoding|test-exports|test-float-extensions|test-integer-expressions|test-literals|test-wat]" >&2
     exit 2
     ;;
 esac
