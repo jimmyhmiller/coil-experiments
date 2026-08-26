@@ -936,12 +936,18 @@ test_memory_instructions() {
   malformed_total=0
   trap_total=0
 
-  for suite in memory_grow memory_redundancy load store address align memory_trap; do
+  for suite in memory_grow memory_redundancy load store address align memory_trap memory; do
     json="$prepared/$suite/script.json"
     dir=${json%/*}
     if [ ! -f "$json" ]; then
       echo "error: prepared $suite suite is missing; run scripts/wasm-spec.sh prepare" >&2
       exit 1
+    fi
+
+    if [ "$suite" = memory ]; then
+      for file in script.0.wasm script.1.wasm script.2.wasm script.3.wasm; do
+        "$coil_bin" run "$dir/$file" --use experiments.wasm.lang
+      done
     fi
 
     if [ "$suite" = memory_redundancy ]; then
@@ -1054,9 +1060,9 @@ test_memory_instructions() {
   done
 
   assertion_total=$((return_total + invalid_total + malformed_total + trap_total))
-  if [ "$return_total" -ne 385 ] || [ "$invalid_total" -ne 139 ] || \
+  if [ "$return_total" -ne 430 ] || [ "$invalid_total" -ne 157 ] || \
      [ "$malformed_total" -ne 67 ] || [ "$trap_total" -ne 206 ] || \
-     [ "$assertion_total" -ne 797 ]; then
+     [ "$assertion_total" -ne 860 ]; then
     echo "error: memory-instruction assertion inventory changed: returns=$return_total invalid=$invalid_total malformed=$malformed_total traps=$trap_total total=$assertion_total" >&2
     exit 1
   fi
