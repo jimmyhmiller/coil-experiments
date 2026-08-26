@@ -62,6 +62,7 @@ scripts/wasm-spec.sh test-exports
 scripts/wasm-spec.sh test-float-extensions
 scripts/wasm-spec.sh test-integer-expressions
 scripts/wasm-spec.sh test-literals
+scripts/wasm-spec.sh test-names
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -213,6 +214,12 @@ official assertion total is 15,601.
 `test-literals` passes the complete pinned MVP `int_literals` and `const` files:
 330 returns, 50 malformed text modules, and all 339 valid module commands. The
 cumulative official assertion total is 15,981.
+
+`test-names` passes the complete pinned MVP `names` file: 479 returns across all
+four modules, including the empty name, Unicode names, control bytes, spaces,
+quotes, backticks, and punctuation. Unsafe UTF-8 byte strings use a collision-free
+hex-encoded Coil identifier while ordinary identifiers retain readable names.
+The cumulative official assertion total is 16,460.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and

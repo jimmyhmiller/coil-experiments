@@ -1759,6 +1759,45 @@ test_literals() {
   echo "literals valid modules: $module_total instantiations passed"
 }
 
+test_names() {
+  coil_bin=${COIL:-coil}
+  json="$prepared/names/script.json"
+  dir=${json%/*}
+  args_file=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-names.XXXXXX")
+  assertion_exe=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-name-assertions.XXXXXX")
+  trap 'rm -f "$args_file" "$assertion_exe"' EXIT HUP INT TERM
+  "$coil_bin" run "$dir/script.0.wasm" --use experiments.wasm.lang -- \
+    --assert-scalar-batch foo i32 0 0
+  "$coil_bin" run "$dir/script.1.wasm" --use experiments.wasm.lang -- \
+    --assert-scalar-batch foo i32 1 0
+  "$coil_bin" build "$dir/script.2.wasm" -o "$assertion_exe" \
+    --use experiments.wasm.lang -- --assert-scalar-batch "" i32 0 0
+  "$assertion_exe"
+  jq -j '
+    .commands[6:481][] | select(.type == "assert_return")
+    | .action.field, "\u0000",
+      .expected[0].type, "\u0000",
+      .expected[0].value, "\u0000",
+      (.action.args | length | tostring), "\u0000",
+      (.action.args[] | .type, "\u0000", .value, "\u0000")
+  ' "$json" > "$args_file"
+  xargs -0 "$coil_bin" build "$dir/script.2.wasm" -o "$assertion_exe" \
+    --use experiments.wasm.lang -- --assert-scalar-batch < "$args_file"
+  "$assertion_exe"
+  "$coil_bin" run "$dir/script.3.wasm" --use experiments.wasm.lang -- \
+    --assert-scalar-batch print32 void 0 2 i32 42 i32 123
+  return_count=$(jq '[.commands[] | select(.type == "assert_return")] | length' "$json")
+  module_count=$(jq '[.commands[] | select(.type == "module")] | length' "$json")
+  if [ "$return_count" -ne 479 ] || [ "$module_count" -ne 4 ]; then
+    echo "error: names inventory changed: returns=$return_count modules=$module_count" >&2
+    exit 1
+  fi
+  rm -f "$args_file" "$assertion_exe"
+  trap - EXIT HUP INT TERM
+  echo "names assert_return: $return_count checks passed"
+  echo "names valid modules: $module_count instantiations passed"
+}
+
 test_wat() {
   coil_bin=${COIL:-coil}
   "$coil_bin" run "$root/tests/wasm/wat_features.wat" \
@@ -1805,9 +1844,10 @@ case "${1:-inventory}" in
   test-float-extensions) test_float_extensions ;;
   test-integer-expressions) test_integer_expressions ;;
   test-literals) test_literals ;;
+  test-names) test_names ;;
   test-wat) test_wat ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-encoding|test-exports|test-float-extensions|test-integer-expressions|test-literals|test-wat]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-encoding|test-exports|test-float-extensions|test-integer-expressions|test-literals|test-names|test-wat]" >&2
     exit 2
     ;;
 esac
