@@ -1625,6 +1625,75 @@ test_float_extensions() {
   echo "float extension assert_invalid: $invalid_total checks passed"
 }
 
+test_integer_expressions() {
+  coil_bin=${COIL:-coil}
+  json="$prepared/int_exprs/script.json"
+  dir=${json%/*}
+  args_file=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-int-exprs.XXXXXX")
+  failure_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-int-expr-failure.XXXXXX")
+  trap 'rm -f "$args_file" "$failure_out"' EXIT HUP INT TERM
+  for wasm in "$dir"/script.*.wasm; do
+    file=${wasm##*/}
+    jq -r --arg file "$file" '
+      .commands
+      | reduce .[] as $command
+          ({current: "", selected: []};
+           if $command.type == "module" then .current = $command.filename
+           elif ($command.type == "assert_return" and .current == $file)
+           then .selected += [$command]
+           else . end)
+      | .selected[]
+      | .action.field,
+        .expected[0].type,
+        .expected[0].value,
+        (.action.args | length | tostring),
+        (.action.args[] | .type, .value)
+    ' "$json" > "$args_file"
+    if [ -s "$args_file" ]; then
+      xargs "$coil_bin" run "$wasm" --use experiments.wasm.lang -- \
+        --assert-scalar-batch < "$args_file"
+    fi
+  done
+  trap_count=0
+  jq -r '
+    .commands
+    | reduce .[] as $command
+        ({current: "", selected: []};
+         if $command.type == "module" then .current = $command.filename
+         elif $command.type == "assert_trap"
+         then .selected += [{file: .current, action: $command.action}]
+         else . end)
+    | .selected[]
+    | ([.file, .action.field, (.action.args | length | tostring)]
+       + [.action.args[] | .type, .value])
+    | join(" ")
+  ' "$json" > "$args_file"
+  while IFS= read -r line; do
+    set -- $line
+    file=$1
+    shift
+    if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang -- \
+         --invoke-scalar "$@" > "$failure_out" 2>&1; then
+      echo "error: expected integer expression trap from $file export $1" >&2
+      exit 1
+    fi
+    if ! grep -q 'program terminated by signal 6' "$failure_out"; then
+      cat "$failure_out" >&2
+      exit 1
+    fi
+    trap_count=$((trap_count + 1))
+  done < "$args_file"
+  return_count=$(jq '[.commands[] | select(.type == "assert_return")] | length' "$json")
+  if [ "$return_count" -ne 75 ] || [ "$trap_count" -ne 14 ]; then
+    echo "error: int_exprs inventory changed: returns=$return_count traps=$trap_count" >&2
+    exit 1
+  fi
+  rm -f "$args_file" "$failure_out"
+  trap - EXIT HUP INT TERM
+  echo "integer expressions assert_return: $return_count checks passed"
+  echo "integer expressions assert_trap: $trap_count checks passed"
+}
+
 test_wat() {
   coil_bin=${COIL:-coil}
   "$coil_bin" run "$root/tests/wasm/wat_features.wat" \
@@ -1669,9 +1738,10 @@ case "${1:-inventory}" in
   test-encoding) test_encoding ;;
   test-exports) test_exports ;;
   test-float-extensions) test_float_extensions ;;
+  test-integer-expressions) test_integer_expressions ;;
   test-wat) test_wat ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-encoding|test-exports|test-float-extensions|test-wat]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-encoding|test-exports|test-float-extensions|test-integer-expressions|test-wat]" >&2
     exit 2
     ;;
 esac

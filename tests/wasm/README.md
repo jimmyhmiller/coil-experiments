@@ -60,6 +60,7 @@ scripts/wasm-spec.sh test-linking
 scripts/wasm-spec.sh test-encoding
 scripts/wasm-spec.sh test-exports
 scripts/wasm-spec.sh test-float-extensions
+scripts/wasm-spec.sh test-integer-expressions
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -203,6 +204,10 @@ external kind. The cumulative official assertion total is 9,974.
 `f64_bitwise`, and `f64_cmp` files: 5,520 returns and 18 validation failures.
 The mixed-type harness checks floating inputs with both floating bit-pattern and
 integer comparison results. The cumulative official assertion total is 15,512.
+
+`test-integer-expressions` passes the complete pinned MVP `int_exprs` file: 75
+mixed-width returns and 14 runtime traps across all 19 modules. The cumulative
+official assertion total is 15,601.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and
