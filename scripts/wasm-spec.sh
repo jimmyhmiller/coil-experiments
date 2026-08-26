@@ -1273,6 +1273,20 @@ test_elements() {
   echo "elements assert_trap: $trap_count check passed"
 }
 
+test_imports() {
+  coil_bin=${COIL:-coil}
+  (cd "$root/tests/wasm/imports-interop" && "$coil_bin" run)
+  echo "imports cross-module function assert_return: 2 checks passed"
+  dir="$prepared/imports"
+  "$coil_bin" run "$dir/script.34.wasm" --use experiments.wasm.lang -- \
+    --assert-scalar-batch \
+      get-0 i32 666 0 \
+      get-1 i32 666 0 \
+      get-x i32 666 0 \
+      get-y i32 666 0
+  echo "imports host-global assert_return: 4 checks passed"
+}
+
 test_wat() {
   coil_bin=${COIL:-coil}
   "$coil_bin" run "$root/tests/wasm/wat_features.wat" \
@@ -1312,9 +1326,10 @@ case "${1:-inventory}" in
   test-types) test_types ;;
   test-data-segments) test_data_segments ;;
   test-elements) test_elements ;;
+  test-imports) test_imports ;;
   test-wat) test_wat ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-wat]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-wat]" >&2
     exit 2
     ;;
 esac

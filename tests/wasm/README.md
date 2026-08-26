@@ -55,6 +55,7 @@ scripts/wasm-spec.sh test-memory-instructions
 scripts/wasm-spec.sh test-types
 scripts/wasm-spec.sh test-data-segments
 scripts/wasm-spec.sh test-elements
+scripts/wasm-spec.sh test-imports
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -159,6 +160,14 @@ table slots store typed native function references, so element segments from
 separately compiled and registered WASM modules can overwrite a shared table and
 be called by the exporting module. The cumulative official assertion total is
 8,908.
+
+`test-imports` currently covers the first registered-module portion and the
+immutable host-global portion of the official MVP `imports` file. A separately
+compiled module imports eight functions from another WASM module plus the
+official `spectest` host functions; its two exported actions pass. Four imported
+host-global actions also pass. The cumulative official assertion total is 8,914.
+The remaining table, memory, invalid, and unlinkable import cases remain
+explicitly outside this partial milestone.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and
