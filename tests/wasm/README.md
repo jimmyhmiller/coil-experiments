@@ -25,7 +25,7 @@ function exports as typed Coil functions:
 
 ```toml
 [readers]
-".wasm" = "experiments.wasm.lang"
+".wasm" = "experiments.wasm.reader"
 ```
 
 ```coil
