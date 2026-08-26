@@ -1528,6 +1528,53 @@ test_encoding() {
   echo "encoding valid modules: $module_count instantiations passed"
 }
 
+test_exports() {
+  coil_bin=${COIL:-coil}
+  json="$prepared/exports/script.json"
+  dir=${json%/*}
+  failure_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-exports-failure.XXXXXX")
+  trap 'rm -f "$failure_out"' EXIT HUP INT TERM
+  "$coil_bin" run "$dir/script.11.wasm" --use experiments.wasm.lang -- \
+    --assert-scalar-batch \
+      e i32 43 1 i32 42 \
+      e i32 43 1 i32 42 \
+      e i32 43 1 i32 42
+  "$coil_bin" run "$dir/script.29.wasm" --use experiments.wasm.lang -- \
+    --assert-scalar-batch e i32 42 0 e i32 42 0 e i32 42 0
+  invalid_count=0
+  for file in $(jq -r '.commands[] | select(.type == "assert_invalid") | .filename' "$json"); do
+    if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+         > "$failure_out" 2>&1; then
+      echo "error: expected export validation failure from $file" >&2
+      exit 1
+    fi
+    if ! grep -q 'WebAssembly validation:' "$failure_out"; then
+      cat "$failure_out" >&2
+      exit 1
+    fi
+    invalid_count=$((invalid_count + 1))
+  done
+  module_count=0
+  for file in $(jq -r '.commands[] | select(.type == "module") | .filename' "$json"); do
+    if ! "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+         > "$failure_out" 2>&1; then
+      echo "error: valid exports module $file failed" >&2
+      cat "$failure_out" >&2
+      exit 1
+    fi
+    module_count=$((module_count + 1))
+  done
+  if [ "$invalid_count" -ne 22 ] || [ "$module_count" -ne 54 ]; then
+    echo "error: exports inventory changed: invalid=$invalid_count modules=$module_count" >&2
+    exit 1
+  fi
+  rm -f "$failure_out"
+  trap - EXIT HUP INT TERM
+  echo "exports assert_return: 6 checks passed"
+  echo "exports assert_invalid: $invalid_count checks passed"
+  echo "exports valid modules: $module_count instantiations passed"
+}
+
 test_wat() {
   coil_bin=${COIL:-coil}
   "$coil_bin" run "$root/tests/wasm/wat_features.wat" \
@@ -1570,9 +1617,10 @@ case "${1:-inventory}" in
   test-imports) test_imports ;;
   test-linking) test_linking ;;
   test-encoding) test_encoding ;;
+  test-exports) test_exports ;;
   test-wat) test_wat ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-encoding|test-wat]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-encoding|test-exports|test-wat]" >&2
     exit 2
     ;;
 esac

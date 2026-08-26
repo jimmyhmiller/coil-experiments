@@ -58,6 +58,7 @@ scripts/wasm-spec.sh test-elements
 scripts/wasm-spec.sh test-imports
 scripts/wasm-spec.sh test-linking
 scripts/wasm-spec.sh test-encoding
+scripts/wasm-spec.sh test-exports
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -191,6 +192,11 @@ all 835 malformed assertions and instantiates all 49 valid module commands.
 Custom sections validate their name envelope even though their payload is
 semantically ignored, and all binary names use strict Unicode scalar-value
 UTF-8 validation. The cumulative official assertion total is 9,946.
+
+`test-exports` passes the complete pinned MVP `exports` file: six returns, 22
+validation failures, and all 54 valid module commands. Export names are compared
+as validated UTF-8 byte strings, so duplicate names are rejected across every
+external kind. The cumulative official assertion total is 9,974.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and
