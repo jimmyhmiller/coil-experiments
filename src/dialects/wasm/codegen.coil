@@ -23,9 +23,9 @@
 (defn zero-expression [(context Code) (tag i64)] (-> Code)
   (let [cast-id (primitive/datum->syntax context "primitive/cast")]
     (cond (= tag 1) `(~cast-id i32 0)
-          (= tag 2) `0
+          (= tag 2) `(~cast-id i64 0)
           (= tag 3) `(~cast-id f32 0)
-          (= tag 4) `0.0
+          (= tag 4) `(~cast-id f64 0)
           :else `0)))
 
 (defn wasm-label [(a (dyn alloc/Allocator)) (serial i64)] (-> Code)
@@ -2053,13 +2053,56 @@
                   (if (>= function-index (primitive/code-count names))
                       (primitive/error "WebAssembly validation: exported function index out of bounds")
                       (let [type-index (al/al-get indices function-index)
+                            signature (al/al-get types type-index)
                             wrapper (export-wrapper-form
                                       context (.name e)
                                       (primitive/code-nth names function-index)
                                       initializer
-                                      (al/al-get types type-index))]
+                                      signature)
+                            hidden (primitive/datum->syntax
+                                     context
+                                     (primitive/code-symbol
+                                       "__wasm_function_type_" (.name e)))
+                            function-type-type (primitive/datum->syntax
+                                                 context "wasmrt/FunctionType")
+                            alloc-static-id (primitive/datum->syntax
+                                              context "primitive/alloc-static")
+                            init-id (primitive/datum->syntax
+                                      context "wasmrt/function-type-init!")
+                            set-id (primitive/datum->syntax
+                                     context "wasmrt/function-type-set!")
+                            signature-length (+ 1 (al/al-len (.params signature)))
+                            signature-forms-builder (primitive/code-list-new)
+                            (mut signature-index) 0]
                         (primitive/code-list-push! forms (primitive/code-nth wrapper 0))
                         (primitive/code-list-push! forms (primitive/code-nth wrapper 1))
+                        (primitive/code-list-push! forms `(export ~hidden))
+                        (primitive/code-list-push!
+                          signature-forms-builder
+                          `(~set-id ~hidden ~0
+                             ~(if (= (al/al-len (.results signature)) 0)
+                                  0
+                                  (kind-tag (al/al-get (.results signature) 0)))))
+                        (loop
+                          (if (>= (load signature-index) (al/al-len (.params signature)))
+                              (break)
+                              (do
+                                (primitive/code-list-push!
+                                  signature-forms-builder
+                                  `(~set-id ~hidden ~(+ 1 (load signature-index))
+                                     ~(kind-tag
+                                        (al/al-get (.params signature)
+                                                   (load signature-index)))))
+                                (store! signature-index (+ (load signature-index) 1)))))
+                        (let [signature-forms
+                                (primitive/code-list-done signature-forms-builder)]
+                          (primitive/code-list-push!
+                            forms
+                            `(defn ~hidden [] (-> (ptr ~function-type-type))
+                               (let [~hidden (~alloc-static-id ~function-type-type)]
+                                 (~init-id ~hidden ~signature-length)
+                                 ~@signature-forms
+                                 ~hidden))))
                         0)))
                   (= (.kind e) 1)
                 (if (or (>= (.index e) 1) (= (primitive/code-count table) 0))
@@ -2139,7 +2182,8 @@
 
 (defn emit-start! [(context Code) (forms CodeBuilder) (payload (slice u8))
                    (names Code) (indices (al/ArrayList i64))
-                   (types (al/ArrayList wasm/FuncType)) (memory Code) (table Code)]
+                   (types (al/ArrayList wasm/FuncType)) (memory Code) (table Code)
+                   (function-import-checks Code)]
                   (-> i64)
   (let [initializer (primitive/datum->syntax context "__coil_wasm_instantiate")
         memory-initializer (if (= (primitive/code-count memory) 0)
@@ -2153,7 +2197,8 @@
           (primitive/code-list-push! forms `(export ~initializer))
           (primitive/code-list-push!
             forms `(defn ~initializer [] (-> void)
-                     (do ~memory-initializer ~table-initializer (do))))
+                     (do ~@function-import-checks
+                         ~memory-initializer ~table-initializer (do))))
           0)
         (match (wasm/start-section payload)
         (wasm/DecodeError [_ message] (primitive/error message))
@@ -2181,6 +2226,7 @@
                                    (if (= (~load-id ~initialized) 0)
                                        (do
                                          (~store-id ~initialized 1)
+                                         ~@function-import-checks
                                          ~memory-initializer
                                          ~table-initializer
                                          (~(primitive/code-nth names function-index)))
@@ -2274,7 +2320,8 @@
 (defn emit-function-imports! [(context Code) (forms CodeBuilder)
                               (imports (al/ArrayList wasm/Import))
                               (types (al/ArrayList wasm/FuncType))
-                              (names CodeBuilder) (indices (mut (al/ArrayList i64)))]
+                              (names CodeBuilder) (checks CodeBuilder)
+                              (indices (mut (al/ArrayList i64)))]
                              (-> i64)
   (let [(mut i) 0]
     (loop
@@ -2307,8 +2354,46 @@
                                           :else (.item-name entry))
                           callee (primitive/datum->syntax
                                    context
-                                   (primitive/code-symbol alias "/" item-name))]
+                                   (primitive/code-symbol alias "/" item-name))
+                          signature (al/al-get types (.type-index entry))
+                          hidden (primitive/datum->syntax
+                                   context
+                                   (primitive/code-symbol
+                                     alias "/__wasm_function_type_" (.item-name entry)))
+                          type-state (primitive/fresh-identifier "wasm-import-function-type")
+                          check-length-id (primitive/datum->syntax
+                                            context "wasmrt/function-type-check-length")
+                          check-byte-id (primitive/datum->syntax
+                                          context "wasmrt/function-type-check-byte")
+                          checks-builder (primitive/code-list-new)
+                          (mut parameter-index) 0]
                       (primitive/code-list-push! forms `(import ~module-path :as ~alias))
+                      (primitive/code-list-push!
+                        checks-builder
+                        `(~check-length-id ~type-state
+                           ~(+ 1 (al/al-len (.params signature)))))
+                      (primitive/code-list-push!
+                        checks-builder
+                        `(~check-byte-id ~type-state 0
+                           ~(if (= (al/al-len (.results signature)) 0)
+                                0
+                                (kind-tag (al/al-get (.results signature) 0)))))
+                      (loop
+                        (if (>= (load parameter-index)
+                                (al/al-len (.params signature)))
+                            (break)
+                            (do
+                              (primitive/code-list-push!
+                                checks-builder
+                                `(~check-byte-id ~type-state
+                                   ~(+ 1 (load parameter-index))
+                                   ~(kind-tag
+                                      (al/al-get (.params signature)
+                                                 (load parameter-index)))))
+                              (store! parameter-index (+ (load parameter-index) 1)))))
+                      (let [type-checks (primitive/code-list-done checks-builder)]
+                        (primitive/code-list-push!
+                          checks `(let [~type-state (~hidden)] ~@type-checks 0)))
                       (primitive/code-list-push! names callee)
                       (al/al-push! [i64] (mut indices) (.type-index entry))))))
             (store! i (+ (load i) 1)))))
@@ -2325,6 +2410,7 @@
         globals (compile-globals a context (.globals s) imports forms)
         memory (compile-memory a context (.memories s) (.data s) imports globals forms)
         imported-names (primitive/code-list-new)
+        function-import-checks-builder (primitive/code-list-new)
         (mut indices) (al/al-new [i64] a)
         (mut i) 0]
     (if (!= (al/al-len defined-indices) (al/al-len bodies))
@@ -2332,8 +2418,11 @@
         0)
     (validate-imported-memory-count! a context imports (.memories s))
     (validate-imported-table-count! a context imports (.tables s))
-    (emit-function-imports! context forms imports types imported-names (mut indices))
+    (emit-function-imports! context forms imports types imported-names
+                            function-import-checks-builder (mut indices))
     (let [imports-code (primitive/code-list-done imported-names)
+          function-import-checks
+            (primitive/code-list-done function-import-checks-builder)
           names-builder (primitive/code-list-new)
           (mut j) 0]
       (loop
@@ -2370,7 +2459,8 @@
                                      (al/al-get bodies (load i))
                                      globals memory table names (load indices) types)))
                 (store! i (+ (load i) 1)))))
-        (emit-start! context forms (.start s) names (load indices) types memory table)
+        (emit-start! context forms (.start s) names (load indices) types memory table
+                     function-import-checks)
         (if (= (slice-len (.exports s)) 0)
             0
             (match (wasm/export-section a (.exports s))

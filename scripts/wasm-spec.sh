@@ -1275,6 +1275,9 @@ test_elements() {
 
 test_imports() {
   coil_bin=${COIL:-coil}
+  failure_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-imports-failure.XXXXXX")
+  unlinkable_dir=$(mktemp -d "$root/tests/wasm/.imports-unlinkable.XXXXXX")
+  trap 'rm -f "$failure_out"; rm -rf "$unlinkable_dir"' EXIT HUP INT TERM
   (cd "$root/tests/wasm/imports-interop" && "$coil_bin" run)
   echo "imports cross-module function assert_return: 2 checks passed"
   dir="$prepared/imports"
@@ -1285,6 +1288,135 @@ test_imports() {
       get-x i32 666 0 \
       get-y i32 666 0
   echo "imports host-global assert_return: 4 checks passed"
+
+  for n in 45 46; do
+    "$coil_bin" run "$dir/script.$n.wasm" --use experiments.wasm.lang -- \
+      --assert-scalar-batch \
+        call i32 11 1 i32 1 \
+        call i32 22 1 i32 2
+    for at in 0 3 100; do
+      if "$coil_bin" run "$dir/script.$n.wasm" --use experiments.wasm.lang -- \
+           --invoke-scalar call 1 i32 "$at" > "$failure_out" 2>&1; then
+        echo "error: expected imported-table trap from script.$n.wasm at $at" >&2
+        exit 1
+      fi
+      if ! grep -q 'program terminated by signal 6' "$failure_out"; then
+        cat "$failure_out" >&2
+        exit 1
+      fi
+    done
+  done
+  echo "imports host-table: 4 returns and 6 traps passed"
+
+  for n in 71 72; do
+    "$coil_bin" run "$dir/script.$n.wasm" --use experiments.wasm.lang -- \
+      --assert-scalar-batch \
+        load i32 0 1 i32 0 \
+        load i32 16 1 i32 10 \
+        load i32 1048576 1 i32 8
+    if "$coil_bin" run "$dir/script.$n.wasm" --use experiments.wasm.lang -- \
+         --invoke-scalar load 1 i32 1000000 > "$failure_out" 2>&1; then
+      echo "error: expected imported-memory trap from script.$n.wasm" >&2
+      exit 1
+    fi
+    if ! grep -q 'program terminated by signal 6' "$failure_out"; then
+      cat "$failure_out" >&2
+      exit 1
+    fi
+  done
+  "$coil_bin" run "$dir/script.99.wasm" --use experiments.wasm.lang -- \
+    --assert-scalar-batch \
+      grow i32 1 1 i32 0 \
+      grow i32 1 1 i32 1 \
+      grow i32 2 1 i32 0 \
+      grow i32 4294967295 1 i32 1 \
+      grow i32 2 1 i32 0
+  echo "imports host-memory: 11 returns and 2 traps passed"
+
+  invalid_count=0
+  for n in 2 47 48 49 73 74 75; do
+    if "$coil_bin" run "$dir/script.$n.wasm" --use experiments.wasm.lang \
+         > "$failure_out" 2>&1; then
+      echo "error: expected multiple-resource validation failure from script.$n.wasm" >&2
+      exit 1
+    fi
+    if ! grep -q 'WebAssembly validation:' "$failure_out"; then
+      cat "$failure_out" >&2
+      exit 1
+    fi
+    invalid_count=$((invalid_count + 1))
+  done
+  spectest_unlinkable_count=0
+  for n in 11 31 32 33 38 42 43 44 62 66 70 86 89 90 94 95 96 97 98; do
+    if "$coil_bin" run "$dir/script.$n.wasm" --use experiments.wasm.lang \
+         > "$failure_out" 2>&1; then
+      echo "error: expected spectest import link failure from script.$n.wasm" >&2
+      exit 1
+    fi
+    spectest_unlinkable_count=$((spectest_unlinkable_count + 1))
+  done
+  cp "$root/tests/wasm/imports-unlinkable/Coil.toml" "$unlinkable_dir/Coil.toml"
+  cp "$root/tests/wasm/imports-unlinkable/main.coil" "$unlinkable_dir/main.coil"
+  cp "$dir/script.0.wasm" "$unlinkable_dir/test.wasm"
+  cp "$dir/script.116.wasm" "$unlinkable_dir/not-wasm.wasm"
+  registered_valid_count=0
+  for n in 3 4 5 6 7 8 9 35 36 50 51 52 76 77 78; do
+    cp "$dir/script.$n.wasm" "$unlinkable_dir/candidate.wasm"
+    if ! (cd "$unlinkable_dir" && "$coil_bin" run) > "$failure_out" 2>&1; then
+      echo "error: valid registered-module import script.$n.wasm failed" >&2
+      cat "$failure_out" >&2
+      exit 1
+    fi
+    registered_valid_count=$((registered_valid_count + 1))
+  done
+  spectest_valid_count=0
+  for n in 53 54 55 56 57 58 59 60 79 80 81 82 83 84; do
+    if ! "$coil_bin" run "$dir/script.$n.wasm" --use experiments.wasm.lang \
+         > "$failure_out" 2>&1; then
+      echo "error: valid spectest import script.$n.wasm failed" >&2
+      cat "$failure_out" >&2
+      exit 1
+    fi
+    spectest_valid_count=$((spectest_valid_count + 1))
+  done
+  if ! "$coil_bin" run "$dir/script.116.wasm" --use experiments.wasm.lang \
+       > "$failure_out" 2>&1; then
+    echo "error: valid registered provider script.116.wasm failed" >&2
+    cat "$failure_out" >&2
+    exit 1
+  fi
+  registered_unlinkable_count=0
+  for n in 10 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 \
+           37 39 40 41 61 63 64 65 67 68 69 85 87 88 91 92 93 117; do
+    if [ "$n" -eq 117 ]; then
+      cp "$dir/script.116.wasm" "$unlinkable_dir/not-wasm.wasm"
+    else
+      cp "$dir/script.0.wasm" "$unlinkable_dir/test.wasm"
+    fi
+    cp "$dir/script.$n.wasm" "$unlinkable_dir/candidate.wasm"
+    if (cd "$unlinkable_dir" && "$coil_bin" run) > "$failure_out" 2>&1; then
+      echo "error: expected registered-module link failure from script.$n.wasm" >&2
+      exit 1
+    fi
+    registered_unlinkable_count=$((registered_unlinkable_count + 1))
+  done
+  malformed_count=0
+  for n in $(seq 100 115); do
+    if "$coil_bin" run "$dir/script.$n.wat" --use experiments.wasm.lang \
+         > "$failure_out" 2>&1; then
+      echo "error: expected malformed import ordering failure from script.$n.wat" >&2
+      exit 1
+    fi
+    malformed_count=$((malformed_count + 1))
+  done
+  rm -f "$failure_out"
+  rm -rf "$unlinkable_dir"
+  trap - EXIT HUP INT TERM
+  echo "imports multiple-resource assert_invalid: $invalid_count checks passed"
+  echo "imports spectest assert_unlinkable: $spectest_unlinkable_count checks passed"
+  echo "imports registered-module assert_unlinkable: $registered_unlinkable_count checks passed"
+  echo "imports valid registration-only modules: $registered_valid_count registered and $spectest_valid_count spectest passed"
+  echo "imports assert_malformed: $malformed_count checks passed"
 }
 
 test_wat() {

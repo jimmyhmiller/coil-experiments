@@ -161,13 +161,17 @@ separately compiled and registered WASM modules can overwrite a shared table and
 be called by the exporting module. The cumulative official assertion total is
 8,908.
 
-`test-imports` currently covers the first registered-module portion and the
-immutable host-global portion of the official MVP `imports` file. A separately
-compiled module imports eight functions from another WASM module plus the
-official `spectest` host functions; its two exported actions pass. Four imported
-host-global actions also pass. The cumulative official assertion total is 8,914.
-The remaining table, memory, invalid, and unlinkable import cases remain
-explicitly outside this partial milestone.
+`test-imports` currently covers registered-module functions and the host global,
+table, and memory action portions of the official MVP `imports` file. A
+separately compiled module imports eight functions from another WASM module plus
+the official `spectest` host functions. The harness passes 21 returns, eight
+runtime traps, all seven binary validation failures, and all 57 unlinkable
+assertions. Unused function imports are resolved eagerly, and their complete
+structural signatures are checked during instantiation. All 30 additional valid
+module commands instantiate, and all 16
+malformed text assertions are rejected. This completes all 109 assertions and
+every module command in the pinned official MVP `imports` file. The cumulative
+official assertion total is 9,017.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and
