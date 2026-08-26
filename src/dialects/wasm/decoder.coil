@@ -469,7 +469,10 @@
                           "WebAssembly name extends past end of section")
             (slice/subslice (.bytes (.cursor p)) start start))
         (let [name (slice/subslice (.bytes (.cursor p)) start (+ start length))]
-          (set! (.at (.cursor p)) (+ start length))
+          (if (utf8-valid? (.bytes (.cursor p)) start length)
+              (set! (.at (.cursor p)) (+ start length))
+              (parser-fail! (mut p) start
+                            "malformed UTF-8 encoding in WebAssembly name"))
           name))))
 
 (defn export-section [(a (dyn alloc/Allocator)) (payload (slice u8))]
@@ -800,6 +803,72 @@
         (= id 11) (do (set! (.data sections) payload) 0)
         :else 0))
 
+(defn utf8-continuation? [(byte i64)] (-> bool)
+  (and (>= byte 0x80) (<= byte 0xbf)))
+
+(defn utf8-valid? [(bytes (slice u8)) (start i64) (length i64)] (-> bool)
+  (let [end (+ start length)
+        (mut at) start
+        (mut valid) true]
+    (loop
+      (if (or (not (load valid)) (>= (load at) end))
+          (break)
+          (let [b0 (primitive/cast i64 (slice/slice-get bytes (load at)))
+                left (- end (load at))]
+            (cond (<= b0 0x7f) (store! at (+ (load at) 1))
+                  (and (>= b0 0xc2) (<= b0 0xdf))
+                    (if (and (>= left 2)
+                             (utf8-continuation?
+                               (primitive/cast i64
+                                 (slice/slice-get bytes (+ (load at) 1)))))
+                        (store! at (+ (load at) 2))
+                        (store! valid false))
+                  (and (>= b0 0xe0) (<= b0 0xef))
+                    (if (< left 3)
+                        (store! valid false)
+                        (let [b1 (primitive/cast i64
+                                   (slice/slice-get bytes (+ (load at) 1)))
+                              b2 (primitive/cast i64
+                                   (slice/slice-get bytes (+ (load at) 2)))
+                              second-valid
+                                (cond (= b0 0xe0) (and (>= b1 0xa0) (<= b1 0xbf))
+                                      (= b0 0xed) (and (>= b1 0x80) (<= b1 0x9f))
+                                      :else (utf8-continuation? b1))]
+                          (if (and second-valid (utf8-continuation? b2))
+                              (store! at (+ (load at) 3))
+                              (store! valid false))))
+                  (and (>= b0 0xf0) (<= b0 0xf4))
+                    (if (< left 4)
+                        (store! valid false)
+                        (let [b1 (primitive/cast i64
+                                   (slice/slice-get bytes (+ (load at) 1)))
+                              b2 (primitive/cast i64
+                                   (slice/slice-get bytes (+ (load at) 2)))
+                              b3 (primitive/cast i64
+                                   (slice/slice-get bytes (+ (load at) 3)))
+                              second-valid
+                                (cond (= b0 0xf0) (and (>= b1 0x90) (<= b1 0xbf))
+                                      (= b0 0xf4) (and (>= b1 0x80) (<= b1 0x8f))
+                                      :else (utf8-continuation? b1))]
+                          (if (and second-valid
+                                   (and (utf8-continuation? b2)
+                                        (utf8-continuation? b3)))
+                              (store! at (+ (load at) 4))
+                              (store! valid false))))
+                  :else (store! valid false)))))
+    (load valid)))
+
+(defn custom-section-envelope [(payload (slice u8))] (-> (Decode i64))
+  (let [(mut c) (cursor payload)]
+    (match (u32! (mut c))
+      (DecodeError [at message] (DecodeError at message))
+      (Decoded [name-length]
+        (if (> name-length (remaining c))
+            (DecodeError (.at c) "WebAssembly custom section name extends past payload")
+            (if (utf8-valid? payload (.at c) name-length)
+                (Decoded 0)
+                (DecodeError (.at c) "malformed UTF-8 encoding in WebAssembly name")))))))
+
 ;; Scan the section envelope and enforce the core binary invariants that apply
 ;; before section-specific decoding: known section ids, strictly increasing
 ;; non-custom sections, unique non-custom sections, and payload bounds.
@@ -838,15 +907,24 @@
                                     (store! failure-at (.at c))
                                     (store! failure "WebAssembly section extends past end of file")
                                     0)
-                                (do
-                                  (if (!= id 0) (store! previous id) 0)
-                                  (if (!= id 0)
-                                      (put-section!
-                                        (mut sections)
-                                        id
-                                        (slice/subslice (.bytes c) (.at c) (+ (.at c) size)))
+                                (let [payload
+                                       (slice/subslice
+                                         (.bytes c) (.at c) (+ (.at c) size))]
+                                  (if (= id 0)
+                                      (match (custom-section-envelope payload)
+                                        (DecodeError [custom-at custom-message]
+                                          (do
+                                            (store! failed true)
+                                            (store! failure-at (+ (.at c) custom-at))
+                                            (store! failure custom-message)
+                                            0))
+                                        (Decoded [_] 0))
+                                      (do
+                                        (store! previous id)
+                                        (put-section! (mut sections) id payload)))
+                                  (if (not (load failed))
+                                      (set! (.at c) (+ (.at c) size))
                                       0)
-                                  (set! (.at c) (+ (.at c) size))
                                   0))))))))))
     (if (load failed)
         (DecodeError (load failure-at) (load failure))

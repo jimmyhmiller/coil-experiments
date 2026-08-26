@@ -1482,6 +1482,52 @@ test_linking() {
   echo "linking post-failed-start assert_return: 2 checks passed"
 }
 
+test_encoding() {
+  coil_bin=${COIL:-coil}
+  command -v jq >/dev/null 2>&1 || {
+    echo "error: jq is required to run prepared spec assertions" >&2
+    exit 1
+  }
+  failure_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-encoding-failure.XXXXXX")
+  trap 'rm -f "$failure_out"' EXIT HUP INT TERM
+  malformed_count=0
+  module_count=0
+  for suite in binary-leb128 binary custom token utf8-custom-section-id \
+               utf8-import-field utf8-import-module utf8-invalid-encoding; do
+    json="$prepared/$suite/script.json"
+    dir=${json%/*}
+    for file in $(jq -r '.commands[] | select(.type == "assert_malformed") | .filename' "$json"); do
+      if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+           > "$failure_out" 2>&1; then
+        echo "error: expected malformed encoding rejection from $suite/$file" >&2
+        exit 1
+      fi
+      malformed_count=$((malformed_count + 1))
+    done
+  done
+  for suite in binary-leb128 binary custom comments inline-module; do
+    json="$prepared/$suite/script.json"
+    dir=${json%/*}
+    for file in $(jq -r '.commands[] | select(.type == "module") | .filename' "$json"); do
+      if ! "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+           > "$failure_out" 2>&1; then
+        echo "error: valid encoded module $suite/$file failed" >&2
+        cat "$failure_out" >&2
+        exit 1
+      fi
+      module_count=$((module_count + 1))
+    done
+  done
+  if [ "$malformed_count" -ne 835 ] || [ "$module_count" -ne 49 ]; then
+    echo "error: encoding inventory changed: malformed=$malformed_count modules=$module_count" >&2
+    exit 1
+  fi
+  rm -f "$failure_out"
+  trap - EXIT HUP INT TERM
+  echo "encoding assert_malformed: $malformed_count checks passed"
+  echo "encoding valid modules: $module_count instantiations passed"
+}
+
 test_wat() {
   coil_bin=${COIL:-coil}
   "$coil_bin" run "$root/tests/wasm/wat_features.wat" \
@@ -1523,9 +1569,10 @@ case "${1:-inventory}" in
   test-elements) test_elements ;;
   test-imports) test_imports ;;
   test-linking) test_linking ;;
+  test-encoding) test_encoding ;;
   test-wat) test_wat ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-wat]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-encoding|test-wat]" >&2
     exit 2
     ;;
 esac

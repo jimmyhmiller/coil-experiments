@@ -57,6 +57,7 @@ scripts/wasm-spec.sh test-data-segments
 scripts/wasm-spec.sh test-elements
 scripts/wasm-spec.sh test-imports
 scripts/wasm-spec.sh test-linking
+scripts/wasm-spec.sh test-encoding
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -183,6 +184,13 @@ unlinkable assertions. A Coil-native recoverable trap boundary retains imported
 memory and table mutations when a start function traps. This completes all 94
 assertions and every module command in the pinned official MVP `linking` file.
 The cumulative official assertion total is 9,111.
+
+`test-encoding` covers the complete pinned MVP `binary-leb128`, `binary`,
+`custom`, `token`, four UTF-8, `comments`, and `inline-module` files. It passes
+all 835 malformed assertions and instantiates all 49 valid module commands.
+Custom sections validate their name envelope even though their payload is
+semantically ignored, and all binary names use strict Unicode scalar-value
+UTF-8 validation. The cumulative official assertion total is 9,946.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and
