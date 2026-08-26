@@ -59,6 +59,7 @@ scripts/wasm-spec.sh test-imports
 scripts/wasm-spec.sh test-linking
 scripts/wasm-spec.sh test-encoding
 scripts/wasm-spec.sh test-exports
+scripts/wasm-spec.sh test-float-extensions
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -197,6 +198,11 @@ UTF-8 validation. The cumulative official assertion total is 9,946.
 validation failures, and all 54 valid module commands. Export names are compared
 as validated UTF-8 byte strings, so duplicate names are rejected across every
 external kind. The cumulative official assertion total is 9,974.
+
+`test-float-extensions` passes the complete pinned MVP `f32_bitwise`, `f32_cmp`,
+`f64_bitwise`, and `f64_cmp` files: 5,520 returns and 18 validation failures.
+The mixed-type harness checks floating inputs with both floating bit-pattern and
+integer comparison results. The cumulative official assertion total is 15,512.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and
