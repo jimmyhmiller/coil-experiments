@@ -1845,6 +1845,45 @@ test_traps_file() {
   echo "traps valid modules: $module_count modules exercised"
 }
 
+test_float_misc() {
+  coil_bin=${COIL:-coil}
+  json="$prepared/float_misc/script.json"
+  dir=${json%/*}
+  wasm="$dir/script.0.wasm"
+  args_file=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-float-misc.XXXXXX")
+  trap 'rm -f "$args_file"' EXIT HUP INT TERM
+  return_count=$(jq '[.commands[] | select(.type == "assert_return")] | length' "$json")
+  offset=0
+  while [ "$offset" -lt "$return_count" ]; do
+    jq -r --argjson lo "$offset" --argjson hi "$((offset + 150))" '
+      [.commands[] | select(.type == "assert_return")][$lo:$hi][]
+      | .action.field,
+        .expected[0].type,
+        .expected[0].value,
+        (.action.args | length | tostring),
+        (.action.args[] | .type, .value)
+    ' "$json" > "$args_file"
+    xargs "$coil_bin" run "$wasm" --use experiments.wasm.lang -- \
+      --assert-scalar-batch < "$args_file"
+    offset=$((offset + 150))
+  done
+  jq -r '
+    .commands[] | select(.type == "assert_return_canonical_nan")
+    | .action.field, (.action.args | length | tostring), (.action.args[].value)
+  ' "$json" > "$args_file"
+  xargs "$coil_bin" run "$wasm" --use experiments.wasm.lang -- \
+    --assert-f64-canonical-nan-batch < "$args_file"
+  canonical_count=$(jq '[.commands[] | select(.type == "assert_return_canonical_nan")] | length' "$json")
+  if [ "$return_count" -ne 439 ] || [ "$canonical_count" -ne 1 ]; then
+    echo "error: float_misc inventory changed: returns=$return_count canonical=$canonical_count" >&2
+    exit 1
+  fi
+  rm -f "$args_file"
+  trap - EXIT HUP INT TERM
+  echo "float_misc assert_return: $return_count checks passed"
+  echo "float_misc canonical NaN: $canonical_count check passed"
+}
+
 test_wat() {
   coil_bin=${COIL:-coil}
   "$coil_bin" run "$root/tests/wasm/wat_features.wat" \
@@ -1893,9 +1932,10 @@ case "${1:-inventory}" in
   test-literals) test_literals ;;
   test-names) test_names ;;
   test-traps-file) test_traps_file ;;
+  test-float-misc) test_float_misc ;;
   test-wat) test_wat ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-encoding|test-exports|test-float-extensions|test-integer-expressions|test-literals|test-names|test-traps-file|test-wat]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-encoding|test-exports|test-float-extensions|test-integer-expressions|test-literals|test-names|test-traps-file|test-float-misc|test-wat]" >&2
     exit 2
     ;;
 esac
