@@ -6,6 +6,8 @@
 (import "coil.slice" :as slice)
 (import "coil.socket" :as socket)
 (import "coil.str" :as str)
+(import "coil.fmt" :as fmt)
+(import "coil.io" :as io)
 (import "coil.http.server" :as http)
 (import "coil.http.parser" :as parser)
 (import "coil.arraylist" :as arraylist)
@@ -30,24 +32,30 @@
 
 (defn split-target [(method (slice u8)) (target (slice u8)) (body (slice u8))] (-> core/Request)
   (match (str/str-find target "?")
-    (None [] (core/Request :method method :path target :query "" :body body))
+    (None []
+          (core/Request
+            :method method
+            :path target
+            :query ""
+            :body body))
     (Some [at]
-          (core/Request :method method
-                        :path (slice/subslice [u8] target 0 at)
-                        :query (slice/subslice [u8] target (+ at 1) (slice/slice-len target))
-                        :body body))))
+          (core/Request
+            :method method
+            :path (slice/subslice [u8] target 0 at)
+            :query (slice/subslice [u8] target (+ at 1) (slice/slice-len target))
+            :body body))))
 
 (defn owned-copy [(bytes (slice u8))] (-> (Result (slice u8) i64))
   (let [(mut memory) (primitive/zeroed (Option (slice u8)))]
     (match (alloc/alloc-bytes (alloc/malloc-allocator) (slice/slice-len bytes) 1)
       (None [] (Err 1))
       (Some [copy]
-           (do
-             (mem/mem-copy [u8]
-                           (slice/slice-data copy)
-                           (slice/slice-data bytes)
-                           (slice/slice-len bytes))
-             (Ok copy))))))
+            (do
+              (mem/mem-copy [u8]
+                            (slice/slice-data copy)
+                            (slice/slice-data bytes)
+                            (slice/slice-len bytes))
+              (Ok copy))))))
 
 (defn request-from-http [(parsed http/Request)] (-> core/Request)
   (match (owned-copy (http/method parsed))
@@ -65,12 +73,11 @@
               (break)
               (match (socket/tcp-write connection
                                        (primitive/cast (ptr i8)
-                                                       (slice/slice-data
-                                                         (slice/subslice [u8]
-                                                                         bytes
-                                                                         (load at)
-                                                                         (- (slice/slice-len bytes)
-                                                                            (load at)))))
+                                                       (slice/slice-data (slice/subslice [u8]
+                                                                                         bytes
+                                                                                         (load at)
+                                                                                         (- (slice/slice-len bytes)
+                                                                                            (load at)))))
                                        (- (slice/slice-len bytes) (load at)))
                 (Err [e] (set! failed true))
                 (Ok [count]
@@ -103,44 +110,62 @@
                 (app (mut core/App))
                 (request http/Request)] (-> i64)
   (let [core-request (request-from-http request)
-        status (send-response!
-                 connection
-                 (core/handle-request (mut app) core-request))]
+        status
+          (send-response! connection
+                          (core/handle-request (mut app) core-request))]
     (http/request-free request)
     status))
 
-;; Parse incrementally until llhttp reports a truncated request, then keep the
-;; owned result as the accumulator for the next retry.
+;; Read one complete HTTP/1.1 request into a fixed buffer and parse it with the
+;; standard library's whole-message parser.
 (defn read-request! [(connection (ptr socket/TcpConnection))] (-> (Result http/Request i64))
-  (let [buffer (primitive/alloc-stack (array u8 16384))
+  (let [chunk (primitive/alloc-stack (array u8 16384))
+        buffer (primitive/alloc-stack str/StrBuf)
         (mut failure-code) 0
+        (mut complete) false
         (mut received) 0
         (mut parsed) (primitive/zeroed http/Request)]
-    (loop (if (or (not (= (load failure-code) 0)) (> (load received) 0)) (break)
-           (match (socket/tcp-read connection
-                                   (primitive/cast (ptr i8)
-                                                   (primitive/index buffer (load received)))
-                                   (- REQUEST_BUFFER_BYTES (load received)))
-             (Err [e] (set! failure-code 1))
-             (Ok [count]
-                 (let [input (slice/slice-new [u8]
-                                              (primitive/cast (ptr u8) buffer)
-                                              (+ (load received) count))]
-                   (if (<= count 0)
-                       (set! failure-code 1)
-                       (do
-                         (set! received (+ (load received) count))
-                         (match (http/parse-request (alloc/malloc-allocator) input)
-                           (Ok [request]
-                               (do
-                                 (set! parsed request)
-                                 (set! received 0)))
-                           (Err [failure]
-                               (do
-                                 (when (> (slice/slice-len (http/body failure)) 0)
-                                   (set! parsed failure))
-                                 (when (not (= (http/error-code failure) parser/HPE_INVALID_EOF_STATE))
-                                  (set! failure-code (http/error-code failure)))))))))))
+    (set! buffer (str/sb-new (alloc/malloc-allocator)))
+    (loop (if (or (not (= (load failure-code) 0)) (load complete))
+              (break)
+              (do
+                (match (socket/tcp-read connection
+                                        (primitive/cast (ptr i8)
+                                                        chunk)
+                                        REQUEST_BUFFER_BYTES)
+                  (Err [e] (set! failure-code 1))
+                  (Ok [count]
+                      (let [input
+                              (if (> count 0)
+                                  (do
+                                    (let [(mut index) 0]
+                                      (loop (if (>= (load index) count)
+                                                (break)
+                                                (do
+                                                  (str/sb-push-byte! (mut buffer)
+                                                                     (load (primitive/index chunk (load index))))
+                                                  (set! index (+ (load index) 1))))))
+                                    (str/sb-str (load buffer)))
+                                  (str/sb-str (load buffer)))]
+                        ;; A one-packet client that waits for the response is valid
+                        ;; HTTP. The whole-message parser pauses on EOF; remember a
+                        ;; zero-byte read so its partial result can be returned.
+                        (if (< count 0)
+                            (set! failure-code 1)
+                            (do
+                              (set! received (+ (load received) count))
+                              (match (http/parse-request (alloc/malloc-allocator) input)
+                                (Ok [request]
+                                    (do
+                                      (set! parsed request)
+                                      (set! complete true)))
+                                (Err [failure]
+                                     (do
+                                       (when (= (http/error-code failure) 14)
+                                         (set! received (- 0 1)))
+                                       (when (!= (http/error-code failure) 14)
+                                         (set! failure-code (http/error-code failure)))))))))))
+                0)))
     (cond (not (= (load failure-code) 0)) (Err (load failure-code))
           (> (load received) 0) (Ok (load parsed))
           :else (Err 1))))
@@ -186,6 +211,9 @@
     (set! (.app server) app)
     (match (socket/tcp-listen (alloc/malloc-allocator)
                               (field server listener)
-                              host port true 16)
+                              host
+                              port
+                              true
+                              16)
       (Err [e] (Err 1))
       (Ok [_] (Ok server)))))
