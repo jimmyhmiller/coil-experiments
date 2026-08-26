@@ -51,6 +51,7 @@ scripts/wasm-spec.sh test-basic-instructions
 scripts/wasm-spec.sh test-evaluation-order
 scripts/wasm-spec.sh test-functions
 scripts/wasm-spec.sh test-globals
+scripts/wasm-spec.sh test-memory-instructions
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -130,6 +131,13 @@ deep stack use, and trap unwinding. The cumulative official assertion total is
 validation failures, four malformed-binary rejections, and one runtime trap.
 Mutable cells, immutable values, initialization, exports, and global index/type
 validation are covered. The cumulative official assertion total is 7,993.
+
+`test-memory-instructions` passes every assertion in the official MVP
+`memory_grow`, `memory_redundancy`, `load`, `store`, `address`, `align`, and
+`memory_trap` files: 385 returns, 139 validation failures, 67 malformed-module
+rejections, and 206 runtime traps. The state-reset actions in
+`memory_redundancy` execute in source order in the same module instance. The
+cumulative official assertion total is 8,790.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and
