@@ -1423,6 +1423,61 @@ test_linking() {
   coil_bin=${COIL:-coil}
   (cd "$root/tests/wasm/linking-functions" && "$coil_bin" run)
   echo "linking cross-module function assert_return: 4 checks passed"
+  (cd "$root/tests/wasm/linking-globals" && "$coil_bin" run)
+  echo "linking cross-module global assert_return: 16 checks passed"
+  (cd "$root/tests/wasm/linking-tables" && "$coil_bin" run)
+  echo "linking cross-module table assert_return: 22 checks passed"
+  (cd "$root/tests/wasm/linking-memory" && "$coil_bin" run)
+  echo "linking cross-module memory assert_return: 18 checks passed"
+
+  trap_exe=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-linking-traps.XXXXXX")
+  trap_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-linking-trap-output.XXXXXX")
+  failure_dir=$(mktemp -d "$root/tests/wasm/.linking-failures.XXXXXX")
+  trap 'rm -f "$trap_exe" "$trap_out"; rm -rf "$failure_dir"' EXIT HUP INT TERM
+  (cd "$root/tests/wasm/linking-traps" && "$coil_bin" build -o "$trap_exe")
+  trap_count=0
+  for mode in $(seq 1 19); do
+    set +e
+    sh -c '"$1" "$2" >/dev/null 2>&1; exit $?' sh "$trap_exe" "$mode" \
+      > "$trap_out" 2>&1
+    status=$?
+    set -e
+    if [ "$status" -ne 134 ]; then
+      echo "error: linking trap mode $mode exited $status instead of SIGABRT" >&2
+      cat "$trap_out" >&2
+      exit 1
+    fi
+    trap_count=$((trap_count + 1))
+  done
+  echo "linking assert_trap: $trap_count checks passed"
+
+  cp "$root/tests/wasm/linking-failures/Coil.toml" "$failure_dir/Coil.toml"
+  cp "$root/tests/wasm/linking-failures/main.coil" "$failure_dir/main.coil"
+  linking_dir="$prepared/linking"
+  cp "$linking_dir/script.2.wasm" "$failure_dir/reexport-f.wasm"
+  cp "$linking_dir/script.5.wasm" "$failure_dir/mg.wasm"
+  cp "$linking_dir/script.9.wasm" "$failure_dir/mt.wasm"
+  cp "$linking_dir/script.19.wasm" "$failure_dir/mm.wasm"
+  cp "$linking_dir/script.28.wasm" "$failure_dir/ms.wasm"
+  unlinkable_count=0
+  for n in 3 4 7 8 15 16 17 18 23 25 26 27; do
+    cp "$linking_dir/script.$n.wasm" "$failure_dir/candidate.wasm"
+    if (cd "$failure_dir" && "$coil_bin" run) > "$trap_out" 2>&1; then
+      echo "error: expected linking failure from script.$n.wasm" >&2
+      exit 1
+    fi
+    unlinkable_count=$((unlinkable_count + 1))
+  done
+  cp "$linking_dir/script.29.wasm" "$failure_dir/candidate.wasm"
+  if (cd "$failure_dir" && "$coil_bin" run) > "$trap_out" 2>&1; then
+    echo "error: expected trapped-start instantiation failure from script.29.wasm" >&2
+    exit 1
+  fi
+  rm -f "$trap_exe" "$trap_out"
+  rm -rf "$failure_dir"
+  trap - EXIT HUP INT TERM
+  echo "linking assert_unlinkable: $unlinkable_count checks passed"
+  echo "linking assert_uninstantiable: 1 check passed"
 }
 
 test_wat() {

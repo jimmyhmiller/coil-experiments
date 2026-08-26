@@ -174,12 +174,15 @@ malformed text assertions are rejected. This completes all 109 assertions and
 every module command in the pinned official MVP `imports` file. The cumulative
 official assertion total is 9,017.
 
-`test-linking` currently covers the first registered-function chain in the
-official MVP `linking` file. Independently compiled modules import, call, and
-re-export a registered module's function, including an export name containing a
-space. All four actions pass. The cumulative official assertion total is 9,021;
-the remaining global, table, memory, start, trap, and unlinkable linking cases
-remain explicitly outside this partial milestone.
+`test-linking` currently covers the registered function, global, table, and
+memory chains in the official MVP `linking` file. Independently compiled modules
+import, call, mutate, and re-export shared resources, including an export name
+containing a space. The harness preserves action order within each chain and
+passes 60 returns, all 19 traps, the trapped-start instantiation, and all 12
+unlinkable assertions. The cumulative official assertion total is 9,109. The
+two post-failed-start shared-resource returns remain explicitly outside this
+partial milestone; they require recoverable native traps so the host can inspect
+the imported memory and table after start failure.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and
