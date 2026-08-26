@@ -69,6 +69,7 @@ scripts/wasm-spec.sh test-float-expressions
 scripts/wasm-spec.sh test-float-literals
 scripts/wasm-spec.sh test-float-memory
 scripts/wasm-spec.sh test-unreached-invalid
+scripts/wasm-spec.sh test-skip-stack-guard-page
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -252,6 +253,12 @@ file. Unconditional transfers use the core specification's polymorphic operand
 stack while nested blocks, loops, and conditional arms receive fresh control
 frames; concrete values above the polymorphic bottom still require exact types.
 The cumulative official assertion total is 18,056.
+
+`test-skip-stack-guard-page` passes all ten exhaustion assertions in the pinned
+MVP file. The reader compiles the large module once, isolates each invocation in
+a child process, and requires the native stack guard-page `SIGSEGV`; an ordinary
+WASM trap does not satisfy exhaustion. The cumulative official assertion total
+is 18,066.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and
