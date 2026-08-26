@@ -81,28 +81,18 @@ run_integer_suite() {
   fi
   args_file=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-$kind.XXXXXX")
   trap 'rm -f "$args_file"' EXIT HUP INT TERM
-  jq -r --arg kind "$kind" '
+  jq -r '
     .commands[]
-    | select(.type == "assert_return"
-             and .action.type == "invoke"
-             and (.expected | length) == 1
-             and .expected[0].type == $kind
-             and ([.action.args[].type] | all(. == $kind)))
+    | select(.type == "assert_return")
     | .action.field,
+      .expected[0].type,
       .expected[0].value,
       (.action.args | length | tostring),
-      (.action.args[].value)
+      (.action.args[] | .type, .value)
   ' "$json" > "$args_file"
-  count=$(jq -r --arg kind "$kind" '[
-    .commands[]
-    | select(.type == "assert_return"
-             and .action.type == "invoke"
-             and (.expected | length) == 1
-             and .expected[0].type == $kind
-             and ([.action.args[].type] | all(. == $kind)))
-  ] | length' "$json")
+  count=$(jq '[.commands[] | select(.type == "assert_return")] | length' "$json")
   xargs "$coil_bin" run "$wasm" --use experiments.wasm.lang -- \
-    "--assert-$kind-batch" < "$args_file"
+    --assert-scalar-batch < "$args_file"
   rm -f "$args_file"
   trap - EXIT HUP INT TERM
   echo "$kind: $count official assert_return checks passed"
@@ -111,6 +101,56 @@ run_integer_suite() {
 test_integers() {
   run_integer_suite i32
   run_integer_suite i64
+  coil_bin=${COIL:-coil}
+  failure_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-integer-failure.XXXXXX")
+  args_file=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-integer-traps.XXXXXX")
+  trap 'rm -f "$failure_out" "$args_file"' EXIT HUP INT TERM
+  invalid_total=0
+  trap_total=0
+  for kind in i32 i64; do
+    json="$prepared/$kind/script.json"
+    dir=${json%/*}
+    wasm="$dir/script.0.wasm"
+    for file in $(jq -r '.commands[] | select(.type == "assert_invalid") | .filename' "$json"); do
+      if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+           > "$failure_out" 2>&1; then
+        echo "error: expected integer validation failure from $kind/$file" >&2
+        exit 1
+      fi
+      if ! grep -q 'WebAssembly validation:' "$failure_out"; then
+        cat "$failure_out" >&2
+        exit 1
+      fi
+      invalid_total=$((invalid_total + 1))
+    done
+    jq -r '
+      .commands[] | select(.type == "assert_trap")
+      | ([.action.field, (.action.args | length | tostring)]
+         + [.action.args[] | .type, .value])
+      | join(" ")
+    ' "$json" > "$args_file"
+    while IFS= read -r line; do
+      set -- $line
+      if "$coil_bin" run "$wasm" --use experiments.wasm.lang -- \
+           --invoke-scalar "$@" > "$failure_out" 2>&1; then
+        echo "error: expected integer trap from $kind export $1" >&2
+        exit 1
+      fi
+      if ! grep -q 'program terminated by signal 6' "$failure_out"; then
+        cat "$failure_out" >&2
+        exit 1
+      fi
+      trap_total=$((trap_total + 1))
+    done < "$args_file"
+  done
+  if [ "$invalid_total" -ne 112 ] || [ "$trap_total" -ne 18 ]; then
+    echo "error: integer rejection inventory changed: invalid=$invalid_total traps=$trap_total" >&2
+    exit 1
+  fi
+  rm -f "$failure_out" "$args_file"
+  trap - EXIT HUP INT TERM
+  echo "integer assert_invalid: $invalid_total checks passed"
+  echo "integer assert_trap: $trap_total checks passed"
 }
 
 run_float_batch() {
@@ -166,6 +206,33 @@ test_floats() {
     run_float_batch "$kind" assert_return_arithmetic_nan \
       "--assert-$kind-arithmetic-nan-batch"
   done
+  coil_bin=${COIL:-coil}
+  failure_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-float-invalid.XXXXXX")
+  trap 'rm -f "$failure_out"' EXIT HUP INT TERM
+  invalid_total=0
+  for kind in f32 f64; do
+    json="$prepared/$kind/script.json"
+    dir=${json%/*}
+    for file in $(jq -r '.commands[] | select(.type == "assert_invalid") | .filename' "$json"); do
+      if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+           > "$failure_out" 2>&1; then
+        echo "error: expected float validation failure from $kind/$file" >&2
+        exit 1
+      fi
+      if ! grep -q 'WebAssembly validation:' "$failure_out"; then
+        cat "$failure_out" >&2
+        exit 1
+      fi
+      invalid_total=$((invalid_total + 1))
+    done
+  done
+  if [ "$invalid_total" -ne 22 ]; then
+    echo "error: float invalid inventory changed: invalid=$invalid_total" >&2
+    exit 1
+  fi
+  rm -f "$failure_out"
+  trap - EXIT HUP INT TERM
+  echo "float assert_invalid: $invalid_total checks passed"
 }
 
 test_conversions() {
@@ -200,6 +267,57 @@ test_conversions() {
     offset=$((offset + 150))
   done
   echo "conversions assert_return: $count checks passed"
+
+  nan_args=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-conversion-nans.XXXXXX")
+  trap 'rm -f "$nan_args"' EXIT HUP INT TERM
+  canonical_count=0
+  arithmetic_count=0
+  for assertion in assert_return_canonical_nan assert_return_arithmetic_nan; do
+    for kind in f32 f64; do
+      jq -r --arg assertion "$assertion" --arg kind "$kind" '
+        .commands[]
+        | select(.type == $assertion and .expected[0].type == $kind)
+        | .action.field, .expected[0].type,
+          (.action.args | length | tostring),
+          (.action.args[] | .type, .value)
+      ' "$json" > "$nan_args"
+      if [ -s "$nan_args" ]; then
+        if [ "$assertion" = assert_return_canonical_nan ]; then
+          mode="--assert-scalar-canonical-nan-batch"
+          canonical_count=$((canonical_count + $(jq --arg kind "$kind" '[.commands[] | select(.type == "assert_return_canonical_nan" and .expected[0].type == $kind)] | length' "$json")))
+        else
+          mode="--assert-scalar-arithmetic-nan-batch"
+          arithmetic_count=$((arithmetic_count + $(jq --arg kind "$kind" '[.commands[] | select(.type == "assert_return_arithmetic_nan" and .expected[0].type == $kind)] | length' "$json")))
+        fi
+        xargs "$coil_bin" run "$wasm" --use experiments.wasm.lang -- \
+          "$mode" < "$nan_args"
+      fi
+    done
+  done
+  rm -f "$nan_args"
+  trap - EXIT HUP INT TERM
+  echo "conversions canonical NaN: $canonical_count checks passed"
+  echo "conversions arithmetic NaN: $arithmetic_count checks passed"
+
+  invalid_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-conversion-invalid.XXXXXX")
+  trap 'rm -f "$invalid_out"' EXIT HUP INT TERM
+  invalid_count=0
+  dir=${json%/*}
+  for file in $(jq -r '.commands[] | select(.type == "assert_invalid") | .filename' "$json"); do
+    if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+         > "$invalid_out" 2>&1; then
+      echo "error: expected conversion validation failure from $file" >&2
+      exit 1
+    fi
+    if ! grep -q 'WebAssembly validation:' "$invalid_out"; then
+      cat "$invalid_out" >&2
+      exit 1
+    fi
+    invalid_count=$((invalid_count + 1))
+  done
+  rm -f "$invalid_out"
+  trap - EXIT HUP INT TERM
+  echo "conversions assert_invalid: $invalid_count checks passed"
 
   trap_count=0
   trap_args=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-conversion-traps.XXXXXX")
@@ -292,6 +410,28 @@ test_memory() {
     trap - EXIT HUP INT TERM
   done
   echo "memory_size: 36 official assertions passed"
+  failure_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-memory-size-invalid.XXXXXX")
+  trap 'rm -f "$failure_out"' EXIT HUP INT TERM
+  invalid_count=0
+  for file in $(jq -r '.commands[] | select(.type == "assert_invalid") | .filename' "$json"); do
+    if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+         > "$failure_out" 2>&1; then
+      echo "error: expected memory_size validation failure from $file" >&2
+      exit 1
+    fi
+    if ! grep -q 'WebAssembly validation:' "$failure_out"; then
+      cat "$failure_out" >&2
+      exit 1
+    fi
+    invalid_count=$((invalid_count + 1))
+  done
+  if [ "$invalid_count" -ne 2 ]; then
+    echo "error: memory_size invalid inventory changed: invalid=$invalid_count" >&2
+    exit 1
+  fi
+  rm -f "$failure_out"
+  trap - EXIT HUP INT TERM
+  echo "memory_size assert_invalid: $invalid_count checks passed"
 }
 
 test_tables() {
@@ -307,6 +447,7 @@ test_tables() {
   echo "focused call_indirect dispatch checks passed"
 
   json="$prepared/call_indirect/script.json"
+  dir=${json%/*}
   wasm="$prepared/call_indirect/script.0.wasm"
   args_file=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-call-indirect.XXXXXX")
   trap_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-call-indirect-trap.XXXXXX")
@@ -345,9 +486,43 @@ test_tables() {
     fi
     trap_count=$((trap_count + 1))
   done < "$args_file"
+  invalid_count=0
+  for file in $(jq -r '.commands[] | select(.type == "assert_invalid") | .filename' "$json"); do
+    if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+         > "$trap_out" 2>&1; then
+      echo "error: expected call_indirect validation failure from $file" >&2
+      exit 1
+    fi
+    if ! grep -q 'WebAssembly validation:' "$trap_out"; then
+      cat "$trap_out" >&2
+      exit 1
+    fi
+    invalid_count=$((invalid_count + 1))
+  done
+  malformed_count=0
+  for file in $(jq -r '.commands[] | select(.type == "assert_malformed") | .filename' "$json"); do
+    if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+         > "$trap_out" 2>&1; then
+      echo "error: expected malformed call_indirect rejection from $file" >&2
+      exit 1
+    fi
+    if ! grep -q 'WAT reader:' "$trap_out"; then
+      cat "$trap_out" >&2
+      exit 1
+    fi
+    malformed_count=$((malformed_count + 1))
+  done
+  jq -r '.commands[] | select(.type == "assert_exhaustion") | .action.field' \
+    "$json" > "$args_file"
+  xargs "$coil_bin" run "$wasm" --use experiments.wasm.lang -- \
+    --assert-exhaustion-0-batch < "$args_file"
+  exhaustion_count=$(jq '[.commands[] | select(.type == "assert_exhaustion")] | length' "$json")
   rm -f "$args_file" "$trap_out"
   trap - EXIT HUP INT TERM
   echo "call_indirect assert_trap: $trap_count checks passed"
+  echo "call_indirect assert_invalid: $invalid_count checks passed"
+  echo "call_indirect assert_malformed: $malformed_count checks passed"
+  echo "call_indirect assert_exhaustion: $exhaustion_count checks passed"
 }
 
 test_control() {
@@ -474,9 +649,23 @@ test_loops() {
     fi
     invalid_count=$((invalid_count + 1))
   done
+  malformed_count=0
+  for file in $(jq -r '.commands[] | select(.type == "assert_malformed") | .filename' "$json"); do
+    if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+         > "$invalid_out" 2>&1; then
+      echo "error: expected malformed loop rejection from $file" >&2
+      exit 1
+    fi
+    if ! grep -q 'WAT reader:' "$invalid_out"; then
+      cat "$invalid_out" >&2
+      exit 1
+    fi
+    malformed_count=$((malformed_count + 1))
+  done
   rm -f "$args_file" "$invalid_out"
   trap - EXIT HUP INT TERM
   echo "loop assert_invalid: $invalid_count checks passed"
+  echo "loop assert_malformed: $malformed_count checks passed"
 }
 
 test_structured_control() {
@@ -629,6 +818,7 @@ test_basic_instructions() {
   return_total=0
   invalid_total=0
   trap_total=0
+  exhaustion_total=0
 
   for suite in nop break-drop switch local_get local_set local_tee call select unreachable; do
     json="$prepared/$suite/script.json"
@@ -681,6 +871,13 @@ test_basic_instructions() {
       fi
       trap_total=$((trap_total + 1))
     done < "$args_file"
+    jq -r '.commands[] | select(.type == "assert_exhaustion") | .action.field' \
+      "$json" > "$args_file"
+    if [ -s "$args_file" ]; then
+      xargs "$coil_bin" run "$wasm" --use experiments.wasm.lang -- \
+        --assert-exhaustion-0-batch < "$args_file"
+      exhaustion_total=$((exhaustion_total + $(jq '[.commands[] | select(.type == "assert_exhaustion")] | length' "$json")))
+    fi
   done
 
   rm -f "$args_file" "$failure_out"
@@ -688,6 +885,7 @@ test_basic_instructions() {
   echo "basic instructions assert_return: $return_total checks passed"
   echo "basic instructions assert_invalid: $invalid_total checks passed"
   echo "basic instructions assert_trap: $trap_total checks passed"
+  echo "basic instructions assert_exhaustion: $exhaustion_total checks passed"
 }
 
 test_evaluation_order() {
@@ -753,6 +951,7 @@ test_functions() {
   invalid_total=0
   malformed_total=0
   trap_total=0
+  exhaustion_total=0
 
   for suite in func forward fac unwind func_ptrs stack; do
     json="$prepared/$suite/script.json"
@@ -839,6 +1038,15 @@ test_functions() {
       fi
       trap_total=$((trap_total + 1))
     done < "$args_file"
+    jq -r '
+      .commands[] | select(.type == "assert_exhaustion")
+      | .action.field, .action.args[0].value
+    ' "$json" > "$args_file"
+    if [ -s "$args_file" ]; then
+      xargs "$coil_bin" run "$dir/script.0.wasm" --use experiments.wasm.lang -- \
+        --assert-exhaustion-i64-batch < "$args_file"
+      exhaustion_total=$((exhaustion_total + $(jq '[.commands[] | select(.type == "assert_exhaustion")] | length' "$json")))
+    fi
   done
 
   rm -f "$args_file" "$failure_out"
@@ -847,6 +1055,7 @@ test_functions() {
   echo "functions assert_invalid: $invalid_total checks passed"
   echo "functions assert_malformed: $malformed_total checks passed"
   echo "functions assert_trap: $trap_total checks passed"
+  echo "functions assert_exhaustion: $exhaustion_total checks passed"
 }
 
 test_globals() {
@@ -2128,6 +2337,51 @@ test_wat() {
   echo "focused textual WAT expression and mutable-local checks passed"
 }
 
+test_all() {
+  test_integers
+  test_floats
+  test_conversions
+  test_memory
+  test_tables
+  test_control
+  test_loops
+  test_structured_control
+  test_start
+  test_basic_instructions
+  test_evaluation_order
+  test_functions
+  test_globals
+  test_memory_instructions
+  test_types
+  test_data_segments
+  test_elements
+  test_imports
+  test_linking
+  test_encoding
+  test_exports
+  test_float_extensions
+  test_integer_expressions
+  test_literals
+  test_names
+  test_traps_file
+  test_float_misc
+  test_float_expressions
+  test_float_literals
+  test_float_memory
+  test_unreached_invalid
+  test_skip_stack_guard_page
+  test_wat
+  file_count=$(find "$prepared" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d '[:space:]')
+  assertion_count=$(find "$prepared" -mindepth 2 -maxdepth 2 -name script.json \
+    -exec jq '[.commands[] | select(.type | startswith("assert_"))] | length' {} \; \
+    | awk '{ total += $1 } END { print total + 0 }')
+  if [ "$file_count" -ne 73 ] || [ "$assertion_count" -ne 18438 ]; then
+    echo "error: pinned release inventory changed: files=$file_count assertions=$assertion_count" >&2
+    exit 1
+  fi
+  echo "all $assertion_count assertions in 73 pinned MVP core files and direct WAT reader checks passed"
+}
+
 case "${1:-inventory}" in
   fetch) fetch_suite ;;
   fetch-wabt) fetch_wabt ;;
@@ -2166,8 +2420,9 @@ case "${1:-inventory}" in
   test-unreached-invalid) test_unreached_invalid ;;
   test-skip-stack-guard-page) test_skip_stack_guard_page ;;
   test-wat) test_wat ;;
+  test-all) test_all ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-encoding|test-exports|test-float-extensions|test-integer-expressions|test-literals|test-names|test-traps-file|test-float-misc|test-float-expressions|test-float-literals|test-float-memory|test-unreached-invalid|test-skip-stack-guard-page|test-wat]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-encoding|test-exports|test-float-extensions|test-integer-expressions|test-literals|test-names|test-traps-file|test-float-misc|test-float-expressions|test-float-literals|test-float-memory|test-unreached-invalid|test-skip-stack-guard-page|test-wat|test-all]" >&2
     exit 2
     ;;
 esac
