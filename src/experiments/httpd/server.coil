@@ -8,6 +8,7 @@
 (import "coil.str" :as str)
 (import "coil.http.server" :as http)
 (import "coil.http.parser" :as parser)
+(import "coil.arraylist" :as arraylist)
 (import "experiments.httpd.core" :as core)
 
 (const REQUEST_BUFFER_BYTES 16384)
@@ -64,10 +65,12 @@
               (break)
               (match (socket/tcp-write connection
                                        (primitive/cast (ptr i8)
-                                                       (slice/slice-data (slice/subslice [u8]
-                                                                                         bytes
-                                                                                         (load at)
-                                                                                         (slice/slice-len bytes))))
+                                                       (slice/slice-data
+                                                         (slice/subslice [u8]
+                                                                         bytes
+                                                                         (load at)
+                                                                         (- (slice/slice-len bytes)
+                                                                            (load at)))))
                                        (- (slice/slice-len bytes) (load at)))
                 (Err [e] (set! failed true))
                 (Ok [count]
@@ -106,38 +109,44 @@
     (http/request-free request)
     status))
 
-;; Parse incrementally until llhttp completes one request. The parser owns the
-;; decoded body and reports how much of a pipelined stream was consumed.
+;; Parse incrementally until llhttp reports a truncated request, then keep the
+;; owned result as the accumulator for the next retry.
 (defn read-request! [(connection (ptr socket/TcpConnection))] (-> (Result http/Request i64))
   (let [buffer (primitive/alloc-stack (array u8 16384))
+        (mut failure-code) 0
         (mut received) 0
-        (mut error) 0
-        (mut complete) false
         (mut parsed) (primitive/zeroed http/Request)]
-    (loop (if (or (not (= (load error) 0)) (load complete)) (break)
+    (loop (if (or (not (= (load failure-code) 0)) (> (load received) 0)) (break)
            (match (socket/tcp-read connection
                                    (primitive/cast (ptr i8)
                                                    (primitive/index buffer (load received)))
                                    (- REQUEST_BUFFER_BYTES (load received)))
-             (Err [e] (set! error 1))
+             (Err [e] (set! failure-code 1))
              (Ok [count]
-                     (if (<= count 0)
-                         (set! error 1)
-                         (do
-                           (set! received (+ (load received) count))
-                           (match (http/parse-request
-                                (alloc/malloc-allocator)
-                                (slice/slice-new [u8] (primitive/cast (ptr u8) buffer) (load received)))
-                         (Ok [request]
-                             (do
-                               (set! parsed request)
-                               (set! complete true)))
-                         (Err [failure]
-                              (when (= (http/error-code failure) 14)
-                                (http/request-free (load parsed)))))))))))
-    (cond (not (= (load error) 0)) (Err (load error))
-          (load complete) (Ok (load parsed))
+                 (let [input (slice/slice-new [u8]
+                                              (primitive/cast (ptr u8) buffer)
+                                              (+ (load received) count))]
+                   (if (<= count 0)
+                       (set! failure-code 1)
+                       (do
+                         (set! received (+ (load received) count))
+                         (match (http/parse-request (alloc/malloc-allocator) input)
+                           (Ok [request]
+                               (do
+                                 (set! parsed request)
+                                 (set! received 0)))
+                           (Err [failure]
+                               (do
+                                 (when (> (slice/slice-len (http/body failure)) 0)
+                                   (set! parsed failure))
+                                 (when (not (= (http/error-code failure) parser/HPE_INVALID_EOF_STATE))
+                                  (set! failure-code (http/error-code failure)))))))))))
+    (cond (not (= (load failure-code) 0)) (Err (load failure-code))
+          (> (load received) 0) (Ok (load parsed))
           :else (Err 1))))
+
+(defn arraylist-free-context! [(request http/Request)] (-> i64)
+  (http/request-free request))
 
 (defn serve-one! [(server (mut Server))] (-> i64)
   (let [connection (primitive/alloc-stack socket/TcpConnection)]
