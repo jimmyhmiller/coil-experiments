@@ -2059,6 +2059,34 @@ test_float_memory() {
   echo "float memory actions: $action_count actions and $module_count modules passed"
 }
 
+test_unreached_invalid() {
+  coil_bin=${COIL:-coil}
+  json="$prepared/unreached-invalid/script.json"
+  dir=${json%/*}
+  failure_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-unreached-invalid.XXXXXX")
+  trap 'rm -f "$failure_out"' EXIT HUP INT TERM
+  invalid_count=0
+  for file in $(jq -r '.commands[] | select(.type == "assert_invalid") | .filename' "$json"); do
+    if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+         > "$failure_out" 2>&1; then
+      echo "error: expected unreachable-code validation failure from $file" >&2
+      exit 1
+    fi
+    if ! grep -q 'WebAssembly validation:' "$failure_out"; then
+      cat "$failure_out" >&2
+      exit 1
+    fi
+    invalid_count=$((invalid_count + 1))
+  done
+  if [ "$invalid_count" -ne 111 ]; then
+    echo "error: unreached-invalid inventory changed: invalid=$invalid_count" >&2
+    exit 1
+  fi
+  rm -f "$failure_out"
+  trap - EXIT HUP INT TERM
+  echo "unreached-invalid assert_invalid: $invalid_count checks passed"
+}
+
 test_wat() {
   coil_bin=${COIL:-coil}
   "$coil_bin" run "$root/tests/wasm/wat_features.wat" \
@@ -2111,9 +2139,10 @@ case "${1:-inventory}" in
   test-float-expressions) test_float_expressions ;;
   test-float-literals) test_float_literals ;;
   test-float-memory) test_float_memory ;;
+  test-unreached-invalid) test_unreached_invalid ;;
   test-wat) test_wat ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-encoding|test-exports|test-float-extensions|test-integer-expressions|test-literals|test-names|test-traps-file|test-float-misc|test-float-expressions|test-float-literals|test-float-memory|test-wat]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-imports|test-linking|test-encoding|test-exports|test-float-extensions|test-integer-expressions|test-literals|test-names|test-traps-file|test-float-misc|test-float-expressions|test-float-literals|test-float-memory|test-unreached-invalid|test-wat]" >&2
     exit 2
     ;;
 esac

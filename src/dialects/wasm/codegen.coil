@@ -167,73 +167,446 @@
           (= raw 0x7c) 4
           :else (primitive/error "WebAssembly validation: invalid MVP block type"))))
 
-;; Consume an unreachable suffix through this region's else or end delimiter.
-;; Every MVP immediate is decoded so delimiter-looking bytes inside constants,
-;; indices, and memory arguments cannot terminate the scan accidentally.
-(defn skip-unreachable-region! [(context Code) (p (mut wasm/Parser))] (-> i64)
-  (let [(mut depth) 0
-        (mut stopped) false
+;; Abstract operand nodes use the same persistent triple shape as codegen
+;; nodes, but only their type tag is significant. Tag zero is the spec's
+;; polymorphic unknown type.
+(defn validation-push! [(stack (mut Code)) (tag i64)] (-> i64)
+  (do (store! stack `(~tag 0 ~(load stack))) 0))
+
+(defn validation-pop! [(stack (mut Code)) (base Code) (unreachable bool)] (-> i64)
+  (if (primitive/code-eq (load stack) base)
+      (if unreachable
+          0
+          (primitive/error "WebAssembly validation: operand stack underflow"))
+      (let [node (pop-node! (mut stack))]
+        (node-kind node))))
+
+(defn validation-expect! [(stack (mut Code)) (base Code) (unreachable bool) (tag i64)]
+                          (-> i64)
+  (let [actual (validation-pop! (mut stack) base unreachable)]
+    (if (or (= actual 0) (= actual tag))
+        actual
+        (primitive/error "WebAssembly validation: type mismatch in unreachable code"))))
+
+(defn validation-finish! [(stack (mut Code)) (base Code) (unreachable bool) (result-tag i64)]
+                          (-> i64)
+  (if (= result-tag 0)
+      (if (not (primitive/code-eq (load stack) base))
+          (primitive/error "WebAssembly validation: unreachable void frame changes stack height")
+          0)
+      (do
+        (validation-expect! (mut stack) base unreachable result-tag)
+        (if (not (primitive/code-eq (load stack) base))
+            (primitive/error "WebAssembly validation: unreachable result stack height mismatch")
+            (validation-push! (mut stack) result-tag)))))
+
+;; Validate a suffix after an unconditional transfer using the core spec's
+;; polymorphic operand-stack rule. Nested control instructions get fresh,
+;; non-polymorphic frames, so dead code is still structurally type checked.
+(defn validate-unreachable-region! [(context Code) (p (mut wasm/Parser))
+                                    (stack (mut Code)) (base Code) (allow-else bool)
+                                    (initial-unreachable bool)
+                                    (region-result-tag i64) (label-tags Code)
+                                    (function-result-tag i64)
+                                    (locals Code) (globals Code) (memory Code) (table Code)
+                                    (function-names Code)
+                                    (function-indices (al/ArrayList i64))
+                                    (types (al/ArrayList wasm/FuncType))] (-> i64)
+  (let [(mut unreachable) initial-unreachable
+        (mut ended) false
         (mut delimiter) 0]
     (loop
-      (if (or (.failed p) (load stopped))
+      (if (or (.failed p) (load ended))
           (break)
           (let [opcode (wasm/parser-byte! (mut p))]
-            (cond (or (= opcode 0x02) (or (= opcode 0x03) (= opcode 0x04)))
+            (cond (= opcode 0x0b)
                     (do
-                      (wasm/parser-byte! (mut p))
-                      (store! depth (+ (load depth) 1)))
+                      (validation-finish! (mut stack) base (load unreachable)
+                                          region-result-tag)
+                      (store! delimiter opcode)
+                      (store! ended true))
                   (= opcode 0x05)
-                    (if (= (load depth) 0)
-                        (do (store! delimiter opcode) (store! stopped true))
-                        0)
-                  (= opcode 0x0b)
-                    (if (= (load depth) 0)
-                        (do (store! delimiter opcode) (store! stopped true))
-                        (store! depth (- (load depth) 1)))
-                  (or (= opcode 0x0c)
-                      (or (= opcode 0x0d)
-                          (or (= opcode 0x10)
-                              (or (= opcode 0x20)
-                                  (or (= opcode 0x21)
-                                      (or (= opcode 0x22)
-                                          (or (= opcode 0x23) (= opcode 0x24))))))))
-                    (do (wasm/parser-u32! (mut p)) 0)
+                    (if allow-else
+                        (do
+                          (validation-finish! (mut stack) base (load unreachable)
+                                              region-result-tag)
+                          (store! delimiter opcode)
+                          (store! ended true))
+                        (primitive/error "WebAssembly validation: else outside if"))
+                  (= opcode 0x00)
+                    (do (store! stack base) (store! unreachable true))
+                  (= opcode 0x01) 0
+                  (or (= opcode 0x02) (= opcode 0x03))
+                    (let [tag (parse-block-tag! context (mut p))
+                          child-base (load stack)
+                          child-tags `(~(if (= opcode 0x03) 0 tag) ~@label-tags)
+                          stop (validate-unreachable-region!
+                                 context (mut p) (mut stack) child-base false false tag child-tags
+                                 function-result-tag locals globals memory table function-names
+                                 function-indices types)]
+                      (if (!= stop 0x0b)
+                          (primitive/error "WebAssembly validation: malformed unreachable block")
+                          0))
+                  (= opcode 0x04)
+                    (do
+                      (validation-expect! (mut stack) base (load unreachable) 1)
+                      (let [tag (parse-block-tag! context (mut p))
+                            child-base (load stack)
+                            child-tags `(~tag ~@label-tags)
+                            then-stop (validate-unreachable-region!
+                                        context (mut p) (mut stack) child-base true false tag child-tags
+                                        function-result-tag locals globals memory table
+                                        function-names function-indices types)]
+                        (if (= then-stop 0x05)
+                            (do
+                              (store! stack child-base)
+                              (let [else-stop (validate-unreachable-region!
+                                                context (mut p) (mut stack) child-base false false tag
+                                                child-tags function-result-tag locals globals
+                                                memory table function-names function-indices types)]
+                                (if (!= else-stop 0x0b)
+                                    (primitive/error "WebAssembly validation: malformed unreachable if")
+                                    0)))
+                            (if (!= then-stop 0x0b)
+                                (primitive/error "WebAssembly validation: malformed unreachable if")
+                                (if (!= tag 0)
+                                    (primitive/error "WebAssembly validation: result if requires else")
+                                    0)))))
+                  (= opcode 0x0c)
+                    (let [depth (wasm/parser-u32! (mut p))]
+                      (if (>= depth (primitive/code-count label-tags))
+                          (primitive/error "WebAssembly validation: branch depth out of bounds")
+                          (let [tag (primitive/code-int (primitive/code-nth label-tags depth))]
+                            (if (!= tag 0)
+                                (validation-expect! (mut stack) base (load unreachable) tag)
+                                0)
+                            (store! stack base)
+                            (store! unreachable true))))
+                  (= opcode 0x0d)
+                    (let [depth (wasm/parser-u32! (mut p))]
+                      (if (>= depth (primitive/code-count label-tags))
+                          (primitive/error "WebAssembly validation: br_if depth out of bounds")
+                          (do
+                            (validation-expect! (mut stack) base (load unreachable) 1)
+                            (let [tag (primitive/code-int (primitive/code-nth label-tags depth))]
+                              (if (!= tag 0)
+                                  (do
+                                    (validation-expect! (mut stack) base (load unreachable) tag)
+                                    (validation-push! (mut stack) tag))
+                                  0)))))
                   (= opcode 0x0e)
                     (let [count (wasm/parser-u32! (mut p))
+                          depths (primitive/code-list-new)
                           (mut i) 0]
                       (loop
                         (if (> (load i) count)
                             (break)
                             (do
-                              (wasm/parser-u32! (mut p))
-                              (store! i (+ (load i) 1))))))
+                              (primitive/code-list-push! depths `~(wasm/parser-u32! (mut p)))
+                              (store! i (+ (load i) 1)))))
+                      (validation-expect! (mut stack) base (load unreachable) 1)
+                      (let [all-depths (primitive/code-list-done depths)
+                            default-depth (primitive/code-int
+                                            (primitive/code-nth all-depths count))]
+                        (if (>= default-depth (primitive/code-count label-tags))
+                            (primitive/error "WebAssembly validation: br_table depth out of bounds")
+                            (let [tag (primitive/code-int
+                                        (primitive/code-nth label-tags default-depth))]
+                              (store! i 0)
+                              (loop
+                                (if (>= (load i) count)
+                                    (break)
+                                    (let [depth (primitive/code-int
+                                                  (primitive/code-nth all-depths (load i)))]
+                                      (if (or (>= depth (primitive/code-count label-tags))
+                                              (!= tag (primitive/code-int
+                                                        (primitive/code-nth label-tags depth))))
+                                          (primitive/error "WebAssembly validation: br_table target mismatch")
+                                          (store! i (+ (load i) 1))))))
+                              (if (!= tag 0)
+                                  (validation-expect! (mut stack) base (load unreachable) tag)
+                                  0)
+                              (store! stack base)
+                              (store! unreachable true)))))
+                  (= opcode 0x0f)
+                    (do
+                      (if (!= function-result-tag 0)
+                          (validation-expect! (mut stack) base (load unreachable)
+                                              function-result-tag)
+                          0)
+                      (store! stack base)
+                      (store! unreachable true))
+                  (= opcode 0x10)
+                    (let [index (wasm/parser-u32! (mut p))]
+                      (if (>= index (primitive/code-count function-names))
+                          (primitive/error "WebAssembly validation: call index out of bounds")
+                          (let [signature (al/al-get types (al/al-get function-indices index))
+                                (mut i) (al/al-len (.params signature))]
+                            (loop
+                              (if (= (load i) 0)
+                                  (break)
+                                  (do
+                                    (store! i (- (load i) 1))
+                                    (validation-expect!
+                                      (mut stack) base (load unreachable)
+                                      (kind-tag (al/al-get (.params signature) (load i)))))))
+                            (if (= (al/al-len (.results signature)) 1)
+                                (validation-push!
+                                  (mut stack) (kind-tag (al/al-get (.results signature) 0)))
+                                0))))
                   (= opcode 0x11)
-                    (do (wasm/parser-u32! (mut p))
-                        (wasm/parser-byte! (mut p))
-                        0)
-                  (and (>= opcode 0x28) (<= opcode 0x3e))
-                    (do (wasm/parser-u32! (mut p))
-                        (wasm/parser-u32! (mut p))
-                        0)
-                  (or (= opcode 0x3f) (= opcode 0x40))
-                    (do (wasm/parser-byte! (mut p)) 0)
-                  (= opcode 0x41) (do (wasm/parser-signed! (mut p) 32) 0)
-                  (= opcode 0x42) (do (wasm/parser-signed! (mut p) 64) 0)
-                  (= opcode 0x43) (do (wasm/parser-fixed-bits! (mut p) 4) 0)
-                  (= opcode 0x44) (do (wasm/parser-fixed-bits! (mut p) 8) 0)
-                  (or (<= opcode 0x01)
-                      (or (= opcode 0x0f)
-                          (or (= opcode 0x1a)
-                              (or (= opcode 0x1b)
-                                  (and (>= opcode 0x45) (<= opcode 0xbf))))))
-                    0
+                    (let [type-index (wasm/parser-u32! (mut p))
+                          zero (wasm/parser-byte! (mut p))]
+                      (if (or (!= zero 0) (>= type-index (al/al-len types))
+                              (= (primitive/code-count table) 0))
+                          (primitive/error "WebAssembly validation: invalid call_indirect")
+                          (let [signature (al/al-get types type-index)
+                                (mut i) (al/al-len (.params signature))]
+                            (validation-expect! (mut stack) base (load unreachable) 1)
+                            (loop
+                              (if (= (load i) 0)
+                                  (break)
+                                  (do
+                                    (store! i (- (load i) 1))
+                                    (validation-expect!
+                                      (mut stack) base (load unreachable)
+                                      (kind-tag (al/al-get (.params signature) (load i)))))))
+                            (if (= (al/al-len (.results signature)) 1)
+                                (validation-push!
+                                  (mut stack) (kind-tag (al/al-get (.results signature) 0)))
+                                0))))
+                  (= opcode 0x1a)
+                    (do (validation-pop! (mut stack) base (load unreachable)) 0)
+                  (= opcode 0x1b)
+                    (do
+                      (validation-expect! (mut stack) base (load unreachable) 1)
+                      (let [right (validation-pop! (mut stack) base (load unreachable))
+                            left (validation-pop! (mut stack) base (load unreachable))]
+                        (if (and (!= left 0) (and (!= right 0) (!= left right)))
+                            (primitive/error "WebAssembly validation: select type mismatch")
+                            (validation-push! (mut stack) (if (= left 0) right left)))))
+                  (= opcode 0x20)
+                    (let [index (wasm/parser-u32! (mut p))]
+                      (if (>= index (primitive/code-count locals))
+                          (primitive/error "WebAssembly validation: local index out of bounds")
+                          (validation-push!
+                            (mut stack)
+                            (primitive/code-int
+                              (primitive/code-nth (primitive/code-nth locals index) 0)))))
+                  (or (= opcode 0x21) (= opcode 0x22))
+                    (let [index (wasm/parser-u32! (mut p))]
+                      (if (>= index (primitive/code-count locals))
+                          (primitive/error "WebAssembly validation: local index out of bounds")
+                          (let [tag (primitive/code-int
+                                      (primitive/code-nth (primitive/code-nth locals index) 0))]
+                            (validation-expect! (mut stack) base (load unreachable) tag)
+                            (if (= opcode 0x22) (validation-push! (mut stack) tag) 0))))
+                  (= opcode 0x23)
+                    (let [index (wasm/parser-u32! (mut p))]
+                      (if (>= index (primitive/code-count globals))
+                          (primitive/error "WebAssembly validation: global index out of bounds")
+                          (validation-push!
+                            (mut stack)
+                            (primitive/code-int
+                              (primitive/code-nth (primitive/code-nth globals index) 0)))))
+                  (= opcode 0x24)
+                    (let [index (wasm/parser-u32! (mut p))]
+                      (if (>= index (primitive/code-count globals))
+                          (primitive/error "WebAssembly validation: global index out of bounds")
+                          (let [global (primitive/code-nth globals index)
+                                tag (primitive/code-int (primitive/code-nth global 0))]
+                            (if (= (primitive/code-int (primitive/code-nth global 1)) 0)
+                                (primitive/error "WebAssembly validation: global.set of immutable global")
+                                (validation-expect! (mut stack) base (load unreachable) tag)))))
+                  (and (>= opcode 0x28) (<= opcode 0x35))
+                    (let [alignment (wasm/parser-u32! (mut p))
+                          offset (wasm/parser-u32! (mut p))
+                          tag (cond (or (= opcode 0x28)
+                                        (and (>= opcode 0x2c) (<= opcode 0x2f))) 1
+                                    (or (= opcode 0x29)
+                                        (and (>= opcode 0x30) (<= opcode 0x35))) 2
+                                    (= opcode 0x2a) 3
+                                    :else 4)
+                          maximum-alignment
+                            (cond (or (= opcode 0x28) (= opcode 0x2a)) 2
+                                  (or (= opcode 0x29) (= opcode 0x2b)) 3
+                                  (or (= opcode 0x2c) (= opcode 0x2d)) 0
+                                  (or (= opcode 0x2e) (= opcode 0x2f)) 1
+                                  (or (= opcode 0x30) (= opcode 0x31)) 0
+                                  (or (= opcode 0x32) (= opcode 0x33)) 1
+                                  :else 2)]
+                      (if (or (= (primitive/code-count memory) 0)
+                              (> alignment maximum-alignment))
+                          (primitive/error "WebAssembly validation: invalid memory load")
+                          (do
+                            (validation-expect! (mut stack) base (load unreachable) 1)
+                            (validation-push! (mut stack) tag))))
+                  (and (>= opcode 0x36) (<= opcode 0x3e))
+                    (let [alignment (wasm/parser-u32! (mut p))
+                          offset (wasm/parser-u32! (mut p))
+                          tag (cond (or (= opcode 0x36)
+                                        (or (= opcode 0x3a) (= opcode 0x3b))) 1
+                                    (or (= opcode 0x37)
+                                        (and (>= opcode 0x3c) (<= opcode 0x3e))) 2
+                                    (= opcode 0x38) 3
+                                    :else 4)
+                          maximum-alignment
+                            (cond (= opcode 0x36) 2
+                                  (= opcode 0x37) 3
+                                  (= opcode 0x38) 2
+                                  (= opcode 0x39) 3
+                                  (= opcode 0x3a) 0
+                                  (= opcode 0x3b) 1
+                                  (= opcode 0x3c) 0
+                                  (= opcode 0x3d) 1
+                                  :else 2)]
+                      (if (or (= (primitive/code-count memory) 0)
+                              (> alignment maximum-alignment))
+                          (primitive/error "WebAssembly validation: invalid memory store")
+                          (do
+                            (validation-expect! (mut stack) base (load unreachable) tag)
+                            (validation-expect! (mut stack) base (load unreachable) 1))))
+                  (= opcode 0x3f)
+                    (let [zero (wasm/parser-byte! (mut p))]
+                      (if (or (!= zero 0) (= (primitive/code-count memory) 0))
+                          (primitive/error "WebAssembly validation: invalid memory.size")
+                          (validation-push! (mut stack) 1)))
+                  (= opcode 0x40)
+                    (let [zero (wasm/parser-byte! (mut p))]
+                      (if (or (!= zero 0) (= (primitive/code-count memory) 0))
+                          (primitive/error "WebAssembly validation: invalid memory.grow")
+                          (do
+                            (validation-expect! (mut stack) base (load unreachable) 1)
+                            (validation-push! (mut stack) 1))))
+                  (= opcode 0x41)
+                    (do (wasm/parser-signed! (mut p) 32)
+                        (validation-push! (mut stack) 1))
+                  (= opcode 0x42)
+                    (do (wasm/parser-signed! (mut p) 64)
+                        (validation-push! (mut stack) 2))
+                  (= opcode 0x43)
+                    (do (wasm/parser-fixed-bits! (mut p) 4)
+                        (validation-push! (mut stack) 3))
+                  (= opcode 0x44)
+                    (do (wasm/parser-fixed-bits! (mut p) 8)
+                        (validation-push! (mut stack) 4))
+                  (= opcode 0x45)
+                    (do (validation-expect! (mut stack) base (load unreachable) 1)
+                        (validation-push! (mut stack) 1))
+                  (and (>= opcode 0x46) (<= opcode 0x4f))
+                    (do (validation-expect! (mut stack) base (load unreachable) 1)
+                        (validation-expect! (mut stack) base (load unreachable) 1)
+                        (validation-push! (mut stack) 1))
+                  (= opcode 0x50)
+                    (do (validation-expect! (mut stack) base (load unreachable) 2)
+                        (validation-push! (mut stack) 1))
+                  (and (>= opcode 0x51) (<= opcode 0x5a))
+                    (do (validation-expect! (mut stack) base (load unreachable) 2)
+                        (validation-expect! (mut stack) base (load unreachable) 2)
+                        (validation-push! (mut stack) 1))
+                  (and (>= opcode 0x5b) (<= opcode 0x60))
+                    (do (validation-expect! (mut stack) base (load unreachable) 3)
+                        (validation-expect! (mut stack) base (load unreachable) 3)
+                        (validation-push! (mut stack) 1))
+                  (and (>= opcode 0x61) (<= opcode 0x66))
+                    (do (validation-expect! (mut stack) base (load unreachable) 4)
+                        (validation-expect! (mut stack) base (load unreachable) 4)
+                        (validation-push! (mut stack) 1))
+                  (and (>= opcode 0x67) (<= opcode 0x69))
+                    (do (validation-expect! (mut stack) base (load unreachable) 1)
+                        (validation-push! (mut stack) 1))
+                  (and (>= opcode 0x6a) (<= opcode 0x78))
+                    (do (validation-expect! (mut stack) base (load unreachable) 1)
+                        (validation-expect! (mut stack) base (load unreachable) 1)
+                        (validation-push! (mut stack) 1))
+                  (and (>= opcode 0x79) (<= opcode 0x7b))
+                    (do (validation-expect! (mut stack) base (load unreachable) 2)
+                        (validation-push! (mut stack) 2))
+                  (and (>= opcode 0x7c) (<= opcode 0x8a))
+                    (do (validation-expect! (mut stack) base (load unreachable) 2)
+                        (validation-expect! (mut stack) base (load unreachable) 2)
+                        (validation-push! (mut stack) 2))
+                  (and (>= opcode 0x8b) (<= opcode 0x91))
+                    (do (validation-expect! (mut stack) base (load unreachable) 3)
+                        (validation-push! (mut stack) 3))
+                  (and (>= opcode 0x92) (<= opcode 0x98))
+                    (do (validation-expect! (mut stack) base (load unreachable) 3)
+                        (validation-expect! (mut stack) base (load unreachable) 3)
+                        (validation-push! (mut stack) 3))
+                  (and (>= opcode 0x99) (<= opcode 0x9f))
+                    (do (validation-expect! (mut stack) base (load unreachable) 4)
+                        (validation-push! (mut stack) 4))
+                  (and (>= opcode 0xa0) (<= opcode 0xa6))
+                    (do (validation-expect! (mut stack) base (load unreachable) 4)
+                        (validation-expect! (mut stack) base (load unreachable) 4)
+                        (validation-push! (mut stack) 4))
+                  (= opcode 0xa7)
+                    (do (validation-expect! (mut stack) base (load unreachable) 2)
+                        (validation-push! (mut stack) 1))
+                  (and (>= opcode 0xa8) (<= opcode 0xa9))
+                    (do (validation-expect! (mut stack) base (load unreachable) 3)
+                        (validation-push! (mut stack) 1))
+                  (and (>= opcode 0xaa) (<= opcode 0xab))
+                    (do (validation-expect! (mut stack) base (load unreachable) 4)
+                        (validation-push! (mut stack) 1))
+                  (and (>= opcode 0xac) (<= opcode 0xad))
+                    (do (validation-expect! (mut stack) base (load unreachable) 1)
+                        (validation-push! (mut stack) 2))
+                  (and (>= opcode 0xae) (<= opcode 0xaf))
+                    (do (validation-expect! (mut stack) base (load unreachable) 3)
+                        (validation-push! (mut stack) 2))
+                  (and (>= opcode 0xb0) (<= opcode 0xb1))
+                    (do (validation-expect! (mut stack) base (load unreachable) 4)
+                        (validation-push! (mut stack) 2))
+                  (and (>= opcode 0xb2) (<= opcode 0xb3))
+                    (do (validation-expect! (mut stack) base (load unreachable) 1)
+                        (validation-push! (mut stack) 3))
+                  (and (>= opcode 0xb4) (<= opcode 0xb5))
+                    (do (validation-expect! (mut stack) base (load unreachable) 2)
+                        (validation-push! (mut stack) 3))
+                  (= opcode 0xb6)
+                    (do (validation-expect! (mut stack) base (load unreachable) 4)
+                        (validation-push! (mut stack) 3))
+                  (and (>= opcode 0xb7) (<= opcode 0xb8))
+                    (do (validation-expect! (mut stack) base (load unreachable) 1)
+                        (validation-push! (mut stack) 4))
+                  (and (>= opcode 0xb9) (<= opcode 0xba))
+                    (do (validation-expect! (mut stack) base (load unreachable) 2)
+                        (validation-push! (mut stack) 4))
+                  (= opcode 0xbb)
+                    (do (validation-expect! (mut stack) base (load unreachable) 3)
+                        (validation-push! (mut stack) 4))
+                  (= opcode 0xbc)
+                    (do (validation-expect! (mut stack) base (load unreachable) 3)
+                        (validation-push! (mut stack) 1))
+                  (= opcode 0xbd)
+                    (do (validation-expect! (mut stack) base (load unreachable) 4)
+                        (validation-push! (mut stack) 2))
+                  (= opcode 0xbe)
+                    (do (validation-expect! (mut stack) base (load unreachable) 1)
+                        (validation-push! (mut stack) 3))
+                  (= opcode 0xbf)
+                    (do (validation-expect! (mut stack) base (load unreachable) 2)
+                        (validation-push! (mut stack) 4))
                   :else
                     (primitive/error "WebAssembly validation: invalid opcode in unreachable code")))))
-    (if (.failed p)
-        (primitive/error (.message p))
-        (if (not (load stopped))
-            (primitive/error "WebAssembly expression lacks a final end opcode")
-            (load delimiter)))))
+    (if (.failed p) (primitive/error (.message p)) 0)
+    (if (not (load ended))
+        (primitive/error "WebAssembly expression lacks a final end opcode")
+        (load delimiter))))
+
+(defn validate-unreachable-suffix! [(context Code) (p (mut wasm/Parser))
+                                    (allow-else bool) (region-result-tag i64)
+                                    (label-tags Code) (function-result-tag i64)
+                                    (locals Code) (globals Code) (memory Code) (table Code)
+                                    (function-names Code)
+                                    (function-indices (al/ArrayList i64))
+                                    (types (al/ArrayList wasm/FuncType))] (-> i64)
+  (let [(mut stack) `()]
+    (validate-unreachable-region! context (mut p) (mut stack) `() allow-else true
+                                  region-result-tag label-tags function-result-tag
+                                  locals globals memory table function-names
+                                  function-indices types)))
 
 (defn finish-region [(a (dyn alloc/Allocator)) (base Code) (stack (mut Code)) (forms CodeBuilder)
                      (result-tag i64)] (-> Code)
@@ -534,7 +907,10 @@
                                           :else
                                             (primitive/error "WebAssembly codegen internal error: invalid unreachable result"))
                           trap-id (primitive/datum->syntax context trap-name)
-                          delimiter (skip-unreachable-region! context (mut p))]
+                          delimiter (validate-unreachable-suffix!
+                                      context (mut p) allow-else region-result-tag label-tags
+                                      function-result-tag locals globals memory table
+                                      function-names function-indices types)]
                       (primitive/code-list-push! forms-builder `(~trap-id))
                       (store! stack region-base)
                       (if (!= region-result-tag 0)
@@ -589,7 +965,10 @@
                                     (push-node! (mut stack) (wasm/F64) expression)
                                   :else
                                     (primitive/error "WebAssembly codegen internal error: invalid return result"))
-                            (let [delimiter (skip-unreachable-region! context (mut p))]
+                            (let [delimiter (validate-unreachable-suffix!
+                                              context (mut p) allow-else region-result-tag
+                                              label-tags function-result-tag locals globals
+                                              memory table function-names function-indices types)]
                               (store! stop-opcode (+ 0x100 delimiter)))
                             (store! ended true))
                           (if (!= block-stop 0x0b)
@@ -686,7 +1065,10 @@
                                         (primitive/error "WebAssembly codegen internal error: invalid if result")))
                             (if returns
                                 (do
-                                  (skip-unreachable-region! context (mut p))
+                                  (validate-unreachable-suffix!
+                                    context (mut p) allow-else region-result-tag label-tags
+                                    function-result-tag locals globals memory table
+                                    function-names function-indices types)
                                   (store! stop-opcode 0x10f)
                                   (store! ended true))
                                 0))))
@@ -702,7 +1084,10 @@
                                           (primitive/code-nth node 1)))))
                           transfer `(break :wasm-function ~branch-value)
                           expression (typed-transfer context transfer function-result-tag)
-                          delimiter (skip-unreachable-region! context (mut p))]
+                          delimiter (validate-unreachable-suffix!
+                                      context (mut p) allow-else region-result-tag label-tags
+                                      function-result-tag locals globals memory table
+                                      function-names function-indices types)]
                       (store! stack region-base)
                       (if (= region-result-tag 0)
                           (do
@@ -811,7 +1196,10 @@
                                                  region-result-tag
                                                  target-tag)
                                 expression (typed-transfer context transfer transfer-tag)
-                                delimiter (skip-unreachable-region! context (mut p))]
+                                delimiter (validate-unreachable-suffix!
+                                            context (mut p) allow-else region-result-tag
+                                            label-tags function-result-tag locals globals memory
+                                            table function-names function-indices types)]
                             (store! stack region-base)
                             (if (= region-result-tag 0)
                                 (do
@@ -893,7 +1281,10 @@
                                       target-tag)
                                   cases-builder (primitive/code-list-new)
                                   (mut case-index) 0
-                                  delimiter (skip-unreachable-region! context (mut p))]
+                                  delimiter (validate-unreachable-suffix!
+                                              context (mut p) allow-else region-result-tag
+                                              label-tags function-result-tag locals globals memory
+                                              table function-names function-indices types)]
                               (loop
                                 (if (>= (load case-index) count)
                                     (break)

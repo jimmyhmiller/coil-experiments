@@ -68,6 +68,7 @@ scripts/wasm-spec.sh test-float-misc
 scripts/wasm-spec.sh test-float-expressions
 scripts/wasm-spec.sh test-float-literals
 scripts/wasm-spec.sh test-float-memory
+scripts/wasm-spec.sh test-unreached-invalid
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -245,6 +246,12 @@ The cumulative official assertion total is 17,885.
 `test-float-memory` passes the complete pinned MVP `float_memory` file: 60
 exact returns, 24 ordered mutating actions, and all six module commands. The
 cumulative official assertion total is 17,945.
+
+`test-unreached-invalid` passes all 111 validation assertions in the pinned MVP
+file. Unconditional transfers use the core specification's polymorphic operand
+stack while nested blocks, loops, and conditional arms receive fresh control
+frames; concrete values above the polymorphic bottom still require exact types.
+The cumulative official assertion total is 18,056.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and
