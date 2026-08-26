@@ -54,6 +54,7 @@ scripts/wasm-spec.sh test-globals
 scripts/wasm-spec.sh test-memory-instructions
 scripts/wasm-spec.sh test-types
 scripts/wasm-spec.sh test-data-segments
+scripts/wasm-spec.sh test-elements
 scripts/wasm-spec.sh test-wat
 ```
 
@@ -151,6 +152,13 @@ instantiation failures and six validation failures, plus all 25 valid module
 instantiations. Constant offsets and imported immutable-i32-global offsets both
 initialize local and imported memories before start execution. The cumulative
 official assertion total is 8,877.
+
+`test-elements` passes the complete official MVP `elem` file: 12 returns, 12
+instantiation failures, six validation failures, and one runtime trap. Runtime
+table slots store typed native function references, so element segments from
+separately compiled and registered WASM modules can overwrite a shared table and
+be called by the exporting module. The cumulative official assertion total is
+8,908.
 
 `test-wat` exercises the Coil-native text reader directly, including named
 parameters, named `local.get`, signed integer constants, floating constants, and

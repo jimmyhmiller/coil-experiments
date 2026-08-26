@@ -1189,6 +1189,90 @@ test_data_segments() {
   echo "data valid modules: 25 instantiations passed"
 }
 
+test_elements() {
+  coil_bin=${COIL:-coil}
+  command -v jq >/dev/null 2>&1 || {
+    echo "error: jq is required to run prepared spec assertions" >&2
+    exit 1
+  }
+  json="$prepared/elem/script.json"
+  dir=${json%/*}
+  failure_out=$(mktemp "${TMPDIR:-/tmp}/coil-wasm-elem-failure.XXXXXX")
+  trap 'rm -f "$failure_out"' EXIT HUP INT TERM
+
+  for n in $(seq 0 17); do
+    "$coil_bin" run "$dir/script.$n.wasm" --use experiments.wasm.lang \
+      > "$failure_out" 2>&1 || {
+        echo "error: valid element module script.$n.wasm failed" >&2
+        cat "$failure_out" >&2
+        exit 1
+      }
+  done
+
+  "$coil_bin" run "$dir/script.7.wasm" --use experiments.wasm.lang -- \
+    --assert-scalar-batch call-7 i32 65 0 call-9 i32 66 0
+  "$coil_bin" run "$dir/script.36.wasm" --use experiments.wasm.lang -- \
+    --assert-scalar-batch call-overwritten i32 66 0
+  "$coil_bin" run "$dir/script.37.wasm" --use experiments.wasm.lang -- \
+    --assert-scalar-batch call-overwritten-element i32 66 0
+  (cd "$root/tests/wasm/table-linking-interop" && "$coil_bin" run)
+
+  if "$coil_bin" run "$dir/script.38.wasm" --use experiments.wasm.lang -- \
+       --invoke-scalar call-7 0 > "$failure_out" 2>&1; then
+    echo "error: expected uninitialized linked-table element trap" >&2
+    exit 1
+  fi
+  if ! grep -q 'program terminated by signal 6' "$failure_out"; then
+    echo "error: linked-table call failed without the expected runtime trap" >&2
+    cat "$failure_out" >&2
+    exit 1
+  fi
+
+  unlinkable_count=0
+  for file in $(jq -r '.commands[] | select(.type == "assert_unlinkable") | .filename' "$json"); do
+    if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+         > "$failure_out" 2>&1; then
+      echo "error: expected element instantiation failure from $file" >&2
+      exit 1
+    fi
+    if ! grep -q 'program terminated by signal 6' "$failure_out"; then
+      echo "error: $file failed without the expected instantiation trap" >&2
+      cat "$failure_out" >&2
+      exit 1
+    fi
+    unlinkable_count=$((unlinkable_count + 1))
+  done
+
+  invalid_count=0
+  for file in $(jq -r '.commands[] | select(.type == "assert_invalid") | .filename' "$json"); do
+    if "$coil_bin" run "$dir/$file" --use experiments.wasm.lang \
+         > "$failure_out" 2>&1; then
+      echo "error: expected element validation failure from $file" >&2
+      exit 1
+    fi
+    if ! grep -q 'WebAssembly validation:' "$failure_out"; then
+      echo "error: $file failed without a validation diagnostic" >&2
+      cat "$failure_out" >&2
+      exit 1
+    fi
+    invalid_count=$((invalid_count + 1))
+  done
+
+  return_count=$(jq '[.commands[] | select(.type == "assert_return")] | length' "$json")
+  trap_count=$(jq '[.commands[] | select(.type == "assert_trap")] | length' "$json")
+  if [ "$return_count" -ne 12 ] || [ "$unlinkable_count" -ne 12 ] || \
+     [ "$invalid_count" -ne 6 ] || [ "$trap_count" -ne 1 ]; then
+    echo "error: element assertion inventory changed: returns=$return_count unlinkable=$unlinkable_count invalid=$invalid_count traps=$trap_count" >&2
+    exit 1
+  fi
+  rm -f "$failure_out"
+  trap - EXIT HUP INT TERM
+  echo "elements assert_return: $return_count checks passed"
+  echo "elements assert_unlinkable: $unlinkable_count checks passed"
+  echo "elements assert_invalid: $invalid_count checks passed"
+  echo "elements assert_trap: $trap_count check passed"
+}
+
 test_wat() {
   coil_bin=${COIL:-coil}
   "$coil_bin" run "$root/tests/wasm/wat_features.wat" \
@@ -1227,9 +1311,10 @@ case "${1:-inventory}" in
   test-memory-instructions) test_memory_instructions ;;
   test-types) test_types ;;
   test-data-segments) test_data_segments ;;
+  test-elements) test_elements ;;
   test-wat) test_wat ;;
   *)
-    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-wat]" >&2
+    echo "usage: scripts/wasm-spec.sh [fetch|fetch-wabt|prepare|inventory|test-integers|test-floats|test-conversions|test-memory|test-tables|test-control|test-loops|test-structured-control|test-start|test-basic-instructions|test-evaluation-order|test-functions|test-globals|test-memory-instructions|test-types|test-data-segments|test-elements|test-wat]" >&2
     exit 2
     ;;
 esac

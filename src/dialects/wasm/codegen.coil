@@ -363,11 +363,22 @@
                                       (wasm/F64 [] "wasmrt/trap-f64")))
                       trap-id (primitive/datum->syntax context trap-name)
                       index-id (primitive/fresh-identifier "wasm-table-index")
-                      function-id (primitive/fresh-identifier "wasm-table-function")
-                      table-get-id (primitive/datum->syntax context "wasmrt/table-get")
+                      entry-id (primitive/fresh-identifier "wasm-table-entry")
+                      table-entry-id (primitive/datum->syntax context "wasmrt/table-entry")
+                      address-id (primitive/datum->syntax context "wasmrt/table-entry-address")
+                      length-id (primitive/datum->syntax
+                                  context "wasmrt/table-entry-signature-length")
+                      byte-id (primitive/datum->syntax
+                                context "wasmrt/table-entry-signature-byte")
+                      call-ptr-id (primitive/datum->syntax context "primitive/call-ptr")
+                      llvm-id (primitive/datum->syntax context "primitive/llvm-ir")
+                      and-id (primitive/datum->syntax context "and")
+                      eq-id (primitive/datum->syntax context "=")
                       table-accessor (primitive/code-nth table 1)
-                      (mut dispatch) `(~trap-id)
-                      (mut slot) (primitive/code-count function-names)]
+                      parameter-types-builder (primitive/code-list-new)
+                      (mut signature-condition)
+                        `(~eq-id (~length-id ~entry-id)
+                                 ~(+ 1 (al/al-len (.params wanted))))]
                   (loop
                     (if (>= (load argument-slot) (primitive/code-count arguments))
                         (break)
@@ -379,30 +390,47 @@
                           (primitive/code-list-push! call-arguments-builder id)
                           (store! argument-slot (+ (load argument-slot) 1)))))
                   (let [call-arguments
-                          (primitive/code-list-done call-arguments-builder)]
+                          (primitive/code-list-done call-arguments-builder)
+                        result-tag (if (= result-count 0)
+                                       0
+                                       (kind-tag (al/al-get (.results wanted) 0)))]
+                  (store! signature-condition
+                          `(~and-id ~(load signature-condition)
+                                    (~eq-id (~byte-id ~entry-id 0) ~result-tag)))
+                  (store! argument-slot 0)
                   (loop
-                    (if (= (load slot) 0)
+                    (if (>= (load argument-slot) (al/al-len (.params wanted)))
                         (break)
-                        (do
-                          (store! slot (- (load slot) 1))
-                          (let [function-index (load slot)]
-                            (if (< function-index (primitive/code-count function-names))
-                                (let [actual-index (al/al-get function-indices function-index)
-                                      actual (al/al-get types actual-index)]
-                                  (if (function-type-equal wanted actual)
-                                      (let [callee (primitive/code-nth function-names function-index)]
-                                        (store! dispatch
-                                                `(if (= ~function-id ~function-index)
-                                                     (~callee ~@call-arguments)
-                                                     ~(load dispatch))))
-                                      0))
-                                0)))))
+                        (let [parameter (al/al-get (.params wanted) (load argument-slot))]
+                          (primitive/code-list-push!
+                            parameter-types-builder (type-code context parameter))
+                          (store! signature-condition
+                                  `(~and-id ~(load signature-condition)
+                                    (~eq-id
+                                      (~byte-id ~entry-id ~(+ 1 (load argument-slot)))
+                                      ~(kind-tag parameter))))
+                          (store! argument-slot (+ (load argument-slot) 1)))))
                   (let [bindings-code (primitive/code-list-done argument-bindings)
                         index-expression (primitive/code-nth table-index 1)
+                        parameter-types (primitive/code-list-done parameter-types-builder)
+                        result-type (if (= result-count 0)
+                                        `i64
+                                        (type-code context (al/al-get (.results wanted) 0)))
+                        fnptr-type `(fnptr c [~@parameter-types] ~result-type)
+                        pointer-call
+                          `(~call-ptr-id
+                             (~llvm-id ~fnptr-type [(~address-id ~entry-id)]
+                               "%r = inttoptr i64 $0 to ptr\nret ptr %r")
+                             ~@call-arguments)
+                        successful-call (if (= result-count 0)
+                                            `(do ~pointer-call (do))
+                                            pointer-call)
                         call `(let [~@bindings-code
                                     ~index-id ~index-expression
-                                    ~function-id (~table-get-id (~table-accessor) ~index-id)]
-                                ~(load dispatch))]
+                                    ~entry-id (~table-entry-id (~table-accessor) ~index-id)]
+                                (if ~(load signature-condition)
+                                    ~successful-call
+                                    (~trap-id)))]
                     (if (= result-count 0)
                         (do (primitive/code-list-push! forms call) 0)
                         (push-node! (mut stack) (al/al-get (.results wanted) 0) call)))))))))))
@@ -1800,17 +1828,22 @@
                                                         globals segments))
                                 `(1 ~accessor)))))))))))))
 
-(defn table-accessor-form [(context Code) (name Code) (source Code)
+(defn table-accessor-form [(context Code) (forms CodeBuilder) (name Code) (source Code)
                            (imported bool) (minimum i64) (has-maximum bool)
                            (maximum i64) (segments (al/ArrayList wasm/ElementSegment))
-                           (function-count i64) (globals Code)] (-> Code)
+                           (function-names Code) (function-indices (al/ArrayList i64))
+                           (types (al/ArrayList wasm/FuncType)) (globals Code)] (-> Code)
   (let [state (primitive/fresh-identifier "wasm-table-state")
         elements-initialized (primitive/fresh-identifier "wasm-elements-initialized")
         table-type (primitive/datum->syntax context "wasmrt/Table")
         alloc-static-id (primitive/datum->syntax context "primitive/alloc-static")
         init-id (primitive/datum->syntax context "wasmrt/table-init!")
         import-check-id (primitive/datum->syntax context "wasmrt/table-import-check")
-        set-id (primitive/datum->syntax context "wasmrt/table-set!")
+        segment-check-id (primitive/datum->syntax context "wasmrt/table-segment-check")
+        set-id (primitive/datum->syntax context "wasmrt/table-set-ref!")
+        set-byte-id (primitive/datum->syntax context "wasmrt/table-set-signature-byte!")
+        fnptr-of-id (primitive/datum->syntax context "primitive/fnptr-of")
+        llvm-id (primitive/datum->syntax context "primitive/llvm-ir")
         cast-id (primitive/datum->syntax context "primitive/cast")
         load-id (primitive/datum->syntax context "load")
         store-id (primitive/datum->syntax context "store!")
@@ -1823,17 +1856,74 @@
                 offset (segment-offset-form context (.offset-is-global segment)
                                             (.offset segment) globals)
                 (mut j) 0]
+            (primitive/code-list-push!
+              element-forms
+              `(~segment-check-id ~state (~cast-id i64 ~offset)
+                                  ~(al/al-len (.functions segment))))
             (loop
-              (if (>= (load j) (al/al-len (.functions segment)))
+                (if (>= (load j) (al/al-len (.functions segment)))
                   (break)
                   (let [function-index (al/al-get (.functions segment) (load j))]
-                    (if (>= function-index function-count)
+                    (if (>= function-index (primitive/code-count function-names))
                         (primitive/error "WebAssembly validation: element function index out of bounds")
-                        (primitive/code-list-push!
-                          element-forms
-                          `(~set-id ~state
-                                    (+ (~cast-id i64 ~offset) ~(load j))
-                                    ~function-index)))
+                        (let [type-index (al/al-get function-indices function-index)
+                              signature (al/al-get types type-index)
+                              callee (primitive/code-nth function-names function-index)
+                              signature-length (+ 1 (al/al-len (.params signature)))
+                              result-tag (if (= (al/al-len (.results signature)) 0)
+                                             0
+                                             (kind-tag (al/al-get (.results signature) 0)))
+                              table-index `(+ (~cast-id i64 ~offset) ~(load j))
+                              address-target
+                                (if (= (al/al-len (.results signature)) 0)
+                                    (let [adapter (primitive/fresh-identifier
+                                                    "wasm-table-void-adapter")
+                                          params-builder (primitive/code-list-new)
+                                          args-builder (primitive/code-list-new)
+                                          (mut p) 0]
+                                      (loop
+                                        (if (>= (load p) (al/al-len (.params signature)))
+                                            (break)
+                                            (let [param (primitive/fresh-identifier
+                                                          "wasm-table-adapter-param")]
+                                              (primitive/code-list-push!
+                                                params-builder
+                                                `(~param
+                                                  ~(type-code
+                                                     context
+                                                     (al/al-get (.params signature)
+                                                                (load p)))))
+                                              (primitive/code-list-push! args-builder param)
+                                              (store! p (+ (load p) 1)))))
+                                      (let [params (primitive/code-list-done params-builder)
+                                            args (primitive/code-list-done args-builder)]
+                                        (primitive/code-list-push!
+                                          forms
+                                          `(defn ~adapter [~@params] (-> i64)
+                                             (do (~callee ~@args) 0))))
+                                      adapter)
+                                    callee)
+                              (mut k) 0]
+                          (primitive/code-list-push!
+                            element-forms
+                            `(~set-id ~state ~table-index
+                                      (~llvm-id i64 [(~fnptr-of-id ~address-target)]
+                                        "%r = ptrtoint $t0 $0 to i64\nret i64 %r")
+                                      ~signature-length))
+                          (primitive/code-list-push!
+                            element-forms `(~set-byte-id ~state ~table-index 0 ~result-tag))
+                          (loop
+                            (if (>= (load k) (al/al-len (.params signature)))
+                                (break)
+                                (do
+                                  (primitive/code-list-push!
+                                    element-forms
+                                    `(~set-byte-id ~state ~table-index
+                                                   ~(+ 1 (load k))
+                                                   ~(kind-tag
+                                                      (al/al-get (.params signature)
+                                                                 (load k)))))
+                                  (store! k (+ (load k) 1)))))))
                     (store! j (+ (load j) 1)))))
             (store! i (+ (load i) 1)))))
     (let [initializers (primitive/code-list-done element-forms)
@@ -1850,7 +1940,8 @@
                0)
            ~state)))))
 
-(defn decoded-elements [(a (dyn alloc/Allocator)) (payload (slice u8))]
+(defn decoded-elements [(a (dyn alloc/Allocator)) (_context Code)
+                        (payload (slice u8))]
                        (-> (al/ArrayList wasm/ElementSegment))
   (if (= (slice-len payload) 0)
       (al/al-new [wasm/ElementSegment] a)
@@ -1861,7 +1952,8 @@
 (defn table-code [(a (dyn alloc/Allocator)) (context Code)
                   (table-payload (slice u8)) (element-payload (slice u8))
                   (imports (al/ArrayList wasm/Import)) (forms CodeBuilder)
-                  (function-count i64) (globals Code)] (-> Code)
+                  (function-names Code) (function-indices (al/ArrayList i64))
+                  (types (al/ArrayList wasm/FuncType)) (globals Code)] (-> Code)
   (let [(mut imported-index) -1
         (mut i) 0]
     (loop
@@ -1880,13 +1972,13 @@
                        context
                        (primitive/code-symbol alias "/__wasm_table_" (.item-name entry)))
               accessor (primitive/fresh-identifier "wasm-table")
-              segments (decoded-elements a element-payload)]
+              segments (decoded-elements a context element-payload)]
           (primitive/code-list-push! forms `(import ~module-path :as ~alias))
           (primitive/code-list-push!
             forms
-            (table-accessor-form context accessor source true
+            (table-accessor-form context forms accessor source true
                                  (.minimum entry) (.has-maximum entry) (.maximum entry)
-                                 segments function-count globals))
+                                 segments function-names function-indices types globals))
           `(1 ~accessor))
         (if (= (slice-len table-payload) 0)
             (if (= (slice-len element-payload) 0)
@@ -1899,12 +1991,13 @@
                     `()
                     (let [declared (al/al-get tables 0)
                           accessor (primitive/fresh-identifier "wasm-table")
-                          segments (decoded-elements a element-payload)]
+                          segments (decoded-elements a context element-payload)]
                       (primitive/code-list-push!
                         forms
-                        (table-accessor-form context accessor `() false
+                        (table-accessor-form context forms accessor `() false
                                              (.minimum declared) (.has-maximum declared)
-                                             (.maximum declared) segments function-count globals))
+                                             (.maximum declared) segments
+                                             function-names function-indices types globals))
                       `(1 ~accessor)))))))))
 
 (defn export-wrapper-form [(context Code) (export-name (slice u8)) (callee Code)
@@ -2057,6 +2150,7 @@
                               `(~(primitive/code-nth table 1)))]
     (if (= (slice-len payload) 0)
         (do
+          (primitive/code-list-push! forms `(export ~initializer))
           (primitive/code-list-push!
             forms `(defn ~initializer [] (-> void)
                      (do ~memory-initializer ~table-initializer (do))))
@@ -2079,6 +2173,7 @@
                                   (primitive/datum->syntax context "primitive/alloc-static")
                                 load-id (primitive/datum->syntax context "load")
                                 store-id (primitive/datum->syntax context "store!")]
+                            (primitive/code-list-push! forms `(export ~initializer))
                             (primitive/code-list-push!
                               forms
                               `(defn ~initializer [] (-> void)
@@ -2092,7 +2187,7 @@
                                        0))))
                             0)))))))))))
 
-(defn decoded-types [(a (dyn alloc/Allocator)) (payload (slice u8))]
+(defn decoded-types [(a (dyn alloc/Allocator)) (_context Code) (payload (slice u8))]
                     (-> (al/ArrayList wasm/FuncType))
   (if (= (slice-len payload) 0)
       (al/al-new [wasm/FuncType] a)
@@ -2100,7 +2195,7 @@
         (wasm/DecodeError [_ message] (primitive/error message))
         (wasm/Decoded [values] values))))
 
-(defn decoded-indices [(a (dyn alloc/Allocator)) (payload (slice u8))]
+(defn decoded-indices [(a (dyn alloc/Allocator)) (_context Code) (payload (slice u8))]
                       (-> (al/ArrayList i64))
   (if (= (slice-len payload) 0)
       (al/al-new [i64] a)
@@ -2108,7 +2203,7 @@
         (wasm/DecodeError [_ message] (primitive/error message))
         (wasm/Decoded [values] values))))
 
-(defn decoded-bodies [(a (dyn alloc/Allocator)) (payload (slice u8))]
+(defn decoded-bodies [(a (dyn alloc/Allocator)) (_context Code) (payload (slice u8))]
                      (-> (al/ArrayList wasm/FuncBody))
   (if (= (slice-len payload) 0)
       (al/al-new [wasm/FuncBody] a)
@@ -2116,7 +2211,7 @@
         (wasm/DecodeError [_ message] (primitive/error message))
         (wasm/Decoded [values] values))))
 
-(defn decoded-imports [(a (dyn alloc/Allocator)) (payload (slice u8))]
+(defn decoded-imports [(a (dyn alloc/Allocator)) (_context Code) (payload (slice u8))]
                       (-> (al/ArrayList wasm/Import))
   (if (= (slice-len payload) 0)
       (al/al-new [wasm/Import] a)
@@ -2124,7 +2219,7 @@
         (wasm/DecodeError [_ message] (primitive/error message))
         (wasm/Decoded [values] values))))
 
-(defn validate-imported-memory-count! [(a (dyn alloc/Allocator))
+(defn validate-imported-memory-count! [(a (dyn alloc/Allocator)) (_context Code)
                                        (imports (al/ArrayList wasm/Import))
                                        (memory-payload (slice u8))] (-> i64)
   (let [(mut imported) 0
@@ -2150,7 +2245,7 @@
         0)
     0))
 
-(defn validate-imported-table-count! [(a (dyn alloc/Allocator))
+(defn validate-imported-table-count! [(a (dyn alloc/Allocator)) (_context Code)
                                       (imports (al/ArrayList wasm/Import))
                                       (table-payload (slice u8))] (-> i64)
   (let [(mut imported) 0
@@ -2223,10 +2318,10 @@
                                  (sections wasm/Sections)] (-> Code)
   (let [s sections
         forms (primitive/code-list-new)
-        types (decoded-types a (.types s))
-        defined-indices (decoded-indices a (.functions s))
-        bodies (decoded-bodies a (.codes s))
-        imports (decoded-imports a (.imports s))
+        types (decoded-types a context (.types s))
+        defined-indices (decoded-indices a context (.functions s))
+        bodies (decoded-bodies a context (.codes s))
+        imports (decoded-imports a context (.imports s))
         globals (compile-globals a context (.globals s) imports forms)
         memory (compile-memory a context (.memories s) (.data s) imports globals forms)
         imported-names (primitive/code-list-new)
@@ -2235,8 +2330,8 @@
     (if (!= (al/al-len defined-indices) (al/al-len bodies))
         (primitive/error "WebAssembly validation: function/code count mismatch")
         0)
-    (validate-imported-memory-count! a imports (.memories s))
-    (validate-imported-table-count! a imports (.tables s))
+    (validate-imported-memory-count! a context imports (.memories s))
+    (validate-imported-table-count! a context imports (.tables s))
     (emit-function-imports! context forms imports types imported-names (mut indices))
     (let [imports-code (primitive/code-list-done imported-names)
           names-builder (primitive/code-list-new)
@@ -2259,7 +2354,7 @@
       (let [names (primitive/code-list-done names-builder)
             imported-count (primitive/code-count imports-code)
             table (table-code a context (.tables s) (.elements s) imports forms
-                              (primitive/code-count names) globals)]
+                              names (load indices) types globals)]
         (store! i 0)
         (loop
           (if (>= (load i) (al/al-len defined-indices))
