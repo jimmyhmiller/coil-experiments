@@ -1,0 +1,606 @@
+(module experiments.carp.ownership-plan)
+
+;; Cleanup and move planning over specialized IR. `consumed?` is an any-path
+;; query; `consumed-on-all-paths?` is its deliberately stricter dual. Scope
+;; cleanup uses both so a conditional move retains a delete on paths where the
+;; value remains owned, while a guaranteed move never receives a second delete.
+
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "experiments.carp.borrow-check" :as check)
+(import "experiments.carp.ir" :as ir)
+(import "experiments.carp.types" :as types)
+
+(defsum OwnershipResource
+  (ResourceBinding [(binding ir/CoreRef)])
+  (ResourceTemporary [(expression-id i64)]))
+
+(defsum OwnershipAction
+  (ActionDelete [(site-id i64)
+                 (resource OwnershipResource)
+                 (type (ptr types/MonoType))])
+  (ActionMove [(site-id i64)
+               (from ir/CoreRef)
+               (to ir/CoreRef)
+               (type (ptr types/MonoType))])
+  (ActionBorrow [(site-id i64) (resource OwnershipResource)]))
+
+(defstruct OwnershipRequirement [(type (ptr types/MonoType))])
+
+(defstruct OwnershipPlan
+  [(actions (al/ArrayList OwnershipAction))
+   (requirements (al/ArrayList OwnershipRequirement))])
+
+(defsum PlanResult
+  (PlanSuccess [(plan OwnershipPlan)])
+  (PlanDuplicateExpressionId [(id i64)]))
+
+(defstruct Parameter [(binding ir/CoreRef) (type (ptr types/MonoType))])
+
+(defn expression-list-captured? [(target ir/CoreRef)
+                                 (expressions (ptr (al/ArrayList (ptr ir/SpecializedExpr))))]
+  (-> bool)
+  (let [n (al/al-len [(ptr ir/SpecializedExpr)] (load expressions))
+        (mut i) 0
+        (mut found) false]
+    (loop
+      (if (or (load found) (>= (load i) n))
+          (break)
+          (do
+            (if (captured? target
+                           (al/al-get [(ptr ir/SpecializedExpr)]
+                                      (load expressions)
+                                      (load i)))
+                (store! found true)
+                0)
+            (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn branch-list-captured? [(target ir/CoreRef)
+                             (branches (ptr (al/ArrayList ir/SpecializedMatchBranch)))]
+  (-> bool)
+  (let [n (al/al-len [ir/SpecializedMatchBranch] (load branches))
+        (mut i) 0
+        (mut found) false]
+    (loop
+      (if (or (load found) (>= (load i) n))
+          (break)
+          (do
+            (if (captured? target
+                           (load (field (al/al-elem [ir/SpecializedMatchBranch]
+                                                    branches
+                                                    (load i))
+                                        body)))
+                (store! found true)
+                0)
+            (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn captured? [(target ir/CoreRef) (expression (ptr ir/SpecializedExpr))]
+  (-> bool)
+  (match (load expression)
+    (ir/ExprLiteral [_ _] false)
+    (ir/ExprInt [_ _ _] false) (ir/ExprByte [_ _ _] false)
+    (ir/ExprLong [_ _ _] false) (ir/ExprFloat [_ _ _] false)
+    (ir/ExprDouble [_ _ _] false) (ir/ExprBool [_ _ _] false)
+    (ir/ExprChar [_ _ _] false) (ir/ExprString [_ _ _] false)
+    (ir/ExprPattern [_ _ _] false) (ir/ExprUnit [_ _] false)
+    (ir/ExprBreak [_ _] false)
+    (ir/ExprArray [_ _ items _] (expression-list-captured? target items))
+    (ir/ExprReference [_ _ binding] (ir/core-ref-same? target binding))
+    (ir/ExprBorrow [_ _ operand] (captured? target operand))
+    (ir/ExprGlobalCall [_ _ _ _ arguments]
+      (expression-list-captured? target arguments))
+    (ir/ExprCall [_ _ callee arguments]
+      (or (captured? target callee) (expression-list-captured? target arguments)))
+    (ir/ExprDo [_ _ expressions] (expression-list-captured? target expressions))
+    (ir/ExprIf [_ _ condition then-branch else-branch]
+      (or (captured? target condition)
+          (or (captured? target then-branch) (captured? target else-branch))))
+    (ir/ExprLet [_ _ _ value body]
+      (or (captured? target value) (captured? target body)))
+    (ir/ExprSet [_ _ _ value] (captured? target value))
+    (ir/ExprWhile [_ _ condition body]
+      (or (captured? target condition) (captured? target body)))
+    (ir/ExprLambda [_ _ _ body] (captured? target body))
+    (ir/ExprMatch [_ _ _ scrutinee branches]
+      (or (captured? target scrutinee) (branch-list-captured? target branches)))
+    (ir/ExprAnnotation [_ _ inner] (captured? target inner))))
+
+(defn expression-list-consumed? [(target ir/CoreRef)
+                                 (expressions (ptr (al/ArrayList (ptr ir/SpecializedExpr))))]
+  (-> bool)
+  (let [n (al/al-len [(ptr ir/SpecializedExpr)] (load expressions))
+        (mut i) 0
+        (mut found) false]
+    (loop
+      (if (or (load found) (>= (load i) n))
+          (break)
+          (do
+            (if (consumed? target
+                           (al/al-get [(ptr ir/SpecializedExpr)]
+                                      (load expressions)
+                                      (load i)))
+                (store! found true)
+                0)
+            (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn branch-list-consumed? [(target ir/CoreRef)
+                             (branches (ptr (al/ArrayList ir/SpecializedMatchBranch)))]
+  (-> bool)
+  (let [n (al/al-len [ir/SpecializedMatchBranch] (load branches))
+        (mut i) 0
+        (mut found) false]
+    (loop
+      (if (or (load found) (>= (load i) n))
+          (break)
+          (do
+            (if (consumed? target
+                           (load (field (al/al-elem [ir/SpecializedMatchBranch]
+                                                    branches
+                                                    (load i))
+                                        body)))
+                (store! found true)
+                0)
+            (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn borrow-consumes? [(target ir/CoreRef) (operand (ptr ir/SpecializedExpr))]
+  (-> bool)
+  (match (load operand)
+    (ir/ExprReference [_ _ _] false)
+    (_ (consumed? target operand))))
+
+(defn consumed? [(target ir/CoreRef) (expression (ptr ir/SpecializedExpr))]
+  (-> bool)
+  (match (load expression)
+    (ir/ExprLiteral [_ _] false)
+    (ir/ExprInt [_ _ _] false) (ir/ExprByte [_ _ _] false)
+    (ir/ExprLong [_ _ _] false) (ir/ExprFloat [_ _ _] false)
+    (ir/ExprDouble [_ _ _] false) (ir/ExprBool [_ _ _] false)
+    (ir/ExprChar [_ _ _] false) (ir/ExprString [_ _ _] false)
+    (ir/ExprPattern [_ _ _] false) (ir/ExprUnit [_ _] false)
+    (ir/ExprBreak [_ _] false)
+    (ir/ExprArray [_ _ items _] (expression-list-consumed? target items))
+    (ir/ExprReference [_ _ binding] (ir/core-ref-same? target binding))
+    (ir/ExprBorrow [_ _ operand] (borrow-consumes? target operand))
+    (ir/ExprGlobalCall [_ _ _ _ arguments]
+      (expression-list-consumed? target arguments))
+    ;; Calling a closure borrows the callable value. Its arguments remain
+    ;; ordinary value positions.
+    (ir/ExprCall [_ _ _ arguments] (expression-list-consumed? target arguments))
+    (ir/ExprDo [_ _ expressions] (expression-list-consumed? target expressions))
+    (ir/ExprIf [_ _ condition then-branch else-branch]
+      (or (consumed? target condition)
+          (or (consumed? target then-branch) (consumed? target else-branch))))
+    (ir/ExprLet [_ _ _ value body]
+      (or (consumed? target value) (consumed? target body)))
+    (ir/ExprSet [_ _ set-target value]
+      (and (not (ir/core-ref-same? target set-target))
+           (consumed? target value)))
+    (ir/ExprWhile [_ _ condition body]
+      (or (consumed? target condition) (consumed? target body)))
+    ;; Any free occurrence is copied into the closure environment at creation.
+    (ir/ExprLambda [_ _ _ body] (captured? target body))
+    (ir/ExprMatch [_ _ by-reference scrutinee branches]
+      (or (if by-reference (borrow-consumes? target scrutinee)
+              (consumed? target scrutinee))
+          (branch-list-consumed? target branches)))
+    (ir/ExprAnnotation [_ _ inner] (consumed? target inner))))
+
+(defn expression-list-consumed-all? [(target ir/CoreRef)
+                                     (expressions (ptr (al/ArrayList (ptr ir/SpecializedExpr))))]
+  (-> bool)
+  (let [n (al/al-len [(ptr ir/SpecializedExpr)] (load expressions))
+        (mut i) 0
+        (mut result) false
+        (mut uncertain) false]
+    (loop
+      (if (or (load result) (load uncertain) (>= (load i) n))
+          (break)
+          (let [expression (al/al-get [(ptr ir/SpecializedExpr)]
+                                      (load expressions)
+                                      (load i))]
+            (cond (consumed-on-all-paths? target expression) (store! result true)
+                  (consumed? target expression) (store! uncertain true)
+                  :else 0)
+            (store! i (+ (load i) 1)))))
+    (load result)))
+
+(defn branch-list-consumed-all? [(target ir/CoreRef)
+                                 (branches (ptr (al/ArrayList ir/SpecializedMatchBranch)))]
+  (-> bool)
+  (let [n (al/al-len [ir/SpecializedMatchBranch] (load branches))
+        (mut i) 0
+        (mut result) (> n 0)]
+    (loop
+      (if (or (not (load result)) (>= (load i) n))
+          (break)
+          (do
+            (if (not (consumed-on-all-paths?
+                       target
+                       (load (field (al/al-elem [ir/SpecializedMatchBranch]
+                                                branches
+                                                (load i))
+                                    body))))
+                (store! result false)
+                0)
+            (store! i (+ (load i) 1)))))
+    (load result)))
+
+(defn consumed-on-all-paths? [(target ir/CoreRef)
+                              (expression (ptr ir/SpecializedExpr))] (-> bool)
+  (match (load expression)
+    (ir/ExprLiteral [_ _] false)
+    (ir/ExprInt [_ _ _] false) (ir/ExprByte [_ _ _] false)
+    (ir/ExprLong [_ _ _] false) (ir/ExprFloat [_ _ _] false)
+    (ir/ExprDouble [_ _ _] false) (ir/ExprBool [_ _ _] false)
+    (ir/ExprChar [_ _ _] false) (ir/ExprString [_ _ _] false)
+    (ir/ExprPattern [_ _ _] false) (ir/ExprUnit [_ _] false)
+    (ir/ExprBreak [_ _] false)
+    (ir/ExprArray [_ _ items _] (expression-list-consumed-all? target items))
+    (ir/ExprReference [_ _ binding] (ir/core-ref-same? target binding))
+    (ir/ExprBorrow [_ _ operand] (borrow-consumes? target operand))
+    (ir/ExprGlobalCall [_ _ _ _ arguments]
+      (expression-list-consumed-all? target arguments))
+    (ir/ExprCall [_ _ _ arguments]
+      (expression-list-consumed-all? target arguments))
+    (ir/ExprDo [_ _ expressions]
+      (expression-list-consumed-all? target expressions))
+    (ir/ExprIf [_ _ condition then-branch else-branch]
+      (if (consumed-on-all-paths? target condition)
+          true
+          (and (not (consumed? target condition))
+               (and (consumed-on-all-paths? target then-branch)
+                    (consumed-on-all-paths? target else-branch)))))
+    (ir/ExprLet [_ _ _ value body]
+      (cond (consumed-on-all-paths? target value) true
+            (consumed? target value) false
+            :else (consumed-on-all-paths? target body)))
+    (ir/ExprSet [_ _ set-target value]
+      (and (not (ir/core-ref-same? target set-target))
+           (consumed-on-all-paths? target value)))
+    ;; A loop condition runs once; its body may run zero times.
+    (ir/ExprWhile [_ _ condition _]
+      (consumed-on-all-paths? target condition))
+    (ir/ExprLambda [_ _ _ body] (captured? target body))
+    (ir/ExprMatch [_ _ by-reference scrutinee branches]
+      (if (and (not by-reference) (consumed-on-all-paths? target scrutinee))
+          true
+          (and (not (consumed? target scrutinee))
+               (branch-list-consumed-all? target branches))))
+    (ir/ExprAnnotation [_ _ inner] (consumed-on-all-paths? target inner))))
+
+(defn requirement-has? [(requirements (ptr (al/ArrayList OwnershipRequirement)))
+                         (type (ptr types/MonoType))] (-> bool)
+  (let [n (al/al-len [OwnershipRequirement] (load requirements))
+        (mut i) 0
+        (mut found) false]
+    (loop
+      (if (or (load found) (>= (load i) n))
+          (break)
+          (do
+            (if (types/type-same-representation?
+                  (load (field (al/al-elem [OwnershipRequirement]
+                                           requirements
+                                           (load i))
+                               type))
+                  type)
+                (store! found true)
+                0)
+            (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn plan-add-delete! [(plan (ptr OwnershipPlan))
+                        (site-id i64)
+                        (resource OwnershipResource)
+                        (type (ptr types/MonoType))] (-> i64)
+  (do
+    (al/al-push! [OwnershipAction]
+                 (field plan actions)
+                 (ActionDelete site-id resource type))
+    (if (requirement-has? (field plan requirements) type)
+        0
+        (al/al-push! [OwnershipRequirement]
+                     (field plan requirements)
+                     (OwnershipRequirement :type type)))))
+
+(defn plan-add-move! [(plan (ptr OwnershipPlan))
+                      (site-id i64)
+                      (from ir/CoreRef)
+                      (to ir/CoreRef)
+                      (type (ptr types/MonoType))] (-> i64)
+  (al/al-push! [OwnershipAction]
+               (field plan actions)
+               (ActionMove site-id from to type)))
+
+(defn collect-list! [(a (dyn alloc/Allocator))
+                     (expressions (ptr (al/ArrayList (ptr ir/SpecializedExpr))))
+                     (facts (ptr check/OwnershipTypeFacts))
+                     (plan (ptr OwnershipPlan))] (-> i64)
+  (let [n (al/al-len [(ptr ir/SpecializedExpr)] (load expressions))
+        (mut i) 0]
+    (loop
+      (if (>= (load i) n)
+          (break)
+          (let [expression (al/al-get [(ptr ir/SpecializedExpr)]
+                                      (load expressions)
+                                      (load i))]
+            (collect-expression! a expression facts plan)
+            (if (and (< (load i) (- n 1))
+                     (check/ownership-owned? (ir/expression-type expression) facts))
+                (plan-add-delete! plan
+                                  (ir/expression-id expression)
+                                  (ResourceTemporary (ir/expression-id expression))
+                                  (ir/expression-type expression))
+                0)
+            (store! i (+ (load i) 1)))))
+    0))
+
+(defn collect-children-list!
+  [(a (dyn alloc/Allocator))
+   (expressions (ptr (al/ArrayList (ptr ir/SpecializedExpr))))
+   (facts (ptr check/OwnershipTypeFacts)) (plan (ptr OwnershipPlan))] (-> i64)
+  (let [n (al/al-len [(ptr ir/SpecializedExpr)] (load expressions)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (collect-expression! a
+                    (al/al-get [(ptr ir/SpecializedExpr)]
+                      (load expressions) (load i)) facts plan)
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn collect-expression! [(a (dyn alloc/Allocator))
+                           (expression (ptr ir/SpecializedExpr))
+                           (facts (ptr check/OwnershipTypeFacts))
+                           (plan (ptr OwnershipPlan))] (-> i64)
+  (match (load expression)
+    (ir/ExprLiteral [_ _] 0)
+    (ir/ExprInt [_ _ _] 0) (ir/ExprByte [_ _ _] 0)
+    (ir/ExprLong [_ _ _] 0) (ir/ExprFloat [_ _ _] 0)
+    (ir/ExprDouble [_ _ _] 0) (ir/ExprBool [_ _ _] 0)
+    (ir/ExprChar [_ _ _] 0) (ir/ExprString [_ _ _] 0)
+    (ir/ExprPattern [_ _ _] 0) (ir/ExprUnit [_ _] 0)
+    (ir/ExprBreak [_ _] 0)
+    (ir/ExprArray [_ _ items _] (collect-children-list! a items facts plan))
+    (ir/ExprReference [_ _ _] 0)
+    (ir/ExprBorrow [_ _ operand] (collect-expression! a operand facts plan))
+    (ir/ExprAnnotation [_ _ inner] (collect-expression! a inner facts plan))
+    (ir/ExprGlobalCall [_ _ _ _ arguments]
+      (collect-children-list! a arguments facts plan))
+    (ir/ExprCall [_ _ callee arguments]
+      (do (collect-expression! a callee facts plan)
+          (collect-children-list! a arguments facts plan)))
+    (ir/ExprDo [_ _ expressions] (collect-list! a expressions facts plan))
+    (ir/ExprIf [_ _ condition then-branch else-branch]
+      (do (collect-expression! a condition facts plan)
+          (collect-expression! a then-branch facts plan)
+          (collect-expression! a else-branch facts plan)))
+    (ir/ExprLet [id _ binding value body]
+      (do
+        (collect-expression! a value facts plan)
+        (collect-expression! a body facts plan)
+        (if (check/ownership-owned? (ir/expression-type value) facts)
+            (do
+              (match (load value)
+                (ir/ExprReference [_ _ source]
+                  (if (not (ir/core-ref-global? source))
+                      (plan-add-move! plan
+                                      id
+                                      source
+                                      binding
+                                      (ir/expression-type value))
+                      0))
+                (_ 0))
+              (if (consumed-on-all-paths? binding body)
+                  0
+                  (plan-add-delete! plan
+                                    id
+                                    (ResourceBinding binding)
+                                    (ir/expression-type value))))
+            0)))
+    (ir/ExprSet [id _ binding value]
+      (do
+        (collect-expression! a value facts plan)
+        (if (and (check/ownership-owned? (ir/expression-type value) facts)
+                 (not (consumed? binding value)))
+            (plan-add-delete! plan
+                              id
+                              (ResourceBinding binding)
+                              (ir/expression-type value))
+            0)))
+    (ir/ExprWhile [_ _ condition body]
+      (do (collect-expression! a condition facts plan)
+          (collect-expression! a body facts plan)))
+    (ir/ExprLambda [_ _ _ body] (collect-expression! a body facts plan))
+    (ir/ExprMatch [_ _ _ scrutinee branches]
+      (do
+        (collect-expression! a scrutinee facts plan)
+        (let [n (al/al-len [ir/SpecializedMatchBranch] (load branches))
+              (mut i) 0]
+          (loop
+            (if (>= (load i) n)
+                (break)
+                (let [branch (al/al-elem [ir/SpecializedMatchBranch]
+                                         branches
+                                         (load i))
+                      bindings (load (field branch bindings))
+                      binding-types (load (field branch binding-types))
+                      body (load (field branch body))
+                      bn (al/al-len [ir/CoreRef] (load bindings))
+                      (mut bi) 0]
+                  (collect-expression! a body facts plan)
+                  (loop
+                    (if (>= (load bi) bn)
+                        (break)
+                        (let [binding (al/al-get [ir/CoreRef] (load bindings) (load bi))]
+                          (if (and (< (load bi)
+                                      (al/al-len [(ptr types/MonoType)]
+                                                 (load binding-types)))
+                                   (let [binding-type
+                                           (al/al-get [(ptr types/MonoType)]
+                                                      (load binding-types)
+                                                      (load bi))]
+                                     (and (check/ownership-owned? binding-type facts)
+                                          (not (consumed-on-all-paths? binding body)))))
+                              (plan-add-delete!
+                                plan
+                                (ir/expression-id body)
+                                (ResourceBinding binding)
+                                (al/al-get [(ptr types/MonoType)]
+                                           (load binding-types)
+                                           (load bi)))
+                              0)
+                          (store! bi (+ (load bi) 1)))))
+                  (store! i (+ (load i) 1)))))
+          0)))))
+
+(defn collect-parameter-deletes! [(parameters (ptr (al/ArrayList Parameter)))
+                                  (body (ptr ir/SpecializedExpr))
+                                  (facts (ptr check/OwnershipTypeFacts))
+                                  (plan (ptr OwnershipPlan))] (-> i64)
+  (let [n (al/al-len [Parameter] (load parameters))
+        (mut i) 0]
+    (loop
+      (if (>= (load i) n)
+          (break)
+          (let [parameter (al/al-elem [Parameter] parameters (load i))
+                binding (load (field parameter binding))
+                type (load (field parameter type))]
+            (if (and (check/ownership-owned? type facts)
+                     (not (consumed-on-all-paths? binding body)))
+                (plan-add-delete! plan
+                                  (ir/expression-id body)
+                                  (ResourceBinding binding)
+                                  type)
+                0)
+            (store! i (+ (load i) 1)))))
+    0))
+
+(defn seen-expression-id! [(seen (ptr (al/ArrayList i64))) (id i64)] (-> bool)
+  (if (own-id-list-has? seen id)
+      false
+      (do (al/al-push! [i64] seen id) true)))
+
+;; Local copy avoids coupling the planning pass to ownership state's public
+;; helper names solely for identity validation.
+(defn own-id-list-has? [(ids (ptr (al/ArrayList i64))) (id i64)] (-> bool)
+  (let [n (al/al-len [i64] (load ids))
+        (mut i) 0
+        (mut found) false]
+    (loop
+      (if (or (load found) (>= (load i) n))
+          (break)
+          (do
+            (if (= (al/al-get [i64] (load ids) (load i)) id)
+                (store! found true)
+                0)
+            (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn ownership-plan-new [(a (dyn alloc/Allocator))] (-> OwnershipPlan)
+  (OwnershipPlan :actions (al/al-new [OwnershipAction] a)
+                 :requirements (al/al-new [OwnershipRequirement] a)))
+
+(defn validate-expression-list! [(seen (ptr (al/ArrayList i64)))
+                                 (expressions (ptr (al/ArrayList (ptr ir/SpecializedExpr))))
+                                 (duplicate (ptr i64))] (-> bool)
+  (let [n (al/al-len [(ptr ir/SpecializedExpr)] (load expressions))
+        (mut i) 0
+        (mut valid) true]
+    (loop
+      (if (or (not (load valid)) (>= (load i) n))
+          (break)
+          (do
+            (if (not (validate-expression-ids!
+                       seen
+                       (al/al-get [(ptr ir/SpecializedExpr)]
+                                  (load expressions)
+                                  (load i))
+                       duplicate))
+                (store! valid false)
+                0)
+            (store! i (+ (load i) 1)))))
+    (load valid)))
+
+(defn validate-branch-list! [(seen (ptr (al/ArrayList i64)))
+                             (branches (ptr (al/ArrayList ir/SpecializedMatchBranch)))
+                             (duplicate (ptr i64))] (-> bool)
+  (let [n (al/al-len [ir/SpecializedMatchBranch] (load branches))
+        (mut i) 0
+        (mut valid) true]
+    (loop
+      (if (or (not (load valid)) (>= (load i) n))
+          (break)
+          (do
+            (if (not (validate-expression-ids!
+                       seen
+                       (load (field (al/al-elem [ir/SpecializedMatchBranch]
+                                                branches
+                                                (load i))
+                                    body))
+                       duplicate))
+                (store! valid false)
+                0)
+            (store! i (+ (load i) 1)))))
+    (load valid)))
+
+(defn validate-expression-ids! [(seen (ptr (al/ArrayList i64)))
+                                (expression (ptr ir/SpecializedExpr))
+                                (duplicate (ptr i64))] (-> bool)
+  (let [id (ir/expression-id expression)]
+    (if (not (seen-expression-id! seen id))
+        (do (store! duplicate id) false)
+        (match (load expression)
+          (ir/ExprLiteral [_ _] true)
+          (ir/ExprInt [_ _ _] true) (ir/ExprByte [_ _ _] true)
+          (ir/ExprLong [_ _ _] true) (ir/ExprFloat [_ _ _] true)
+          (ir/ExprDouble [_ _ _] true) (ir/ExprBool [_ _ _] true)
+          (ir/ExprChar [_ _ _] true) (ir/ExprString [_ _ _] true)
+          (ir/ExprPattern [_ _ _] true) (ir/ExprUnit [_ _] true)
+          (ir/ExprBreak [_ _] true)
+          (ir/ExprArray [_ _ items _]
+            (validate-expression-list! seen items duplicate))
+          (ir/ExprReference [_ _ _] true)
+          (ir/ExprBorrow [_ _ operand]
+            (validate-expression-ids! seen operand duplicate))
+          (ir/ExprAnnotation [_ _ inner]
+            (validate-expression-ids! seen inner duplicate))
+          (ir/ExprGlobalCall [_ _ _ _ arguments]
+            (validate-expression-list! seen arguments duplicate))
+          (ir/ExprCall [_ _ callee arguments]
+            (and (validate-expression-ids! seen callee duplicate)
+                 (validate-expression-list! seen arguments duplicate)))
+          (ir/ExprDo [_ _ expressions]
+            (validate-expression-list! seen expressions duplicate))
+          (ir/ExprIf [_ _ condition then-branch else-branch]
+            (and (validate-expression-ids! seen condition duplicate)
+                 (and (validate-expression-ids! seen then-branch duplicate)
+                      (validate-expression-ids! seen else-branch duplicate))))
+          (ir/ExprLet [_ _ _ value body]
+            (and (validate-expression-ids! seen value duplicate)
+                 (validate-expression-ids! seen body duplicate)))
+          (ir/ExprSet [_ _ _ value]
+            (validate-expression-ids! seen value duplicate))
+          (ir/ExprWhile [_ _ condition body]
+            (and (validate-expression-ids! seen condition duplicate)
+                 (validate-expression-ids! seen body duplicate)))
+          (ir/ExprLambda [_ _ _ body]
+            (validate-expression-ids! seen body duplicate))
+          (ir/ExprMatch [_ _ _ scrutinee branches]
+            (and (validate-expression-ids! seen scrutinee duplicate)
+                 (validate-branch-list! seen branches duplicate)))))))
+
+(defn prepare [(a (dyn alloc/Allocator))
+               (body (ptr ir/SpecializedExpr))
+               (parameters (ptr (al/ArrayList Parameter)))
+               (facts (ptr check/OwnershipTypeFacts))] (-> PlanResult)
+  (let [(mut seen) (al/al-new [i64] a)
+        duplicate (primitive/alloc-stack i64)]
+    (if (not (validate-expression-ids! (mut seen) body duplicate))
+        (PlanDuplicateExpressionId (load duplicate))
+        (let [(mut plan) (ownership-plan-new a)]
+          (collect-expression! a body facts (mut plan))
+          (collect-parameter-deletes! parameters body facts (mut plan))
+          (PlanSuccess (load plan))))))

@@ -1,0 +1,271 @@
+(module experiments.carp.check)
+
+;; The semantic gate between monomorphization and Coil emission. Every
+;; specialized function is borrow checked with exact interface-derived
+;; managedness facts, then receives a cleanup/move/borrow plan.
+
+(import "experiments.carp.borrow-check" :as borrow)
+(import "experiments.carp.infer" :as schemes)
+(import "experiments.carp.infer-engine" :as infer)
+(import "experiments.carp.ir" :as ir)
+(import "experiments.carp.managed" :as managed)
+(import "experiments.carp.ownership-plan" :as ownership)
+(import "experiments.carp.types" :as types)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "coil.str" :as str)
+
+(export CleanupTarget CheckedFunction CheckedValue CheckedModule CheckResult check-module
+        check-failed? checked-module check-error)
+
+(defstruct CleanupTarget
+  [(type (ptr types/MonoType)) (implementation ir/CoreRef)
+   (signature (ptr types/MonoType))])
+
+(defstruct CheckedFunction
+  [(function ir/SpecializedFunction)
+   (plan ownership/OwnershipPlan)])
+
+(defstruct CheckedValue
+  [(value ir/SpecializedValue) (plan ownership/OwnershipPlan)])
+
+(defstruct CheckedModule
+  [(functions (al/ArrayList CheckedFunction))
+   (values (al/ArrayList CheckedValue))
+   (cleanups (al/ArrayList CleanupTarget))
+   (types (al/ArrayList ir/ResolvedTypeDefinition))])
+
+(defstruct CheckResult
+  [(module CheckedModule) (failed i64) (message (slice u8))])
+
+(defn check-failed? [(result CheckResult)] (-> bool) (!= (.failed result) 0))
+(defn checked-module [(result CheckResult)] (-> CheckedModule) (.module result))
+(defn check-error [(result CheckResult)] (-> (slice u8)) (.message result))
+
+(defn ownership-parameters
+  [(a (dyn alloc/Allocator)) (function (ptr ir/SpecializedFunction))]
+  (-> (al/ArrayList ownership/Parameter))
+  (let [(mut parameters) (al/al-new [ownership/Parameter] a)
+        n (al/al-len [ir/CoreRef] (load (field function parameters)))
+        type-count (al/al-len [(ptr types/MonoType)]
+                     (load (field function parameter-types)))
+        (mut i) 0]
+    (if (= n type-count)
+        (loop (if (>= (load i) n) (break)
+                  (do (al/al-push! [ownership/Parameter] (mut parameters)
+                        (ownership/Parameter
+                          :binding (al/al-get [ir/CoreRef]
+                                     (load (field function parameters)) (load i))
+                          :type (al/al-get [(ptr types/MonoType)]
+                                  (load (field function parameter-types)) (load i))))
+                      (store! i (+ (load i) 1))))) 0)
+    (load parameters)))
+
+(defn inferred-binding-scheme
+  [(inferred (ptr infer/InferredModule)) (reference ir/CoreRef)]
+  (-> (ptr schemes/TypeScheme))
+  (let [n (al/al-len [infer/InferredBinding] (load (field inferred globals)))
+        (mut i) n
+        (mut found) (primitive/cast (ptr schemes/TypeScheme) 0)]
+    (loop (if (or (<= (load i) 0)
+                  (!= (primitive/cast i64 (load found)) 0)) (break)
+              (do (store! i (- (load i) 1))
+                  (let [entry (al/al-elem [infer/InferredBinding]
+                                  (field inferred globals) (load i))]
+                    (if (ir/core-ref-same? (load (field entry reference)) reference)
+                        (store! found (field entry scheme)) 0)))))
+    (load found)))
+
+(defn cleanup-target-has? [(targets (ptr (al/ArrayList CleanupTarget)))
+                           (type (ptr types/MonoType))] (-> bool)
+  (let [n (al/al-len [CleanupTarget] (load targets)) (mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) n) (load found)) (break)
+              (let [target (al/al-elem [CleanupTarget] targets (load i))]
+                (if (types/type-same-representation?
+                      (load (field target type)) type)
+                      (store! found true) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn collect-cleanup-target!
+  [(a (dyn alloc/Allocator)) (resolved (ptr ir/ResolvedModule))
+   (inferred (ptr infer/InferredModule))
+   (targets (ptr (al/ArrayList CleanupTarget)))
+   (type (ptr types/MonoType))] (-> i64)
+  (if (cleanup-target-has? targets type) 0
+      (let [arguments (types/type-arguments-new a)
+            _argument (types/type-arguments-push! arguments type)
+            expected (types/type-function a arguments (types/type-unit a))
+            n (al/al-len [ir/CoreImplementation]
+                (load (field resolved implementations)))
+            (mut i) 0 (mut found) false]
+        (match (load type)
+          (types/TypeFunction [_ _]
+            (do (al/al-push! [CleanupTarget] targets
+                  (CleanupTarget :type type
+                    :implementation (ir/core-ref -1 "__carp_closure_delete" true)
+                    :signature expected))
+                (store! found true)))
+          (_ 0))
+        (loop (if (or (>= (load i) n) (load found)) (break)
+                  (let [edge (al/al-get [ir/CoreImplementation]
+                               (load (field resolved implementations)) (load i))]
+                    (if (str/str-eq (.name (.interface edge)) "delete")
+                        (let [scheme (inferred-binding-scheme inferred (.implementation edge))]
+                          (if (= (primitive/cast i64 scheme) 0) 0
+                              (let [next (alloc/box! a i64
+                                           (+ (types/type-max-variable-id expected) 1))
+                                    candidate (schemes/instantiate-scheme a (load scheme) next)
+                                    solver (alloc/box! a types/TypeSolver
+                                             (types/type-solver-new a))]
+                                (if (types/unify-success?
+                                      (types/type-unify-call! solver candidate expected))
+                                    (do (al/al-push! [CleanupTarget] targets
+                                          (CleanupTarget :type type
+                                            :implementation (.implementation edge)
+                                            :signature expected))
+                                        (store! found true))
+                                    0)))) 0)
+                    (store! i (+ (load i) 1)))))
+        (if (load found) 0
+            (let [(mut out) (str/sb-new a)]
+              (str/sb-push-str! (mut out)
+                "ownership planning found no concrete delete implementation for ")
+              (match (load type)
+                (types/TypeString [] (str/sb-push-str! (mut out) "String"))
+                (types/TypeNamed [name _] (str/sb-push-str! (mut out) name))
+                (types/TypeFunction [_ _] (str/sb-push-str! (mut out) "Fn"))
+                (_ (str/sb-push-str! (mut out) "type")))
+              (primitive/error (str/sb-finish! (mut out))))))))
+
+(defn collect-cleanup-targets!
+  [(a (dyn alloc/Allocator)) (resolved (ptr ir/ResolvedModule))
+   (inferred (ptr infer/InferredModule))
+   (functions (ptr (al/ArrayList CheckedFunction)))
+   (targets (ptr (al/ArrayList CleanupTarget)))] (-> i64)
+  (let [n (al/al-len [CheckedFunction] (load functions)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (let [checked (al/al-elem [CheckedFunction] functions (load i))
+                    plan (field checked plan)
+                    requirements (field plan requirements)
+                    rn (al/al-len [ownership/OwnershipRequirement]
+                         (load requirements))
+                    (mut ri) 0]
+                (loop (if (>= (load ri) rn) (break)
+                          (do (collect-cleanup-target! a resolved inferred targets
+                                (load (field (al/al-elem [ownership/OwnershipRequirement]
+                                               requirements (load ri)) type)))
+                              (store! ri (+ (load ri) 1)))))
+                (store! i (+ (load i) 1)))))
+    0))
+
+(defn collect-value-cleanup-targets!
+  [(a (dyn alloc/Allocator)) (resolved (ptr ir/ResolvedModule))
+   (inferred (ptr infer/InferredModule))
+   (values (ptr (al/ArrayList CheckedValue)))
+   (targets (ptr (al/ArrayList CleanupTarget)))] (-> i64)
+  (let [n (al/al-len [CheckedValue] (load values)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (let [checked (al/al-elem [CheckedValue] values (load i))
+                    requirements (field (field checked plan) requirements)
+                    rn (al/al-len [ownership/OwnershipRequirement]
+                         (load requirements))
+                    (mut ri) 0]
+                (loop (if (>= (load ri) rn) (break)
+                          (do (collect-cleanup-target! a resolved inferred targets
+                                (load (field (al/al-elem [ownership/OwnershipRequirement]
+                                               requirements (load ri)) type)))
+                              (store! ri (+ (load ri) 1)))))
+                (store! i (+ (load i) 1)))))
+    0))
+
+(defn check-module [(a (dyn alloc/Allocator))
+                    (resolved (ptr ir/ResolvedModule))
+                    (inferred (ptr infer/InferredModule))
+                    (specialized (ptr ir/SpecializedModule))]
+  (-> CheckResult)
+  (let [(mut checked) (al/al-new [CheckedFunction] a)
+        (mut checked-values) (al/al-new [CheckedValue] a)
+        (mut cleanups) (al/al-new [CleanupTarget] a)
+        (mut facts) (managed/build-ownership-facts
+                      a resolved inferred specialized)
+        n (al/al-len [ir/SpecializedFunction]
+            (load (field specialized functions)))
+        (mut i) 0 (mut failed) 0 (mut message) ""]
+    (loop (if (or (>= (load i) n) (!= (load failed) 0)) (break)
+              (let [function (al/al-elem [ir/SpecializedFunction]
+                               (field specialized functions) (load i))
+                    parameter-count (al/al-len [ir/CoreRef]
+                                      (load (field function parameters)))
+                    parameter-type-count (al/al-len
+                                           [(ptr types/MonoType)]
+                                           (load (field function parameter-types)))]
+                (if (!= parameter-count parameter-type-count)
+                    (do (store! failed 1)
+                        (store! message "specialized function parameter/type arity mismatch"))
+                    (let [flags (borrow/check-borrows a (load (field function body))
+                                  (load (field function parameters)) (mut facts))]
+                      (if (.escaped flags)
+                          (do (store! failed 1)
+                              (store! message "borrow escapes its owner"))
+                          (if (.after-move flags)
+                              (do (store! failed 1)
+                                  (store! message "value used or borrowed after move"))
+                              (if (.captured-move flags)
+                                  (do (store! failed 1)
+                                      (store! message "owned value moved into escaping closure"))
+                                  (let [(mut parameters)
+                                          (ownership-parameters a function)
+                                        planned (ownership/prepare
+                                                  a (load (field function body))
+                                                  (mut parameters) (mut facts))]
+                                    (match planned
+                                      (ownership/PlanSuccess [plan]
+                                        (al/al-push! [CheckedFunction] (mut checked)
+                                          (CheckedFunction
+                                            :function (load function) :plan plan)))
+                                      (ownership/PlanDuplicateExpressionId [_]
+                                        (do (store! failed 1)
+                                            (store! message
+                                              "specialized expression IDs are not unique"))))))))))
+                (store! i (+ (load i) 1)))))
+    (let [vn (al/al-len [ir/SpecializedValue]
+               (load (field specialized values)))]
+      (store! i 0)
+      (loop
+        (if (or (>= (load i) vn) (!= (load failed) 0)) (break)
+            (let [value (al/al-elem [ir/SpecializedValue]
+                          (field specialized values) (load i))
+                  flags (borrow/check-borrows a (load (field value body))
+                          (ir/core-ref-list-new a) (mut facts))]
+              (if (.escaped flags)
+                  (do (store! failed 1)
+                      (store! message "borrow escapes global initializer"))
+                  (if (.after-move flags)
+                      (do (store! failed 1)
+                          (store! message "global initializer uses value after move"))
+                      (let [(mut parameters) (al/al-new [ownership/Parameter] a)
+                            planned (ownership/prepare a (load (field value body))
+                                      (mut parameters) (mut facts))]
+                        (match planned
+                          (ownership/PlanSuccess [plan]
+                            (al/al-push! [CheckedValue] (mut checked-values)
+                              (CheckedValue :value (load value) :plan plan)))
+                          (ownership/PlanDuplicateExpressionId [_]
+                            (do (store! failed 1)
+                                (store! message
+                                  "global initializer expression IDs are not unique")))))))
+              (store! i (+ (load i) 1))))))
+    (if (= (load failed) 0)
+        (do (collect-cleanup-targets! a resolved inferred
+              (mut checked) (mut cleanups))
+            (collect-value-cleanup-targets! a resolved inferred
+              (mut checked-values) (mut cleanups))
+            0)
+        0)
+        (CheckResult :module (CheckedModule :functions (load checked)
+                           :values (load checked-values)
+                           :cleanups (load cleanups)
+                           :types (load (field resolved types)))
+                 :failed (load failed) :message (load message))))

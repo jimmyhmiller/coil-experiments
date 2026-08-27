@@ -1,0 +1,267 @@
+(module experiments.carp.ownership-plan-test)
+
+(import "coil.alloc" :as alloc :use [malloc-allocator])
+(import "coil.arraylist" :as al)
+(import "coil.assert" :use *)
+(import "experiments.carp.borrow-check" :as check)
+(import "experiments.carp.ir" :as ir)
+(import "experiments.carp.ownership-plan" :as plan)
+(import "experiments.carp.types" :as types)
+
+(defn plan-widget [(a (dyn alloc/Allocator))] (-> (ptr types/MonoType))
+  (types/type-named a "Widget" (types/type-arguments-new a)))
+
+(defn plan-facts [(a (dyn alloc/Allocator))] (-> check/OwnershipTypeFacts)
+  (let [(mut facts) (check/ownership-facts-new a)]
+    (check/ownership-facts-add-owned! (mut facts) "Widget")
+    (load facts)))
+
+(defn parameter-list [(a (dyn alloc/Allocator))]
+  (-> (ptr (al/ArrayList plan/Parameter)))
+  (alloc/box! a
+              (al/ArrayList plan/Parameter)
+              (al/al-new [plan/Parameter] a)))
+
+(defn action-count-delete [(value plan/OwnershipPlan)] (-> i64)
+  (let [actions (field value actions)
+        n (al/al-len [plan/OwnershipAction] (load actions))
+        (mut i) 0
+        (mut count) 0]
+    (loop
+      (if (>= (load i) n)
+          (break)
+          (do
+            (match (al/al-get [plan/OwnershipAction] (load actions) (load i))
+              (plan/ActionDelete [_ _ _] (store! count (+ (load count) 1)))
+              (_ 0))
+            (store! i (+ (load i) 1)))))
+    (load count)))
+
+(defn action-count-move [(value plan/OwnershipPlan)] (-> i64)
+  (let [actions (field value actions)
+        n (al/al-len [plan/OwnershipAction] (load actions))
+        (mut i) 0
+        (mut count) 0]
+    (loop
+      (if (>= (load i) n)
+          (break)
+          (do
+            (match (al/al-get [plan/OwnershipAction] (load actions) (load i))
+              (plan/ActionMove [_ _ _ _] (store! count (+ (load count) 1)))
+              (_ 0))
+            (store! i (+ (load i) 1)))))
+    (load count)))
+
+(defn requirement-count [(value plan/OwnershipPlan)] (-> i64)
+  (al/al-len [plan/OwnershipRequirement] (load (field value requirements))))
+
+(deftest unused-owned-local-is-deleted
+  (let [a (malloc-allocator)
+        widget (plan-widget a)
+        unit (types/type-unit a)
+        binding (ir/core-ref -1 "w" false)
+        body (ir/expression-box
+               a
+               (ir/ExprLet 3
+                           unit
+                           binding
+                           (ir/expression-literal a 1 widget)
+                           (ir/expression-literal a 2 unit)))
+        parameters (parameter-list a)
+        (mut facts) (plan-facts a)]
+    (match (plan/prepare a body parameters (mut facts))
+      (plan/PlanSuccess [result]
+        (do
+          (assert-eq (action-count-delete result) 1)
+          (assert-eq (requirement-count result) 1)))
+      (_ (assert false)))))
+
+(deftest guaranteed-move-suppresses-scope-delete
+  (let [a (malloc-allocator)
+        widget (plan-widget a)
+        binding (ir/core-ref -1 "w" false)
+        body (ir/expression-box
+               a
+               (ir/ExprLet 3
+                           widget
+                           binding
+                           (ir/expression-literal a 1 widget)
+                           (ir/expression-reference a 2 widget binding)))
+        parameters (parameter-list a)
+        (mut facts) (plan-facts a)]
+    (match (plan/prepare a body parameters (mut facts))
+      (plan/PlanSuccess [result] (assert-eq (action-count-delete result) 0))
+      (_ (assert false)))))
+
+(deftest conditional-move-retains-scope-delete
+  (let [a (malloc-allocator)
+        widget (plan-widget a)
+        boolean (types/type-boolean a)
+        binding (ir/core-ref -1 "w" false)
+        conditional (ir/expression-box
+                      a
+                      (ir/ExprIf 4
+                                 widget
+                                 (ir/expression-literal a 1 boolean)
+                                 (ir/expression-reference a 2 widget binding)
+                                 (ir/expression-literal a 3 widget)))
+        body (ir/expression-box
+               a
+               (ir/ExprLet 6
+                           widget
+                           binding
+                           (ir/expression-literal a 5 widget)
+                           conditional))
+        parameters (parameter-list a)
+        (mut facts) (plan-facts a)]
+    (assert (plan/consumed? binding conditional))
+    (assert (not (plan/consumed-on-all-paths? binding conditional)))
+    (match (plan/prepare a body parameters (mut facts))
+      (plan/PlanSuccess [result] (assert-eq (action-count-delete result) 1))
+      (_ (assert false)))))
+
+(deftest all-branch-move-suppresses-delete
+  (let [a (malloc-allocator)
+        widget (plan-widget a)
+        boolean (types/type-boolean a)
+        binding (ir/core-ref -1 "w" false)
+        conditional (ir/expression-box
+                      a
+                      (ir/ExprIf 4
+                                 widget
+                                 (ir/expression-literal a 1 boolean)
+                                 (ir/expression-reference a 2 widget binding)
+                                 (ir/expression-reference a 3 widget binding)))
+        body (ir/expression-box
+               a
+               (ir/ExprLet 6
+                           widget
+                           binding
+                           (ir/expression-literal a 5 widget)
+                           conditional))
+        parameters (parameter-list a)
+        (mut facts) (plan-facts a)]
+    (assert (plan/consumed-on-all-paths? binding conditional))
+    (match (plan/prepare a body parameters (mut facts))
+      (plan/PlanSuccess [result] (assert-eq (action-count-delete result) 0))
+      (_ (assert false)))))
+
+(deftest owned-alias-plans-a-move
+  (let [a (malloc-allocator)
+        widget (plan-widget a)
+        original (ir/core-ref -1 "w" false)
+        alias (ir/core-ref -2 "a" false)
+        inner (ir/expression-box
+                a
+                (ir/ExprLet 4
+                            widget
+                            alias
+                            (ir/expression-reference a 2 widget original)
+                            (ir/expression-reference a 3 widget alias)))
+        body (ir/expression-box
+               a
+               (ir/ExprLet 6
+                           widget
+                           original
+                           (ir/expression-literal a 1 widget)
+                           inner))
+        parameters (parameter-list a)
+        (mut facts) (plan-facts a)]
+    (match (plan/prepare a body parameters (mut facts))
+      (plan/PlanSuccess [result]
+        (do
+          (assert-eq (action-count-move result) 1)
+          (assert-eq (action-count-delete result) 0)))
+      (_ (assert false)))))
+
+(deftest owned-self-rebind-keeps-one-scope-delete
+  (let [a (malloc-allocator)
+        widget (plan-widget a)
+        unit (types/type-unit a)
+        binding (ir/core-ref -1 "w" false)
+        expressions (ir/expression-list-new a)]
+    (ir/expression-list-push!
+      expressions
+      (ir/expression-box a
+                         (ir/ExprSet 2
+                                     unit
+                                     binding
+                                     (ir/expression-reference a 1 widget binding))))
+    (ir/expression-list-push! expressions (ir/expression-literal a 3 unit))
+    (let [sequence (ir/expression-box a (ir/ExprDo 4 unit expressions))
+          body (ir/expression-box
+                 a
+                 (ir/ExprLet 6
+                             unit
+                             binding
+                             (ir/expression-literal a 5 widget)
+                             sequence))
+          parameters (parameter-list a)
+          (mut facts) (plan-facts a)]
+      (match (plan/prepare a body parameters (mut facts))
+        (plan/PlanSuccess [result] (assert-eq (action-count-delete result) 1))
+        (_ (assert false))))))
+
+(deftest discarded-owned-temporary-is-deleted
+  (let [a (malloc-allocator)
+        widget (plan-widget a)
+        unit (types/type-unit a)
+        expressions (ir/expression-list-new a)]
+    (ir/expression-list-push! expressions (ir/expression-literal a 1 widget))
+    (ir/expression-list-push! expressions (ir/expression-literal a 2 unit))
+    (let [body (ir/expression-box a (ir/ExprDo 3 unit expressions))
+          parameters (parameter-list a)
+          (mut facts) (plan-facts a)]
+      (match (plan/prepare a body parameters (mut facts))
+        (plan/PlanSuccess [result] (assert-eq (action-count-delete result) 1))
+        (_ (assert false))))))
+
+(deftest owned-call-arguments-are-not-discarded-temporaries
+  (let [a (malloc-allocator)
+        widget (plan-widget a)
+        unit (types/type-unit a)
+        signature-arguments (types/type-arguments-new a)
+        _first-type (types/type-arguments-push! signature-arguments widget)
+        _second-type (types/type-arguments-push! signature-arguments widget)
+        signature (types/type-function a signature-arguments unit)
+        arguments (ir/expression-list-new a)
+        _first (ir/expression-list-push! arguments
+                 (ir/expression-literal a 1 widget))
+        _second (ir/expression-list-push! arguments
+                  (ir/expression-literal a 2 widget))
+        body (ir/expression-box a
+               (ir/ExprGlobalCall 3 unit (ir/core-ref 9 "consume" true)
+                 signature arguments))
+        parameters (parameter-list a)
+        (mut facts) (plan-facts a)]
+    (match (plan/prepare a body parameters (mut facts))
+      (plan/PlanSuccess [result] (assert-eq (action-count-delete result) 0))
+      (_ (assert false)))))
+
+(deftest unconsumed-owned-parameter-is-deleted
+  (let [a (malloc-allocator)
+        widget (plan-widget a)
+        unit (types/type-unit a)
+        binding (ir/core-ref -1 "p" false)
+        parameters (parameter-list a)
+        body (ir/expression-literal a 1 unit)
+        (mut facts) (plan-facts a)]
+    (al/al-push! [plan/Parameter]
+                 parameters
+                 (plan/Parameter :binding binding :type widget))
+    (match (plan/prepare a body parameters (mut facts))
+      (plan/PlanSuccess [result] (assert-eq (action-count-delete result) 1))
+      (_ (assert false)))))
+
+(deftest duplicate-expression-identities-are-rejected
+  (let [a (malloc-allocator)
+        unit (types/type-unit a)
+        expressions (ir/expression-list-new a)]
+    (ir/expression-list-push! expressions (ir/expression-literal a 1 unit))
+    (ir/expression-list-push! expressions (ir/expression-literal a 1 unit))
+    (let [body (ir/expression-box a (ir/ExprDo 2 unit expressions))
+          parameters (parameter-list a)
+          (mut facts) (plan-facts a)]
+      (match (plan/prepare a body parameters (mut facts))
+        (plan/PlanDuplicateExpressionId [id] (assert-eq id 1))
+        (_ (assert false))))))

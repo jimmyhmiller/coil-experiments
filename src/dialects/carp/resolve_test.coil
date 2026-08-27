@@ -1,0 +1,261 @@
+(module experiments.carp.resolve-test)
+
+(import "experiments.carp.surface" :as reader)
+(import "experiments.carp.forms" :as forms)
+(import "experiments.carp.resolve" :as resolve)
+(import "experiments.carp.ir" :as ir)
+(import "experiments.carp.primitives" :as primitives)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.assert" :use *)
+(import "coil.str" :as str)
+
+(defn resolve-source [(a (dyn alloc/Allocator)) (source (slice u8))]
+  (-> resolve/ResolveResult)
+  (let [lowered (forms/lower a "resolve-test.carp" (reader/read a source))]
+    (resolve/resolve a (.module lowered))))
+
+(defn function-at [(module ir/ResolvedModule) (index i64)] (-> ir/ResolvedFunction)
+  (al/al-get [ir/ResolvedFunction] (.functions module) index))
+
+(deftest collects-before-resolving-forward-and-recursive-calls
+  (let [a (alloc/malloc-allocator)
+        result (resolve-source a
+          "(defn first [x] (second x)) (defn second [y] (first y))")]
+    (assert (not (resolve/resolve-failed? result)))
+    (assert-eq (resolve/global-count result) (+ (primitives/binding-count a) 2))
+    (let [module (resolve/resolved-module result)
+          first (function-at module 0)
+          second (function-at module 1)]
+      (match (load (.body first))
+        (ir/ResolvedCall [_ callee _]
+          (match (load callee)
+            (ir/ResolvedReference [_ binding]
+              (assert-eq (ir/core-ref-id binding)
+                         (ir/core-ref-id (.reference second))))
+            (_ (assert false))))
+        (_ (assert false))))))
+
+(deftest lexical-shadowing-mints-distinct-negative-identities
+  (let [a (alloc/malloc-allocator)
+        result (resolve-source a
+          "(def value 1) (defn choose [value] (let [copy value value copy] value))")]
+    (assert (not (resolve/resolve-failed? result)))
+    (let [module (resolve/resolved-module result)
+          choose (function-at module 0)
+          parameter (al/al-get [ir/CoreRef] (load (.parameters choose)) 0)]
+      (assert (< (ir/core-ref-id parameter) 0))
+      (match (load (.body choose))
+        (ir/ResolvedLet [_ copy-binding copy-value rest]
+          (do (assert (< (ir/core-ref-id copy-binding) 0))
+              (assert (!= (ir/core-ref-id copy-binding) (ir/core-ref-id parameter)))
+              (match (load copy-value)
+                (ir/ResolvedReference [_ source]
+                  (assert-eq (ir/core-ref-id source) (ir/core-ref-id parameter)))
+                (_ (assert false)))
+              (match (load rest)
+                (ir/ResolvedLet [_ shadow-binding shadow-value body]
+                  (do (assert (!= (ir/core-ref-id shadow-binding)
+                                  (ir/core-ref-id parameter)))
+                      (match (load shadow-value)
+                        (ir/ResolvedReference [_ source]
+                          (assert-eq (ir/core-ref-id source)
+                                     (ir/core-ref-id copy-binding)))
+                        (_ (assert false)))
+                      (match (load body)
+                        (ir/ResolvedReference [_ source]
+                          (assert-eq (ir/core-ref-id source)
+                                     (ir/core-ref-id shadow-binding)))
+                        (_ (assert false)))))
+                (_ (assert false)))))
+        (_ (assert false))))))
+
+(deftest module-imports-and-qualified-references-resolve-one-global
+  (let [a (alloc/malloc-allocator)
+        result (resolve-source a
+          "(defmodule A (defn identity [x] x)) (defmodule B (use A) (defn imported [x] (identity x)) (defn qualified [x] (A.identity x)))")]
+    (assert (not (resolve/resolve-failed? result)))
+    (assert-eq (resolve/global-count result) (+ (primitives/binding-count a) 3))
+    (let [module (resolve/resolved-module result)
+          identity (function-at module 0)
+          imported (function-at module 1)
+          qualified (function-at module 2)]
+      (match (load (.body imported))
+        (ir/ResolvedCall [_ callee _]
+          (match (load callee)
+            (ir/ResolvedReference [_ binding]
+              (assert-eq (ir/core-ref-id binding)
+                         (ir/core-ref-id (.reference identity))))
+            (_ (assert false))))
+        (_ (assert false)))
+      (match (load (.body qualified))
+        (ir/ResolvedCall [_ callee _]
+          (match (load callee)
+            (ir/ResolvedReference [_ binding]
+              (assert-eq (ir/core-ref-id binding)
+                         (ir/core-ref-id (.reference identity))))
+            (_ (assert false))))
+        (_ (assert false))))))
+
+(deftest overload-call-head-selects-by-arity
+  (let [a (alloc/malloc-allocator)
+        result (resolve-source a
+          "(defn pick [x] x) (defn pick [x y] y) (defn one [z] (pick z)) (defn two [z] (pick z z))")]
+    (assert (not (resolve/resolve-failed? result)))
+    (let [module (resolve/resolved-module result)
+          unary (function-at module 0)
+          binary (function-at module 1)
+          one (function-at module 2)
+          two (function-at module 3)]
+      (match (load (.body one))
+        (ir/ResolvedCall [_ callee _]
+          (match (load callee)
+            (ir/ResolvedReference [_ binding]
+              (assert-eq (ir/core-ref-id binding)
+                         (ir/core-ref-id (.reference unary))))
+            (_ (assert false))))
+        (_ (assert false)))
+      (match (load (.body two))
+        (ir/ResolvedCall [_ callee _]
+          (match (load callee)
+            (ir/ResolvedReference [_ binding]
+              (assert-eq (ir/core-ref-id binding)
+                         (ir/core-ref-id (.reference binary))))
+            (_ (assert false))))
+        (_ (assert false))))))
+
+(deftest generic-struct-type-arrays-declare-callable-constructors
+  (let [a (alloc/malloc-allocator)
+        result (resolve-source a
+          "(deftype [Pair a b] [a a b b]) (defn make [x y] (Pair.init x y)) (defn first [pair] (Pair.a pair))")]
+    (assert (not (resolve/resolve-failed? result)))
+    (assert-eq (resolve/global-count result) (+ (primitives/binding-count a) 10))))
+
+(deftest preserves-runtime-numeric-literal-kinds
+  (let [a (alloc/malloc-allocator)
+        result (resolve-source a
+          "(defn literals [] (do 1 2b 3l 4.0f 5.0))")]
+    (assert (not (resolve/resolve-failed? result)))
+    (let [function (function-at (resolve/resolved-module result) 0)
+          body (.body function)]
+      (match (load body)
+        (ir/ResolvedDo [_ expressions]
+          (do
+            (match (load (al/al-get [(ptr ir/ResolvedExpr)] (load expressions) 0))
+              (ir/ResolvedInt [_ _] (assert true)) (_ (assert false)))
+            (match (load (al/al-get [(ptr ir/ResolvedExpr)] (load expressions) 1))
+              (ir/ResolvedByte [_ _] (assert true)) (_ (assert false)))
+            (match (load (al/al-get [(ptr ir/ResolvedExpr)] (load expressions) 2))
+              (ir/ResolvedLong [_ _] (assert true)) (_ (assert false)))
+            (match (load (al/al-get [(ptr ir/ResolvedExpr)] (load expressions) 3))
+              (ir/ResolvedFloat [_ _] (assert true)) (_ (assert false)))
+            (match (load (al/al-get [(ptr ir/ResolvedExpr)] (load expressions) 4))
+              (ir/ResolvedDouble [_ _] (assert true)) (_ (assert false)))))
+        (_ (assert false))))))
+
+(deftest sum-constructors-retain-polymorphic-call-signatures
+  (let [a (alloc/malloc-allocator)
+        result (resolve-source a
+          "(deftype (Maybe a) (Just [a]) (Nothing []))")]
+    (assert (not (resolve/resolve-failed? result)))
+    (let [module (resolve/resolved-module result)]
+      (assert-eq (al/al-len [ir/ResolvedSignature] (.signatures module)) 6)
+      (let [signature (al/al-get [ir/ResolvedSignature] (.signatures module) 0)]
+        (match (.kind signature)
+          (ir/ResolvedConstructorSignature [] (assert true))
+          (_ (assert false)))))))
+
+(deftest registered-struct-fields-resolve-through-parent-module-scope
+  (let [a (alloc/malloc-allocator)
+        result (resolve-source a
+          "(defmodule Pattern (register-type MatchResult [start Int end Int]) (defmodule MatchResult (defn begin [x] (MatchResult.start x))))")]
+    (assert (not (resolve/resolve-failed? result)))
+    (let [module (resolve/resolved-module result)]
+      (assert-eq (al/al-len [ir/ResolvedSignature] (.signatures module)) 11))))
+
+(deftest retains-qualified-type-definitions-and-all-payload-types
+  (let [a (alloc/malloc-allocator)
+        result (resolve-source a
+          "(defmodule Nested (register-type Product [left Int right String]) (deftype (Choice a) (One [a]) (Both [a Int])))")]
+    (assert (not (resolve/resolve-failed? result)))
+    (let [module (resolve/resolved-module result)]
+      (assert-eq (al/al-len [ir/ResolvedTypeDefinition] (.types module)) 2)
+      (let [product (al/al-get [ir/ResolvedTypeDefinition] (.types module) 0)
+            choice (al/al-get [ir/ResolvedTypeDefinition] (.types module) 1)]
+        (assert (str/str-eq (.name product) "Nested.Product"))
+        (assert-eq (al/al-len [(ptr ir/ResolvedType)] (load (.fields product))) 2)
+        (assert (str/str-eq (.name choice) "Nested.Choice"))
+        (assert-eq (al/al-len [(ptr ir/ResolvedType)] (load (.fields choice))) 3)))))
+
+(deftest same-arity-qualified-overloads-remain-candidates-for-inference
+  (let [a (alloc/malloc-allocator)
+        result (resolve-source a
+          "(defmodule A (defn suffix [x n] x)) (defmodule B (defn suffix [x n] x)) (defn choose [x n] (suffix x n))")]
+    (assert (not (resolve/resolve-failed? result)))
+    (let [module (resolve/resolved-module result) choose (function-at module 2)]
+      (match (load (.body choose))
+        (ir/ResolvedCall [_ callee _]
+          (match (load callee)
+            (ir/ResolvedOverload [_ _ candidates]
+              (assert-eq (al/al-len [ir/CoreRef] (load candidates)) 2))
+            (_ (assert false))))
+        (_ (assert false))))))
+
+(deftest unique-qualified-member-fallback-resolves-directly
+  (let [a (alloc/malloc-allocator)
+        result (resolve-source a
+          "(defmodule Copier (defn copy [x] x) (implements copy Copier.copy)) (defmodule String (register string-set-at! (Fn [(Ref String) Int (Ref String)] ()))) (defn write [dst src] (string-set-at! dst 0 src))")]
+    (assert (not (resolve/resolve-failed? result)))
+    (let [module (resolve/resolved-module result) write (function-at module 1)]
+      (match (load (.body write))
+        (ir/ResolvedCall [_ callee _]
+          (match (load callee)
+            (ir/ResolvedReference [_ binding]
+              (let [resolved-binding binding]
+                (assert (str/str-eq (.name resolved-binding)
+                                    "String.string-set-at!"))))
+            (_ (assert false))))
+        (_ (assert false))))))
+
+(deftest retains-builtin-and-expanded-definition-signatures
+  (let [a (alloc/malloc-allocator)
+        result (resolve-source a
+          "(register add (Fn [Int Int] Int)) (meta-set! id \"sig\" (Fn [a] a)) (defn id [x] x)")]
+    (assert (not (resolve/resolve-failed? result)))
+    (let [module (resolve/resolved-module result)]
+      (assert-eq (al/al-len [ir/ResolvedSignature] (.signatures module)) 2)
+      (let [signature (al/al-get [ir/ResolvedSignature] (.signatures module) 1)
+            function (function-at module 0)]
+        (assert (ir/core-ref-same? (.reference signature) (.reference function)))
+        (match (.kind signature)
+          (ir/ResolvedDefinitionSignature [] (assert true))
+          (_ (assert false)))))))
+
+(deftest retains-interface-implementation-edges-and-dispatch-candidates
+  (let [a (alloc/malloc-allocator)
+        result (resolve-source a
+          "(definterface zero (Fn [] a)) (defmodule Intish (defn zero [] 0) (implements zero Intish.zero)) (defn make [] (zero))")]
+    (assert (not (resolve/resolve-failed? result)))
+    (let [module (resolve/resolved-module result)
+          make (function-at module 1)]
+      (assert-eq (al/al-len [ir/CoreImplementation] (.implementations module)) 1)
+      (match (load (.body make))
+        (ir/ResolvedCall [_ callee _]
+          (match (load callee)
+            (ir/ResolvedOverload [_ name candidates]
+              (do (assert (str/str-eq name "zero"))
+                  (assert-eq (al/al-len [ir/CoreRef] (load candidates)) 1)))
+            (_ (assert false))))
+        (_ (assert false))))))
+
+(deftest ambiguous-imports-and-unresolved-names-are-source-spanned-errors
+  (let [a (alloc/malloc-allocator)
+        ambiguous (resolve-source a
+          "(defmodule A (defn choose [x] x)) (defmodule B (defn choose [x] x)) (use A) (use B) (defn bad [x] (choose x))")
+        missing (resolve-source a "(defn bad [x] (missing x))")]
+    (assert (resolve/resolve-failed? ambiguous))
+    (assert (resolve/resolve-failed? missing))
+    (let [error (resolve/resolve-error missing) span (.span error) start (.start span)]
+      (assert (str/str-eq (.source span) "resolve-test.carp"))
+      (assert-eq (.line start) 1)
+      (assert (> (.column start) 1)))))

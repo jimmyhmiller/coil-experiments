@@ -1,0 +1,1191 @@
+(module experiments.carp.specialize)
+
+;; Lossless resolved-to-specialized expression lowering. A caller supplies an
+;; isolated solver containing the concrete bindings for one definition
+;; instantiation; inferred module bindings remain immutable and reusable.
+
+(import "experiments.carp.infer-engine" :as infer)
+(import "experiments.carp.infer" :as schemes)
+(import "experiments.carp.ir" :as ir)
+(import "experiments.carp.types" :as types)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "coil.str" :as str)
+
+(export SpecializationResult specialize-expression specialization-failed?
+        specialized-expression specialization-error
+        SpecializationRequest ModuleSpecializationResult
+        specialize-module module-specialization-failed?
+        specialized-module module-specialization-error)
+
+(defstruct SpecializationResult
+  [(expression (ptr ir/SpecializedExpr)) (failed i64) (message (slice u8))])
+(defstruct SpecializedConstraint [(id i64) (expected (ptr types/MonoType))])
+(defstruct Specializer
+  [(a (dyn alloc/Allocator)) (inferred (ptr infer/InferredModule))
+   (substitution (ptr types/TypeSolver)) (failed (ptr i64))
+   (message (ptr (slice u8)))
+   (constraints (ptr (al/ArrayList SpecializedConstraint)))
+   (parameters (ptr (al/ArrayList ir/CoreRef)))
+   (parameter-types (ptr (al/ArrayList (ptr types/MonoType))))])
+(defstruct OverloadSelection
+  [(callee ir/CoreRef) (signature (ptr types/MonoType))
+   (matches i64)])
+
+(defn type-label [(type (ptr types/MonoType))] (-> (slice u8))
+  (match (load type)
+    (types/TypeVariable [_] "variable")
+    (types/TypeInteger [] "Int")
+    (types/TypeString [] "String")
+    (types/TypeBoolean [] "Bool")
+    (types/TypeUnit [] "Unit")
+    (types/TypeNamed [name _] name)
+    (types/TypeReference [_ _] "Ref")
+    (types/TypeFunction [_ _] "Fn")))
+
+(defn signature-first-label [(signature (ptr types/MonoType))]
+  (-> (slice u8))
+  (match (load signature)
+    (types/TypeFunction [arguments _]
+      (if (= (al/al-len [(ptr types/MonoType)] (load arguments)) 0) "none"
+          (type-label (al/al-get [(ptr types/MonoType)] (load arguments) 0))))
+    (_ "not-fn")))
+
+(defn signature-result-label [(signature (ptr types/MonoType))]
+  (-> (slice u8))
+  (match (load signature)
+    (types/TypeFunction [_ result] (type-label result))
+    (_ "not-fn")))
+
+(defn append-type-detail! [(out (mut str/StrBuf))
+                           (type (ptr types/MonoType))] (-> i64)
+  (match (load type)
+    (types/TypeNamed [name arguments]
+      (do (str/sb-push-str! (mut out) name)
+          (let [n (al/al-len [(ptr types/MonoType)] (load arguments)) (mut i) 0]
+            (if (> n 0) (str/sb-push-str! (mut out) "[") 0)
+            (loop (if (>= (load i) n) (break)
+                      (do (if (> (load i) 0) (str/sb-push-str! (mut out) ",") 0)
+                          (append-type-detail! (mut out)
+                            (al/al-get [(ptr types/MonoType)]
+                              (load arguments) (load i)))
+                          (store! i (+ (load i) 1)))))
+            (if (> n 0) (str/sb-push-str! (mut out) "]") 0)
+            0)))
+    (types/TypeReference [inner _]
+      (do (str/sb-push-str! (mut out) "Ref[")
+          (append-type-detail! (mut out) inner)
+          (str/sb-push-str! (mut out) "]") 0))
+    (_ (str/sb-push-str! (mut out) (type-label type)))))
+
+(defn append-signature-label! [(out (mut str/StrBuf))
+                               (signature (ptr types/MonoType))] (-> i64)
+  (match (load signature)
+    (types/TypeFunction [arguments result]
+      (let [n (al/al-len [(ptr types/MonoType)] (load arguments)) (mut i) 0]
+        (str/sb-push-str! (mut out) "[")
+        (loop (if (>= (load i) n) (break)
+                  (do (if (> (load i) 0) (str/sb-push-str! (mut out) ", ") 0)
+                      (append-type-detail! (mut out)
+                        (al/al-get [(ptr types/MonoType)]
+                          (load arguments) (load i)))
+                      (store! i (+ (load i) 1)))))
+        (str/sb-push-str! (mut out) "] -> ")
+        (append-type-detail! (mut out) result)
+        0))
+    (_ (str/sb-push-str! (mut out) "not-fn"))))
+
+(defstruct SpecializationRequest
+  [(source ir/CoreRef) (signature (ptr types/MonoType)) (reference ir/CoreRef)])
+(defstruct ModuleSpecializationResult
+  [(module ir/SpecializedModule) (failed i64) (message (slice u8))])
+
+(defn specialization-failed? [(result SpecializationResult)] (-> bool)
+  (!= (.failed result) 0))
+(defn specialized-expression [(result SpecializationResult)]
+  (-> (ptr ir/SpecializedExpr)) (.expression result))
+(defn specialization-error [(result SpecializationResult)] (-> (slice u8))
+  (.message result))
+(defn module-specialization-failed? [(result ModuleSpecializationResult)] (-> bool)
+  (!= (.failed result) 0))
+(defn specialized-module [(result ModuleSpecializationResult)] (-> ir/SpecializedModule)
+  (.module result))
+(defn module-specialization-error [(result ModuleSpecializationResult)]
+  (-> (slice u8)) (.message result))
+
+(defn fail! [(s (mut Specializer)) (message (slice u8))] (-> i64)
+  (if (= (load (load (field s failed))) 0)
+      (do (store! (load (field s failed)) 1)
+          (store! (load (field s message)) message) 0) 0))
+
+(defn node-type [(s (mut Specializer)) (id i64)] (-> (ptr types/MonoType))
+  (let [module (load (field s inferred))
+        n (al/al-len [infer/InferredNodeType] (.node-types module))
+        (mut i) 0 (mut found) (primitive/cast (ptr types/MonoType) 0)]
+    (loop (if (or (>= (load i) n)
+                  (!= (primitive/cast i64 (load found)) 0)) (break)
+              (let [entry (al/al-get [infer/InferredNodeType]
+                                     (.node-types module) (load i))]
+                (if (= (.id entry) id) (store! found (.type entry)) 0)
+                (store! i (+ (load i) 1)))))
+    (if (= (primitive/cast i64 (load found)) 0)
+        (do (fail! (mut s) "specialization: expression has no inferred type")
+            (types/type-unit (load (field s a))))
+        (let [inference-copy (types/type-clone-resolved (load (field s a))
+                               (field (load (field s inferred)) solver)
+                               (load found))]
+          (types/type-clone-resolved (load (field s a))
+            (load (field s substitution)) inference-copy)))))
+
+(defn parameter-type [(s (ptr Specializer)) (reference ir/CoreRef)]
+  (-> (ptr types/MonoType))
+  (let [parameters (load (field s parameters))
+        parameter-types (load (field s parameter-types))
+        n (al/al-len [ir/CoreRef] (load parameters))
+        (mut i) 0 (mut found) (primitive/cast (ptr types/MonoType) 0)]
+    (loop (if (or (>= (load i) n)
+                  (!= (primitive/cast i64 (load found)) 0)) (break)
+              (do (if (ir/core-ref-same?
+                        (al/al-get [ir/CoreRef] (load parameters) (load i)) reference)
+                      (store! found (al/al-get [(ptr types/MonoType)]
+                                      (load parameter-types) (load i))) 0)
+                  (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn resolved-node-type [(s (mut Specializer)) (expression (ptr ir/ResolvedExpr))]
+  (-> (ptr types/MonoType))
+  (match (load expression)
+    (ir/ResolvedReference [_ reference]
+      (let [parameter (parameter-type s reference)]
+        (if (= (primitive/cast i64 parameter) 0)
+            (node-type (mut s) (ir/resolved-expression-id expression))
+            parameter)))
+    (_ (node-type (mut s) (ir/resolved-expression-id expression)))))
+
+(defn call-at [(s (ptr Specializer)) (id i64)] (-> (ptr infer/InferredCall))
+  (let [module (load (field s inferred))
+        n (al/al-len [infer/InferredCall] (.calls module))
+        (mut i) 0 (mut found) (primitive/cast (ptr infer/InferredCall) 0)]
+    (loop (if (or (>= (load i) n)
+                  (!= (primitive/cast i64 (load found)) 0)) (break)
+              (let [entry (al/al-elem [infer/InferredCall]
+                                      (field module calls) (load i))]
+                (if (= (load (field entry id)) id) (store! found entry) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn overload-at [(s (ptr Specializer)) (id i64)]
+  (-> (ptr infer/InferredOverloadConstraint))
+  (let [module (load (field s inferred))
+        n (al/al-len [infer/InferredOverloadConstraint] (.overloads module))
+        (mut i) 0
+        (mut found) (primitive/cast (ptr infer/InferredOverloadConstraint) 0)]
+    (loop (if (or (>= (load i) n)
+                  (!= (primitive/cast i64 (load found)) 0)) (break)
+              (let [entry (al/al-elem [infer/InferredOverloadConstraint]
+                                      (field module overloads) (load i))]
+                (if (= (load (field entry id)) id) (store! found entry) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn binding-scheme [(s (ptr Specializer)) (reference ir/CoreRef)]
+  (-> (ptr schemes/TypeScheme))
+  (let [module (load (field s inferred))
+        n (al/al-len [infer/InferredBinding] (.globals module))
+        (mut i) n (mut found) (primitive/cast (ptr schemes/TypeScheme) 0)]
+    (loop (if (or (<= (load i) 0)
+                  (!= (primitive/cast i64 (load found)) 0)) (break)
+              (do (store! i (- (load i) 1))
+              (let [entry (al/al-elem [infer/InferredBinding]
+                                      (field module globals) (load i))]
+                (if (ir/core-ref-same? (load (field entry reference)) reference)
+                    (store! found (field entry scheme)) 0)
+                0))))
+    (load found)))
+
+(defn inferred-binding-at [(s (ptr Specializer)) (reference ir/CoreRef)]
+  (-> (ptr infer/InferredBinding))
+  (let [module (load (field s inferred))
+        n (al/al-len [infer/InferredBinding] (.globals module))
+        (mut i) n (mut found) (primitive/cast (ptr infer/InferredBinding) 0)]
+    (loop (if (or (<= (load i) 0)
+                  (!= (primitive/cast i64 (load found)) 0)) (break)
+              (do (store! i (- (load i) 1))
+                  (let [entry (al/al-elem [infer/InferredBinding]
+                                (field module globals) (load i))]
+                    (if (ir/core-ref-same?
+                          (load (field entry reference)) reference)
+                        (store! found entry) 0)))))
+    (load found)))
+
+(defn specialize-type [(s (ptr Specializer)) (source (ptr types/MonoType))]
+  (-> (ptr types/MonoType))
+  (let [inference-copy (types/type-clone-resolved (load (field s a))
+                         (field (load (field s inferred)) solver) source)]
+    (types/type-clone-resolved (load (field s a))
+      (load (field s substitution)) inference-copy)))
+
+(defn specialized-constraint-type [(s (ptr Specializer)) (id i64)
+                                   (fallback (ptr types/MonoType))]
+  (-> (ptr types/MonoType))
+  (let [constraints (load (field s constraints))
+        n (al/al-len [SpecializedConstraint] (load constraints))
+        (mut i) n (mut found) (primitive/cast (ptr types/MonoType) 0)]
+    (loop (if (or (<= (load i) 0)
+                  (!= (primitive/cast i64 (load found)) 0)) (break)
+              (do (store! i (- (load i) 1))
+              (let [constraint (al/al-get [SpecializedConstraint]
+                                 (load constraints) (load i))]
+                (if (= (.id constraint) id)
+                    (store! found (.expected constraint)) 0)))))
+    (if (= (primitive/cast i64 (load found)) 0)
+        (specialize-type s fallback)
+        (types/type-clone-resolved (load (field s a))
+          (load (field s substitution)) (load found)))))
+
+(defn type-concrete? [(type (ptr types/MonoType))] (-> bool)
+  (match (load type)
+    (types/TypeVariable [_] false)
+    (types/TypeNamed [_ arguments]
+      (let [n (al/al-len [(ptr types/MonoType)] (load arguments))
+            (mut i) 0 (mut concrete) true]
+        (loop (if (or (>= (load i) n) (not (load concrete))) (break)
+                  (do (if (not (type-concrete?
+                                 (al/al-get [(ptr types/MonoType)]
+                                   (load arguments) (load i))))
+                          (store! concrete false) 0)
+                      (store! i (+ (load i) 1)))))
+        (load concrete)))
+    (types/TypeReference [inner _] (type-concrete? inner))
+    (types/TypeFunction [arguments result]
+      (let [n (al/al-len [(ptr types/MonoType)] (load arguments))
+            (mut i) 0 (mut concrete) (type-concrete? result)]
+        (loop (if (or (>= (load i) n) (not (load concrete))) (break)
+                  (do (if (not (type-concrete?
+                                 (al/al-get [(ptr types/MonoType)]
+                                   (load arguments) (load i))))
+                          (store! concrete false) 0)
+                      (store! i (+ (load i) 1)))))
+        (load concrete)))
+    (_ true)))
+
+(defn overload-candidate-signature [(s (ptr Specializer))
+                                    (candidate ir/CoreRef)
+                                    (next (ptr i64))]
+  (-> (ptr types/MonoType))
+  (let [definition (inferred-definition-at (load (field s inferred)) candidate)]
+    (if (!= (primitive/cast i64 definition) 0)
+        (let [resolved (types/type-clone-resolved (load (field s a))
+                         (field (load (field s inferred)) solver)
+                         (load (field definition signature)))]
+          (if (type-concrete? resolved) resolved
+              (schemes/instantiate-scheme (load (field s a))
+                (load (binding-scheme s candidate)) next)))
+        (schemes/instantiate-scheme (load (field s a))
+          (load (binding-scheme s candidate)) next))))
+
+(defn select-overload [(s (mut Specializer)) (id i64) (strict bool)]
+  (-> OverloadSelection)
+  (let [constraint (overload-at s id)]
+    (if (= (primitive/cast i64 constraint) 0)
+        (do (fail! (mut s) "specialization: overload constraint is missing")
+            (OverloadSelection :callee (ir/core-ref 0 "" true)
+              :signature (types/type-unit (load (field s a))) :matches 0))
+        (let [expected (specialized-constraint-type
+                         s id (load (field constraint expected)))
+              candidates (load (field constraint candidates))
+              n (al/al-len [ir/CoreRef] (load candidates))
+              (mut i) 0 (mut exact-matches) 0 (mut compatible-matches) 0
+              (mut exact-selected) (ir/core-ref 0 "" true)
+              (mut compatible-selected) (ir/core-ref 0 "" true)
+              (mut exact-signature) (types/type-unit (load (field s a)))
+              (mut compatible-signature) (types/type-unit (load (field s a)))]
+          (loop (if (>= (load i) n) (break)
+                    (let [candidate (al/al-get [ir/CoreRef]
+                                      (load candidates) (load i))
+                          scheme (binding-scheme s candidate)]
+                      (if (= (primitive/cast i64 scheme) 0) 0
+                          (let [next (alloc/box! (load (field s a)) i64
+                                       (+ (types/type-max-variable-id expected) 1))
+                                signature (overload-candidate-signature s candidate next)
+                                trial (alloc/box! (load (field s a)) types/TypeSolver
+                                        (types/type-solver-new (load (field s a))))
+                                outcome (types/type-unify! trial signature expected)]
+                            (if (types/unify-success? outcome)
+                                (do (store! exact-matches (+ (load exact-matches) 1))
+                                    (store! exact-selected candidate)
+                                    (store! exact-signature
+                                      (types/type-clone-resolved
+                                        (load (field s a)) trial signature)))
+                                (let [compatible-trial
+                                       (alloc/box! (load (field s a)) types/TypeSolver
+                                         (types/type-solver-new (load (field s a))))
+                                      compatible-outcome
+                                       (types/type-unify-call! compatible-trial
+                                         signature expected)]
+                                  (if (types/unify-success? compatible-outcome)
+                                      (do (store! compatible-matches
+                                            (+ (load compatible-matches) 1))
+                                          (store! compatible-selected candidate)
+                                          (store! compatible-signature
+                                            (types/type-clone-resolved
+                                              (load (field s a)) compatible-trial
+                                              signature))) 0)))))
+                      (store! i (+ (load i) 1)))))
+          (let [matches (if (> (load exact-matches) 0)
+                          (load exact-matches) (load compatible-matches))
+                selected (if (> (load exact-matches) 0)
+                           (load exact-selected) (load compatible-selected))
+                selected-signature (if (> (load exact-matches) 0)
+                                     (load exact-signature)
+                                     (load compatible-signature))]
+          (if (= matches 0)
+              (fail! (mut s) "specialization: no overload candidate matches concrete call")
+              (if (and strict (> matches 1))
+                  (let [(mut out) (str/sb-new (load (field s a)))
+                        owner (load (field constraint owner))]
+                    (str/sb-push-str! (mut out)
+                      "specialization: concrete overload call is ambiguous: ")
+                    (str/sb-push-str! (mut out) (.name owner))
+                    (str/sb-push-str! (mut out) ": ")
+                    (str/sb-push-str! (mut out) (load (field constraint name)))
+                    (str/sb-push-str! (mut out) "[")
+                    (str/sb-push-str! (mut out) (signature-first-label expected))
+                    (str/sb-push-str! (mut out) " -> ")
+                    (str/sb-push-str! (mut out) (signature-result-label expected))
+                    (str/sb-push-str! (mut out) "]")
+                    (str/sb-push-str! (mut out) "; matching candidates: ")
+                    (let [(mut j) 0 (mut written) 0]
+                      (loop (if (>= (load j) n) (break)
+                                (let [candidate (al/al-get [ir/CoreRef]
+                                                  (load candidates) (load j))
+                                      scheme (binding-scheme s candidate)]
+                                  (if (= (primitive/cast i64 scheme) 0) 0
+                                      (let [next (alloc/box! (load (field s a)) i64
+                                                   (+ (types/type-max-variable-id expected) 1))
+                                            signature (overload-candidate-signature
+                                                        s candidate next)
+                                            trial (alloc/box! (load (field s a))
+                                                    types/TypeSolver
+                                                    (types/type-solver-new
+                                                      (load (field s a))))]
+                                        (if (types/unify-success?
+                                              (types/type-unify-call! trial signature expected))
+                                            (do (if (> (load written) 0)
+                                                    (str/sb-push-str! (mut out) ", ") 0)
+                                                (str/sb-push-str! (mut out) (.name candidate))
+                                                (str/sb-push-str! (mut out) "[")
+                                                (str/sb-push-str! (mut out)
+                                                  (signature-first-label signature))
+                                                (str/sb-push-str! (mut out) "]")
+                                                (store! written (+ (load written) 1))) 0)))
+                                  (store! j (+ (load j) 1))))))
+                    (fail! (mut s) (str/sb-finish! (mut out)))) 0))
+          (OverloadSelection :callee selected
+            :signature selected-signature :matches matches))))))
+
+(defn specialize-list [(s (mut Specializer))
+                       (source (ptr (al/ArrayList (ptr ir/ResolvedExpr))))]
+  (-> (ptr (al/ArrayList (ptr ir/SpecializedExpr))))
+  (let [result (ir/expression-list-new (load (field s a)))
+        n (al/al-len [(ptr ir/ResolvedExpr)] (load source)) (mut i) 0]
+    (loop (if (or (>= (load i) n)
+                  (!= (load (load (field s failed))) 0)) (break)
+              (do (ir/expression-list-push! result
+                    (specialize-node (mut s)
+                      (al/al-get [(ptr ir/ResolvedExpr)] (load source) (load i))))
+                  (store! i (+ (load i) 1)))))
+    result))
+
+(defn constrain-call! [(s (mut Specializer)) (id i64)
+                       (signature (ptr types/MonoType))
+                       (arguments (ptr (al/ArrayList (ptr ir/ResolvedExpr))))]
+  (-> i64)
+  (let [argument-types (types/type-arguments-new (load (field s a)))
+        n (al/al-len [(ptr ir/ResolvedExpr)] (load arguments)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (types/type-arguments-push! argument-types
+                    (resolved-node-type (mut s)
+                      (al/al-get [(ptr ir/ResolvedExpr)]
+                        (load arguments) (load i))))
+                  (store! i (+ (load i) 1)))))
+    (let [expected (types/type-function (load (field s a)) argument-types
+                     (node-type (mut s) id))]
+      (if (types/unify-success?
+            (types/type-unify-call! (load (field s substitution))
+                                    signature expected))
+          0
+          (let [(mut out) (str/sb-new (load (field s a)))]
+            (str/sb-push-str! (mut out)
+              "specialization: selected call signature does not match its arguments: selected=")
+            (append-signature-label! (mut out) signature)
+            (str/sb-push-str! (mut out) "; call=")
+            (append-signature-label! (mut out) expected)
+            (fail! (mut s) (str/sb-finish! (mut out))))))))
+
+(defn constrain-specialized-call!
+  [(s (mut Specializer)) (id i64) (signature (ptr types/MonoType))
+   (arguments (ptr (al/ArrayList (ptr ir/SpecializedExpr))))] (-> i64)
+  (let [argument-types (types/type-arguments-new (load (field s a)))
+        n (al/al-len [(ptr ir/SpecializedExpr)] (load arguments)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (types/type-arguments-push! argument-types
+                    (ir/expression-type
+                      (al/al-get [(ptr ir/SpecializedExpr)]
+                        (load arguments) (load i))))
+                  (store! i (+ (load i) 1)))))
+    (let [expected (types/type-function (load (field s a)) argument-types
+                     (node-type (mut s) id))]
+      (if (types/unify-success?
+            (types/type-unify-call! (load (field s substitution))
+                                    signature expected))
+          0
+          (fail! (mut s)
+            "specialization: selected call signature does not match specialized arguments")))))
+
+(defn override-overload-call! [(s (mut Specializer)) (id i64)
+                               (arguments (ptr (al/ArrayList (ptr ir/ResolvedExpr))))]
+  (-> i64)
+  (let [argument-types (types/type-arguments-new (load (field s a)))
+        n (al/al-len [(ptr ir/ResolvedExpr)] (load arguments)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (types/type-arguments-push! argument-types
+                    (node-type (mut s)
+                      (ir/resolved-expression-id
+                        (al/al-get [(ptr ir/ResolvedExpr)]
+                          (load arguments) (load i)))))
+                  (store! i (+ (load i) 1)))))
+    (let [result-type (node-type (mut s) id)]
+      (al/al-push! [SpecializedConstraint] (load (field s constraints))
+        (SpecializedConstraint :id id
+          :expected (types/type-function (load (field s a)) argument-types
+                      result-type))))
+    0))
+
+(defn override-specialized-overload-call!
+  [(s (mut Specializer)) (id i64)
+   (arguments (ptr (al/ArrayList (ptr ir/SpecializedExpr))))] (-> i64)
+  (let [argument-types (types/type-arguments-new (load (field s a)))
+        n (al/al-len [(ptr ir/SpecializedExpr)] (load arguments)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (types/type-arguments-push! argument-types
+                    (ir/expression-type
+                      (al/al-get [(ptr ir/SpecializedExpr)]
+                        (load arguments) (load i))))
+                  (store! i (+ (load i) 1)))))
+    (let [result-type (node-type (mut s) id)]
+      (al/al-push! [SpecializedConstraint] (load (field s constraints))
+        (SpecializedConstraint :id id
+          :expected (types/type-function (load (field s a)) argument-types
+                      result-type))))
+    0))
+
+(defn constrain-callee-overloads! [(s (mut Specializer))
+                                   (callee ir/CoreRef)
+                                   (signature (ptr types/MonoType))] (-> i64)
+  (let [definition (inferred-definition-at (load (field s inferred)) callee)]
+    (if (= (primitive/cast i64 definition) 0) 0
+        (let [definition-signature
+               (types/type-clone-resolved (load (field s a))
+                 (field (load (field s inferred)) solver)
+                 (load (field definition signature)))]
+          (if (not (types/unify-success?
+                     (types/type-unify! (load (field s substitution))
+                                        definition-signature signature)))
+              0
+              (let [module (load (field s inferred))
+                    n (al/al-len [infer/InferredOverloadConstraint]
+                        (.overloads module))
+                    (mut i) 0 (mut previous) -1 (mut resolved) 0]
+                (loop
+                  (store! resolved 0)
+                  (store! i 0)
+                  (loop (if (>= (load i) n) (break)
+                            (let [constraint (al/al-get
+                                               [infer/InferredOverloadConstraint]
+                                               (.overloads module) (load i))]
+                              (if (ir/core-ref-same? (.owner constraint) callee)
+                                  (let [selected
+                                         (select-overload (mut s) (.id constraint) false)]
+                                    (if (= (.matches selected) 1)
+                                        (do (types/type-unify-call!
+                                              (load (field s substitution))
+                                              (.signature selected)
+                                              (specialize-type s (.expected constraint)))
+                                            (store! resolved (+ (load resolved) 1))) 0)) 0)
+                              (store! i (+ (load i) 1)))))
+                  (if (= (load resolved) (load previous)) (break)
+                      (store! previous (load resolved))))
+                0))))))
+
+(defn constrain-request-scheme! [(s (mut Specializer)) (source ir/CoreRef)
+                                 (signature (ptr types/MonoType))] (-> i64)
+  (let [binding (inferred-binding-at s source)]
+    (if (= (primitive/cast i64 binding) 0) 0
+        (let [original (types/type-clone-resolved (load (field s a))
+                         (field (load (field s inferred)) solver)
+                         (load (field (field binding scheme) body)))
+              _original-mapping
+                (types/type-unify! (load (field s substitution)) original signature)
+              next (alloc/box! (load (field s a)) i64
+                     (+ (types/type-max-variable-id signature) 1))
+              instantiation (schemes/instantiate-scheme-full
+                              (load (field s a))
+                              (load (field binding scheme)) next)]
+          (types/type-unify! (load (field s substitution))
+                             (.body instantiation) signature)
+          (let [constraints (load (field binding constraints))
+                n (al/al-len [infer/InferredOverloadConstraint]
+                    (load constraints))
+                (mut i) 0]
+            (loop (if (>= (load i) n) (break)
+                      (let [constraint
+                             (al/al-get [infer/InferredOverloadConstraint]
+                               (load constraints) (load i))]
+                        (if (>= (.id constraint) 0)
+                            (let [instantiated
+                                   (schemes/instantiate-from-scheme
+                                     (load (field s a)) instantiation
+                                     (.expected constraint))
+                                  original (overload-at s (.id constraint))]
+                              (al/al-push! [SpecializedConstraint]
+                                (load (field s constraints))
+                                (SpecializedConstraint :id (.id constraint)
+                                  :expected instantiated))
+                              (if (= (primitive/cast i64 original) 0) 0
+                                  (do (types/type-unify!
+                                        (load (field s substitution))
+                                        (specialize-type s
+                                          (load (field original expected)))
+                                        instantiated)
+                                      0))) 0)
+                        (store! i (+ (load i) 1))))))
+          0))))
+
+(defn pattern-binding-type [(s (mut Specializer)) (reference ir/CoreRef)]
+  (-> (ptr types/MonoType))
+  (let [module (load (field s inferred))
+        n (al/al-len [infer/InferredPatternBinding] (.pattern-bindings module))
+        (mut i) 0 (mut found) (primitive/cast (ptr types/MonoType) 0)]
+    (loop (if (or (>= (load i) n)
+                  (!= (primitive/cast i64 (load found)) 0)) (break)
+              (let [entry (al/al-get [infer/InferredPatternBinding]
+                                     (.pattern-bindings module) (load i))]
+                (if (ir/core-ref-same? (.reference entry) reference)
+                    (store! found (.type entry)) 0)
+                (store! i (+ (load i) 1)))))
+    (if (= (primitive/cast i64 (load found)) 0)
+        (do (fail! (mut s) "specialization: pattern binding has no inferred type")
+            (types/type-unit (load (field s a))))
+        (specialize-type s (load found)))))
+
+(defn specialize-pattern [(s (mut Specializer))
+                          (source (ptr ir/ResolvedPattern))]
+  (-> (ptr ir/SpecializedPattern))
+  (let [a (load (field s a))]
+    (match (load source)
+      (ir/ResolvedPatternIgnore []
+        (ir/specialized-pattern-box a (ir/SpecializedPatternIgnore)))
+      (ir/ResolvedPatternBind [binding]
+        (ir/specialized-pattern-box a (ir/SpecializedPatternBind binding)))
+      (ir/ResolvedPatternInt [value]
+        (ir/specialized-pattern-box a (ir/SpecializedPatternInt value)))
+      (ir/ResolvedPatternBool [value]
+        (ir/specialized-pattern-box a (ir/SpecializedPatternBool value)))
+      (ir/ResolvedPatternConstructor [constructor arguments]
+        (let [converted (ir/specialized-pattern-list-new a)
+              n (al/al-len [(ptr ir/ResolvedPattern)] (load arguments))
+              (mut i) 0]
+          (loop (if (>= (load i) n) (break)
+                    (do (ir/specialized-pattern-list-push! converted
+                          (specialize-pattern (mut s)
+                            (al/al-get [(ptr ir/ResolvedPattern)]
+                              (load arguments) (load i))))
+                        (store! i (+ (load i) 1)))))
+          (ir/specialized-pattern-box a
+            (ir/SpecializedPatternConstructor constructor converted)))))))
+
+(defn specialize-branches [(s (mut Specializer))
+                           (source (ptr (al/ArrayList ir/ResolvedMatchBranch)))]
+  (-> (ptr (al/ArrayList ir/SpecializedMatchBranch)))
+  (let [a (load (field s a)) result (ir/branch-list-new a)
+        n (al/al-len [ir/ResolvedMatchBranch] (load source)) (mut i) 0]
+    (loop (if (or (>= (load i) n)
+                  (!= (load (load (field s failed))) 0)) (break)
+              (let [branch (al/al-get [ir/ResolvedMatchBranch]
+                                     (load source) (load i))
+                    binding-types (alloc/box! a
+                                    (al/ArrayList (ptr types/MonoType))
+                                    (al/al-new [(ptr types/MonoType)] a))
+                    bn (al/al-len [ir/CoreRef] (load (.bindings branch)))
+                    (mut j) 0]
+                (loop (if (>= (load j) bn) (break)
+                          (do (al/al-push! [(ptr types/MonoType)] binding-types
+                                (pattern-binding-type (mut s)
+                                  (al/al-get [ir/CoreRef]
+                                    (load (.bindings branch)) (load j))))
+                              (store! j (+ (load j) 1)))))
+                (let [pattern (specialize-pattern (mut s) (.pattern branch))
+                      body (specialize-node (mut s) (.body branch))]
+                  (ir/branch-list-push! result
+                    (ir/SpecializedMatchBranch
+                      :pattern pattern :bindings (.bindings branch)
+                      :binding-types binding-types :body body)))
+                (store! i (+ (load i) 1)))))
+    result))
+
+(defn specialize-node [(s (mut Specializer)) (source (ptr ir/ResolvedExpr))]
+  (-> (ptr ir/SpecializedExpr))
+  (let [a (load (field s a)) id (ir/resolved-expression-id source)
+        type (resolved-node-type (mut s) source)]
+    (match (load source)
+      (ir/ResolvedInt [_ value] (ir/expression-box a (ir/ExprInt id type value)))
+      (ir/ResolvedByte [_ value] (ir/expression-box a (ir/ExprByte id type value)))
+      (ir/ResolvedLong [_ value] (ir/expression-box a (ir/ExprLong id type value)))
+      (ir/ResolvedFloat [_ value] (ir/expression-box a (ir/ExprFloat id type value)))
+      (ir/ResolvedDouble [_ value] (ir/expression-box a (ir/ExprDouble id type value)))
+      (ir/ResolvedBool [_ value] (ir/expression-box a (ir/ExprBool id type value)))
+      (ir/ResolvedChar [_ value] (ir/expression-box a (ir/ExprChar id type value)))
+      (ir/ResolvedString [_ value] (ir/expression-box a (ir/ExprString id type value)))
+      (ir/ResolvedPattern [_ value] (ir/expression-box a (ir/ExprPattern id type value)))
+      (ir/ResolvedUnit [_] (ir/expression-box a (ir/ExprUnit id type)))
+      (ir/ResolvedReference [_ binding]
+        (let [parameter (parameter-type s binding)]
+          (ir/expression-box a
+            (ir/ExprReference id
+              (if (= (primitive/cast i64 parameter) 0) type parameter)
+              binding))))
+      (ir/ResolvedOverload [_ _ _]
+        (let [selected (select-overload (mut s) id true)]
+          (if (= (.matches selected) 1)
+              (ir/expression-box a
+                (ir/ExprReference id
+                  (types/type-clone-resolved a (load (field s substitution))
+                    (.signature selected))
+                  (.callee selected)))
+              (ir/expression-box a (ir/ExprUnit id type)))))
+      (ir/ResolvedCall [_ callee arguments]
+        (let [call (call-at s id)]
+          (if (= (primitive/cast i64 call) 0)
+              (match (load callee)
+                (ir/ResolvedOverload [_ _ _]
+                  (let [specialized-arguments (specialize-list (mut s) arguments)
+                        _ (override-specialized-overload-call!
+                            (mut s) id specialized-arguments)
+                        selected (select-overload (mut s) id true)]
+                    (if (= (.matches selected) 1)
+                        (do (constrain-call! (mut s) id (.signature selected) arguments)
+                            (let [committed-signature
+                                   (types/type-clone-resolved a
+                                     (load (field s substitution))
+                                     (.signature selected))]
+                              (ir/expression-box a
+                                (ir/ExprGlobalCall id (node-type (mut s) id)
+                                  (.callee selected) committed-signature
+                                  specialized-arguments))))
+                        (ir/expression-box a (ir/ExprUnit id type)))))
+                (_ (ir/expression-box a
+                     (ir/ExprCall id type (specialize-node (mut s) callee)
+                       (specialize-list (mut s) arguments)))))
+              (let [entry (load call)
+                    signature0 (types/type-clone-resolved a
+                                 (field (load (field s inferred)) solver)
+                                 (.signature entry))
+                    signature (types/type-clone-resolved a
+                                (load (field s substitution)) signature0)
+                    _arguments-before-owner
+                      (constrain-call! (mut s) id signature arguments)
+                    _owner (constrain-callee-overloads!
+                             (mut s) (.callee entry) signature)
+                    _arguments-after-owner
+                      (constrain-call! (mut s) id signature arguments)
+                    specialized-arguments (specialize-list (mut s) arguments)
+                    _arguments-after-specialization
+                      (constrain-specialized-call!
+                        (mut s) id signature specialized-arguments)
+                    committed-signature (types/type-clone-resolved a
+                                          (load (field s substitution)) signature)]
+                (if (and (= (ir/core-ref-id (.callee entry)) 5)
+                         (= (al/al-len [(ptr ir/SpecializedExpr)]
+                              (load specialized-arguments)) 1))
+                    (ir/expression-box a
+                      (ir/ExprBorrow id type
+                        (al/al-get [(ptr ir/SpecializedExpr)]
+                          (load specialized-arguments) 0)))
+                    (if (match (load callee)
+                          (ir/ResolvedReference [_ binding]
+                            (not (ir/core-ref-global? binding)))
+                          (_ false))
+                        (ir/expression-box a
+                          (ir/ExprCall id (node-type (mut s) id)
+                            (specialize-node (mut s) callee)
+                            specialized-arguments))
+                        (ir/expression-box a
+                          (ir/ExprGlobalCall id (node-type (mut s) id) (.callee entry)
+                                             committed-signature
+                                             specialized-arguments))))))))
+      (ir/ResolvedDo [_ expressions]
+        (ir/expression-box a (ir/ExprDo id type (specialize-list (mut s) expressions))))
+      (ir/ResolvedIf [_ condition then-branch else-branch]
+        (ir/expression-box a (ir/ExprIf id type
+          (specialize-node (mut s) condition)
+          (specialize-node (mut s) then-branch)
+          (specialize-node (mut s) else-branch))))
+      (ir/ResolvedLet [_ binding value body]
+        (ir/expression-box a (ir/ExprLet id type binding
+          (specialize-node (mut s) value) (specialize-node (mut s) body))))
+      (ir/ResolvedSet [_ binding value]
+        (ir/expression-box a
+          (ir/ExprSet id type binding (specialize-node (mut s) value))))
+      (ir/ResolvedWhile [_ condition body]
+        (ir/expression-box a (ir/ExprWhile id type
+          (specialize-node (mut s) condition) (specialize-node (mut s) body))))
+      (ir/ResolvedBreak [_] (ir/expression-box a (ir/ExprBreak id type)))
+      (ir/ResolvedLambda [_ parameters body]
+        (ir/expression-box a
+          (ir/ExprLambda id type parameters (specialize-node (mut s) body))))
+      (ir/ResolvedAnnotation [_ inner _]
+        (ir/expression-box a
+          (ir/ExprAnnotation id type (specialize-node (mut s) inner))))
+      (ir/ResolvedMatch [_ by-reference scrutinee branches]
+        (ir/expression-box a
+          (ir/ExprMatch id type by-reference
+            (specialize-node (mut s) scrutinee)
+            (specialize-branches (mut s) branches))))
+      (ir/ResolvedArray [_ items static]
+        (ir/expression-box a
+          (ir/ExprArray id type (specialize-list (mut s) items) static))))))
+
+(defn specialize-expression
+  [(a (dyn alloc/Allocator)) (inferred (ptr infer/InferredModule))
+   (substitution (ptr types/TypeSolver)) (source (ptr ir/ResolvedExpr))]
+  (-> SpecializationResult)
+  (let [failed (alloc/box! a i64 0) message (alloc/box! a (slice u8) "")
+        constraints (alloc/box! a (al/ArrayList SpecializedConstraint)
+                      (al/al-new [SpecializedConstraint] a))
+        parameters (alloc/box! a (al/ArrayList ir/CoreRef)
+                     (al/al-new [ir/CoreRef] a))
+        parameter-types (alloc/box! a (al/ArrayList (ptr types/MonoType))
+                         (al/al-new [(ptr types/MonoType)] a))
+        (mut s) (load (Specializer :a a :inferred inferred
+                       :substitution substitution :failed failed :message message
+                       :constraints constraints :parameters parameters
+                       :parameter-types parameter-types))
+        expression (specialize-node (mut s) source)]
+    (SpecializationResult :expression expression :failed (load failed)
+                          :message (load message))))
+
+(defn specialize-owned-expression
+  [(a (dyn alloc/Allocator)) (inferred (ptr infer/InferredModule))
+   (substitution (ptr types/TypeSolver)) (owner ir/CoreRef)
+   (signature (ptr types/MonoType))
+   (parameters (ptr (al/ArrayList ir/CoreRef)))
+   (source (ptr ir/ResolvedExpr))]
+  (-> SpecializationResult)
+  (let [failed (alloc/box! a i64 0) message (alloc/box! a (slice u8) "")
+        constraints (alloc/box! a (al/ArrayList SpecializedConstraint)
+                      (al/al-new [SpecializedConstraint] a))
+        parameter-types (alloc/box! a (al/ArrayList (ptr types/MonoType))
+                         (al/al-new [(ptr types/MonoType)] a))
+        (mut s) (load (Specializer :a a :inferred inferred
+                       :substitution substitution :failed failed :message message
+                       :constraints constraints :parameters parameters
+                       :parameter-types parameter-types))]
+    (match (load signature)
+      (types/TypeFunction [arguments _]
+        (let [n (al/al-len [(ptr types/MonoType)] (load arguments)) (mut i) 0]
+          (loop (if (>= (load i) n) (break)
+                    (do (al/al-push! [(ptr types/MonoType)] parameter-types
+                          (al/al-get [(ptr types/MonoType)]
+                            (load arguments) (load i)))
+                        (store! i (+ (load i) 1)))))))
+      (_ 0))
+    (constrain-request-scheme! (mut s) owner signature)
+    (let [expression (specialize-node (mut s) source)]
+      (SpecializationResult :expression expression :failed (load failed)
+                            :message (load message)))))
+
+(defn resolved-function-at [(module (ptr ir/ResolvedModule)) (reference ir/CoreRef)]
+  (-> (ptr ir/ResolvedFunction))
+  (let [n (al/al-len [ir/ResolvedFunction] (load (field module functions)))
+        (mut i) 0 (mut found) (primitive/cast (ptr ir/ResolvedFunction) 0)]
+    (loop (if (or (>= (load i) n)
+                  (!= (primitive/cast i64 (load found)) 0)) (break)
+              (let [entry (al/al-elem [ir/ResolvedFunction]
+                                      (field module functions) (load i))]
+                (if (ir/core-ref-same? (load (field entry reference)) reference)
+                    (store! found entry) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn inferred-definition-at [(module (ptr infer/InferredModule))
+                              (reference ir/CoreRef)]
+  (-> (ptr infer/InferredDefinition))
+  (let [n (al/al-len [infer/InferredDefinition]
+                     (load (field module definitions)))
+        (mut i) n (mut found) (primitive/cast (ptr infer/InferredDefinition) 0)]
+    (loop (if (or (<= (load i) 0)
+                  (!= (primitive/cast i64 (load found)) 0)) (break)
+              (do (store! i (- (load i) 1))
+              (let [entry (al/al-elem [infer/InferredDefinition]
+                                      (field module definitions) (load i))]
+                (if (ir/core-ref-same? (load (field entry reference)) reference)
+                    (store! found entry) 0)
+                0))))
+    (load found)))
+
+(defn inferred-scheme-at [(module (ptr infer/InferredModule))
+                          (reference ir/CoreRef)]
+  (-> (ptr schemes/TypeScheme))
+  (let [n (al/al-len [infer/InferredBinding] (load (field module globals)))
+        (mut i) n (mut found) (primitive/cast (ptr schemes/TypeScheme) 0)]
+    (loop (if (or (<= (load i) 0)
+                  (!= (primitive/cast i64 (load found)) 0)) (break)
+              (do (store! i (- (load i) 1))
+                  (let [entry (al/al-elem [infer/InferredBinding]
+                                (field module globals) (load i))]
+                    (if (ir/core-ref-same?
+                          (load (field entry reference)) reference)
+                        (store! found (field entry scheme)) 0)))))
+    (load found)))
+
+(defn request-index [(requests (ptr (al/ArrayList SpecializationRequest)))
+                     (source ir/CoreRef) (signature (ptr types/MonoType))] (-> i64)
+  (let [n (al/al-len [SpecializationRequest] (load requests))
+        (mut i) 0 (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0)) (break)
+              (let [entry (al/al-get [SpecializationRequest]
+                                     (load requests) (load i))]
+                (if (and (ir/core-ref-same? (.source entry) source)
+                         (types/type-same-representation? (.signature entry) signature))
+                    (store! found (load i)) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn enqueue! [(requests (ptr (al/ArrayList SpecializationRequest)))
+                (source ir/CoreRef) (signature (ptr types/MonoType))
+                (next-id (ptr i64))] (-> ir/CoreRef)
+  (let [existing (request-index requests source signature)]
+    (if (>= existing 0)
+        (let [found (al/al-get [SpecializationRequest] (load requests) existing)]
+          (.reference found))
+        (let [reference (ir/core-ref (load next-id) (.name source) true)]
+          (store! next-id (+ (load next-id) 1))
+          (al/al-push! [SpecializationRequest] requests
+            (SpecializationRequest :source source :signature signature
+                                   :reference reference))
+          reference))))
+
+(defn collect-call-list! [(resolved (ptr ir/ResolvedModule))
+                          (requests (ptr (al/ArrayList SpecializationRequest)))
+                          (next-id (ptr i64))
+                          (items (ptr (al/ArrayList (ptr ir/SpecializedExpr))))]
+  (-> i64)
+  (let [n (al/al-len [(ptr ir/SpecializedExpr)] (load items)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (collect-calls! resolved requests next-id
+                    (al/al-get [(ptr ir/SpecializedExpr)] (load items) (load i)))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn collect-calls! [(resolved (ptr ir/ResolvedModule))
+                      (requests (ptr (al/ArrayList SpecializationRequest)))
+                      (next-id (ptr i64)) (expression (ptr ir/SpecializedExpr))]
+  (-> i64)
+  (match (load expression)
+    (ir/ExprReference [_ signature source]
+      (do (if (!= (primitive/cast i64
+                    (resolved-function-at resolved source)) 0)
+              (do (enqueue! requests source signature next-id) 0) 0)
+          0))
+    (ir/ExprGlobalCall [_ _ callee signature arguments]
+      (do (if (!= (primitive/cast i64
+                    (resolved-function-at resolved callee)) 0)
+              (do (enqueue! requests callee signature next-id) 0) 0)
+          (collect-call-list! resolved requests next-id arguments)))
+    (ir/ExprCall [_ _ callee arguments]
+      (do (collect-calls! resolved requests next-id callee)
+          (collect-call-list! resolved requests next-id arguments)))
+    (ir/ExprBorrow [_ _ operand]
+      (collect-calls! resolved requests next-id operand))
+    (ir/ExprDo [_ _ expressions]
+      (collect-call-list! resolved requests next-id expressions))
+    (ir/ExprIf [_ _ condition then-branch else-branch]
+      (do (collect-calls! resolved requests next-id condition)
+          (collect-calls! resolved requests next-id then-branch)
+          (collect-calls! resolved requests next-id else-branch)))
+    (ir/ExprLet [_ _ _ value body]
+      (do (collect-calls! resolved requests next-id value)
+          (collect-calls! resolved requests next-id body)))
+    (ir/ExprSet [_ _ _ value]
+      (collect-calls! resolved requests next-id value))
+    (ir/ExprWhile [_ _ condition body]
+      (do (collect-calls! resolved requests next-id condition)
+          (collect-calls! resolved requests next-id body)))
+    (ir/ExprLambda [_ _ _ body]
+      (collect-calls! resolved requests next-id body))
+    (ir/ExprAnnotation [_ _ inner]
+      (collect-calls! resolved requests next-id inner))
+    (ir/ExprArray [_ _ items _]
+      (collect-call-list! resolved requests next-id items))
+    (ir/ExprMatch [_ _ _ scrutinee branches]
+      (do (collect-calls! resolved requests next-id scrutinee)
+          (let [n (al/al-len [ir/SpecializedMatchBranch] (load branches))
+                (mut i) 0]
+            (loop (if (>= (load i) n) (break)
+                      (do (let [branch (al/al-get [ir/SpecializedMatchBranch]
+                                         (load branches) (load i))]
+                            (collect-calls! resolved requests next-id (.body branch)))
+                          (store! i (+ (load i) 1))))))
+          0))
+    (_ 0)))
+
+(defn maximum-global-id [(module (ptr ir/ResolvedModule))] (-> i64)
+  (let [n (al/al-len [ir/ResolvedFunction] (load (field module functions)))
+        (mut i) 0 (mut maximum) 129]
+    (loop (if (>= (load i) n) (break)
+              (do (let [entry (al/al-get [ir/ResolvedFunction]
+                                (load (field module functions)) (load i))]
+                    (if (> (ir/core-ref-id (.reference entry)) (load maximum))
+                        (store! maximum (ir/core-ref-id (.reference entry))) 0))
+                  (store! i (+ (load i) 1)))))
+    (load maximum)))
+
+;; Cleanup is implicit in Carp source, so delete implementations are not
+;; necessarily reachable through ordinary call edges. Seed their concrete
+;; specializations whenever a named runtime type is reached. This keeps the
+;; ownership backend honest: emission can call the same resolved implementation
+;; that an explicit `(delete value)` overload would select.
+(defn enqueue-delete-for-type!
+  [(a (dyn alloc/Allocator)) (resolved (ptr ir/ResolvedModule))
+   (inferred (ptr infer/InferredModule))
+   (requests (ptr (al/ArrayList SpecializationRequest))) (next-id (ptr i64))
+   (type (ptr types/MonoType))] (-> i64)
+  (let [managed-shape
+          (match (load type)
+            (types/TypeNamed [_ _] true)
+            (types/TypeString [] true)
+            (_ false))]
+    (if managed-shape
+      (let [arguments (types/type-arguments-new a)
+            _argument (types/type-arguments-push! arguments type)
+            expected (types/type-function a arguments (types/type-unit a))
+            n (al/al-len [ir/CoreImplementation]
+                (load (field resolved implementations)))
+            (mut i) 0 (mut found) false]
+        (loop (if (or (>= (load i) n) (load found)) (break)
+                  (let [edge (al/al-get [ir/CoreImplementation]
+                               (load (field resolved implementations)) (load i))]
+                    (if (str/str-eq (.name (.interface edge)) "delete")
+                        (let [scheme (inferred-scheme-at inferred (.implementation edge))]
+                          (if (= (primitive/cast i64 scheme) 0) 0
+                              (let [fresh (alloc/box! a i64
+                                            (+ (types/type-max-variable-id expected) 1))
+                                    candidate (schemes/instantiate-scheme
+                                                a (load scheme) fresh)
+                                    solver (alloc/box! a types/TypeSolver
+                                             (types/type-solver-new a))]
+                                (if (types/unify-success?
+                                      (types/type-unify-call! solver candidate expected))
+                                    (do (if (= (primitive/cast i64
+                                                  (resolved-function-at resolved
+                                                    (.implementation edge))) 0)
+                                            0
+                                            (do (enqueue! requests (.implementation edge)
+                                                  expected next-id)
+                                                0))
+                                        (store! found true))
+                                    0))))
+                        0)
+                    (store! i (+ (load i) 1)))))
+        0)
+      0)))
+
+(defn enqueue-delete-types-list!
+  [(a (dyn alloc/Allocator)) (resolved (ptr ir/ResolvedModule))
+   (inferred (ptr infer/InferredModule))
+   (requests (ptr (al/ArrayList SpecializationRequest))) (next-id (ptr i64))
+   (items (ptr (al/ArrayList (ptr ir/SpecializedExpr))))] (-> i64)
+  (let [n (al/al-len [(ptr ir/SpecializedExpr)] (load items)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (enqueue-delete-types-expression! a resolved inferred requests
+                    next-id (al/al-get [(ptr ir/SpecializedExpr)]
+                              (load items) (load i)))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn enqueue-delete-types-expression!
+  [(a (dyn alloc/Allocator)) (resolved (ptr ir/ResolvedModule))
+   (inferred (ptr infer/InferredModule))
+   (requests (ptr (al/ArrayList SpecializationRequest))) (next-id (ptr i64))
+   (expression (ptr ir/SpecializedExpr))] (-> i64)
+  (enqueue-delete-for-type! a resolved inferred requests next-id
+    (ir/expression-type expression))
+  (match (load expression)
+    (ir/ExprArray [_ _ items _]
+      (enqueue-delete-types-list! a resolved inferred requests next-id items))
+    (ir/ExprBorrow [_ _ operand]
+      (enqueue-delete-types-expression! a resolved inferred requests next-id operand))
+    (ir/ExprGlobalCall [_ _ _ _ arguments]
+      (enqueue-delete-types-list! a resolved inferred requests next-id arguments))
+    (ir/ExprCall [_ _ callee arguments]
+      (do (enqueue-delete-types-expression! a resolved inferred requests next-id callee)
+          (enqueue-delete-types-list! a resolved inferred requests next-id arguments)))
+    (ir/ExprDo [_ _ expressions]
+      (enqueue-delete-types-list! a resolved inferred requests next-id expressions))
+    (ir/ExprIf [_ _ condition then-branch else-branch]
+      (do (enqueue-delete-types-expression! a resolved inferred requests next-id condition)
+          (enqueue-delete-types-expression! a resolved inferred requests next-id then-branch)
+          (enqueue-delete-types-expression! a resolved inferred requests next-id else-branch)))
+    (ir/ExprLet [_ _ _ value body]
+      (do (enqueue-delete-types-expression! a resolved inferred requests next-id value)
+          (enqueue-delete-types-expression! a resolved inferred requests next-id body)))
+    (ir/ExprSet [_ _ _ value]
+      (enqueue-delete-types-expression! a resolved inferred requests next-id value))
+    (ir/ExprWhile [_ _ condition body]
+      (do (enqueue-delete-types-expression! a resolved inferred requests next-id condition)
+          (enqueue-delete-types-expression! a resolved inferred requests next-id body)))
+    (ir/ExprLambda [_ _ _ body]
+      (enqueue-delete-types-expression! a resolved inferred requests next-id body))
+    (ir/ExprAnnotation [_ _ inner]
+      (enqueue-delete-types-expression! a resolved inferred requests next-id inner))
+    (ir/ExprMatch [_ _ _ scrutinee branches]
+      (do (enqueue-delete-types-expression! a resolved inferred requests next-id scrutinee)
+          (let [n (al/al-len [ir/SpecializedMatchBranch] (load branches)) (mut i) 0]
+            (loop (if (>= (load i) n) (break)
+                      (let [branch (al/al-get [ir/SpecializedMatchBranch]
+                                     (load branches) (load i))]
+                        (enqueue-delete-types-expression! a resolved inferred requests
+                          next-id (.body branch))
+                        (store! i (+ (load i) 1))))))
+          0))
+    (_ 0)))
+
+(defn specialize-module
+  [(a (dyn alloc/Allocator)) (resolved (ptr ir/ResolvedModule))
+   (inferred (ptr infer/InferredModule))
+   (roots (ptr (al/ArrayList SpecializationRequest)))]
+  (-> ModuleSpecializationResult)
+  (let [requests (alloc/box! a (al/ArrayList SpecializationRequest)
+                   (al/al-new [SpecializationRequest] a))
+        functions (alloc/box! a (al/ArrayList ir/SpecializedFunction)
+                    (al/al-new [ir/SpecializedFunction] a))
+        values (alloc/box! a (al/ArrayList ir/SpecializedValue)
+                 (al/al-new [ir/SpecializedValue] a))
+        next-id (alloc/box! a i64 (+ (maximum-global-id resolved) 1))
+        failed (alloc/box! a i64 0) message (alloc/box! a (slice u8) "")
+        root-count (al/al-len [SpecializationRequest] (load roots))
+        (mut i) 0]
+    (loop (if (>= (load i) root-count) (break)
+              (do (let [root (al/al-get [SpecializationRequest]
+                               (load roots) (load i))]
+                    (enqueue! requests (.source root) (.signature root) next-id))
+                  (store! i (+ (load i) 1)))))
+    (let [value-count (al/al-len [ir/ResolvedValue]
+                        (load (field resolved values)))]
+      (store! i 0)
+      (loop
+        (if (or (>= (load i) value-count) (!= (load failed) 0)) (break)
+            (let [value (al/al-elem [ir/ResolvedValue]
+                          (field resolved values) (load i))
+                  definition (inferred-definition-at inferred
+                               (load (field value reference)))
+                  solver (alloc/box! a types/TypeSolver (types/type-solver-new a))]
+              (if (= (primitive/cast i64 definition) 0)
+                  (do (store! failed 1)
+                      (store! message "specialization: global value type is missing"))
+                  (let [result (specialize-expression a inferred solver
+                                 (load (field value body)))]
+                    (if (specialization-failed? result)
+                        (do (store! failed 1)
+                            (store! message (specialization-error result)))
+                        (let [value-type (types/type-clone-resolved a
+                                           (field inferred solver)
+                                           (load (field definition signature)))
+                              specialized-body (specialized-expression result)
+                              source (load (field value reference))]
+                          (if (not (type-concrete? value-type))
+                              0
+                              (do (al/al-push! [ir/SpecializedValue] values
+                                    (ir/SpecializedValue :source source
+                                      :reference source :type value-type
+                                      :body specialized-body))
+                                  (collect-calls! resolved requests next-id specialized-body)
+                                  (enqueue-delete-types-expression! a resolved inferred
+                                    requests next-id specialized-body)))))))
+              (store! i (+ (load i) 1))))))
+    (store! i 0)
+    (loop (if (or (>= (load i) (al/al-len [SpecializationRequest]
+                                  (load requests)))
+                  (!= (load failed) 0)) (break)
+              (let [request (al/al-get [SpecializationRequest]
+                              (load requests) (load i))
+                    function (resolved-function-at resolved (.source request))
+                    definition (inferred-definition-at inferred (.source request))]
+                (if (or (= (primitive/cast i64 function) 0)
+                        (= (primitive/cast i64 definition) 0))
+                    (do (store! failed 1)
+                        (store! message "specialization: requested function definition is missing"))
+                    (let [solver (alloc/box! a types/TypeSolver (types/type-solver-new a))
+                          scheme (inferred-scheme-at inferred (.source request))
+                          scheme-next (alloc/box! a i64
+                                        (+ (types/type-max-variable-id
+                                             (.signature request)) 1))
+                          definition-type
+                            (if (= (primitive/cast i64 scheme) 0)
+                                (types/type-clone-resolved a
+                                  (field inferred solver)
+                                  (load (field definition signature)))
+                                (schemes/instantiate-scheme a (load scheme) scheme-next))
+                          outcome (types/type-unify-call! solver definition-type
+                                                         (.signature request))]
+                      (if (not (types/unify-success? outcome))
+                          (let [source-reference (.source request)
+                                (mut out) (str/sb-new a)]
+                            (str/sb-push-str! (mut out)
+                              "specialization: requested signature does not match definition: ")
+                            (str/sb-push-str! (mut out) (.name source-reference))
+                            (str/sb-push-str! (mut out) "; requested=")
+                            (append-signature-label! (mut out) (.signature request))
+                            (str/sb-push-str! (mut out) "; definition=")
+                            (append-signature-label! (mut out) definition-type)
+                            (store! failed 1)
+                            (store! message (str/sb-finish! (mut out))))
+                          (let [body-result (specialize-owned-expression
+                                              a inferred solver (.source request)
+                                              (.signature request)
+                                              (load (field function parameters))
+                                              (load (field function body)))]
+                            (if (specialization-failed? body-result)
+                                (do (store! failed 1)
+                                    (store! message (specialization-error body-result)))
+                                (let [signature (types/type-clone-resolved a solver
+                                                   definition-type)
+                                      parameter-types (types/type-arguments-new a)]
+                                  (match (load signature)
+                                    (types/TypeFunction [arguments _]
+                                      (let [pn (al/al-len [(ptr types/MonoType)]
+                                                 (load arguments)) (mut pi) 0]
+                                        (loop (if (>= (load pi) pn) (break)
+                                                  (do (types/type-arguments-push!
+                                                        parameter-types
+                                                        (al/al-get [(ptr types/MonoType)]
+                                                          (load arguments) (load pi)))
+                                                      (store! pi (+ (load pi) 1)))))))
+                                    (_ 0))
+                                  (let [body (specialized-expression body-result)]
+                                    (al/al-push! [ir/SpecializedFunction] functions
+                                      (ir/SpecializedFunction
+                                        :source (.source request)
+                                        :reference (.reference request)
+                                        :signature signature
+                                        :parameters (load (field function parameters))
+                                        :parameter-types parameter-types :body body))
+                                    (collect-calls! resolved requests next-id body)
+                                    (enqueue-delete-types-expression! a resolved inferred
+                                      requests next-id body))))))))
+                (store! i (+ (load i) 1)))))
+    (ModuleSpecializationResult
+      :module (ir/SpecializedModule :functions (load functions) :values (load values))
+      :failed (load failed) :message (load message))))

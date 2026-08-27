@@ -1,0 +1,590 @@
+(module experiments.carp.types)
+
+;; Backend-independent monotypes and the destructive unification solver used by
+;; Carp inference. Type nodes and child arrays belong to the compiler's arena;
+;; pointers are stable for the compilation and the whole arena is released at
+;; once. This makes recursive types explicit without copying trees on every
+;; substitution.
+
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :as slice)
+(import "coil.str" :as str)
+
+(defsum MonoLifetime
+  (LifetimeVariable [(id i64)])
+  (LifetimeStatic []))
+
+(defsum MonoType
+  (TypeVariable [(id i64)])
+  (TypeInteger [])
+  (TypeString [])
+  (TypeBoolean [])
+  (TypeUnit [])
+  (TypeNamed [(name (slice u8))
+              (arguments (ptr (al/ArrayList (ptr MonoType))))])
+  (TypeReference [(inner (ptr MonoType)) (lifetime MonoLifetime)])
+  (TypeFunction [(arguments (ptr (al/ArrayList (ptr MonoType))))
+                 (result (ptr MonoType))]))
+
+(defstruct TypeBinding [(variable i64) (value (ptr MonoType))])
+(defstruct LifetimeBinding [(variable i64) (value MonoLifetime)])
+(defstruct ConstructorBinding [(variable (slice u8)) (value (slice u8))])
+
+(defstruct TypeSolver
+  [(allocator (dyn alloc/Allocator))
+   (bindings (al/ArrayList TypeBinding))
+   (lifetime-bindings (al/ArrayList LifetimeBinding))
+   (constructor-bindings (al/ArrayList ConstructorBinding))])
+
+(defsum UnifyResult
+  (UnifySuccess [])
+  (UnifyError [(message (slice u8))]))
+
+(defn type-box [(a (dyn alloc/Allocator)) (value MonoType)] (-> (ptr MonoType))
+  (alloc/box! a MonoType value))
+
+(defn type-variable [(a (dyn alloc/Allocator)) (id i64)] (-> (ptr MonoType))
+  (type-box a (TypeVariable id)))
+
+(defn type-integer [(a (dyn alloc/Allocator))] (-> (ptr MonoType))
+  (type-box a (TypeInteger)))
+
+(defn type-string [(a (dyn alloc/Allocator))] (-> (ptr MonoType))
+  (type-box a (TypeString)))
+
+(defn type-boolean [(a (dyn alloc/Allocator))] (-> (ptr MonoType))
+  (type-box a (TypeBoolean)))
+
+(defn type-unit [(a (dyn alloc/Allocator))] (-> (ptr MonoType))
+  (type-box a (TypeUnit)))
+
+(defn type-arguments-new [(a (dyn alloc/Allocator))]
+  (-> (ptr (al/ArrayList (ptr MonoType))))
+  (alloc/box! a
+              (al/ArrayList (ptr MonoType))
+              (al/al-new [(ptr MonoType)] a)))
+
+(defn type-arguments-push! [(arguments (ptr (al/ArrayList (ptr MonoType))))
+                            (argument (ptr MonoType))] (-> i64)
+  (al/al-push! [(ptr MonoType)] arguments argument))
+
+(defn type-named [(a (dyn alloc/Allocator))
+                  (name (slice u8))
+                  (arguments (ptr (al/ArrayList (ptr MonoType))))]
+  (-> (ptr MonoType))
+  (type-box a (TypeNamed name arguments)))
+
+(defn lifetime-variable [(id i64)] (-> MonoLifetime)
+  (LifetimeVariable id))
+
+(defn lifetime-static [] (-> MonoLifetime)
+  (LifetimeStatic))
+
+(defn type-reference [(a (dyn alloc/Allocator))
+                      (inner (ptr MonoType))
+                      (lifetime MonoLifetime)] (-> (ptr MonoType))
+  (type-box a (TypeReference inner lifetime)))
+
+(defn type-function [(a (dyn alloc/Allocator))
+                     (arguments (ptr (al/ArrayList (ptr MonoType))))
+                     (result (ptr MonoType))] (-> (ptr MonoType))
+  (type-box a (TypeFunction arguments result)))
+
+(defn type-solver-new [(a (dyn alloc/Allocator))] (-> TypeSolver)
+  (TypeSolver :allocator a
+              :bindings (al/al-new [TypeBinding] a)
+              :lifetime-bindings (al/al-new [LifetimeBinding] a)
+              :constructor-bindings (al/al-new [ConstructorBinding] a)))
+
+(defn type-solver-binding [(solver (ptr TypeSolver)) (variable i64)] (-> (ptr MonoType))
+  (let [bindings (field solver bindings)
+        (mut i) (al/al-len [TypeBinding] (load bindings))
+        (mut result) (primitive/cast (ptr MonoType) 0)]
+    (loop
+      (if (or (= (load i) 0)
+              (!= (primitive/cast i64 (load result)) 0))
+          (break)
+          (do
+            (store! i (- (load i) 1))
+            (let [binding (al/al-elem [TypeBinding] bindings (load i))]
+              (if (= (load (field binding variable)) variable)
+                  (store! result (load (field binding value)))
+                  0)))))
+    (load result)))
+
+(defn type-solver-lifetime-binding [(solver (ptr TypeSolver)) (variable i64)]
+  (-> MonoLifetime)
+  (let [bindings (field solver lifetime-bindings)
+        (mut i) (al/al-len [LifetimeBinding] (load bindings))
+        (mut result) (LifetimeVariable variable)
+        (mut found) false]
+    (loop
+      (if (or (= (load i) 0) (load found))
+          (break)
+          (do
+            (store! i (- (load i) 1))
+            (let [binding (al/al-elem [LifetimeBinding] bindings (load i))]
+              (if (= (load (field binding variable)) variable)
+                  (do
+                    (store! result (load (field binding value)))
+                    (store! found true))
+                  0)))))
+    (load result)))
+
+(defn type-solver-constructor-binding [(solver (ptr TypeSolver))
+                                       (variable (slice u8))] (-> (slice u8))
+  (let [bindings (field solver constructor-bindings)
+        (mut i) (al/al-len [ConstructorBinding] (load bindings))
+        (mut result) variable
+        (mut found) false]
+    (loop
+      (if (or (= (load i) 0) (load found))
+          (break)
+          (do
+            (store! i (- (load i) 1))
+            (let [binding (al/al-elem [ConstructorBinding] bindings (load i))]
+              (if (= (load (field binding variable)) variable)
+                  (do
+                    (store! result (load (field binding value)))
+                    (store! found true))
+                  0)))))
+    (load result)))
+
+(defn type-resolve [(solver (ptr TypeSolver)) (value (ptr MonoType))]
+  (-> (ptr MonoType))
+  (match (load value)
+    (TypeVariable [variable]
+      (let [bound (type-solver-binding solver variable)]
+        (if (= (primitive/cast i64 bound) 0)
+            value
+            (type-resolve solver bound))))
+    (TypeInteger [] value)
+    (TypeString [] value)
+    (TypeBoolean [] value)
+    (TypeUnit [] value)
+    (TypeNamed [_ _] value)
+    (TypeReference [_ _] value)
+    (TypeFunction [_ _] value)))
+
+(defn lifetime-resolve [(solver (ptr TypeSolver)) (value MonoLifetime)]
+  (-> MonoLifetime)
+  (match value
+    (LifetimeStatic [] (LifetimeStatic))
+    (LifetimeVariable [variable]
+      (let [bound (type-solver-lifetime-binding solver variable)]
+        (match bound
+          (LifetimeStatic [] (LifetimeStatic))
+          (LifetimeVariable [next]
+            (if (= next variable)
+                bound
+                (lifetime-resolve solver bound))))))))
+
+(defn constructor-variable? [(name (slice u8))] (-> bool)
+  (if (= (slice/slice-len name) 0)
+      false
+      (let [first (primitive/cast i64 (slice/slice-get name 0))]
+        (and (>= first 97) (<= first 122)))))
+
+(defn constructor-resolve [(solver (ptr TypeSolver)) (name (slice u8))]
+  (-> (slice u8))
+  (let [bound (type-solver-constructor-binding solver name)]
+    (if (= bound name) name (constructor-resolve solver bound))))
+
+(defn type-clone-resolved [(a (dyn alloc/Allocator)) (solver (ptr TypeSolver))
+                           (source (ptr MonoType))] (-> (ptr MonoType))
+  (let [resolved (type-resolve solver source)]
+    (match (load resolved)
+      (TypeVariable [id] (type-variable a id))
+      (TypeInteger [] (type-integer a))
+      (TypeString [] (type-string a))
+      (TypeBoolean [] (type-boolean a))
+      (TypeUnit [] (type-unit a))
+      (TypeNamed [name arguments]
+        (let [copied (type-arguments-new a)
+              n (al/al-len [(ptr MonoType)] (load arguments)) (mut i) 0]
+          (loop (if (>= (load i) n) (break)
+                    (do (type-arguments-push! copied
+                          (type-clone-resolved a solver
+                            (al/al-get [(ptr MonoType)]
+                              (load arguments) (load i))))
+                        (store! i (+ (load i) 1)))))
+          (type-named a (constructor-resolve solver name) copied)))
+      (TypeReference [inner lifetime]
+        (type-reference a (type-clone-resolved a solver inner)
+                        (lifetime-resolve solver lifetime)))
+      (TypeFunction [arguments result]
+        (let [copied (type-arguments-new a)
+              n (al/al-len [(ptr MonoType)] (load arguments)) (mut i) 0]
+          (loop (if (>= (load i) n) (break)
+                    (do (type-arguments-push! copied
+                          (type-clone-resolved a solver
+                            (al/al-get [(ptr MonoType)]
+                              (load arguments) (load i))))
+                        (store! i (+ (load i) 1)))))
+          (type-function a copied (type-clone-resolved a solver result)))))))
+
+(defn type-unify-call-argument! [(solver (mut TypeSolver))
+                                 (parameter (ptr MonoType))
+                                 (argument (ptr MonoType))] (-> UnifyResult)
+  (let [resolved-parameter (type-resolve (mut solver) parameter)
+        resolved-argument (type-resolve (mut solver) argument)]
+    (match (load resolved-parameter)
+      (TypeReference [inner _]
+        (match (load resolved-argument)
+          (TypeReference [_ _]
+            (type-unify! (mut solver) resolved-parameter resolved-argument))
+          (TypeVariable [_]
+            (type-unify! (mut solver) resolved-parameter resolved-argument))
+          (_ (type-unify! (mut solver) inner resolved-argument))))
+      (_ (type-unify! (mut solver) resolved-parameter resolved-argument)))))
+
+(defn type-unify-call! [(solver (mut TypeSolver))
+                        (signature (ptr MonoType))
+                        (expected (ptr MonoType))] (-> UnifyResult)
+  (let [resolved-signature (type-resolve (mut solver) signature)
+        resolved-expected (type-resolve (mut solver) expected)]
+    (match (load resolved-signature)
+      (TypeFunction [parameters result]
+        (match (load resolved-expected)
+          (TypeFunction [arguments expected-result]
+            (let [n (al/al-len [(ptr MonoType)] (load parameters))]
+              (if (!= n (al/al-len [(ptr MonoType)] (load arguments)))
+                  (UnifyError "call arity does not match")
+                  (let [(mut i) 0 (mut outcome) (UnifySuccess)]
+                    (loop (if (or (>= (load i) n)
+                                  (not (unify-success? (load outcome)))) (break)
+                              (do (store! outcome
+                                    (type-unify-call-argument! (mut solver)
+                                      (al/al-get [(ptr MonoType)]
+                                        (load parameters) (load i))
+                                      (al/al-get [(ptr MonoType)]
+                                        (load arguments) (load i))))
+                                  (store! i (+ (load i) 1)))))
+                    (if (unify-success? (load outcome))
+                        (type-unify! (mut solver) result expected-result)
+                        (load outcome))))))
+          (_ (type-unify! (mut solver) resolved-signature resolved-expected))))
+      (_ (type-unify! (mut solver) resolved-signature resolved-expected)))))
+
+(defn type-max-variable-id [(source (ptr MonoType))] (-> i64)
+  (match (load source)
+    (TypeVariable [id] id)
+    (TypeNamed [_ arguments]
+      (let [n (al/al-len [(ptr MonoType)] (load arguments))
+            (mut i) 0 (mut maximum) 0]
+        (loop (if (>= (load i) n) (break)
+                  (do (let [candidate (type-max-variable-id
+                                        (al/al-get [(ptr MonoType)]
+                                          (load arguments) (load i)))]
+                        (if (> candidate (load maximum))
+                            (store! maximum candidate) 0))
+                      (store! i (+ (load i) 1)))))
+        (load maximum)))
+    (TypeReference [inner _] (type-max-variable-id inner))
+    (TypeFunction [arguments result]
+      (let [n (al/al-len [(ptr MonoType)] (load arguments))
+            (mut i) 0 (mut maximum) (type-max-variable-id result)]
+        (loop (if (>= (load i) n) (break)
+                  (do (let [candidate (type-max-variable-id
+                                        (al/al-get [(ptr MonoType)]
+                                          (load arguments) (load i)))]
+                        (if (> candidate (load maximum))
+                            (store! maximum candidate) 0))
+                      (store! i (+ (load i) 1)))))
+        (load maximum)))
+    (_ 0)))
+
+(defn lifetime-same? [(left MonoLifetime) (right MonoLifetime)] (-> bool)
+  (match left
+    (LifetimeStatic []
+      (match right (LifetimeStatic [] true) (LifetimeVariable [_] false)))
+    (LifetimeVariable [left-id]
+      (match right
+        (LifetimeVariable [right-id] (= left-id right-id))
+        (LifetimeStatic [] false)))))
+
+(defn type-same-with-lifetimes? [(left (ptr MonoType))
+                                 (right (ptr MonoType))
+                                 (compare-lifetimes bool)] (-> bool)
+  (match (load left)
+    (TypeVariable [left-id]
+      (match (load right) (TypeVariable [right-id] (= left-id right-id)) (_ false)))
+    (TypeInteger [] (match (load right) (TypeInteger [] true) (_ false)))
+    (TypeString [] (match (load right) (TypeString [] true) (_ false)))
+    (TypeBoolean [] (match (load right) (TypeBoolean [] true) (_ false)))
+    (TypeUnit [] (match (load right) (TypeUnit [] true) (_ false)))
+    (TypeNamed [left-name left-arguments]
+      (match (load right)
+        (TypeNamed [right-name right-arguments]
+          (let [n (al/al-len [(ptr MonoType)] (load left-arguments))
+                (mut same) (and (= left-name right-name)
+                                (= n (al/al-len [(ptr MonoType)] (load right-arguments))))
+                (mut i) 0]
+            (loop
+              (if (or (not (load same)) (>= (load i) n))
+                  (break)
+                  (do
+                    (if (not (type-same-with-lifetimes?
+                               (al/al-get [(ptr MonoType)] (load left-arguments) (load i))
+                               (al/al-get [(ptr MonoType)] (load right-arguments) (load i))
+                               compare-lifetimes))
+                        (store! same false)
+                        0)
+                    (store! i (+ (load i) 1)))))
+            (load same)))
+        (_ false)))
+    (TypeReference [left-inner left-lifetime]
+      (match (load right)
+        (TypeReference [right-inner right-lifetime]
+          (and (type-same-with-lifetimes? left-inner right-inner compare-lifetimes)
+               (if compare-lifetimes
+                   (lifetime-same? left-lifetime right-lifetime)
+                   true)))
+        (_ false)))
+    (TypeFunction [left-arguments left-result]
+      (match (load right)
+        (TypeFunction [right-arguments right-result]
+          (let [n (al/al-len [(ptr MonoType)] (load left-arguments))
+                (mut same) (and (= n (al/al-len [(ptr MonoType)] (load right-arguments)))
+                                (type-same-with-lifetimes? left-result
+                                                           right-result
+                                                           compare-lifetimes))
+                (mut i) 0]
+            (loop
+              (if (or (not (load same)) (>= (load i) n))
+                  (break)
+                  (do
+                    (if (not (type-same-with-lifetimes?
+                               (al/al-get [(ptr MonoType)] (load left-arguments) (load i))
+                               (al/al-get [(ptr MonoType)] (load right-arguments) (load i))
+                               compare-lifetimes))
+                        (store! same false)
+                        0)
+                    (store! i (+ (load i) 1)))))
+            (load same)))
+        (_ false)))))
+
+(defn type-same? [(left (ptr MonoType)) (right (ptr MonoType))] (-> bool)
+  (type-same-with-lifetimes? left right true))
+
+(defn type-same-representation? [(left (ptr MonoType)) (right (ptr MonoType))]
+  (-> bool)
+  (type-same-with-lifetimes? left right false))
+
+(defn type-occurs? [(solver (ptr TypeSolver))
+                    (variable i64)
+                    (candidate (ptr MonoType))] (-> bool)
+  (let [resolved (type-resolve solver candidate)]
+    (match (load resolved)
+      (TypeVariable [id] (= id variable))
+      (TypeInteger [] false)
+      (TypeString [] false)
+      (TypeBoolean [] false)
+      (TypeUnit [] false)
+      (TypeNamed [_ arguments]
+        (let [n (al/al-len [(ptr MonoType)] (load arguments))
+              (mut found) false
+              (mut i) 0]
+          (loop
+            (if (or (load found) (>= (load i) n))
+                (break)
+                (do
+                  (if (type-occurs? solver
+                                   variable
+                                   (al/al-get [(ptr MonoType)] (load arguments) (load i)))
+                      (store! found true)
+                      0)
+                  (store! i (+ (load i) 1)))))
+          (load found)))
+      (TypeReference [inner _] (type-occurs? solver variable inner))
+      (TypeFunction [arguments result]
+        (let [n (al/al-len [(ptr MonoType)] (load arguments))
+              (mut found) (type-occurs? solver variable result)
+              (mut i) 0]
+          (loop
+            (if (or (load found) (>= (load i) n))
+                (break)
+                (do
+                  (if (type-occurs? solver
+                                   variable
+                                   (al/al-get [(ptr MonoType)] (load arguments) (load i)))
+                      (store! found true)
+                      0)
+                  (store! i (+ (load i) 1)))))
+          (load found))))))
+
+(defn type-bind-variable! [(solver (ptr TypeSolver))
+                           (variable i64)
+                           (value (ptr MonoType))] (-> UnifyResult)
+  (let [resolved (type-resolve solver value)]
+    (match (load resolved)
+      (TypeVariable [other]
+        (if (= variable other)
+            (UnifySuccess)
+            (do
+              (al/al-push! [TypeBinding]
+                           (field solver bindings)
+                           (TypeBinding :variable variable :value resolved))
+              (UnifySuccess))))
+      (_
+        (if (type-occurs? solver variable resolved)
+            (UnifyError "occurs check failed: infinite type")
+            (do
+              (al/al-push! [TypeBinding]
+                           (field solver bindings)
+                           (TypeBinding :variable variable :value resolved))
+              (UnifySuccess)))))))
+
+(defn lifetime-unify! [(solver (ptr TypeSolver))
+                       (left MonoLifetime)
+                       (right MonoLifetime)] (-> UnifyResult)
+  (let [resolved-left (lifetime-resolve solver left)
+        resolved-right (lifetime-resolve solver right)]
+    (match resolved-left
+      (LifetimeStatic []
+        (match resolved-right
+          (LifetimeStatic [] (UnifySuccess))
+          (LifetimeVariable [variable]
+            (do
+              (al/al-push! [LifetimeBinding]
+                           (field solver lifetime-bindings)
+                           (LifetimeBinding :variable variable :value resolved-left))
+              (UnifySuccess)))))
+      (LifetimeVariable [variable]
+        (match resolved-right
+          (LifetimeVariable [other]
+            (if (= variable other)
+                (UnifySuccess)
+                (do
+                  (al/al-push! [LifetimeBinding]
+                               (field solver lifetime-bindings)
+                               (LifetimeBinding :variable variable :value resolved-right))
+                  (UnifySuccess))))
+          (LifetimeStatic []
+            (do
+              (al/al-push! [LifetimeBinding]
+                           (field solver lifetime-bindings)
+                           (LifetimeBinding :variable variable :value resolved-right))
+              (UnifySuccess))))))))
+
+(defn constructor-unify! [(solver (ptr TypeSolver))
+                          (left (slice u8))
+                          (right (slice u8))] (-> UnifyResult)
+  (let [resolved-left (constructor-resolve solver left)
+        resolved-right (constructor-resolve solver right)]
+    (cond (= resolved-left resolved-right) (UnifySuccess)
+          (constructor-variable? resolved-left)
+            (do
+              (al/al-push! [ConstructorBinding]
+                           (field solver constructor-bindings)
+                           (ConstructorBinding :variable resolved-left :value resolved-right))
+              (UnifySuccess))
+          (constructor-variable? resolved-right)
+            (do
+              (al/al-push! [ConstructorBinding]
+                           (field solver constructor-bindings)
+                           (ConstructorBinding :variable resolved-right :value resolved-left))
+              (UnifySuccess))
+          :else (UnifyError "nominal type constructors do not match"))))
+
+(defn nominal-arity-error [(solver (ptr TypeSolver))
+                           (left-name (slice u8)) (left-arity i64)
+                           (right-name (slice u8)) (right-arity i64)]
+  (-> UnifyResult)
+  (let [(mut out) (str/sb-new (load (field solver allocator)))]
+    (str/sb-push-str! (mut out) "nominal type arity does not match: ")
+    (str/sb-push-str! (mut out) left-name)
+    (str/sb-push-str! (mut out) "/")
+    (str/sb-push-i64! (mut out) left-arity)
+    (str/sb-push-str! (mut out) " vs ")
+    (str/sb-push-str! (mut out) right-name)
+    (str/sb-push-str! (mut out) "/")
+    (str/sb-push-i64! (mut out) right-arity)
+    (UnifyError (str/sb-finish! (mut out)))))
+
+(defn unify-success? [(result UnifyResult)] (-> bool)
+  (match result (UnifySuccess [] true) (UnifyError [_] false)))
+
+(defn type-unify! [(solver (ptr TypeSolver))
+                   (left (ptr MonoType))
+                   (right (ptr MonoType))] (-> UnifyResult)
+  (let [resolved-left (type-resolve solver left)
+        resolved-right (type-resolve solver right)]
+    (match (load resolved-left)
+      (TypeVariable [variable]
+        (type-bind-variable! solver variable resolved-right))
+      (_
+        (match (load resolved-right)
+          (TypeVariable [variable]
+            (type-bind-variable! solver variable resolved-left))
+          (TypeInteger []
+            (match (load resolved-left)
+              (TypeInteger [] (UnifySuccess))
+              (_ (UnifyError "types do not match"))))
+          (TypeString []
+            (match (load resolved-left)
+              (TypeString [] (UnifySuccess))
+              (_ (UnifyError "types do not match"))))
+          (TypeBoolean []
+            (match (load resolved-left)
+              (TypeBoolean [] (UnifySuccess))
+              (_ (UnifyError "types do not match"))))
+          (TypeUnit []
+            (match (load resolved-left)
+              (TypeUnit [] (UnifySuccess))
+              (_ (UnifyError "types do not match"))))
+          (TypeNamed [right-name right-arguments]
+            (match (load resolved-left)
+              (TypeNamed [left-name left-arguments]
+                (let [n (al/al-len [(ptr MonoType)] (load left-arguments))
+                      (mut result)
+                        (if (= n (al/al-len [(ptr MonoType)] (load right-arguments)))
+                            (constructor-unify! solver left-name right-name)
+                            (nominal-arity-error solver left-name n right-name
+                              (al/al-len [(ptr MonoType)] (load right-arguments))))
+                      (mut i) 0]
+                  (loop
+                    (if (or (not (unify-success? (load result))) (>= (load i) n))
+                        (break)
+                        (do
+                          (store! result
+                                  (type-unify!
+                                    solver
+                                    (al/al-get [(ptr MonoType)] (load left-arguments) (load i))
+                                    (al/al-get [(ptr MonoType)] (load right-arguments) (load i))))
+                          (store! i (+ (load i) 1)))))
+                  (load result)))
+              (_ (UnifyError "types do not match"))))
+          (TypeReference [right-inner right-lifetime]
+            (match (load resolved-left)
+              (TypeReference [left-inner left-lifetime]
+                (let [inner-result (type-unify! solver left-inner right-inner)]
+                  (if (unify-success? inner-result)
+                      (lifetime-unify! solver left-lifetime right-lifetime)
+                      inner-result)))
+              (_ (UnifyError "types do not match"))))
+          (TypeFunction [right-arguments right-result]
+            (match (load resolved-left)
+              (TypeFunction [left-arguments left-result]
+                (let [n (al/al-len [(ptr MonoType)] (load left-arguments))
+                      (mut result)
+                        (if (= n (al/al-len [(ptr MonoType)] (load right-arguments)))
+                            (UnifySuccess)
+                            (UnifyError "function arity does not match"))
+                      (mut i) 0]
+                  (loop
+                    (if (or (not (unify-success? (load result))) (>= (load i) n))
+                        (break)
+                        (do
+                          (store! result
+                                  (type-unify!
+                                    solver
+                                    (al/al-get [(ptr MonoType)] (load left-arguments) (load i))
+                                    (al/al-get [(ptr MonoType)] (load right-arguments) (load i))))
+                          (store! i (+ (load i) 1)))))
+                  (if (unify-success? (load result))
+                      (type-unify! solver left-result right-result)
+                      (load result))))
+              (_ (UnifyError "types do not match")))))))))

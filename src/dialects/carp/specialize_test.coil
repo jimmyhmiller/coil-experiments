@@ -1,0 +1,158 @@
+(module experiments.carp.specialize-test)
+
+(import "experiments.carp.surface" :as reader)
+(import "experiments.carp.forms" :as forms)
+(import "experiments.carp.resolve" :as resolve)
+(import "experiments.carp.infer-engine" :as infer)
+(import "experiments.carp.specialize" :as specialize)
+(import "experiments.carp.ir" :as ir)
+(import "experiments.carp.types" :as types)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.assert" :use *)
+
+(defstruct Fixture [(resolved ir/ResolvedModule) (inferred infer/InferredModule)])
+
+(defn fixture [(a (dyn alloc/Allocator)) (source (slice u8))] (-> Fixture)
+  (let [lowered (forms/lower a "specialize-test.carp" (reader/read a source))
+        resolved-result (resolve/resolve a (.module lowered))]
+    (assert (not (resolve/resolve-failed? resolved-result)))
+    (let [resolved (resolve/resolved-module resolved-result)
+          inferred-result (infer/infer-module a resolved)]
+      (assert (not (infer/inference-failed? inferred-result)))
+      (Fixture :resolved resolved :inferred (infer/inferred-module inferred-result)))))
+
+(defn specialize-function-body [(a (dyn alloc/Allocator)) (source (slice u8))]
+  (-> specialize/SpecializationResult)
+  (let [input (fixture a source)
+        function (al/al-get [ir/ResolvedFunction] (.functions (.resolved input)) 0)
+        inferred (alloc/box! a infer/InferredModule (.inferred input))
+        solver (alloc/box! a types/TypeSolver (types/type-solver-new a))]
+    (specialize/specialize-expression a inferred solver (.body function))))
+
+(deftest specialization-preserves-array-and-literal-payloads
+  (let [a (alloc/malloc-allocator)
+        result (specialize-function-body a "(defn values [] [1 2])")]
+    (assert (not (specialize/specialization-failed? result)))
+    (match (load (specialize/specialized-expression result))
+      (ir/ExprArray [_ _ items false]
+        (do (assert-eq (al/al-len [(ptr ir/SpecializedExpr)] (load items)) 2)
+            (match (load (al/al-get [(ptr ir/SpecializedExpr)] (load items) 0))
+              (ir/ExprInt [_ _ value] (assert-eq value 1))
+              (_ (assert false)))))
+      (_ (assert false)))))
+
+(deftest specialization-retains-selected-global-call-signatures
+  (let [a (alloc/malloc-allocator)
+        result (specialize-function-body a
+          "(register take-int (Fn [Int] Int)) (defn use [] (take-int 7))")]
+    (assert (not (specialize/specialization-failed? result)))
+    (match (load (specialize/specialized-expression result))
+      (ir/ExprGlobalCall [_ _ callee signature arguments]
+        (do (let [resolved-callee callee]
+              (assert-eq (.name resolved-callee) "take-int"))
+            (match (load signature)
+              (types/TypeFunction [_ result-type]
+                (match (load result-type)
+                  (types/TypeInteger [] (assert true))
+                  (_ (assert false))))
+              (_ (assert false)))
+            (assert-eq (al/al-len [(ptr ir/SpecializedExpr)] (load arguments)) 1)))
+      (_ (assert false)))))
+
+(deftest specialization-selects-deferred-overloads-from-concrete-instantiation
+  (let [a (alloc/malloc-allocator)
+        input (fixture a
+          "(defmodule A (register pick (Fn [Int] Int))) (defmodule B (register pick (Fn [String] String))) (defn choose [x] (pick x))")
+        function (al/al-get [ir/ResolvedFunction] (.functions (.resolved input)) 0)
+        definition (al/al-get [infer/InferredDefinition]
+                     (.definitions (.inferred input)) 0)
+        inferred (alloc/box! a infer/InferredModule (.inferred input))
+        solver (alloc/box! a types/TypeSolver (types/type-solver-new a))
+        arguments (types/type-arguments-new a)]
+    (types/type-arguments-push! arguments (types/type-integer a))
+    (let [requested (types/type-function a arguments (types/type-integer a))
+          definition-type (types/type-clone-resolved a
+                            (field inferred solver) (.signature definition))]
+      (assert (types/unify-success?
+                (types/type-unify! solver definition-type requested)))
+      (let [result (specialize/specialize-expression
+                     a inferred solver (.body function))]
+        (assert (not (specialize/specialization-failed? result)))
+        (match (load (specialize/specialized-expression result))
+          (ir/ExprGlobalCall [_ _ callee _ _]
+            (let [resolved-callee callee]
+              (assert-eq (.name resolved-callee) "A.pick")))
+          (_ (assert false)))))))
+
+(deftest specialization-retains-constructor-patterns-and-binding-types
+  (let [a (alloc/malloc-allocator)
+        result (specialize-function-body a
+          "(deftype (Maybe a) (Just [a]) (Nothing [])) (defn get [m] (match m (Just x) x (Nothing) 0))")]
+    (assert (not (specialize/specialization-failed? result)))
+    (match (load (specialize/specialized-expression result))
+      (ir/ExprMatch [_ _ false _ branches]
+        (do (assert-eq (al/al-len [ir/SpecializedMatchBranch]
+                         (load branches)) 2)
+            (let [branch (al/al-get [ir/SpecializedMatchBranch]
+                           (load branches) 0)]
+              (assert-eq (al/al-len [(ptr types/MonoType)]
+                           (load (.binding-types branch))) 1)
+              (match (load (al/al-get [(ptr types/MonoType)]
+                             (load (.binding-types branch)) 0))
+                (types/TypeInteger [] (assert true))
+                (_ (assert false)))
+              (match (load (.pattern branch))
+                (ir/SpecializedPatternConstructor [_ arguments]
+                  (assert-eq (al/al-len [(ptr ir/SpecializedPattern)]
+                               (load arguments)) 1))
+                (_ (assert false))))))
+      (_ (assert false)))))
+
+(deftest module-specialization-follows-concrete-user-function-calls
+  (let [a (alloc/malloc-allocator)
+        input (fixture a "(defn identity [x] x) (defn main [] (identity 1))")
+        resolved (alloc/box! a ir/ResolvedModule (.resolved input))
+        inferred (alloc/box! a infer/InferredModule (.inferred input))
+        main-function (al/al-get [ir/ResolvedFunction]
+                        (load (field resolved functions)) 1)
+        arguments (types/type-arguments-new a)
+        signature (types/type-function a arguments (types/type-integer a))
+        roots (alloc/box! a (al/ArrayList specialize/SpecializationRequest)
+                (al/al-new [specialize/SpecializationRequest] a))]
+    (al/al-push! [specialize/SpecializationRequest] roots
+      (specialize/SpecializationRequest
+        :source (.reference main-function) :signature signature
+        :reference (ir/core-ref 0 "" true)))
+    (let [result (specialize/specialize-module a resolved inferred roots)]
+      (assert (not (specialize/module-specialization-failed? result)))
+      (let [module (specialize/specialized-module result)]
+        (assert-eq (al/al-len [ir/SpecializedFunction] (.functions module)) 2)
+        (let [main (al/al-get [ir/SpecializedFunction] (.functions module) 0)
+              identity (al/al-get [ir/SpecializedFunction] (.functions module) 1)]
+          (match (load (.body main))
+            (ir/ExprGlobalCall [_ _ callee call-signature _]
+              (do (assert (ir/core-ref-same? callee (.source identity)))
+                  (assert (types/type-same-representation?
+                            call-signature (.signature identity)))))
+            (_ (assert false))))))))
+
+(deftest module-specialization-propagates-qualified-overloads-through-call-chains
+  (let [a (alloc/malloc-allocator)
+        input (fixture a
+          "(definterface str (Fn [a] String)) (definterface = (Fn [a a] Bool)) (defmodule Int (register str (Fn [Int] String)) (register = (Fn [Int Int] Bool)) (implements str Int.str) (implements = Int.=)) (defn display [x] (str x)) (defn handler [x y op] (do (display x) (display y) (op x y))) (defn assert-equal [x y] (handler x y =)) (defn main [] (assert-equal 1 1))")
+        resolved (alloc/box! a ir/ResolvedModule (.resolved input))
+        inferred (alloc/box! a infer/InferredModule (.inferred input))
+        functions (load (field resolved functions))
+        main-function (al/al-get [ir/ResolvedFunction] functions
+                        (- (al/al-len [ir/ResolvedFunction] functions) 1))
+        arguments (types/type-arguments-new a)
+        signature (types/type-function a arguments (types/type-boolean a))
+        roots (alloc/box! a (al/ArrayList specialize/SpecializationRequest)
+                (al/al-new [specialize/SpecializationRequest] a))]
+    (al/al-push! [specialize/SpecializationRequest] roots
+      (specialize/SpecializationRequest
+        :source (.reference main-function) :signature signature
+        :reference (ir/core-ref 0 "" true)))
+    (let [result (specialize/specialize-module a resolved inferred roots)]
+      (assert (not (specialize/module-specialization-failed? result))))))

@@ -1,0 +1,1733 @@
+(module experiments.carp.resolve)
+
+;; Two-pass surface-to-core name resolution. The collection pass mints stable
+;; global identities before any body is visited, permitting recursion and
+;; forward references. Body resolution uses a lexical stack with distinct
+;; negative identities for every binder and emits source-spanned failures.
+
+(import "experiments.carp.forms" :as forms)
+(import "experiments.carp.ir" :as ir)
+(import "experiments.carp.primitives" :as primitives)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+
+(export ResolveError ResolveResult resolve resolve-failed? resolved-module
+        resolve-error global-count global-at)
+
+(defstruct ResolveError [(message (slice u8)) (span forms/SurfaceSpan)])
+(defstruct ResolveResult
+  [(module ir/ResolvedModule)
+   (globals (al/ArrayList ir/CoreRef))
+   (failed i64)
+   (error ResolveError)])
+(defstruct GlobalBinding
+  [(name (slice u8)) (reference ir/CoreRef) (arity i64) (declared bool)])
+(defstruct LocalBinding [(name (slice u8)) (reference ir/CoreRef)])
+(defstruct ImportBinding [(scope (slice u8)) (target (slice u8))])
+(defstruct Resolver
+  [(a (dyn alloc/Allocator))
+   (globals (al/ArrayList GlobalBinding))
+   (imports (al/ArrayList ImportBinding))
+   (implementations (al/ArrayList ir/CoreImplementation))
+   (locals (al/ArrayList LocalBinding))
+   (next-global i64)
+   (next-local i64)
+   (next-expression i64)
+   (failed i64)
+   (error ResolveError)])
+
+(defn resolve-failed? [(result ResolveResult)] (-> bool) (!= (.failed result) 0))
+(defn resolved-module [(result ResolveResult)] (-> ir/ResolvedModule) (.module result))
+(defn resolve-error [(result ResolveResult)] (-> ResolveError) (.error result))
+(defn global-count [(result ResolveResult)] (-> i64)
+  (al/al-len [ir/CoreRef] (.globals result)))
+(defn global-at [(result ResolveResult) (index i64)] (-> ir/CoreRef)
+  (al/al-get [ir/CoreRef] (.globals result) index))
+
+(defn fail-at! [(r (mut Resolver)) (node (ptr forms/CarpNode))
+                (message (slice u8))] (-> i64)
+  (if (= (load (field r failed)) 0)
+      (do (store! (field r failed) 1)
+          (store! (field r error)
+                  (ResolveError :message message :span (forms/span-of node)))) 0)
+  0)
+
+(defn fail-name! [(r (mut Resolver)) (node (ptr forms/CarpNode))
+                  (message (slice u8)) (name (slice u8))] (-> i64)
+  (let [(mut out) (str/sb-new (load (field r a)))]
+    (str/sb-push-str! (mut out) message)
+    (str/sb-push-str! (mut out) ": ")
+    (str/sb-push-str! (mut out) name)
+    (fail-at! (mut r) node (str/sb-finish! (mut out)))))
+
+(defn simple-name [(node (ptr forms/CarpNode))] (-> (slice u8))
+  (match (forms/form-of node)
+    (forms/Symbol [segments]
+      (if (= (al/al-len [(slice u8)] (load segments)) 1)
+          (al/al-get [(slice u8)] (load segments) 0) ""))
+    (_ "")))
+
+(defn symbol-key [(r (mut Resolver)) (node (ptr forms/CarpNode))] (-> (slice u8))
+  (match (forms/form-of node)
+    (forms/Symbol [segments]
+      (let [n (al/al-len [(slice u8)] (load segments))]
+        (if (= n 0) ""
+            (let [(mut out) (str/sb-new (load (field r a))) (mut i) 0]
+              (loop (if (>= (load i) n) (break)
+                        (do (if (> (load i) 0)
+                                (str/sb-push-byte! (mut out) (primitive/cast u8 46)) 0)
+                            (str/sb-push-str! (mut out)
+                              (al/al-get [(slice u8)] (load segments) (load i)))
+                            (store! i (+ (load i) 1)))))
+              (str/sb-finish! (mut out))))))
+    (_ "")))
+
+(defn named? [(node (ptr forms/CarpNode)) (name (slice u8))] (-> bool)
+  (str/str-eq (simple-name node) name))
+
+(defn qualified? [(name (slice u8))] (-> bool)
+  (let [n (slice-len name) (mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) n) (load found)) (break)
+              (do (if (= (slice-get name (load i)) (primitive/cast u8 46))
+                      (store! found true) 0)
+                  (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn append-scope [(r (mut Resolver)) (scope (slice u8)) (name (slice u8))]
+  (-> (slice u8))
+  (if (= (slice-len scope) 0) name
+      (let [(mut out) (str/sb-new (load (field r a)))]
+        (str/sb-push-str! (mut out) scope)
+        (str/sb-push-byte! (mut out) (primitive/cast u8 46))
+        (str/sb-push-str! (mut out) name)
+        (str/sb-finish! (mut out)))))
+
+(defn field-setter-name [(r (mut Resolver)) (name (slice u8)) (bang bool)]
+  (-> (slice u8))
+  (let [(mut out) (str/sb-new (load (field r a)))]
+    (str/sb-push-str! (mut out) "set-")
+    (str/sb-push-str! (mut out) name)
+    (if bang (str/sb-push-byte! (mut out) (primitive/cast u8 33)) 0)
+    (str/sb-finish! (mut out))))
+
+(defn field-updater-name [(r (mut Resolver)) (name (slice u8)) (bang bool)]
+  (-> (slice u8))
+  (let [(mut out) (str/sb-new (load (field r a)))]
+    (str/sb-push-str! (mut out) "update-")
+    (str/sb-push-str! (mut out) name)
+    (if bang (str/sb-push-byte! (mut out) (primitive/cast u8 33)) 0)
+    (str/sb-finish! (mut out))))
+
+(defn list-items [(node (ptr forms/CarpNode))]
+  (-> (ptr (al/ArrayList (ptr forms/CarpNode))))
+  (match (forms/form-of node)
+    (forms/ListForm [items] items)
+    (_ (primitive/cast (ptr (al/ArrayList (ptr forms/CarpNode))) 0))))
+
+(defn semantic-count [(items (ptr (al/ArrayList (ptr forms/CarpNode))))] (-> i64)
+  (let [n (al/al-len [(ptr forms/CarpNode)] (load items))
+        (mut i) 0 (mut count) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (match (forms/form-of
+                           (al/al-get [(ptr forms/CarpNode)] (load items) (load i)))
+                    (forms/Comment [_] 0)
+                    (_ (store! count (+ (load count) 1))))
+                  (store! i (+ (load i) 1)))))
+    (load count)))
+
+(defn semantic-items [(r (mut Resolver))
+                      (raw (ptr (al/ArrayList (ptr forms/CarpNode))))]
+  (-> (ptr (al/ArrayList (ptr forms/CarpNode))))
+  (let [a (load (field r a))
+        items (alloc/box! a (al/ArrayList (ptr forms/CarpNode))
+                          (al/al-new [(ptr forms/CarpNode)] a))
+        n (al/al-len [(ptr forms/CarpNode)] (load raw)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (let [item (al/al-get [(ptr forms/CarpNode)] (load raw) (load i))]
+                (match (forms/form-of item)
+                  (forms/Comment [_] 0)
+                  (_ (al/al-push! [(ptr forms/CarpNode)] items item)))
+                (store! i (+ (load i) 1)))))
+    items))
+
+(defn parameter-count [(r (mut Resolver)) (node (ptr forms/CarpNode))] (-> i64)
+  (match (forms/form-of node)
+    (forms/ArrayForm [items] (semantic-count items))
+    (_ -1)))
+
+(defn signature-arity [(r (mut Resolver)) (node (ptr forms/CarpNode))] (-> i64)
+  (match (forms/form-of node)
+    (forms/ListForm [raw]
+      (let [items (semantic-items (mut r) raw)]
+        (if (< (al/al-len [(ptr forms/CarpNode)] (load items)) 2) -1
+            (let [head (al/al-get [(ptr forms/CarpNode)] (load items) 0)]
+              (if (or (named? head "Fn") (named? head "λ"))
+                  (parameter-count (mut r)
+                    (al/al-get [(ptr forms/CarpNode)] (load items) 1))
+                  -1)))))
+    (_ -1)))
+
+(defn declared-type-name [(r (mut Resolver)) (node (ptr forms/CarpNode))]
+  (-> (slice u8))
+  (match (forms/form-of node)
+    (forms/Symbol [_] (simple-name node))
+    (forms/ListForm [raw]
+      (let [items (semantic-items (mut r) raw)]
+        (if (= (al/al-len [(ptr forms/CarpNode)] (load items)) 0) ""
+            (simple-name (al/al-get [(ptr forms/CarpNode)] (load items) 0)))))
+    (forms/ArrayForm [raw]
+      (let [items (semantic-items (mut r) raw)]
+        (if (= (al/al-len [(ptr forms/CarpNode)] (load items)) 0) ""
+            (simple-name (al/al-get [(ptr forms/CarpNode)] (load items) 0)))))
+    (_ "")))
+
+(defn global-index-exact [(r (ptr Resolver)) (name (slice u8)) (arity i64)] (-> i64)
+  (let [n (al/al-len [GlobalBinding] (load (field r globals)))
+        (mut i) 0 (mut found) -1]
+    (loop (if (>= (load i) n) (break)
+              (let [binding (al/al-get [GlobalBinding]
+                                       (load (field r globals)) (load i))]
+                (if (and (str/str-eq (.name binding) name)
+                         (or (< arity 0) (or (< (.arity binding) 0)
+                                            (= (.arity binding) arity))))
+                    (if (= (load found) -1) (store! found (load i))
+                        (store! found -2)) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn global-index-first-exact [(r (ptr Resolver)) (name (slice u8))] (-> i64)
+  (let [n (al/al-len [GlobalBinding] (load (field r globals)))
+        (mut i) 0 (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0)) (break)
+              (let [binding (al/al-get [GlobalBinding]
+                                       (load (field r globals)) (load i))]
+                (if (str/str-eq (.name binding) name) (store! found (load i)) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn global-reference-at [(r (ptr Resolver)) (index i64)] (-> ir/CoreRef)
+  (let [binding (al/al-get [GlobalBinding] (load (field r globals)) index)]
+    (.reference binding)))
+
+(defn add-global! [(r (mut Resolver)) (node (ptr forms/CarpNode))
+                   (scope (slice u8)) (name (slice u8)) (arity i64)] (-> i64)
+  (let [qualified (append-scope (mut r) scope name)
+        n (al/al-len [GlobalBinding] (load (field r globals)))
+        (mut i) 0 (mut existing) -1]
+    (loop (if (>= (load i) n) (break)
+              (let [binding (al/al-get [GlobalBinding]
+                                       (load (field r globals)) (load i))]
+                (if (and (str/str-eq (.name binding) qualified)
+                         (= (.arity binding) arity))
+                    (store! existing (load i)) 0)
+                (store! i (+ (load i) 1)))))
+    (if (>= (load existing) 0)
+        (let [binding (al/al-elem [GlobalBinding]
+                                  (field r globals) (load existing))]
+          ;; Carp is interactive and permits redefinition. Repeated source
+          ;; declarations retain the original identity; ordered definitions
+          ;; let later lowering apply its last-definition-wins rule.
+          (do (store! (field binding declared) true) 0))
+        (let [reference (ir/core-ref (load (field r next-global)) qualified true)]
+          (store! (field r next-global) (+ (load (field r next-global)) 1))
+          (al/al-push! [GlobalBinding] (mut (field r globals))
+                       (GlobalBinding :name qualified :reference reference
+                                      :arity arity :declared true))))))
+
+(defn add-generated-global! [(r (mut Resolver)) (scope (slice u8))
+                             (name (slice u8)) (arity i64)] (-> i64)
+  (let [qualified (append-scope (mut r) scope name)
+        existing (global-index-exact (mut r) qualified arity)]
+    (if (>= existing 0) 0
+        (let [reference (ir/core-ref (load (field r next-global)) qualified true)]
+          (store! (field r next-global) (+ (load (field r next-global)) 1))
+          (al/al-push! [GlobalBinding] (mut (field r globals))
+            (GlobalBinding :name qualified :reference reference
+                           :arity arity :declared false))))))
+
+(defn global-source-declared? [(r (mut Resolver)) (scope (slice u8))
+                               (name (slice u8)) (arity i64)] (-> bool)
+  (let [qualified (append-scope (mut r) scope name)
+        index (global-index-exact (mut r) qualified arity)]
+    (if (< index 0) false
+        (let [binding (al/al-get [GlobalBinding]
+                        (load (field r globals)) index)]
+          (.declared binding)))))
+
+(defn add-constructor! [(r (mut Resolver)) (node (ptr forms/CarpNode))
+                        (scope (slice u8)) (type-name (slice u8))
+                        (name (slice u8)) (arity i64)] (-> i64)
+  (let [owner (append-scope (mut r) scope type-name)
+        qualified (append-scope (mut r) owner name)
+        bare (append-scope (mut r) scope name)
+        reference (ir/core-ref (load (field r next-global)) qualified true)]
+    (store! (field r next-global) (+ (load (field r next-global)) 1))
+    (al/al-push! [GlobalBinding] (mut (field r globals))
+                 (GlobalBinding :name qualified :reference reference
+                                :arity arity :declared true))
+    (if (str/str-eq bare qualified) 0
+        (al/al-push! [GlobalBinding] (mut (field r globals))
+                     (GlobalBinding :name bare :reference reference
+                                    :arity arity :declared true)))))
+
+(defn add-interface! [(r (mut Resolver)) (node (ptr forms/CarpNode))
+                      (scope (slice u8)) (name (slice u8)) (arity i64)] (-> i64)
+  (let [qualified (append-scope (mut r) scope name)
+        existing (global-index-exact (mut r) qualified arity)]
+    (if (>= existing 0) 0
+        (add-global! (mut r) node scope name arity))))
+
+(defn record-import! [(r (mut Resolver)) (scope (slice u8))
+                      (node (ptr forms/CarpNode))] (-> i64)
+  (let [raw (list-items node)]
+    (if (= (primitive/cast i64 raw) 0) 0
+        (let [items (semantic-items (mut r) raw)]
+          (if (!= (al/al-len [(ptr forms/CarpNode)] (load items)) 2) 0
+              (let [target (symbol-key (mut r)
+                             (al/al-get [(ptr forms/CarpNode)] (load items) 1))]
+                (if (= (slice-len target) 0) 0
+                    (al/al-push! [ImportBinding] (mut (field r imports))
+                                 (ImportBinding :scope scope :target target)))))))))
+
+(defn record-import-target! [(r (mut Resolver)) (scope (slice u8))
+                             (target-node (ptr forms/CarpNode))] (-> i64)
+  (let [target (symbol-key (mut r) target-node)]
+    (if (= (slice-len target) 0)
+        (fail-at! (mut r) target-node "with module name must be a symbol")
+        (al/al-push! [ImportBinding] (mut (field r imports))
+                     (ImportBinding :scope scope :target target)))))
+
+(defn collect-node! [(r (mut Resolver)) (scope (slice u8))
+                     (node (ptr forms/CarpNode))] (-> i64)
+  (match (forms/form-of node)
+    (forms/ListForm [raw]
+      (let [items (semantic-items (mut r) raw)
+            n (al/al-len [(ptr forms/CarpNode)] (load items))]
+        (if (= n 0) 0
+            (let [head (al/al-get [(ptr forms/CarpNode)] (load items) 0)]
+              (cond
+                (named? head "with")
+                  (if (< n 2) (fail-at! (mut r) node "with expects a module and body")
+                      (do (record-import-target! (mut r) scope
+                            (al/al-get [(ptr forms/CarpNode)] (load items) 1))
+                          (let [(mut i) 2]
+                            (loop (if (or (>= (load i) n)
+                                          (!= (load (field r failed)) 0)) (break)
+                                      (do (collect-node! (mut r) scope
+                                            (al/al-get [(ptr forms/CarpNode)]
+                                                       (load items) (load i)))
+                                          (store! i (+ (load i) 1)))))
+                            0)))
+                (named? head "defmodule")
+                  (if (< n 2) (fail-at! (mut r) node "defmodule expects a name")
+                      (let [name (simple-name
+                                   (al/al-get [(ptr forms/CarpNode)] (load items) 1))]
+                        (if (= (slice-len name) 0)
+                            (fail-at! (mut r) node "defmodule name must be a symbol")
+                            (let [nested (append-scope (mut r) scope name)
+                                  (mut i) 2]
+                              (loop (if (or (>= (load i) n)
+                                            (!= (load (field r failed)) 0)) (break)
+                                        (do (collect-node! (mut r) nested
+                                              (al/al-get [(ptr forms/CarpNode)]
+                                                         (load items) (load i)))
+                                            (store! i (+ (load i) 1)))))
+                              0))))
+                (or (named? head "use") (named? head "use-all"))
+                  (record-import! (mut r) scope node)
+                (named? head "defn")
+                  (if (< n 4) (fail-at! (mut r) node "defn expects name, parameters, and body")
+                      (let [name (simple-name
+                                   (al/al-get [(ptr forms/CarpNode)] (load items) 1))
+                            arity (parameter-count (mut r)
+                                    (al/al-get [(ptr forms/CarpNode)] (load items) 2))]
+                        (if (or (= (slice-len name) 0) (< arity 0))
+                            (fail-at! (mut r) node "invalid function declaration")
+                            (add-global! (mut r) node scope name arity))))
+                (named? head "def")
+                  (if (< n 3) (fail-at! (mut r) node "def expects name and value")
+                      (let [name (simple-name
+                                   (al/al-get [(ptr forms/CarpNode)] (load items) 1))]
+                        (if (= (slice-len name) 0)
+                            (fail-at! (mut r) node "def name must be a symbol")
+                            (add-global! (mut r) node scope name -1))))
+                (named? head "register-type")
+                  (if (< n 2) (fail-at! (mut r) node "register-type expects a name")
+                      (let [type-name (simple-name
+                                        (al/al-get [(ptr forms/CarpNode)]
+                                                   (load items) 1))]
+                        (if (= (slice-len type-name) 0)
+                            (fail-at! (mut r) node "register-type name must be a symbol")
+                            (if (< n 3) 0
+                                (let [fields-node (al/al-get [(ptr forms/CarpNode)]
+                                                            (load items) 2)]
+                                  (match (forms/form-of fields-node)
+                                    (forms/ArrayForm [fields]
+                                      (let [field-items (semantic-items (mut r) fields)
+                                            field-count (al/al-len [(ptr forms/CarpNode)]
+                                                                  (load field-items))
+                                            owner (append-scope (mut r) scope type-name)
+                                            (mut field-index) 0]
+                                        (if (!= (% field-count 2) 0)
+                                            (fail-at! (mut r) fields-node
+                                                      "invalid registered struct fields")
+                                            (do
+                                              (add-generated-global! (mut r) owner
+                                                                     "init" (/ field-count 2))
+                                              (add-generated-global! (mut r) owner "str" 1)
+                                              (add-generated-global! (mut r) owner "prn" 1)
+                                              (loop (if (>= (load field-index) field-count)
+                                                        (break)
+                                                        (let [field-node (al/al-get
+                                                                          [(ptr forms/CarpNode)]
+                                                                          (load field-items)
+                                                                          (load field-index))
+                                                              field-name (simple-name field-node)]
+                                                          (if (= (slice-len field-name) 0)
+                                                              (fail-at! (mut r) field-node
+                                                                        "field name must be a symbol")
+                                                              (add-generated-global! (mut r) owner
+                                                                                     field-name 1))
+                                                          (if (> (slice-len field-name) 0)
+                                                              (do (add-generated-global! (mut r) owner
+                                                                    (field-setter-name (mut r)
+                                                                      field-name false) 2)
+                                                                  (add-generated-global! (mut r) owner
+                                                                    (field-setter-name (mut r)
+                                                                      field-name true) 2)
+                                                                  (add-generated-global! (mut r) owner
+                                                                    (field-updater-name (mut r)
+                                                                      field-name false) 2)) 0)
+                                                          (store! field-index
+                                                                  (+ (load field-index) 2)))))
+                                              0))))
+                                    (_ (fail-at! (mut r) fields-node
+                                                 "registered struct fields must be an array"))))))))
+                (named? head "register")
+                  (if (< n 3) (fail-at! (mut r) node "register expects name and signature")
+                      (let [name (simple-name
+                                   (al/al-get [(ptr forms/CarpNode)] (load items) 1))
+                            arity (signature-arity (mut r)
+                                    (al/al-get [(ptr forms/CarpNode)] (load items) 2))]
+                        (if (= (slice-len name) 0)
+                            (fail-at! (mut r) node "invalid register declaration")
+                            (add-global! (mut r) node scope name arity))))
+                (named? head "deftemplate")
+                  (if (< n 3)
+                      (fail-at! (mut r) node "deftemplate expects name and signature")
+                      (let [name (simple-name
+                                   (al/al-get [(ptr forms/CarpNode)] (load items) 1))
+                            arity (signature-arity (mut r)
+                                    (al/al-get [(ptr forms/CarpNode)] (load items) 2))]
+                        (if (or (= (slice-len name) 0) (< arity 0))
+                            (fail-at! (mut r) node "invalid deftemplate declaration")
+                            (add-global! (mut r) node scope name arity))))
+                (named? head "definterface")
+                  (if (< n 3)
+                      (fail-at! (mut r) node "definterface expects name and signature")
+                      (let [name (simple-name
+                                   (al/al-get [(ptr forms/CarpNode)] (load items) 1))
+                            arity (signature-arity (mut r)
+                                    (al/al-get [(ptr forms/CarpNode)] (load items) 2))]
+                        (if (= (slice-len name) 0)
+                            (fail-at! (mut r) node "invalid interface declaration")
+                            (add-interface! (mut r) node scope name arity))))
+                (named? head "deftype")
+                  (if (< n 2) (fail-at! (mut r) node "deftype expects a name")
+                      (let [type-name (declared-type-name (mut r)
+                                        (al/al-get [(ptr forms/CarpNode)]
+                                                   (load items) 1))
+                            type-node (al/al-get [(ptr forms/CarpNode)]
+                                        (load items) 1)
+                            owner (append-scope (mut r) scope type-name)
+                            (mut i) 2]
+                        (add-generated-global! (mut r) owner "str" 1)
+                        (add-generated-global! (mut r) owner "prn" 1)
+                        (add-generated-global! (mut r) owner "copy" 1)
+                        (add-generated-global! (mut r) owner "delete" 1)
+                        (loop (if (or (>= (load i) n)
+                                      (!= (load (field r failed)) 0)) (break)
+                                  (let [constructor-node
+                                          (al/al-get [(ptr forms/CarpNode)]
+                                                     (load items) (load i))]
+                                    (match (forms/form-of constructor-node)
+                                      (forms/ListForm [constructor-raw]
+                                        (let [constructor-items
+                                                (semantic-items (mut r) constructor-raw)]
+                                          (if (< (al/al-len [(ptr forms/CarpNode)]
+                                                           (load constructor-items)) 2)
+                                              (fail-at! (mut r) constructor-node
+                                                        "constructor expects fields")
+                                              (let [name (simple-name
+                                                           (al/al-get
+                                                             [(ptr forms/CarpNode)]
+                                                             (load constructor-items) 0))
+                                                    arity (parameter-count (mut r)
+                                                            (al/al-get
+                                                              [(ptr forms/CarpNode)]
+                                                              (load constructor-items) 1))]
+                                                (if (or (= (slice-len name) 0)
+                                                        (< arity 0))
+                                                    (fail-at! (mut r) constructor-node
+                                                              "invalid constructor")
+                                                    (add-constructor! (mut r) constructor-node
+                                                                      scope type-name
+                                                                      name arity))))))
+                                      (forms/ArrayForm [fields]
+                                        (let [field-items (semantic-items (mut r) fields)
+                                              field-count (al/al-len [(ptr forms/CarpNode)]
+                                                                    (load field-items))]
+                                          (if (or (= (slice-len type-name) 0)
+                                                  (!= (% field-count 2) 0))
+                                              (fail-at! (mut r) constructor-node
+                                                        "invalid struct fields")
+                                              (let [owner (append-scope (mut r) scope type-name)
+                                                    (mut field-index) 0]
+                                                (add-generated-global! (mut r) owner
+                                                                       "init" (/ field-count 2))
+                                                (loop (if (>= (load field-index) field-count)
+                                                          (break)
+                                                          (let [field-node (al/al-get
+                                                                            [(ptr forms/CarpNode)]
+                                                                            (load field-items)
+                                                                            (load field-index))
+                                                                field-name (simple-name field-node)]
+                                                            (if (= (slice-len field-name) 0)
+                                                                (fail-at! (mut r) field-node
+                                                                          "field name must be a symbol")
+                                                                (add-generated-global! (mut r) owner
+                                                                                       field-name 1))
+                                                            (if (> (slice-len field-name) 0)
+                                                                (do (add-generated-global! (mut r) owner
+                                                                      (field-setter-name (mut r)
+                                                                        field-name false) 2)
+                                                                    (add-generated-global! (mut r) owner
+                                                                      (field-setter-name (mut r)
+                                                                        field-name true) 2)
+                                                                    (add-generated-global! (mut r) owner
+                                                                      (field-updater-name (mut r)
+                                                                        field-name false) 2)) 0)
+                                                            (store! field-index
+                                                                    (+ (load field-index) 2)))))
+                                                0))))
+                                      (forms/Symbol [_]
+                                        (let [name (simple-name constructor-node)]
+                                          (if (= (slice-len name) 0)
+                                              (fail-at! (mut r) constructor-node
+                                                        "invalid nullary constructor")
+                                              (add-constructor! (mut r) constructor-node
+                                                                scope type-name name 0))))
+                                      (_ (fail-at! (mut r) constructor-node
+                                                   "constructor must be a list or field array")))
+                                    (store! i (+ (load i) 1)))))
+                        0))
+                (named? head "do")
+                  (let [(mut i) 1]
+                    (loop (if (or (>= (load i) n)
+                                  (!= (load (field r failed)) 0)) (break)
+                              (do (collect-node! (mut r) scope
+                                    (al/al-get [(ptr forms/CarpNode)]
+                                               (load items) (load i)))
+                                  (store! i (+ (load i) 1)))))
+                    0)
+                :else 0)))))
+    (_ 0)))
+
+(defn collect-module! [(r (mut Resolver)) (module forms/CarpModule)] (-> i64)
+  (let [n (forms/module-count module) (mut i) 0]
+    (loop (if (or (>= (load i) n) (!= (load (field r failed)) 0)) (break)
+              (do (collect-node! (mut r) "" (forms/module-at module (load i)))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn seed-primitives! [(r (mut Resolver))] (-> i64)
+  (let [entries (primitives/bindings (load (field r a)))
+        n (al/al-len [primitives/PrimitiveBinding] entries)
+        (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (let [entry (al/al-get [primitives/PrimitiveBinding] entries (load i))]
+                (al/al-push! [GlobalBinding] (mut (field r globals))
+                  (GlobalBinding :name (.name entry)
+                                 :reference (ir/core-ref (.id entry) (.name entry) true)
+                                 :arity (.arity entry) :declared false))
+                (store! i (+ (load i) 1)))))
+    (store! (field r next-global) (+ (primitives/max-id) 1))
+    0))
+
+(defn local-index [(r (ptr Resolver)) (name (slice u8))] (-> i64)
+  (let [(mut i) (al/al-len [LocalBinding] (load (field r locals)))
+        (mut found) -1]
+    (loop (if (or (= (load i) 0) (!= (load found) -1)) (break)
+              (do (store! i (- (load i) 1))
+                  (let [binding (al/al-get [LocalBinding]
+                                           (load (field r locals)) (load i))]
+                    (if (str/str-eq (.name binding) name)
+                        (store! found (load i)) 0)))))
+    (load found)))
+
+(defn import-candidate [(r (mut Resolver)) (scope (slice u8))
+                        (name (slice u8)) (arity i64)] (-> i64)
+  (let [n (al/al-len [ImportBinding] (load (field r imports)))
+        (mut i) 0 (mut found) -1]
+    (loop (if (>= (load i) n) (break)
+              (let [imported (al/al-get [ImportBinding]
+                                        (load (field r imports)) (load i))]
+                (if (str/str-eq (.scope imported) scope)
+                    (let [qualified (append-scope (mut r) (.target imported) name)
+                          candidate (global-index-exact (mut r) qualified arity)]
+                      (if (>= candidate 0)
+                          (if (= (load found) -1) (store! found candidate)
+                              (store! found -2)) 0)) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn qualified-basename? [(qualified (slice u8)) (name (slice u8))] (-> bool)
+  (let [qualified-length (slice-len qualified) name-length (slice-len name)]
+    (and (> qualified-length name-length)
+         (and (= (slice-get [u8] qualified (- (- qualified-length name-length) 1))
+                 (primitive/cast u8 46))
+              (str/str-eq (subslice qualified (- qualified-length name-length)
+                                    qualified-length)
+                          name)))))
+
+(defn parent-scope [(scope (slice u8))] (-> (slice u8))
+  (let [n (slice-len scope) (mut i) 0 (mut last-dot) -1]
+    (loop (if (>= (load i) n) (break)
+              (do (if (= (slice-get [u8] scope (load i)) (primitive/cast u8 46))
+                      (store! last-dot (load i)) 0)
+                  (store! i (+ (load i) 1)))))
+    (if (< (load last-dot) 0) "" (subslice scope 0 (load last-dot)))))
+
+(defn scoped-candidate [(r (mut Resolver)) (scope (slice u8))
+                        (name (slice u8)) (arity i64)] (-> i64)
+  (let [(mut current) scope (mut found) -1]
+    (loop (if (or (= (slice-len (load current)) 0) (>= (load found) 0)) (break)
+              (let [candidate (global-index-exact (mut r)
+                                (append-scope (mut r) (load current) name) arity)]
+                (if (>= candidate 0) (store! found candidate) 0)
+                (store! current (parent-scope (load current))))))
+    (load found)))
+
+(defn unqualified-candidate [(r (mut Resolver)) (name (slice u8)) (arity i64)]
+  (-> i64)
+  (let [n (al/al-len [GlobalBinding] (load (field r globals)))
+        (mut i) 0 (mut found) -1]
+    (loop (if (>= (load i) n) (break)
+              (let [binding (al/al-get [GlobalBinding]
+                                       (load (field r globals)) (load i))]
+                (if (and (qualified-basename? (.name binding) name)
+                         (or (< arity 0) (or (< (.arity binding) 0)
+                                            (= (.arity binding) arity))))
+                    (if (= (load found) -1) (store! found (load i))
+                        (store! found -2)) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn resolve-binding [(r (mut Resolver)) (scope (slice u8))
+                       (node (ptr forms/CarpNode)) (arity i64)] (-> ir/CoreRef)
+  (let [name (symbol-key (mut r) node)]
+    (if (= (slice-len name) 0)
+        (do (fail-at! (mut r) node "expected a name") (ir/core-ref 0 "" false))
+        (if (not (qualified? name))
+            (let [local (local-index (mut r) name)]
+              (if (>= local 0)
+                  (let [binding (al/al-get [LocalBinding]
+                                           (load (field r locals)) local)]
+                    (.reference binding))
+                  (let [scoped (scoped-candidate (mut r) scope name arity)
+                        imported (import-candidate (mut r) scope name arity)
+                        root (global-index-exact (mut r) name arity)
+                        fallback (unqualified-candidate (mut r) name arity)
+                        selected (cond (= imported -2) -2
+                                       (>= scoped 0) scoped
+                                       (>= imported 0) imported
+                                       (>= root 0) root
+                                       :else fallback)]
+                    (if (= selected -2)
+                        (do (fail-name! (mut r) node "ambiguous name" name)
+                            (ir/core-ref 0 name true))
+                        (if (< selected 0)
+                            (do (fail-name! (mut r) node "unresolved name" name)
+                                (ir/core-ref 0 name true))
+                            (let [binding (al/al-get [GlobalBinding]
+                                                   (load (field r globals)) selected)]
+                              (.reference binding)))))))
+            (let [relative (scoped-candidate (mut r) scope name arity)
+                  absolute (global-index-exact (mut r) name arity)
+                  selected (if (>= relative 0) relative absolute)]
+              (if (< selected 0)
+                  (do (fail-name! (mut r) node "unresolved qualified name" name)
+                      (ir/core-ref 0 name true))
+                  (let [binding (al/al-get [GlobalBinding]
+                                           (load (field r globals)) selected)]
+                    (.reference binding))))))))
+
+(defn overload-candidates [(r (mut Resolver)) (name (slice u8)) (arity i64)]
+  (-> (ptr (al/ArrayList ir/CoreRef)))
+  (let [a (load (field r a))
+        result (ir/core-ref-list-new a)
+        n (al/al-len [GlobalBinding] (load (field r globals)))
+        (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (let [binding (al/al-get [GlobalBinding]
+                                       (load (field r globals)) (load i))]
+                (if (and (qualified-basename? (.name binding) name)
+                         (or (< arity 0) (or (< (.arity binding) 0)
+                                            (= (.arity binding) arity))))
+                    (let [candidate (.reference binding)
+                          count (al/al-len [ir/CoreRef] (load result))
+                          (mut j) 0 (mut duplicate) false]
+                      (loop (if (or (>= (load j) count) (load duplicate)) (break)
+                                (do (if (ir/core-ref-same? candidate
+                                          (al/al-get [ir/CoreRef] (load result) (load j)))
+                                        (store! duplicate true) 0)
+                                    (store! j (+ (load j) 1)))))
+                      (if (load duplicate) 0
+                          (al/al-push! [ir/CoreRef] result candidate))) 0)
+                (store! i (+ (load i) 1)))))
+    result))
+
+(defn interface-implementation-candidates [(r (mut Resolver))
+                                            (interface ir/CoreRef)]
+  (-> (ptr (al/ArrayList ir/CoreRef)))
+  (let [result (ir/core-ref-list-new (load (field r a)))
+        n (al/al-len [ir/CoreImplementation]
+                     (load (field r implementations))) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (let [edge (al/al-get [ir/CoreImplementation]
+                                     (load (field r implementations)) (load i))]
+                (if (ir/core-ref-same? (.interface edge) interface)
+                    (al/al-push! [ir/CoreRef] result (.implementation edge)) 0)
+                (store! i (+ (load i) 1)))))
+    result))
+
+(defn resolve-reference-expression [(r (mut Resolver)) (scope (slice u8))
+                                    (node (ptr forms/CarpNode)) (arity i64)]
+  (-> (ptr ir/ResolvedExpr))
+  (let [a (load (field r a)) key (symbol-key (mut r) node)
+        name (if (qualified? key) key (simple-name node))]
+    (if (or (= (slice-len name) 0) (qualified? name))
+        (ir/resolved-expression-box a
+          (ir/ResolvedReference (next-expression! (mut r))
+                                (resolve-binding (mut r) scope node arity)))
+        (let [local (local-index (mut r) name)
+              scoped (scoped-candidate (mut r) scope name arity)
+              imported (import-candidate (mut r) scope name arity)
+              root (global-index-exact (mut r) name arity)
+              fallback (unqualified-candidate (mut r) name arity)
+              interface-reference (if (>= root 0)
+                                    (global-reference-at (mut r) root)
+                                    (ir/core-ref 0 "" true))
+              interface-candidates
+                (if (>= root 0)
+                    (interface-implementation-candidates
+                      (mut r) interface-reference)
+                    (ir/core-ref-list-new a))
+              interface-count (al/al-len [ir/CoreRef] (load interface-candidates))]
+          (if (and (< local 0) (> interface-count 0))
+              (ir/resolved-expression-box a
+                (ir/ResolvedOverload (next-expression! (mut r)) name
+                                     interface-candidates))
+              (if (and (< local 0)
+                   (and (< scoped 0)
+                        (and (= imported -1)
+                             (and (< root 0) (= fallback -2)))))
+              (ir/resolved-expression-box a
+                (ir/ResolvedOverload (next-expression! (mut r)) name
+                                     (overload-candidates (mut r) name arity)))
+              (ir/resolved-expression-box a
+                (ir/ResolvedReference (next-expression! (mut r))
+                                      (resolve-binding (mut r) scope node arity)))))))))
+
+(defn next-expression! [(r (mut Resolver))] (-> i64)
+  (let [id (load (field r next-expression))]
+    (store! (field r next-expression) (+ id 1)) id))
+
+(defn push-local! [(r (mut Resolver)) (node (ptr forms/CarpNode))]
+  (-> ir/CoreRef)
+  (let [name (simple-name node)
+        reference (ir/core-ref (load (field r next-local)) name false)]
+    (store! (field r next-local) (- (load (field r next-local)) 1))
+    (al/al-push! [LocalBinding] (mut (field r locals))
+                 (LocalBinding :name name :reference reference))
+    reference))
+
+(defn restore-locals! [(r (mut Resolver)) (count i64)] (-> i64)
+  (loop (if (<= (al/al-len [LocalBinding] (load (field r locals))) count) (break)
+            (al/al-pop! [LocalBinding] (mut (field r locals)))))
+  0)
+
+(defn resolve-sequence [(r (mut Resolver)) (scope (slice u8))
+                        (items (ptr (al/ArrayList (ptr forms/CarpNode))))
+                        (start i64)] (-> (ptr ir/ResolvedExpr))
+  (let [a (load (field r a))
+        output (ir/resolved-expression-list-new a)
+        n (al/al-len [(ptr forms/CarpNode)] (load items))
+        (mut i) start]
+    (loop (if (or (>= (load i) n) (!= (load (field r failed)) 0)) (break)
+              (do (al/al-push! [(ptr ir/ResolvedExpr)] output
+                               (resolve-expression (mut r) scope
+                                 (al/al-get [(ptr forms/CarpNode)]
+                                            (load items) (load i))))
+                  (store! i (+ (load i) 1)))))
+    (if (= (al/al-len [(ptr ir/ResolvedExpr)] (load output)) 0)
+        (ir/resolved-expression-box a (ir/ResolvedUnit (next-expression! (mut r))))
+        (if (= (al/al-len [(ptr ir/ResolvedExpr)] (load output)) 1)
+            (al/al-get [(ptr ir/ResolvedExpr)] (load output) 0)
+            (ir/resolved-expression-box a
+              (ir/ResolvedDo (next-expression! (mut r)) output))))))
+
+(defn resolve-collection [(r (mut Resolver)) (scope (slice u8))
+                          (raw (ptr (al/ArrayList (ptr forms/CarpNode))))
+                          (static bool)] (-> (ptr ir/ResolvedExpr))
+  (let [a (load (field r a)) items (semantic-items (mut r) raw)
+        output (ir/resolved-expression-list-new a)
+        n (al/al-len [(ptr forms/CarpNode)] (load items)) (mut i) 0]
+    (loop (if (or (>= (load i) n) (!= (load (field r failed)) 0)) (break)
+              (do (al/al-push! [(ptr ir/ResolvedExpr)] output
+                    (resolve-expression (mut r) scope
+                      (al/al-get [(ptr forms/CarpNode)] (load items) (load i))))
+                  (store! i (+ (load i) 1)))))
+    (ir/resolved-expression-box a
+      (ir/ResolvedArray (next-expression! (mut r)) output static))))
+
+(defn resolve-type [(r (mut Resolver)) (node (ptr forms/CarpNode))]
+  (-> (ptr ir/ResolvedType))
+  (let [a (load (field r a))]
+    (match (forms/form-of node)
+      (forms/Symbol [_]
+        (ir/resolved-type-box a (ir/ResolvedTypeName (symbol-key (mut r) node))))
+      (forms/ListForm [raw]
+        (let [items (semantic-items (mut r) raw)
+              n (al/al-len [(ptr forms/CarpNode)] (load items))]
+          (if (= n 0)
+              (ir/resolved-type-box a (ir/ResolvedTypeName "Unit"))
+              (let [name (symbol-key (mut r)
+                           (al/al-get [(ptr forms/CarpNode)] (load items) 0))
+                    arguments (ir/resolved-type-list-new a) (mut i) 1]
+                (loop (if (>= (load i) n) (break)
+                          (do (al/al-push! [(ptr ir/ResolvedType)] arguments
+                                (resolve-type (mut r)
+                                  (al/al-get [(ptr forms/CarpNode)]
+                                             (load items) (load i))))
+                              (store! i (+ (load i) 1)))))
+                (ir/resolved-type-box a
+                  (ir/ResolvedTypeApply name arguments))))))
+      (forms/ArrayForm [raw]
+        (let [items (semantic-items (mut r) raw)
+              arguments (ir/resolved-type-list-new a)
+              n (al/al-len [(ptr forms/CarpNode)] (load items)) (mut i) 0]
+          (loop (if (>= (load i) n) (break)
+                    (do (al/al-push! [(ptr ir/ResolvedType)] arguments
+                          (resolve-type (mut r)
+                            (al/al-get [(ptr forms/CarpNode)] (load items) (load i))))
+                        (store! i (+ (load i) 1)))))
+          (ir/resolved-type-box a (ir/ResolvedTypeApply "__arguments" arguments))))
+      (_ (do (fail-at! (mut r) node "invalid type syntax")
+             (ir/resolved-type-box a (ir/ResolvedTypeName "Invalid")))))))
+
+(defn resolve-let [(r (mut Resolver)) (scope (slice u8))
+                   (node (ptr forms/CarpNode))
+                   (items (ptr (al/ArrayList (ptr forms/CarpNode))))]
+  (-> (ptr ir/ResolvedExpr))
+  (let [a (load (field r a))]
+    (if (< (al/al-len [(ptr forms/CarpNode)] (load items)) 3)
+        (do (fail-at! (mut r) node "let expects bindings and a body")
+            (ir/resolved-expression-box a (ir/ResolvedUnit (next-expression! (mut r)))))
+        (match (forms/form-of
+                 (al/al-get [(ptr forms/CarpNode)] (load items) 1))
+          (forms/ArrayForm [raw-bindings]
+            (let [bindings (semantic-items (mut r) raw-bindings)
+                  count (al/al-len [(ptr forms/CarpNode)] (load bindings))
+                  original (al/al-len [LocalBinding] (load (field r locals)))]
+              (if (!= (% count 2) 0)
+                  (do (fail-at! (mut r) node "let bindings must be pairs")
+                      (ir/resolved-expression-box a
+                        (ir/ResolvedUnit (next-expression! (mut r)))))
+                  (let [refs (alloc/box! a (al/ArrayList ir/CoreRef)
+                                      (al/al-new [ir/CoreRef] a))
+                        values (ir/resolved-expression-list-new a)
+                        (mut i) 0]
+                    (loop (if (or (>= (load i) count)
+                                  (!= (load (field r failed)) 0)) (break)
+                              (let [name-node (al/al-get [(ptr forms/CarpNode)]
+                                                        (load bindings) (load i))
+                                    value (resolve-expression (mut r) scope
+                                            (al/al-get [(ptr forms/CarpNode)]
+                                              (load bindings) (+ (load i) 1)))]
+                                (if (= (slice-len (simple-name name-node)) 0)
+                                    (fail-at! (mut r) name-node
+                                              "let binding must be a symbol")
+                                    (do (al/al-push! [(ptr ir/ResolvedExpr)] values value)
+                                        (al/al-push! [ir/CoreRef] refs
+                                                     (push-local! (mut r) name-node))))
+                                (store! i (+ (load i) 2)))))
+                    (let [(mut body) (resolve-sequence (mut r) scope items 2)
+                          (mut j) (al/al-len [ir/CoreRef] (load refs))]
+                      (loop (if (= (load j) 0) (break)
+                                (do (store! j (- (load j) 1))
+                                    (store! body
+                                      (ir/resolved-expression-box a
+                                        (ir/ResolvedLet (next-expression! (mut r))
+                                          (al/al-get [ir/CoreRef] (load refs) (load j))
+                                          (al/al-get [(ptr ir/ResolvedExpr)]
+                                                     (load values) (load j))
+                                          (load body)))))))
+                      (restore-locals! (mut r) original)
+                      (load body))))))
+          (_ (do (fail-at! (mut r) node "let expects a binding array")
+                 (ir/resolved-expression-box a
+                   (ir/ResolvedUnit (next-expression! (mut r))))))))))
+
+(defn resolve-lambda [(r (mut Resolver)) (scope (slice u8))
+                      (node (ptr forms/CarpNode))
+                      (items (ptr (al/ArrayList (ptr forms/CarpNode))))]
+  (-> (ptr ir/ResolvedExpr))
+  (let [a (load (field r a))
+        n (al/al-len [(ptr forms/CarpNode)] (load items))]
+    (if (< n 3)
+        (do (fail-at! (mut r) node "fn expects parameters and a body")
+            (ir/resolved-expression-box a (ir/ResolvedUnit (next-expression! (mut r)))))
+        (let [params-node (al/al-get [(ptr forms/CarpNode)] (load items) 1)
+              original (al/al-len [LocalBinding] (load (field r locals)))
+              parameters (alloc/box! a (al/ArrayList ir/CoreRef)
+                                     (al/al-new [ir/CoreRef] a))]
+          (match (forms/form-of params-node)
+            (forms/ArrayForm [raw]
+              (let [params (semantic-items (mut r) raw)
+                    count (al/al-len [(ptr forms/CarpNode)] (load params))
+                    (mut i) 0]
+                (loop (if (or (>= (load i) count)
+                              (!= (load (field r failed)) 0)) (break)
+                          (let [parameter (al/al-get [(ptr forms/CarpNode)]
+                                                     (load params) (load i))]
+                            (if (= (slice-len (simple-name parameter)) 0)
+                                (fail-at! (mut r) parameter "parameter must be a symbol")
+                                (al/al-push! [ir/CoreRef] parameters
+                                             (push-local! (mut r) parameter)))
+                            (store! i (+ (load i) 1)))))))
+            (_ (fail-at! (mut r) params-node "fn parameters must be an array")))
+          (let [body (resolve-sequence (mut r) scope items 2)]
+            (restore-locals! (mut r) original)
+            (ir/resolved-expression-box a
+              (ir/ResolvedLambda (next-expression! (mut r)) parameters body)))))))
+
+(defn resolve-pattern [(r (mut Resolver)) (scope (slice u8))
+                       (node (ptr forms/CarpNode))
+                       (bindings (ptr (al/ArrayList ir/CoreRef)))]
+  (-> (ptr ir/ResolvedPattern))
+  (let [a (load (field r a))]
+    (match (forms/form-of node)
+      (forms/Symbol [_]
+        (let [name (simple-name node)]
+          (if (str/str-eq name "_")
+              (ir/resolved-pattern-box a (ir/ResolvedPatternIgnore))
+              (let [binding (push-local! (mut r) node)]
+                (al/al-push! [ir/CoreRef] bindings binding)
+                (ir/resolved-pattern-box a (ir/ResolvedPatternBind binding))))))
+      (forms/IntLit [value]
+        (ir/resolved-pattern-box a (ir/ResolvedPatternInt value)))
+      (forms/BoolLit [value]
+        (ir/resolved-pattern-box a (ir/ResolvedPatternBool value)))
+      (forms/ListForm [raw]
+        (let [items (semantic-items (mut r) raw)
+              n (al/al-len [(ptr forms/CarpNode)] (load items))]
+          (if (= n 0)
+              (ir/resolved-pattern-box a (ir/ResolvedPatternIgnore))
+              (let [head (al/al-get [(ptr forms/CarpNode)] (load items) 0)
+                    arguments (ir/resolved-pattern-list-new a)
+                    constructor (resolve-binding (mut r) scope head (- n 1))
+                    (mut i) 1]
+                (loop (if (or (>= (load i) n)
+                              (!= (load (field r failed)) 0)) (break)
+                          (do (al/al-push! [(ptr ir/ResolvedPattern)] arguments
+                                (resolve-pattern (mut r) scope
+                                  (al/al-get [(ptr forms/CarpNode)]
+                                             (load items) (load i)) bindings))
+                              (store! i (+ (load i) 1)))))
+                (ir/resolved-pattern-box a
+                  (ir/ResolvedPatternConstructor constructor arguments))))))
+      (_ (do (fail-at! (mut r) node "unsupported match pattern")
+             (ir/resolved-pattern-box a (ir/ResolvedPatternIgnore)))))))
+
+(defn resolve-match [(r (mut Resolver)) (scope (slice u8))
+                     (node (ptr forms/CarpNode))
+                     (items (ptr (al/ArrayList (ptr forms/CarpNode))))
+                     (by-reference bool)] (-> (ptr ir/ResolvedExpr))
+  (let [a (load (field r a))
+        n (al/al-len [(ptr forms/CarpNode)] (load items))]
+    (if (or (< n 4) (!= (% (- n 2) 2) 0))
+        (do (fail-at! (mut r) node "match expects pattern/body pairs")
+            (ir/resolved-expression-box a (ir/ResolvedUnit (next-expression! (mut r)))))
+        (let [scrutinee (resolve-expression (mut r) scope
+                           (al/al-get [(ptr forms/CarpNode)] (load items) 1))
+              branches (ir/resolved-branch-list-new a)
+              (mut i) 2]
+          (loop (if (or (>= (load i) n) (!= (load (field r failed)) 0)) (break)
+                    (let [original (al/al-len [LocalBinding] (load (field r locals)))
+                          branch-bindings (alloc/box! a (al/ArrayList ir/CoreRef)
+                                                   (al/al-new [ir/CoreRef] a))
+                          pattern (resolve-pattern (mut r) scope
+                                    (al/al-get [(ptr forms/CarpNode)]
+                                               (load items) (load i)) branch-bindings)
+                          body (resolve-expression (mut r) scope
+                                 (al/al-get [(ptr forms/CarpNode)]
+                                            (load items) (+ (load i) 1)))]
+                      (restore-locals! (mut r) original)
+                      (al/al-push! [ir/ResolvedMatchBranch] branches
+                        (ir/ResolvedMatchBranch :pattern pattern
+                                                :bindings branch-bindings :body body))
+                      (store! i (+ (load i) 2)))))
+          (ir/resolved-expression-box a
+            (ir/ResolvedMatch (next-expression! (mut r)) by-reference
+                              scrutinee branches))))))
+
+(defn resolve-expression [(r (mut Resolver)) (scope (slice u8))
+                          (node (ptr forms/CarpNode))] (-> (ptr ir/ResolvedExpr))
+  (let [a (load (field r a))]
+    (match (forms/form-of node)
+      (forms/IntLit [value]
+        (ir/resolved-expression-box a (ir/ResolvedInt (next-expression! (mut r)) value)))
+      (forms/ByteLit [value]
+        (ir/resolved-expression-box a (ir/ResolvedByte (next-expression! (mut r)) value)))
+      (forms/LongLit [value]
+        (ir/resolved-expression-box a (ir/ResolvedLong (next-expression! (mut r)) value)))
+      (forms/FloatLit [value]
+        (ir/resolved-expression-box a (ir/ResolvedFloat (next-expression! (mut r)) value)))
+      (forms/DoubleLit [value]
+        (ir/resolved-expression-box a (ir/ResolvedDouble (next-expression! (mut r)) value)))
+      (forms/BoolLit [value]
+        (ir/resolved-expression-box a (ir/ResolvedBool (next-expression! (mut r)) value)))
+      (forms/CharLit [value]
+        (ir/resolved-expression-box a (ir/ResolvedChar (next-expression! (mut r)) value)))
+      (forms/StringLit [value]
+        (ir/resolved-expression-box a (ir/ResolvedString (next-expression! (mut r)) value)))
+      (forms/PatternLit [value]
+        (ir/resolved-expression-box a (ir/ResolvedPattern (next-expression! (mut r)) value)))
+      (forms/Comment [_]
+        (ir/resolved-expression-box a (ir/ResolvedUnit (next-expression! (mut r)))))
+      (forms/Symbol [_]
+        (resolve-reference-expression (mut r) scope node -1))
+      (forms/ArrayForm [items] (resolve-collection (mut r) scope items false))
+      (forms/StaticArrayForm [items] (resolve-collection (mut r) scope items true))
+      (forms/DictionaryForm [_]
+        (do (fail-at! (mut r) node "dictionary expressions require map lowering")
+            (ir/resolved-expression-box a (ir/ResolvedUnit (next-expression! (mut r))))))
+      (forms/ListForm [raw]
+        (let [items (semantic-items (mut r) raw)
+              n (al/al-len [(ptr forms/CarpNode)] (load items))]
+          (if (= n 0)
+              (ir/resolved-expression-box a (ir/ResolvedUnit (next-expression! (mut r))))
+              (let [head (al/al-get [(ptr forms/CarpNode)] (load items) 0)]
+                (cond
+                  (named? head "do") (resolve-sequence (mut r) scope items 1)
+                  (named? head "if")
+                    (if (!= n 4)
+                        (do (fail-at! (mut r) node "if expects three arguments")
+                            (ir/resolved-expression-box a
+                              (ir/ResolvedUnit (next-expression! (mut r)))))
+                        (ir/resolved-expression-box a
+                          (ir/ResolvedIf (next-expression! (mut r))
+                            (resolve-expression (mut r) scope
+                              (al/al-get [(ptr forms/CarpNode)] (load items) 1))
+                            (resolve-expression (mut r) scope
+                              (al/al-get [(ptr forms/CarpNode)] (load items) 2))
+                            (resolve-expression (mut r) scope
+                              (al/al-get [(ptr forms/CarpNode)] (load items) 3)))))
+                  (or (named? head "let") (named? head "let-do"))
+                    (resolve-let (mut r) scope node items)
+                  (named? head "fn") (resolve-lambda (mut r) scope node items)
+                  (named? head "match")
+                    (resolve-match (mut r) scope node items false)
+                  (named? head "match-ref")
+                    (resolve-match (mut r) scope node items true)
+                  (named? head "the")
+                    (if (!= n 3)
+                        (do (fail-at! (mut r) node "the expects a type and expression")
+                            (ir/resolved-expression-box a
+                              (ir/ResolvedUnit (next-expression! (mut r)))))
+                        (ir/resolved-expression-box a
+                          (ir/ResolvedAnnotation (next-expression! (mut r))
+                            (resolve-expression (mut r) scope
+                              (al/al-get [(ptr forms/CarpNode)] (load items) 2))
+                            (resolve-type (mut r)
+                              (al/al-get [(ptr forms/CarpNode)] (load items) 1)))))
+                  (named? head "set!")
+                    (if (!= n 3)
+                        (do (fail-at! (mut r) node "set! expects name and value")
+                            (ir/resolved-expression-box a
+                              (ir/ResolvedUnit (next-expression! (mut r)))))
+                        (ir/resolved-expression-box a
+                          (ir/ResolvedSet (next-expression! (mut r))
+                            (resolve-binding (mut r) scope
+                              (al/al-get [(ptr forms/CarpNode)] (load items) 1) -1)
+                            (resolve-expression (mut r) scope
+                              (al/al-get [(ptr forms/CarpNode)] (load items) 2)))))
+                  (named? head "while")
+                    (if (!= n 3)
+                        (do (fail-at! (mut r) node "while expects condition and body")
+                            (ir/resolved-expression-box a
+                              (ir/ResolvedUnit (next-expression! (mut r)))))
+                        (ir/resolved-expression-box a
+                          (ir/ResolvedWhile (next-expression! (mut r))
+                            (resolve-expression (mut r) scope
+                              (al/al-get [(ptr forms/CarpNode)] (load items) 1))
+                            (resolve-expression (mut r) scope
+                              (al/al-get [(ptr forms/CarpNode)] (load items) 2)))))
+                  (named? head "break")
+                    (ir/resolved-expression-box a
+                      (ir/ResolvedBreak (next-expression! (mut r))))
+                  :else
+                    (let [arguments (ir/resolved-expression-list-new a)
+                          (mut i) 1]
+                      (loop (if (or (>= (load i) n)
+                                    (!= (load (field r failed)) 0)) (break)
+                                (do (al/al-push! [(ptr ir/ResolvedExpr)] arguments
+                                      (resolve-expression (mut r) scope
+                                        (al/al-get [(ptr forms/CarpNode)]
+                                                   (load items) (load i))))
+                                    (store! i (+ (load i) 1)))))
+                      (let [callee (if (> (slice-len (symbol-key (mut r) head)) 0)
+                                       (resolve-reference-expression
+                                         (mut r) scope head (- n 1))
+                                       (resolve-expression (mut r) scope head))]
+                        (ir/resolved-expression-box a
+                          (ir/ResolvedCall (next-expression! (mut r))
+                                           callee arguments))))))))))))
+
+(defn global-for-definition [(r (mut Resolver)) (scope (slice u8))
+                             (name (slice u8)) (arity i64)] (-> ir/CoreRef)
+  (let [index (global-index-exact (mut r) (append-scope (mut r) scope name) arity)]
+    (if (< index 0) (ir/core-ref 0 name true)
+        (let [binding (al/al-get [GlobalBinding]
+                                 (load (field r globals)) index)]
+          (.reference binding)))))
+
+(defn record-signature! [(r (mut Resolver)) (scope (slice u8))
+                         (name-node (ptr forms/CarpNode))
+                         (type-node (ptr forms/CarpNode))
+                         (kind ir/ResolvedSignatureKind)
+                         (module (mut ir/ResolvedModule))] (-> i64)
+  (let [name (simple-name name-node)
+        arity (signature-arity (mut r) type-node)]
+    (if (= (slice-len name) 0)
+        (fail-at! (mut r) name-node "signature name must be a symbol")
+        (let [reference (global-for-definition (mut r) scope name arity)
+              resolved-type (resolve-type (mut r) type-node)]
+          (al/al-push! [ir/ResolvedSignature] (mut (field module signatures))
+            (ir/ResolvedSignature :reference reference
+                                  :type resolved-type
+                                  :kind kind))))))
+
+(defn constructor-function-type [(r (mut Resolver))
+                                 (argument-node (ptr forms/CarpNode))
+                                 (result-type (ptr ir/ResolvedType))]
+  (-> (ptr ir/ResolvedType))
+  (let [a (load (field r a)) parts (ir/resolved-type-list-new a)]
+    (al/al-push! [(ptr ir/ResolvedType)] parts
+                 (resolve-type (mut r) argument-node))
+    (al/al-push! [(ptr ir/ResolvedType)] parts result-type)
+    (ir/resolved-type-box a (ir/ResolvedTypeApply "Fn" parts))))
+
+(defn nullary-constructor-function-type [(r (mut Resolver))
+                                         (result-type (ptr ir/ResolvedType))]
+  (-> (ptr ir/ResolvedType))
+  (let [a (load (field r a)) arguments (ir/resolved-type-list-new a)
+        parts (ir/resolved-type-list-new a)]
+    (al/al-push! [(ptr ir/ResolvedType)] parts
+      (ir/resolved-type-box a (ir/ResolvedTypeApply "__arguments" arguments)))
+    (al/al-push! [(ptr ir/ResolvedType)] parts result-type)
+    (ir/resolved-type-box a (ir/ResolvedTypeApply "Fn" parts))))
+
+(defn function-type-resolved
+  [(r (mut Resolver)) (arguments (ptr (al/ArrayList (ptr ir/ResolvedType))))
+   (result (ptr ir/ResolvedType))] (-> (ptr ir/ResolvedType))
+  (let [a (load (field r a)) parts (ir/resolved-type-list-new a)]
+    (al/al-push! [(ptr ir/ResolvedType)] parts
+      (ir/resolved-type-box a (ir/ResolvedTypeApply "__arguments" arguments)))
+    (al/al-push! [(ptr ir/ResolvedType)] parts result)
+    (ir/resolved-type-box a (ir/ResolvedTypeApply "Fn" parts))))
+
+(defn reference-type-resolved [(r (mut Resolver))
+                               (inner (ptr ir/ResolvedType))]
+  (-> (ptr ir/ResolvedType))
+  (let [arguments (ir/resolved-type-list-new (load (field r a)))]
+    (al/al-push! [(ptr ir/ResolvedType)] arguments inner)
+    (ir/resolved-type-box (load (field r a))
+      (ir/ResolvedTypeApply "Ref" arguments))))
+
+(defn declared-resolved-type [(r (mut Resolver))
+                              (node (ptr forms/CarpNode))]
+  (-> (ptr ir/ResolvedType))
+  (let [a (load (field r a)) arguments (ir/resolved-type-list-new a)]
+    (match (forms/form-of node)
+      (forms/Symbol [_]
+        (ir/resolved-type-box a (ir/ResolvedTypeName (simple-name node))))
+      (forms/ListForm [raw]
+        (let [items (semantic-items (mut r) raw)
+              name (simple-name (al/al-get [(ptr forms/CarpNode)] (load items) 0))
+              n (al/al-len [(ptr forms/CarpNode)] (load items)) (mut i) 1]
+          (loop (if (>= (load i) n) (break)
+                    (do (al/al-push! [(ptr ir/ResolvedType)] arguments
+                          (resolve-type (mut r)
+                            (al/al-get [(ptr forms/CarpNode)]
+                                       (load items) (load i))))
+                        (store! i (+ (load i) 1)))))
+          (ir/resolved-type-box a (ir/ResolvedTypeApply name arguments))))
+      (forms/ArrayForm [raw]
+        (let [items (semantic-items (mut r) raw)
+              name (simple-name (al/al-get [(ptr forms/CarpNode)] (load items) 0))
+              n (al/al-len [(ptr forms/CarpNode)] (load items)) (mut i) 1]
+          (loop (if (>= (load i) n) (break)
+                    (do (al/al-push! [(ptr ir/ResolvedType)] arguments
+                          (resolve-type (mut r)
+                            (al/al-get [(ptr forms/CarpNode)]
+                                       (load items) (load i))))
+                        (store! i (+ (load i) 1)))))
+          (ir/resolved-type-box a (ir/ResolvedTypeApply name arguments))))
+      (_ (ir/resolved-type-box a (ir/ResolvedTypeName "Invalid"))))))
+
+(defn scoped-declared-resolved-type
+  [(r (mut Resolver)) (scope (slice u8)) (node (ptr forms/CarpNode))]
+  (-> (ptr ir/ResolvedType))
+  (let [a (load (field r a)) base (declared-resolved-type (mut r) node)
+        owner (append-scope (mut r) scope (declared-type-name (mut r) node))]
+    (match (load base)
+      (ir/ResolvedTypeName [_]
+        (ir/resolved-type-box a (ir/ResolvedTypeName owner)))
+      (ir/ResolvedTypeApply [_ arguments]
+        (ir/resolved-type-box a (ir/ResolvedTypeApply owner arguments))))))
+
+(defn record-generated-function-signature!
+  [(r (mut Resolver)) (owner (slice u8)) (name (slice u8))
+   (arguments (ptr (al/ArrayList (ptr ir/ResolvedType))))
+   (result (ptr ir/ResolvedType)) (module (mut ir/ResolvedModule))] (-> i64)
+  (let [arity (al/al-len [(ptr ir/ResolvedType)] (load arguments))]
+    (if (global-source-declared? (mut r) owner name arity) 0
+        (let [reference (global-for-definition (mut r) owner name arity)
+              signature-type (function-type-resolved (mut r) arguments result)]
+          (al/al-push! [ir/ResolvedSignature] (mut (field module signatures))
+            (ir/ResolvedSignature
+              :reference reference :type signature-type
+              :kind (ir/ResolvedConstructorSignature)))))))
+
+(defn record-standard-type-signatures!
+  [(r (mut Resolver)) (owner (slice u8)) (type (ptr ir/ResolvedType))
+   (include-memory bool) (module (mut ir/ResolvedModule))] (-> i64)
+  (let [a (load (field r a))
+        ref-arguments (ir/resolved-type-list-new a)
+        owned-arguments (ir/resolved-type-list-new a)
+        string-type (ir/resolved-type-box a (ir/ResolvedTypeName "String"))
+        unit-type (ir/resolved-type-box a (ir/ResolvedTypeName "Unit"))]
+    (al/al-push! [(ptr ir/ResolvedType)] ref-arguments
+      (reference-type-resolved (mut r) type))
+    (al/al-push! [(ptr ir/ResolvedType)] owned-arguments type)
+    (record-generated-function-signature! (mut r) owner "str"
+      ref-arguments string-type (mut module))
+    (record-generated-function-signature! (mut r) owner "prn"
+      ref-arguments string-type (mut module))
+    (if include-memory
+        (do (record-generated-function-signature! (mut r) owner "copy"
+              ref-arguments type (mut module))
+            (record-generated-function-signature! (mut r) owner "delete"
+              owned-arguments unit-type (mut module)) 0) 0)))
+
+(defn record-struct-signatures!
+  [(r (mut Resolver)) (scope (slice u8))
+   (items (ptr (al/ArrayList (ptr forms/CarpNode))))
+   (include-memory bool)
+   (module (mut ir/ResolvedModule))] (-> i64)
+  (let [declaration-node (al/al-get [(ptr forms/CarpNode)] (load items) 1)
+        fields-node (al/al-get [(ptr forms/CarpNode)] (load items) 2)
+        type-name (declared-type-name (mut r) declaration-node)
+        owner (append-scope (mut r) scope type-name)
+        result-type (scoped-declared-resolved-type
+                      (mut r) scope declaration-node)]
+    (match (forms/form-of fields-node)
+      (forms/ArrayForm [raw]
+        (let [fields (semantic-items (mut r) raw)
+              n (al/al-len [(ptr forms/CarpNode)] (load fields))
+              init-arguments (ir/resolved-type-list-new (load (field r a)))
+              field-names (alloc/box! (load (field r a))
+                            (al/ArrayList (slice u8))
+                            (al/al-new [(slice u8)] (load (field r a))))
+              (mut i) 0]
+          (loop (if (>= (load i) n) (break)
+                    (do (al/al-push! [(slice u8)] field-names
+                          (simple-name (al/al-get [(ptr forms/CarpNode)]
+                                         (load fields) (load i))))
+                        (al/al-push! [(ptr ir/ResolvedType)] init-arguments
+                          (resolve-type (mut r)
+                            (al/al-get [(ptr forms/CarpNode)]
+                                       (load fields) (+ (load i) 1))))
+                        (store! i (+ (load i) 2)))))
+          (record-standard-type-signatures! (mut r) owner result-type
+                                             include-memory (mut module))
+          (let [reference (global-for-definition (mut r) owner "init" (/ n 2))
+                signature-type (function-type-resolved
+                                 (mut r) init-arguments result-type)]
+            (al/al-push! [ir/ResolvedTypeDefinition] (mut (field module types))
+              (ir/ResolvedTypeDefinition :name owner :type result-type
+                :fields init-arguments
+                :shape (ir/ResolvedStructShape field-names reference)))
+            (al/al-push! [ir/ResolvedSignature] (mut (field module signatures))
+              (ir/ResolvedSignature :reference reference :type signature-type
+                                    :kind (ir/ResolvedConstructorSignature))))
+          (store! i 0)
+          (loop (if (>= (load i) n) (break)
+                    (let [field-node (al/al-get [(ptr forms/CarpNode)]
+                                                (load fields) (load i))
+                          field-type (resolve-type (mut r)
+                                       (al/al-get [(ptr forms/CarpNode)]
+                                                  (load fields) (+ (load i) 1)))
+                          arguments (ir/resolved-type-list-new (load (field r a)))]
+                      (al/al-push! [(ptr ir/ResolvedType)] arguments
+                        (reference-type-resolved (mut r) result-type))
+                      (let [reference (global-for-definition
+                                       (mut r) owner (simple-name field-node) 1)
+                            signature-type (function-type-resolved
+                              (mut r) arguments
+                              (reference-type-resolved (mut r) field-type))]
+                        (al/al-push! [ir/ResolvedSignature]
+                          (mut (field module signatures))
+                          (ir/ResolvedSignature
+                            :reference reference :type signature-type
+                            :kind (ir/ResolvedConstructorSignature))))
+                      (let [setter-arguments
+                              (ir/resolved-type-list-new (load (field r a)))]
+                        (al/al-push! [(ptr ir/ResolvedType)] setter-arguments result-type)
+                        (al/al-push! [(ptr ir/ResolvedType)] setter-arguments field-type)
+                        (record-generated-function-signature!
+                          (mut r) owner
+                          (field-setter-name (mut r) (simple-name field-node) false)
+                          setter-arguments result-type (mut module)))
+                      (let [mutator-arguments
+                              (ir/resolved-type-list-new (load (field r a)))
+                            unit-type (ir/resolved-type-box (load (field r a))
+                                        (ir/ResolvedTypeName "Unit"))]
+                        (al/al-push! [(ptr ir/ResolvedType)] mutator-arguments
+                          (reference-type-resolved (mut r) result-type))
+                        (al/al-push! [(ptr ir/ResolvedType)] mutator-arguments field-type)
+                        (record-generated-function-signature!
+                          (mut r) owner
+                          (field-setter-name (mut r) (simple-name field-node) true)
+                          mutator-arguments unit-type (mut module)))
+                      (let [callback-arguments
+                              (ir/resolved-type-list-new (load (field r a)))
+                            updater-arguments
+                              (ir/resolved-type-list-new (load (field r a)))]
+                        (al/al-push! [(ptr ir/ResolvedType)] callback-arguments field-type)
+                        (let [callback (function-type-resolved
+                                         (mut r) callback-arguments field-type)]
+                          (al/al-push! [(ptr ir/ResolvedType)] updater-arguments result-type)
+                          (al/al-push! [(ptr ir/ResolvedType)] updater-arguments
+                            (reference-type-resolved (mut r) callback))
+                          (record-generated-function-signature!
+                            (mut r) owner
+                            (field-updater-name (mut r) (simple-name field-node) false)
+                            updater-arguments result-type (mut module))))
+                      (store! i (+ (load i) 2)))))
+          0))
+      (_ 0))))
+
+(defn record-sum-constructor-signatures!
+  [(r (mut Resolver)) (scope (slice u8))
+   (items (ptr (al/ArrayList (ptr forms/CarpNode))))
+   (module (mut ir/ResolvedModule))] (-> i64)
+  (let [result-node (al/al-get [(ptr forms/CarpNode)] (load items) 1)
+        result-type (scoped-declared-resolved-type (mut r) scope result-node)
+        owner (append-scope (mut r) scope
+                (declared-type-name (mut r) result-node))
+        field-types (ir/resolved-type-list-new (load (field r a)))
+        constructors (alloc/box! (load (field r a))
+                       (al/ArrayList ir/ResolvedConstructor)
+                       (al/al-new [ir/ResolvedConstructor] (load (field r a))))
+        n (al/al-len [(ptr forms/CarpNode)] (load items)) (mut i) 2]
+    (loop
+      (if (or (>= (load i) n) (!= (load (field r failed)) 0)) (break)
+          (let [constructor-node (al/al-get [(ptr forms/CarpNode)]
+                                            (load items) (load i))]
+            (match (forms/form-of constructor-node)
+              (forms/ListForm [raw]
+                (let [constructor-items (semantic-items (mut r) raw)
+                      name-node (al/al-get [(ptr forms/CarpNode)]
+                                           (load constructor-items) 0)
+                      arguments-node (al/al-get [(ptr forms/CarpNode)]
+                                                (load constructor-items) 1)
+                      resolved-arguments (resolve-type (mut r) arguments-node)
+                      arity (parameter-count (mut r) arguments-node)
+                      reference (global-for-definition
+                                  (mut r) scope (simple-name name-node) arity)
+                      signature-type (constructor-function-type
+                                       (mut r) arguments-node result-type)]
+                  (match (load resolved-arguments)
+                    (ir/ResolvedTypeApply [_ arguments]
+                      (let [an (al/al-len [(ptr ir/ResolvedType)] (load arguments))
+                            (mut ai) 0]
+                        (loop (if (>= (load ai) an) (break)
+                                  (do (al/al-push! [(ptr ir/ResolvedType)] field-types
+                                        (al/al-get [(ptr ir/ResolvedType)]
+                                          (load arguments) (load ai)))
+                                      (store! ai (+ (load ai) 1)))))))
+                    (_ 0))
+                  (al/al-push! [ir/ResolvedSignature] (mut (field module signatures))
+                    (ir/ResolvedSignature
+                      :reference reference
+                      :type signature-type
+                      :kind (ir/ResolvedConstructorSignature)))
+                  (match (load resolved-arguments)
+                    (ir/ResolvedTypeApply [_ arguments]
+                      (al/al-push! [ir/ResolvedConstructor] constructors
+                        (ir/ResolvedConstructor :reference reference :fields arguments)))
+                    (_ 0))))
+              (forms/Symbol [_]
+                (let [reference (global-for-definition
+                                  (mut r) scope (simple-name constructor-node) 0)
+                      signature-type (nullary-constructor-function-type
+                                       (mut r) result-type)]
+                  (al/al-push! [ir/ResolvedSignature] (mut (field module signatures))
+                    (ir/ResolvedSignature
+                      :reference reference
+                      :type signature-type
+                      :kind (ir/ResolvedConstructorSignature)))
+                  (al/al-push! [ir/ResolvedConstructor] constructors
+                    (ir/ResolvedConstructor :reference reference
+                      :fields (ir/resolved-type-list-new (load (field r a)))))))
+              (_ 0))
+            (store! i (+ (load i) 1)))))
+    (al/al-push! [ir/ResolvedTypeDefinition] (mut (field module types))
+      (ir/ResolvedTypeDefinition :name owner :type result-type :fields field-types
+        :shape (ir/ResolvedSumShape constructors)))
+    (record-standard-type-signatures! (mut r) owner result-type true (mut module))
+    0))
+
+(defn resolve-function! [(r (mut Resolver)) (scope (slice u8))
+                         (node (ptr forms/CarpNode))
+                         (output (mut (al/ArrayList ir/ResolvedFunction)))] (-> i64)
+  (let [items (semantic-items (mut r) (list-items node))
+        name-node (al/al-get [(ptr forms/CarpNode)] (load items) 1)
+        params-node (al/al-get [(ptr forms/CarpNode)] (load items) 2)
+        name (simple-name name-node)
+        arity (parameter-count (mut r) params-node)
+        original (al/al-len [LocalBinding] (load (field r locals)))
+        parameters (alloc/box! (load (field r a)) (al/ArrayList ir/CoreRef)
+                               (al/al-new [ir/CoreRef] (load (field r a))))]
+    (match (forms/form-of params-node)
+      (forms/ArrayForm [raw]
+        (let [params (semantic-items (mut r) raw)
+              n (al/al-len [(ptr forms/CarpNode)] (load params)) (mut i) 0]
+          (loop (if (or (>= (load i) n) (!= (load (field r failed)) 0)) (break)
+                    (let [parameter (al/al-get [(ptr forms/CarpNode)]
+                                               (load params) (load i))]
+                      (if (= (slice-len (simple-name parameter)) 0)
+                          (fail-at! (mut r) parameter "parameter must be a symbol")
+                          (al/al-push! [ir/CoreRef] parameters
+                                       (push-local! (mut r) parameter)))
+                      (store! i (+ (load i) 1)))))))
+      (_ (fail-at! (mut r) params-node "parameters must be an array")))
+    (let [body (resolve-sequence (mut r) scope items 3)
+          function-reference (global-for-definition (mut r) scope name arity)]
+      (restore-locals! (mut r) original)
+      (if (= (load (field r failed)) 0)
+          (al/al-push! [ir/ResolvedFunction] (mut output)
+            (ir/ResolvedFunction :reference function-reference
+                                 :parameters parameters :body body)) 0))
+    0))
+
+(defn ignorable-top-level? [(head (ptr forms/CarpNode))] (-> bool)
+  (or (named? head "meta-set!")
+      (or (named? head "deprecated")
+      (or (named? head "doc")
+      (or (named? head "hidden")
+          (or (named? head "private")
+              (or (named? head "sig")
+                  (or (named? head "implements")
+                      (or (named? head "deftype")
+                          (or (named? head "definterface")
+                              (or (named? head "register")
+                                  (or (named? head "register-type")
+                                      (or (named? head "recursive")
+                                      (or (named? head "deftemplate")
+                                          (or (named? head "system-include")
+                                              (or (named? head "use")
+                                                  (named? head "use-all")))))))))))))))))
+
+(defn record-implementation! [(r (mut Resolver)) (scope (slice u8))
+                              (node (ptr forms/CarpNode))
+                              (items (ptr (al/ArrayList (ptr forms/CarpNode))))]
+  (-> i64)
+  (if (!= (al/al-len [(ptr forms/CarpNode)] (load items)) 3)
+      (fail-at! (mut r) node "implements expects an interface and implementation")
+      (let [interface-node (al/al-get [(ptr forms/CarpNode)] (load items) 1)
+            implementation-node (al/al-get [(ptr forms/CarpNode)] (load items) 2)
+            interface-name (symbol-key (mut r) interface-node)
+            interface-index (global-index-first-exact (mut r) interface-name)]
+        (if (< interface-index 0)
+            (fail-name! (mut r) interface-node "unknown interface" interface-name)
+            (let [interface-binding (al/al-get [GlobalBinding]
+                                               (load (field r globals)) interface-index)
+                  implementation (resolve-binding (mut r) scope implementation-node -1)]
+              (if (= (load (field r failed)) 0)
+                  (al/al-push! [ir/CoreImplementation]
+                    (mut (field r implementations))
+                    (ir/CoreImplementation :interface (.reference interface-binding)
+                                           :implementation implementation)) 0))))))
+
+(defn implementation-edge-exists? [(r (ptr Resolver)) (interface ir/CoreRef)
+                                    (implementation ir/CoreRef)] (-> bool)
+  (let [n (al/al-len [ir/CoreImplementation]
+                     (load (field r implementations)))
+        (mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) n) (load found)) (break)
+              (let [edge (al/al-get [ir/CoreImplementation]
+                                     (load (field r implementations)) (load i))]
+                (if (and (ir/core-ref-same? (.interface edge) interface)
+                         (ir/core-ref-same? (.implementation edge) implementation))
+                    (store! found true) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn add-auto-implementations! [(r (mut Resolver))] (-> i64)
+  ;; Every explicit edge identifies a real interface. Carp additionally treats
+  ;; qualified globals whose basename is the interface name as implementations.
+  (let [explicit-count (al/al-len [ir/CoreImplementation]
+                         (load (field r implementations)))
+        global-count (al/al-len [GlobalBinding] (load (field r globals)))
+        (mut i) 0]
+    (loop (if (>= (load i) explicit-count) (break)
+              (let [edge (al/al-get [ir/CoreImplementation]
+                                     (load (field r implementations)) (load i))
+                    interface (.interface edge) (mut j) 0]
+                (loop (if (>= (load j) global-count) (break)
+                          (let [binding (al/al-get [GlobalBinding]
+                                                  (load (field r globals)) (load j))
+                                implementation (.reference binding)]
+                            (if (and (qualified-basename? (.name binding)
+                                      (.name interface))
+                                     (not (implementation-edge-exists?
+                                            (mut r) interface implementation)))
+                                (al/al-push! [ir/CoreImplementation]
+                                  (mut (field r implementations))
+                                  (ir/CoreImplementation
+                                    :interface interface
+                                    :implementation implementation)) 0)
+                            (store! j (+ (load j) 1)))))
+                (store! i (+ (load i) 1)))))
+    0))
+
+(defn collect-implementations-node! [(r (mut Resolver)) (scope (slice u8))
+                                     (node (ptr forms/CarpNode))] (-> i64)
+  (match (forms/form-of node)
+    (forms/ListForm [raw]
+      (let [items (semantic-items (mut r) raw)
+            n (al/al-len [(ptr forms/CarpNode)] (load items))]
+        (if (= n 0) 0
+            (let [head (al/al-get [(ptr forms/CarpNode)] (load items) 0)]
+              (cond
+                (named? head "implements")
+                  (record-implementation! (mut r) scope node items)
+                (named? head "defmodule")
+                  (let [nested (append-scope (mut r) scope
+                                 (simple-name (al/al-get [(ptr forms/CarpNode)]
+                                                        (load items) 1)))
+                        (mut i) 2]
+                    (loop (if (or (>= (load i) n)
+                                  (!= (load (field r failed)) 0)) (break)
+                              (do (collect-implementations-node! (mut r) nested
+                                    (al/al-get [(ptr forms/CarpNode)]
+                                               (load items) (load i)))
+                                  (store! i (+ (load i) 1)))))
+                    0)
+                (or (named? head "with") (named? head "do"))
+                  (let [(mut i) (if (named? head "with") 2 1)]
+                    (loop (if (or (>= (load i) n)
+                                  (!= (load (field r failed)) 0)) (break)
+                              (do (collect-implementations-node! (mut r) scope
+                                    (al/al-get [(ptr forms/CarpNode)]
+                                               (load items) (load i)))
+                                  (store! i (+ (load i) 1)))))
+                    0)
+                :else 0)))))
+    (_ 0)))
+
+(defn collect-implementations! [(r (mut Resolver)) (module forms/CarpModule)]
+  (-> i64)
+  (let [n (forms/module-count module) (mut i) 0]
+    (loop (if (or (>= (load i) n) (!= (load (field r failed)) 0)) (break)
+              (do (collect-implementations-node! (mut r) ""
+                    (forms/module-at module (load i)))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn resolve-node! [(r (mut Resolver)) (scope (slice u8))
+                     (node (ptr forms/CarpNode))
+                     (module (mut ir/ResolvedModule))] (-> i64)
+  (match (forms/form-of node)
+    (forms/Comment [_] 0)
+    (forms/ListForm [raw]
+      (let [items (semantic-items (mut r) raw)
+            n (al/al-len [(ptr forms/CarpNode)] (load items))]
+        (if (= n 0)
+            (al/al-push! [(ptr ir/ResolvedExpr)] (mut (field module expressions))
+                         (resolve-expression (mut r) scope node))
+            (let [head (al/al-get [(ptr forms/CarpNode)] (load items) 0)]
+              (cond
+                (named? head "with")
+                  (let [(mut i) 2]
+                    (loop (if (or (>= (load i) n)
+                                  (!= (load (field r failed)) 0)) (break)
+                              (do (resolve-node! (mut r) scope
+                                    (al/al-get [(ptr forms/CarpNode)]
+                                               (load items) (load i)) (mut module))
+                                  (store! i (+ (load i) 1)))))
+                    0)
+                (named? head "defmodule")
+                  (let [name (simple-name
+                               (al/al-get [(ptr forms/CarpNode)] (load items) 1))
+                        nested (append-scope (mut r) scope name) (mut i) 2]
+                    (loop (if (or (>= (load i) n)
+                                  (!= (load (field r failed)) 0)) (break)
+                              (do (resolve-node! (mut r) nested
+                                    (al/al-get [(ptr forms/CarpNode)]
+                                               (load items) (load i)) (mut module))
+                                  (store! i (+ (load i) 1)))))
+                    0)
+                (named? head "defn")
+                  (resolve-function! (mut r) scope node (mut (field module functions)))
+                (named? head "def")
+                  (let [name (simple-name
+                               (al/al-get [(ptr forms/CarpNode)] (load items) 1))
+                        reference (global-for-definition (mut r) scope name -1)
+                        body (resolve-expression (mut r) scope
+                               (al/al-get [(ptr forms/CarpNode)] (load items) 2))]
+                    (if (= (load (field r failed)) 0)
+                        (al/al-push! [ir/ResolvedValue] (mut (field module values))
+                          (ir/ResolvedValue :reference reference :body body)) 0))
+                (named? head "register")
+                  (if (< n 3) (fail-at! (mut r) node "register expects name and signature")
+                      (record-signature! (mut r) scope
+                        (al/al-get [(ptr forms/CarpNode)] (load items) 1)
+                        (al/al-get [(ptr forms/CarpNode)] (load items) 2)
+                        (ir/ResolvedBuiltinSignature) (mut module)))
+                (named? head "deftemplate")
+                  (if (< n 3) (fail-at! (mut r) node "deftemplate expects name and signature")
+                      (record-signature! (mut r) scope
+                        (al/al-get [(ptr forms/CarpNode)] (load items) 1)
+                        (al/al-get [(ptr forms/CarpNode)] (load items) 2)
+                        (ir/ResolvedTemplateSignature) (mut module)))
+                (named? head "definterface")
+                  (if (< n 3) (fail-at! (mut r) node "definterface expects name and signature")
+                      (record-signature! (mut r) scope
+                        (al/al-get [(ptr forms/CarpNode)] (load items) 1)
+                        (al/al-get [(ptr forms/CarpNode)] (load items) 2)
+                        (ir/ResolvedInterfaceSignature) (mut module)))
+                (named? head "sig")
+                  (if (!= n 3) (fail-at! (mut r) node "sig expects name and signature")
+                      (record-signature! (mut r) scope
+                        (al/al-get [(ptr forms/CarpNode)] (load items) 1)
+                        (al/al-get [(ptr forms/CarpNode)] (load items) 2)
+                        (ir/ResolvedDefinitionSignature) (mut module)))
+                (named? head "deftype")
+                  (if (< n 3) 0
+                      (match (forms/form-of
+                               (al/al-get [(ptr forms/CarpNode)] (load items) 2))
+                        (forms/ArrayForm [_]
+                          (record-struct-signatures!
+                            (mut r) scope items true (mut module)))
+                        (_ (record-sum-constructor-signatures!
+                             (mut r) scope items (mut module)))))
+                (named? head "register-type")
+                  (if (< n 3) 0
+                      (match (forms/form-of
+                               (al/al-get [(ptr forms/CarpNode)] (load items) 2))
+                        (forms/ArrayForm [_]
+                          (record-struct-signatures!
+                            (mut r) scope items false (mut module)))
+                        (_ 0)))
+                (named? head "meta-set!")
+                  (if (!= n 4) 0
+                      (match (forms/form-of
+                               (al/al-get [(ptr forms/CarpNode)] (load items) 2))
+                        (forms/StringLit [key]
+                          (if (str/str-eq key "sig")
+                              (record-signature! (mut r) scope
+                                (al/al-get [(ptr forms/CarpNode)] (load items) 1)
+                                (al/al-get [(ptr forms/CarpNode)] (load items) 3)
+                                (ir/ResolvedDefinitionSignature) (mut module)) 0))
+                        (_ 0)))
+                (named? head "do")
+                  (let [(mut i) 1]
+                    (loop (if (or (>= (load i) n)
+                                  (!= (load (field r failed)) 0)) (break)
+                              (do (resolve-node! (mut r) scope
+                                    (al/al-get [(ptr forms/CarpNode)]
+                                               (load items) (load i)) (mut module))
+                                  (store! i (+ (load i) 1)))))
+                    0)
+                (ignorable-top-level? head) 0
+                :else
+                  (al/al-push! [(ptr ir/ResolvedExpr)]
+                               (mut (field module expressions))
+                               (resolve-expression (mut r) scope node)))))))
+    (_ (al/al-push! [(ptr ir/ResolvedExpr)] (mut (field module expressions))
+                    (resolve-expression (mut r) scope node))))
+  0)
+
+(defn resolve [(a (dyn alloc/Allocator)) (surface forms/CarpModule)]
+  (-> ResolveResult)
+  (let [(mut r) (load (Resolver :a a
+                                :globals (al/al-new [GlobalBinding] a)
+                                :imports (al/al-new [ImportBinding] a)
+                                :implementations (al/al-new [ir/CoreImplementation] a)
+                                :locals (al/al-new [LocalBinding] a)
+                                :next-global 0 :next-local -1 :next-expression 0
+                                :failed 0
+                                :error (ResolveError :message ""
+                                                     :span (forms/synthetic-span))))
+        (mut output) (load (ir/ResolvedModule
+                            :functions (al/al-new [ir/ResolvedFunction] a)
+                            :values (al/al-new [ir/ResolvedValue] a)
+                            :types (al/al-new [ir/ResolvedTypeDefinition] a)
+                            :signatures (al/al-new [ir/ResolvedSignature] a)
+                            :implementations (al/al-new [ir/CoreImplementation] a)
+                            :expressions (al/al-new [(ptr ir/ResolvedExpr)] a)))]
+    (seed-primitives! (mut r))
+    (collect-module! (mut r) surface)
+    (collect-implementations! (mut r) surface)
+    (add-auto-implementations! (mut r))
+    (let [n (al/al-len [ir/CoreImplementation]
+                       (load (field (mut r) implementations))) (mut i) 0]
+      (loop (if (>= (load i) n) (break)
+                (do (al/al-push! [ir/CoreImplementation]
+                      (mut (field (mut output) implementations))
+                      (al/al-get [ir/CoreImplementation]
+                        (load (field (mut r) implementations)) (load i)))
+                    (store! i (+ (load i) 1))))))
+    (let [n (forms/module-count surface) (mut i) 0]
+      (loop (if (or (>= (load i) n) (!= (load (field r failed)) 0)) (break)
+                (do (resolve-node! (mut r) "" (forms/module-at surface (load i))
+                                   (mut output))
+                    (store! i (+ (load i) 1))))))
+    (let [globals (al/al-new [ir/CoreRef] a)
+          n (al/al-len [GlobalBinding] (load (field r globals)))
+          (mut i) 0 (mut public-globals) (load globals)]
+      (loop (if (>= (load i) n) (break)
+                (do (let [binding (al/al-get [GlobalBinding]
+                                             (load (field r globals)) (load i))
+                          reference (.reference binding)
+                          count (al/al-len [ir/CoreRef] (load (mut public-globals)))
+                          (mut j) 0 (mut duplicate) false]
+                      (loop (if (or (>= (load j) count) (load duplicate)) (break)
+                                (do (if (ir/core-ref-same? reference
+                                          (al/al-get [ir/CoreRef]
+                                            (load (mut public-globals)) (load j)))
+                                        (store! duplicate true) 0)
+                                    (store! j (+ (load j) 1)))))
+                      (if (load duplicate) 0
+                          (al/al-push! [ir/CoreRef] (mut public-globals) reference)))
+                    (store! i (+ (load i) 1)))))
+      (ResolveResult :module (load (mut output)) :globals (load (mut public-globals))
+                     :failed (load (field r failed)) :error (load (field r error))))))

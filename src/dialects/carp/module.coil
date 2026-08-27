@@ -1,0 +1,224 @@
+(module experiments.carp.module)
+
+;; Pure Carp module loading over a caller-supplied source registry. Filesystem
+;; and package resolution stay driver policy; this phase deterministically
+;; splices load forms, detects canonical-file cycles, and preserves source IDs.
+
+(import "experiments.carp.surface" :as reader)
+(import "experiments.carp.forms" :as forms)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+
+(export ModuleSource ModuleError ModuleResult ModuleLoader loader-new add-source!
+        load-module load-failed? error-message error-path error-has-span?
+        module-source-count)
+
+(defstruct ModuleSource
+  [(path (slice u8)) (file (slice u8)) (text (slice u8))])
+(defstruct ModuleError
+  [(message (slice u8)) (path (slice u8)) (span forms/SurfaceSpan) (has-span i64)])
+(defstruct ModuleResult
+  [(module forms/CarpModule) (failed i64) (error ModuleError)])
+(defstruct ModuleLoader
+  [(a (dyn alloc/Allocator)) (sources (al/ArrayList ModuleSource))])
+(defstruct LoadState
+  [(loader (ptr ModuleLoader))
+   (active (al/ArrayList (slice u8)))
+   (visited (al/ArrayList (slice u8)))
+   (output (al/ArrayList (ptr forms/CarpNode)))
+   (failed i64)
+   (error ModuleError)])
+
+(defn zero-error [] (-> ModuleError)
+  (ModuleError :message "" :path "" :span (forms/synthetic-span) :has-span 0))
+(defn loader-new [(a (dyn alloc/Allocator))] (-> ModuleLoader)
+  (ModuleLoader :a a :sources (al/al-new [ModuleSource] a)))
+(defn add-source! [(loader (mut ModuleLoader)) (path (slice u8))
+                   (file (slice u8)) (source (slice u8))] (-> i64)
+  (al/al-push! [ModuleSource] (mut (field loader sources))
+               (ModuleSource :path path :file file :text source)))
+(defn module-source-count [(loader (ptr ModuleLoader))] (-> i64)
+  (al/al-len [ModuleSource] (load (field loader sources))))
+(defn load-failed? [(result ModuleResult)] (-> bool) (!= (.failed result) 0))
+(defn error-message [(error ModuleError)] (-> (slice u8)) (.message error))
+(defn error-path [(error ModuleError)] (-> (slice u8)) (.path error))
+(defn error-has-span? [(error ModuleError)] (-> bool) (!= (.has-span error) 0))
+
+(defn source-index [(loader (ptr ModuleLoader)) (path (slice u8))] (-> i64)
+  (let [n (module-source-count loader) (mut i) 0 (mut found) -1]
+    (loop (if (or (>= (load i) n) (!= (load found) -1))
+              (break)
+              (let [source (al/al-get [ModuleSource] (load (field loader sources)) (load i))]
+                (if (str/str-eq (.path source) path) (store! found (load i)) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn contains? [(items (al/ArrayList (slice u8))) (value (slice u8))] (-> bool)
+  (let [n (al/al-len [(slice u8)] items) (mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) n) (load found)) (break)
+              (do (if (str/str-eq (al/al-get [(slice u8)] items (load i)) value)
+                      (store! found true) 0)
+                  (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn simple-name [(node (ptr forms/CarpNode))] (-> (slice u8))
+  (match (forms/form-of node)
+    (forms/Symbol [segments]
+      (if (= (al/al-len [(slice u8)] (load segments)) 1)
+          (al/al-get [(slice u8)] (load segments) 0) ""))
+    (_ "")))
+(defn named? [(node (ptr forms/CarpNode)) (name (slice u8))] (-> bool)
+  (str/str-eq (simple-name node) name))
+
+(defn starts-core? [(path (slice u8))] (-> bool)
+  (and (>= (slice-len path) 5) (str/str-eq (subslice path 0 5) "core/")))
+(defn normalize-load-path [(path (slice u8))] (-> (slice u8))
+  (if (starts-core? path) (subslice path 5 (slice-len path)) path))
+
+;; Returns the decoded target of `(load ...)` or `(load-once ...)`, else empty.
+(defn load-target [(node (ptr forms/CarpNode))] (-> (slice u8))
+  (match (forms/form-of node)
+    (forms/ListForm [items]
+      (if (= (al/al-len [(ptr forms/CarpNode)] (load items)) 2)
+          (let [head (al/al-get [(ptr forms/CarpNode)] (load items) 0)
+                target (al/al-get [(ptr forms/CarpNode)] (load items) 1)]
+            (if (or (named? head "load") (named? head "load-once"))
+                (match (forms/form-of target)
+                  (forms/StringLit [path] (normalize-load-path path))
+                  (_ ""))
+                ""))
+          ""))
+    (_ "")))
+
+(defn load-and-use-name [(node (ptr forms/CarpNode))] (-> (slice u8))
+  (match (forms/form-of node)
+    (forms/ListForm [items]
+      (if (= (al/al-len [(ptr forms/CarpNode)] (load items)) 2)
+          (let [head (al/al-get [(ptr forms/CarpNode)] (load items) 0)]
+            (if (named? head "load-and-use")
+                (simple-name (al/al-get [(ptr forms/CarpNode)] (load items) 1)) ""))
+          ""))
+    (_ "")))
+
+(defn append-extension [(a (dyn alloc/Allocator)) (name (slice u8))] (-> (slice u8))
+  (let [(mut out) (str/sb-new a)]
+    (str/sb-push-str! (mut out) name)
+    (str/sb-push-str! (mut out) ".carp")
+    (str/sb-finish! (mut out))))
+
+(defn two-item-list [(a (dyn alloc/Allocator)) (span forms/SurfaceSpan)
+                     (head (ptr forms/CarpNode)) (argument (ptr forms/CarpNode))]
+  (-> (ptr forms/CarpNode))
+  (let [items (alloc/box! a (al/ArrayList (ptr forms/CarpNode))
+                          (al/al-new [(ptr forms/CarpNode)] a))]
+    (al/al-push! [(ptr forms/CarpNode)] items head)
+    (al/al-push! [(ptr forms/CarpNode)] items argument)
+    (forms/list-new a span items)))
+
+(defn use-node [(a (dyn alloc/Allocator)) (source (ptr forms/CarpNode))
+                (module-name (slice u8))] (-> (ptr forms/CarpNode))
+  (let [span (forms/span-of source)]
+    (two-item-list a span (forms/symbol-new a span "use-all")
+                   (forms/symbol-new a span module-name))))
+
+(defn marker [(a (dyn alloc/Allocator)) (command (slice u8))
+              (file (slice u8))] (-> (ptr forms/CarpNode))
+  (let [span (forms/synthetic-span)
+        items (alloc/box! a (al/ArrayList (ptr forms/CarpNode))
+                          (al/al-new [(ptr forms/CarpNode)] a))
+        name-segments (alloc/box! a (al/ArrayList (slice u8))
+                                  (al/al-new [(slice u8)] a))]
+    (al/al-push! [(slice u8)] name-segments "Unsafe")
+    (al/al-push! [(slice u8)] name-segments command)
+    (al/al-push! [(ptr forms/CarpNode)] items
+                 (forms/node-new-at a span (forms/Symbol name-segments)))
+    (if (> (slice-len file) 0)
+        (al/al-push! [(ptr forms/CarpNode)] items
+                     (forms/node-new-at a span (forms/StringLit file))) 0)
+    (forms/list-new a span items)))
+
+(defn fail-load! [(state (mut LoadState)) (path (slice u8))
+                  (message (slice u8))] (-> i64)
+  (if (= (load (field state failed)) 0)
+      (do (store! (field state failed) 1)
+          (store! (field state error)
+                  (ModuleError :message message :path path
+                               :span (forms/synthetic-span) :has-span 0))) 0)
+  0)
+
+(defn pop-active! [(state (mut LoadState))] (-> i64)
+  (al/al-pop! [(slice u8)] (mut (field state active)))
+  0)
+
+(defn load-path! [(state (mut LoadState)) (path (slice u8))] (-> i64)
+  (let [loader (load (field state loader))
+        index (source-index loader path)]
+    (if (= index -1)
+        (fail-load! (mut state) path "module source not found")
+        (let [source (al/al-get [ModuleSource] (load (field loader sources)) index)]
+          (cond
+            (contains? (load (field state active)) (.file source))
+              (fail-load! (mut state) path "recursive module load")
+            (contains? (load (field state visited)) (.file source)) 0
+            :else
+              (do
+                (al/al-push! [(slice u8)] (mut (field state active)) (.file source))
+                (let [a (load (field loader a))
+                      read-result (reader/read a (.text source))
+                      lowered (forms/lower a (.file source) read-result)]
+                  (if (forms/lower-failed? lowered)
+                      (do (store! (field state failed) 1)
+                          (store! (field state error)
+                                  (ModuleError :message (.message lowered) :path path
+                                               :span (.at lowered) :has-span 1)))
+                      (do
+                        (al/al-push! [(ptr forms/CarpNode)] (mut (field state output))
+                                     (marker a "load-stack-push!" (.file source)))
+                        (let [module (.module lowered)
+                              n (forms/module-count module)
+                              (mut i) 0]
+                          (loop
+                            (if (or (>= (load i) n) (!= (load (field state failed)) 0))
+                                (break)
+                                (let [form (forms/module-at module (load i))
+                                      use-name (load-and-use-name form)
+                                      target (load-target form)]
+                                  (cond
+                                    (> (slice-len use-name) 0)
+                                      (do (load-path! (mut state)
+                                                      (append-extension a use-name))
+                                          (if (= (load (field state failed)) 0)
+                                              (al/al-push! [(ptr forms/CarpNode)]
+                                                (mut (field state output))
+                                                (use-node a form use-name)) 0))
+                                    (> (slice-len target) 0)
+                                      (load-path! (mut state) target)
+                                    :else
+                                      (al/al-push! [(ptr forms/CarpNode)]
+                                        (mut (field state output))
+                                        (forms/clone-node a form)))
+                                  (store! i (+ (load i) 1))))))
+                        (if (= (load (field state failed)) 0)
+                            (do
+                              (al/al-push! [(ptr forms/CarpNode)]
+                                (mut (field state output))
+                                (marker a "load-stack-pop!" ""))
+                              (al/al-push! [(slice u8)]
+                                (mut (field state visited)) (.file source))) 0))))
+                (pop-active! (mut state)))))))
+  0)
+
+(defn load-module [(loader (ptr ModuleLoader)) (root (slice u8))] (-> ModuleResult)
+  (let [a (load (field loader a))
+        (mut state) (load (LoadState :loader loader
+                                    :active (al/al-new [(slice u8)] a)
+                                    :visited (al/al-new [(slice u8)] a)
+                                    :output (al/al-new [(ptr forms/CarpNode)] a)
+                                    :failed 0 :error (zero-error)))]
+    (load-path! (mut state) root)
+    (ModuleResult :module (forms/CarpModule :forms (load (field state output)))
+                  :failed (load (field state failed))
+                  :error (load (field state error)))))

@@ -1,0 +1,223 @@
+(module experiments.carp.reader)
+
+;; Reader-provider entry point for Carp source that has no external loads. It
+;; executes the Carp compiler phases at Coil compile time and returns ordinary
+;; hygienic Coil declarations. Registry-backed Core/load handling is layered on
+;; this same pipeline next.
+
+(import "experiments.carp.surface" :as reader)
+(import "experiments.carp.forms" :as forms)
+(import "experiments.carp.module" :as modules)
+(import "experiments.carp.expand" :as expand)
+(import "experiments.carp.ct-eval" :as eval)
+(import "experiments.carp.resolve" :as resolve)
+(import "experiments.carp.infer-engine" :as infer)
+(import "experiments.carp.specialize" :as specialize)
+(import "experiments.carp.check" :as check)
+(import "experiments.carp.emit" :as emit)
+(import "experiments.carp.ir" :as ir)
+(import "experiments.carp.types" :as types)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.fs" :as fs)
+(import "coil.os" :as os)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+
+(export read-carp)
+
+(defn basename [(path (slice u8))] (-> (slice u8))
+  (let [n (slice-len path) (mut start) 0 (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (if (= (slice-get path (load i)) (primitive/cast u8 47))
+                      (store! start (+ (load i) 1)) 0)
+                  (store! i (+ (load i) 1)))))
+    (subslice path (load start) n)))
+
+(defn add-registry-path! [(a (dyn alloc/Allocator))
+                          (loader (mut modules/ModuleLoader))
+                          (path (slice u8))] (-> i64)
+  (if (= (slice-len path) 0) 0
+      (match (fs/read-file a path)
+        (Ok [text]
+          (modules/add-source! (mut loader) (basename path) path text))
+        (Err [_]
+          (primitive/error "Carp reader: cannot read a registry source")))))
+
+(defn add-registry! [(a (dyn alloc/Allocator))
+                     (loader (mut modules/ModuleLoader))
+                     (registry (slice u8))] (-> i64)
+  (let [n (slice-len registry) (mut start) 0 (mut i) 0]
+    (loop (if (> (load i) n) (break)
+              (if (or (= (load i) n)
+                      (= (slice-get registry (load i)) (primitive/cast u8 58)))
+                  (do (add-registry-path! a (mut loader)
+                        (subslice registry (load start) (load i)))
+                      (store! start (+ (load i) 1))
+                      (store! i (+ (load i) 1)))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn registry-from-environment [(a (dyn alloc/Allocator))]
+  (-> (slice u8))
+  (match (os/env-get a "COIL_CARP_REGISTRY")
+    (Err [_] (primitive/error "Carp reader: cannot query COIL_CARP_REGISTRY"))
+    (Ok [value]
+      (match value
+        (None [] "")
+        (Some [owned] (os/owned-string-slice owned))))))
+
+(defn environment-present? [(a (dyn alloc/Allocator)) (name (slice u8))]
+  (-> bool)
+  (match (os/env-get a name)
+    (Err [_] false)
+    (Ok [value] (match value (None [] false) (Some [_] true)))))
+
+(defn append-module! [(output (mut (al/ArrayList (ptr forms/CarpNode))))
+                      (module forms/CarpModule)] (-> i64)
+  (let [n (forms/module-count module) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (al/al-push! [(ptr forms/CarpNode)] (mut output)
+                    (forms/module-at module (load i)))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn expansion-message [(a (dyn alloc/Allocator)) (error eval/CtError)]
+  (-> (slice u8))
+  (let [span (.span error) start (.start span) (mut out) (str/sb-new a)]
+    (str/sb-push-str! (mut out) (.source span))
+    (str/sb-push-str! (mut out) ":")
+    (str/sb-push-i64! (mut out) (.line start))
+    (str/sb-push-str! (mut out) ":")
+    (str/sb-push-i64! (mut out) (.column start))
+    (str/sb-push-str! (mut out) ": expansion: ")
+    (str/sb-push-str! (mut out) (.message error))
+    (str/sb-finish! (mut out))))
+
+(defn resolution-message [(a (dyn alloc/Allocator)) (error resolve/ResolveError)]
+  (-> (slice u8))
+  (let [span (.span error) start (.start span) (mut out) (str/sb-new a)]
+    (str/sb-push-str! (mut out) (.source span))
+    (str/sb-push-str! (mut out) ":")
+    (str/sb-push-i64! (mut out) (.line start))
+    (str/sb-push-str! (mut out) ":")
+    (str/sb-push-i64! (mut out) (.column start))
+    (str/sb-push-str! (mut out) ": resolve: ")
+    (str/sb-push-str! (mut out) (.message error))
+    (str/sb-finish! (mut out))))
+
+(defn load-source-module [(a (dyn alloc/Allocator))
+                          (source-name (slice u8)) (source (slice u8))]
+  (-> forms/CarpModule)
+  (let [registry (registry-from-environment a)]
+    (if (= (slice-len registry) 0)
+        (let [lowered (forms/lower a source-name (reader/read a source))]
+          (if (forms/lower-failed? lowered)
+              (primitive/error "Carp reader: malformed source") 0)
+          (.module lowered))
+        (let [(mut loader) (modules/loader-new a)
+              root-key (basename source-name)]
+          (add-registry! a (mut loader) registry)
+          (modules/add-source! (mut loader) root-key source-name source)
+          (let [no-core (environment-present? a "COIL_CARP_NO_CORE")
+                root (modules/load-module (mut loader) root-key)]
+            (if (modules/load-failed? root)
+                (primitive/error (modules/error-message (.error root))) 0)
+            (let [(mut output) (al/al-new [(ptr forms/CarpNode)] a)]
+              (if no-core 0
+                  (let [core (modules/load-module (mut loader) "Core.carp")]
+                    (if (modules/load-failed? core)
+                        (primitive/error (modules/error-message (.error core))) 0)
+                    (append-module! (mut output) (.module core))))
+              (append-module! (mut output) (.module root))
+              (forms/CarpModule :forms (load output))))))))
+
+(defn main-function [(module (ptr ir/ResolvedModule))]
+  (-> (ptr ir/ResolvedFunction))
+  (let [n (al/al-len [ir/ResolvedFunction] (load (field module functions)))
+        (mut i) 0 (mut found) (primitive/cast (ptr ir/ResolvedFunction) 0)]
+    (loop (if (or (>= (load i) n)
+                  (!= (primitive/cast i64 (load found)) 0)) (break)
+              (let [entry (al/al-elem [ir/ResolvedFunction]
+                            (field module functions) (load i))
+                    reference (load (field entry reference))]
+                (if (str/str-eq (.name reference) "main") (store! found entry) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn definition-signature [(module (ptr infer/InferredModule))
+                            (reference ir/CoreRef)]
+  (-> (ptr types/MonoType))
+  (let [n (al/al-len [infer/InferredDefinition]
+            (load (field module definitions)))
+        (mut i) 0 (mut found) (primitive/cast (ptr types/MonoType) 0)]
+    (loop (if (or (>= (load i) n)
+                  (!= (primitive/cast i64 (load found)) 0)) (break)
+              (let [entry (al/al-elem [infer/InferredDefinition]
+                            (field module definitions) (load i))]
+                (if (ir/core-ref-same? (load (field entry reference)) reference)
+                    (store! found (load (field entry signature))) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn prepare-source [(a (dyn alloc/Allocator))
+                      (source-name (slice u8)) (source (slice u8))]
+  (-> (ptr check/CheckedModule))
+  (let [loaded (load-source-module a source-name source)
+        (mut config) (expand/config-new a)]
+    (expand/config-add-prelude! (mut config) "Dynamic")
+    (expand/config-set-host! (mut config) "arm64" "macos" "native")
+    (let [expanded-result (expand/expand-module-with a loaded (load config))]
+      (if (expand/expand-failed? expanded-result)
+          (let [error (expand/expand-error expanded-result)]
+            (primitive/error (expansion-message a error))) 0)
+      (let [resolved-result (resolve/resolve
+                              a (expand/expanded-module expanded-result))]
+      (if (resolve/resolve-failed? resolved-result)
+          (let [error (resolve/resolve-error resolved-result)]
+            (primitive/error (resolution-message a error))) 0)
+      (let [resolved (alloc/box! a ir/ResolvedModule
+                       (resolve/resolved-module resolved-result))
+            inferred-result (infer/infer-module a resolved)]
+        (if (infer/inference-failed? inferred-result)
+            (primitive/error (infer/inference-error inferred-result)) 0)
+        (let [inferred (alloc/box! a infer/InferredModule
+                         (infer/inferred-module inferred-result))
+              main (main-function resolved)]
+          (if (= (primitive/cast i64 main) 0)
+              (primitive/error "Carp emission: program has no main function") 0)
+          (let [inferred-signature (definition-signature inferred
+                                     (load (field main reference)))]
+            (if (= (primitive/cast i64 inferred-signature) 0)
+                (primitive/error "Carp emission: main has no inferred signature") 0)
+            (let [signature (types/type-clone-resolved
+                              a (field inferred solver) inferred-signature)
+                  roots (alloc/box! a
+                          (al/ArrayList specialize/SpecializationRequest)
+                          (al/al-new [specialize/SpecializationRequest] a))]
+              (al/al-push! [specialize/SpecializationRequest] roots
+                (specialize/SpecializationRequest
+                  :source (load (field main reference)) :signature signature
+                  :reference (ir/core-ref 0 "" true)))
+              (let [specialized-result (specialize/specialize-module
+                                         a resolved inferred roots)]
+                (if (specialize/module-specialization-failed? specialized-result)
+                    (primitive/error
+                      (specialize/module-specialization-error specialized-result)) 0)
+                (let [specialized (alloc/box! a ir/SpecializedModule
+                                    (specialize/specialized-module specialized-result))
+                      checked-result (check/check-module
+                                       a resolved inferred specialized)]
+                  (if (check/check-failed? checked-result)
+                      (primitive/error (check/check-error checked-result)) 0)
+                  (alloc/box! a check/CheckedModule
+                    (check/checked-module checked-result))))))))))))
+
+(defn read-carp [(context Code)] (-> Code)
+  (let [a (alloc/malloc-allocator)
+        source-name (primitive/code-str (primitive/code-nth context 1))
+        source (primitive/code-str (primitive/code-nth context 2))
+        checked (prepare-source a source-name source)]
+    (emit/emit-module a context checked)))

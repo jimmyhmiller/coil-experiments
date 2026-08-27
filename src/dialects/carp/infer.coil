@@ -1,0 +1,306 @@
+(module experiments.carp.infer)
+
+;; Hindley-Milner inference over resolved Carp. This first boundary converts
+;; retained declaration syntax into reusable schemes and instantiates each use
+;; with fresh type and lifetime identities. Expression inference builds on the
+;; same structures; declaration variables deliberately live at negative IDs so
+;; they cannot collide with positive inference variables.
+
+(import "experiments.carp.ir" :as ir)
+(import "experiments.carp.types" :as types)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+
+(export TypeScheme SchemeResult scheme-failed? scheme-value scheme-error
+        declaration-scheme instantiate-scheme instantiate-scheme-full
+        instantiate-from-scheme
+        SchemeInstantiation SignatureAudit audit-signatures)
+
+(defstruct TypeScheme
+  [(type-variables (ptr (al/ArrayList i64)))
+   (lifetime-variables (ptr (al/ArrayList i64)))
+   (body (ptr types/MonoType))])
+
+(defsum SchemeResult
+  (SchemeOk [(scheme TypeScheme)])
+  (SchemeError [(message (slice u8))]))
+
+(defstruct NamedVariable [(name (slice u8)) (id i64)])
+(defstruct ConversionState
+  [(a (dyn alloc/Allocator))
+   (type-variables (ptr (al/ArrayList NamedVariable)))
+   (lifetime-variables (ptr (al/ArrayList NamedVariable)))
+   (failed (ptr i64))
+   (message (ptr (slice u8)))])
+(defstruct Instantiation [(from i64) (to i64)])
+(defstruct SchemeInstantiation
+  [(body (ptr types/MonoType))
+   (type-mapping (ptr (al/ArrayList Instantiation)))
+   (lifetime-mapping (ptr (al/ArrayList Instantiation)))])
+(defstruct SignatureAudit [(count i64) (failed bool) (message (slice u8))])
+
+(defn scheme-failed? [(result SchemeResult)] (-> bool)
+  (match result (SchemeOk [_] false) (SchemeError [_] true)))
+
+(defn scheme-value [(result SchemeResult)] (-> TypeScheme)
+  (match result
+    (SchemeOk [scheme] scheme)
+    (SchemeError [_]
+      (TypeScheme :type-variables (primitive/cast (ptr (al/ArrayList i64)) 0)
+                  :lifetime-variables (primitive/cast (ptr (al/ArrayList i64)) 0)
+                  :body (primitive/cast (ptr types/MonoType) 0)))))
+
+(defn scheme-error [(result SchemeResult)] (-> (slice u8))
+  (match result (SchemeOk [_] "") (SchemeError [message] message)))
+
+(defn fail-conversion! [(state (mut ConversionState)) (message (slice u8))]
+  (-> i64)
+  (if (= (load (load (field state failed))) 0)
+      (do (store! (load (field state failed)) 1)
+          (store! (load (field state message)) message)
+          0) 0))
+
+(defn lowercase-name? [(name (slice u8))] (-> bool)
+  (if (= (slice-len name) 0) false
+      (let [first (slice-get [u8] name 0)]
+        (and (>= first (primitive/cast u8 97))
+             (<= first (primitive/cast u8 122))))))
+
+(defn named-variable-id! [(variables (ptr (al/ArrayList NamedVariable)))
+                           (name (slice u8))] (-> i64)
+  (let [n (al/al-len [NamedVariable] (load variables))
+        (mut i) 0 (mut found) 0]
+    (loop (if (or (>= (load i) n) (!= (load found) 0)) (break)
+              (let [entry (al/al-get [NamedVariable] (load variables) (load i))]
+                (if (str/str-eq (.name entry) name) (store! found (.id entry)) 0)
+                (store! i (+ (load i) 1)))))
+    (if (!= (load found) 0) (load found)
+        (let [id (- 0 (+ n 1))]
+          (al/al-push! [NamedVariable] variables
+                       (NamedVariable :name name :id id))
+          id))))
+
+(defn convert-type [(state (mut ConversionState)) (source (ptr ir/ResolvedType))]
+  (-> (ptr types/MonoType))
+  (let [a (load (field state a))]
+    (match (load source)
+      (ir/ResolvedTypeName [name]
+        (cond (str/str-eq name "Int") (types/type-integer a)
+              (str/str-eq name "String") (types/type-string a)
+              (str/str-eq name "Bool") (types/type-boolean a)
+              (or (str/str-eq name "Unit") (str/str-eq name "()"))
+                (types/type-unit a)
+              (lowercase-name? name)
+                (types/type-variable a
+                  (named-variable-id! (load (field state type-variables)) name))
+              :else
+                (types/type-named a name (types/type-arguments-new a))))
+      (ir/ResolvedTypeApply [name arguments]
+        (cond
+          (or (str/str-eq name "Fn") (str/str-eq name "λ"))
+            (if (< (al/al-len [(ptr ir/ResolvedType)] (load arguments)) 2)
+                (do (fail-conversion! (mut state)
+                      "function type expects argument vector and result")
+                    (types/type-unit a))
+                (let [argument-source (al/al-get [(ptr ir/ResolvedType)]
+                                                 (load arguments) 0)
+                      result-source (al/al-get [(ptr ir/ResolvedType)]
+                                               (load arguments) 1)
+                      converted-arguments (types/type-arguments-new a)]
+                  (do
+                    (match (load argument-source)
+                      (ir/ResolvedTypeApply [argument-name argument-items]
+                        (if (not (str/str-eq argument-name "__arguments"))
+                            (fail-conversion! (mut state)
+                              "function arguments must be an array")
+                            (let [n (al/al-len [(ptr ir/ResolvedType)]
+                                               (load argument-items))
+                                  (mut i) 0]
+                              (loop
+                                (if (>= (load i) n) (break)
+                                    (do
+                                      (types/type-arguments-push!
+                                        converted-arguments
+                                        (convert-type (mut state)
+                                          (al/al-get [(ptr ir/ResolvedType)]
+                                            (load argument-items) (load i))))
+                                      (store! i (+ (load i) 1))))))))
+                      (_ (fail-conversion! (mut state)
+                           "function arguments must be an array")))
+                    (types/type-function a converted-arguments
+                      (convert-type (mut state) result-source)))))
+          (or (str/str-eq name "Ref") (str/str-eq name "ref"))
+            (if (= (al/al-len [(ptr ir/ResolvedType)] (load arguments)) 0)
+                (do (fail-conversion! (mut state) "Ref expects an inner type")
+                    (types/type-unit a))
+                (let [inner (convert-type (mut state)
+                              (al/al-get [(ptr ir/ResolvedType)] (load arguments) 0))
+                      lifetime
+                        (if (> (al/al-len [(ptr ir/ResolvedType)] (load arguments)) 1)
+                            (match (load (al/al-get [(ptr ir/ResolvedType)]
+                                                   (load arguments) 1))
+                              (ir/ResolvedTypeName [lifetime-name]
+                                (if (str/str-eq lifetime-name "static")
+                                    (types/lifetime-static)
+                                    (types/lifetime-variable
+                                      (named-variable-id!
+                                        (load (field state lifetime-variables))
+                                        lifetime-name))))
+                              (_ (types/lifetime-variable
+                                   (named-variable-id!
+                                     (load (field state lifetime-variables)) "_"))))
+                            (types/lifetime-variable
+                              (named-variable-id!
+                                (load (field state lifetime-variables)) "_")))]
+                  (types/type-reference a inner lifetime)))
+          :else
+            (let [converted (types/type-arguments-new a)
+                  n (al/al-len [(ptr ir/ResolvedType)] (load arguments))
+                  (mut i) 0]
+              (loop (if (>= (load i) n) (break)
+                        (do (types/type-arguments-push! converted
+                              (convert-type (mut state)
+                                (al/al-get [(ptr ir/ResolvedType)]
+                                  (load arguments) (load i))))
+                            (store! i (+ (load i) 1)))))
+              (types/type-named a name converted)))))))
+
+(defn copy-variable-ids [(a (dyn alloc/Allocator))
+                         (variables (ptr (al/ArrayList NamedVariable)))]
+  (-> (ptr (al/ArrayList i64)))
+  (let [result (alloc/box! a (al/ArrayList i64) (al/al-new [i64] a))
+        n (al/al-len [NamedVariable] (load variables)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (let [entry (al/al-get [NamedVariable]
+                                         (load variables) (load i))]
+                    (al/al-push! [i64] result (.id entry)))
+                  (store! i (+ (load i) 1)))))
+    result))
+
+(defn declaration-scheme [(a (dyn alloc/Allocator))
+                          (source (ptr ir/ResolvedType))] (-> SchemeResult)
+  (let [type-variables (alloc/box! a (al/ArrayList NamedVariable)
+                         (al/al-new [NamedVariable] a))
+        lifetime-variables (alloc/box! a (al/ArrayList NamedVariable)
+                             (al/al-new [NamedVariable] a))
+        failed (alloc/box! a i64 0)
+        message (alloc/box! a (slice u8) "")
+        (mut state) (load (ConversionState :a a
+                           :type-variables type-variables
+                           :lifetime-variables lifetime-variables
+                           :failed failed :message message))
+        body (convert-type (mut state) source)]
+    (if (!= (load failed) 0) (SchemeError (load message))
+        (SchemeOk
+          (TypeScheme :type-variables (copy-variable-ids a type-variables)
+                      :lifetime-variables (copy-variable-ids a lifetime-variables)
+                      :body body)))))
+
+(defn instantiation-lookup [(mapping (ptr (al/ArrayList Instantiation)))
+                            (from i64)] (-> i64)
+  (let [n (al/al-len [Instantiation] (load mapping)) (mut i) 0 (mut result) from]
+    (loop (if (or (>= (load i) n) (!= (load result) from)) (break)
+              (let [entry (al/al-get [Instantiation] (load mapping) (load i))]
+                (if (= (.from entry) from) (store! result (.to entry)) 0)
+                (store! i (+ (load i) 1)))))
+    (load result)))
+
+(defn instantiate-type [(a (dyn alloc/Allocator)) (source (ptr types/MonoType))
+                        (type-mapping (ptr (al/ArrayList Instantiation)))
+                        (lifetime-mapping (ptr (al/ArrayList Instantiation)))]
+  (-> (ptr types/MonoType))
+  (match (load source)
+    (types/TypeVariable [id]
+      (types/type-variable a (instantiation-lookup type-mapping id)))
+    (types/TypeInteger [] (types/type-integer a))
+    (types/TypeString [] (types/type-string a))
+    (types/TypeBoolean [] (types/type-boolean a))
+    (types/TypeUnit [] (types/type-unit a))
+    (types/TypeNamed [name arguments]
+      (let [converted (types/type-arguments-new a)
+            n (al/al-len [(ptr types/MonoType)] (load arguments)) (mut i) 0]
+        (loop (if (>= (load i) n) (break)
+                  (do (types/type-arguments-push! converted
+                        (instantiate-type a
+                          (al/al-get [(ptr types/MonoType)] (load arguments) (load i))
+                          type-mapping lifetime-mapping))
+                      (store! i (+ (load i) 1)))))
+        (types/type-named a name converted)))
+    (types/TypeReference [inner lifetime]
+      (types/type-reference a
+        (instantiate-type a inner type-mapping lifetime-mapping)
+        (match lifetime
+          (types/LifetimeStatic [] (types/lifetime-static))
+          (types/LifetimeVariable [id]
+            (types/lifetime-variable
+              (instantiation-lookup lifetime-mapping id))))))
+    (types/TypeFunction [arguments result]
+      (let [converted (types/type-arguments-new a)
+            n (al/al-len [(ptr types/MonoType)] (load arguments)) (mut i) 0]
+        (loop (if (>= (load i) n) (break)
+                  (do (types/type-arguments-push! converted
+                        (instantiate-type a
+                          (al/al-get [(ptr types/MonoType)] (load arguments) (load i))
+                          type-mapping lifetime-mapping))
+                      (store! i (+ (load i) 1)))))
+        (types/type-function a converted
+          (instantiate-type a result type-mapping lifetime-mapping))))))
+
+(defn build-instantiation [(a (dyn alloc/Allocator))
+                           (variables (ptr (al/ArrayList i64)))
+                           (next (mut i64))]
+  (-> (ptr (al/ArrayList Instantiation)))
+  (let [mapping (alloc/box! a (al/ArrayList Instantiation)
+                  (al/al-new [Instantiation] a))
+        n (al/al-len [i64] (load variables)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (al/al-push! [Instantiation] mapping
+                    (Instantiation :from (al/al-get [i64] (load variables) (load i))
+                                   :to (load next)))
+                  (store! next (+ (load next) 1))
+                  (store! i (+ (load i) 1)))))
+    mapping))
+
+(defn instantiate-scheme-full [(a (dyn alloc/Allocator)) (scheme TypeScheme)
+                               (next (mut i64))] (-> SchemeInstantiation)
+  (let [type-mapping (build-instantiation a (.type-variables scheme) (mut next))
+        lifetime-mapping (build-instantiation a (.lifetime-variables scheme) (mut next))]
+    (SchemeInstantiation
+      :body (instantiate-type a (.body scheme) type-mapping lifetime-mapping)
+      :type-mapping type-mapping :lifetime-mapping lifetime-mapping)))
+
+(defn instantiate-from-scheme [(a (dyn alloc/Allocator))
+                               (instantiation SchemeInstantiation)
+                               (source (ptr types/MonoType))]
+  (-> (ptr types/MonoType))
+  (instantiate-type a source (.type-mapping instantiation)
+                           (.lifetime-mapping instantiation)))
+
+(defn instantiate-scheme [(a (dyn alloc/Allocator)) (scheme TypeScheme)
+                          (next (mut i64))] (-> (ptr types/MonoType))
+  (let [instantiation (instantiate-scheme-full a scheme (mut next))]
+    (.body instantiation)))
+
+(defn audit-signatures [(a (dyn alloc/Allocator)) (module ir/ResolvedModule)]
+  (-> SignatureAudit)
+  (let [n (al/al-len [ir/ResolvedSignature] (.signatures module))
+        (mut i) 0 (mut failed) false (mut message) ""]
+    (loop (if (or (>= (load i) n) (load failed)) (break)
+              (let [signature (al/al-get [ir/ResolvedSignature]
+                                         (.signatures module) (load i))
+                    result (declaration-scheme a (.type signature))]
+                (if (scheme-failed? result)
+                    (let [reference (.reference signature)
+                          (mut out) (str/sb-new a)]
+                      (str/sb-push-str! (mut out) "signature ")
+                      (str/sb-push-str! (mut out) (.name reference))
+                      (str/sb-push-str! (mut out) ": ")
+                      (str/sb-push-str! (mut out) (scheme-error result))
+                      (store! failed true)
+                      (store! message (str/sb-finish! (mut out)))
+                      0) 0)
+                (store! i (+ (load i) 1)))))
+    (SignatureAudit :count (load i) :failed (load failed) :message (load message))))

@@ -1,0 +1,223 @@
+(module experiments.carp.infer-engine-test)
+
+(import "experiments.carp.surface" :as reader)
+(import "experiments.carp.forms" :as forms)
+(import "experiments.carp.resolve" :as resolve)
+(import "experiments.carp.expand" :as expand)
+(import "experiments.carp.infer-engine" :as infer)
+(import "experiments.carp.ir" :as ir)
+(import "experiments.carp.types" :as types)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.assert" :use *)
+
+(defn infer-source [(a (dyn alloc/Allocator)) (source (slice u8))]
+  (-> infer/InferenceResult)
+  (let [lowered (forms/lower a "infer-engine-test.carp" (reader/read a source))
+        resolved (resolve/resolve a (.module lowered))]
+    (assert (not (resolve/resolve-failed? resolved)))
+    (infer/infer-module a (resolve/resolved-module resolved))))
+
+(defn infer-expanded-source [(a (dyn alloc/Allocator)) (source (slice u8))]
+  (-> infer/InferenceResult)
+  (let [lowered (forms/lower a "infer-engine-test.carp" (reader/read a source))
+        (mut config) (expand/config-new a)]
+    (expand/config-add-prelude! (mut config) "Dynamic")
+    (let [expanded (expand/expand-module-with a (.module lowered) (load config))]
+      (assert (not (expand/expand-failed? expanded)))
+      (let [resolved (resolve/resolve a (expand/expanded-module expanded))]
+        (assert (not (resolve/resolve-failed? resolved)))
+        (infer/infer-module a (resolve/resolved-module resolved))))))
+
+(deftest infers-recursive-functions-and-polymorphic-registered-calls
+  (let [a (alloc/malloc-allocator)
+        result (infer-source a
+          "(register same (Fn [a a] Bool)) (sig loop (Fn [Int] Bool)) (defn loop [n] (if (same n 0) true (loop 0)))")]
+    (assert (not (infer/inference-failed? result)))
+    (let [module (infer/inferred-module result)]
+      (assert (> (al/al-len [infer/InferredNodeType] (.node-types module)) 0))
+      (assert-eq (al/al-len [infer/InferredCall] (.calls module)) 2))))
+
+(deftest selects-a-qualified-overload-from-argument-types
+  (let [a (alloc/malloc-allocator)
+        result (infer-source a
+          "(defmodule A (register pick (Fn [Int] Int))) (defmodule B (register pick (Fn [String] String))) (sig choose (Fn [Int] Int)) (defn choose [x] (pick x))")]
+    (assert (not (infer/inference-failed? result)))
+    (let [module (infer/inferred-module result)
+          call (al/al-get [infer/InferredCall] (.calls module) 0)]
+      (let [chosen (.callee call)]
+        (assert (ir/core-ref-global? chosen))))))
+
+(deftest rejects-branch-type-mismatches
+  (let [a (alloc/malloc-allocator)
+        result (infer-source a "(defn bad [x] (if true 1 \"no\"))")]
+    (assert (infer/inference-failed? result))))
+
+(deftest generalizes-inferred-top-level-functions-after-their-definition
+  (let [a (alloc/malloc-allocator)
+        result (infer-source a
+          "(defn identity [x] x) (defn use [] (do (identity 1) (identity \"ok\")))")]
+    (assert (not (infer/inference-failed? result)))))
+
+(deftest infers-array-endo-filter-with-borrowed-predicate
+  (let [a (alloc/malloc-allocator)
+        result (infer-source a
+          "(defn keep-all [xs] (Array.endo-filter &(fn [x] true) xs))")]
+    (assert (not (infer/inference-failed? result)))))
+
+(deftest infers-array-endo-map-with-borrowed-endomorphism
+  (let [a (alloc/malloc-allocator)
+        result (infer-source a
+          "(defn map-in-place [xs] (Array.endo-map &(fn [x] x) xs))")]
+    (assert (not (infer/inference-failed? result)))))
+
+(deftest infers-array-string-conversion-from-a-borrow
+  (let [a (alloc/malloc-allocator)
+        result (infer-source a "(defn render [xs] (Array.str &xs))")]
+    (assert (not (infer/inference-failed? result)))))
+
+(deftest implicitly-borrows-values-for-reference-parameters
+  (let [a (alloc/malloc-allocator)
+        result (infer-source a
+          "(register consume-ref (Fn [(Ref String)] Int)) (defn use [s] (consume-ref s))")]
+    (assert (not (infer/inference-failed? result)))))
+
+(deftest preserves-reference-parameters-while-inferring-forwarders
+  (let [a (alloc/malloc-allocator)
+        result (infer-source a
+          "(register inspect (Fn [(Ref String)] Bool)) (defn forwarding [x] (inspect x)) (defn use [] (forwarding &\"ok\"))")]
+    (assert (not (infer/inference-failed? result)))))
+
+(deftest infers-pattern-literals-as-pattern-values
+  (let [a (alloc/malloc-allocator)
+        result (infer-source a
+          "(register matches (Fn [(Ref Pattern) (Ref String)] Bool)) (defn test [s] (matches #\"x\" s))")]
+    (assert (not (infer/inference-failed? result)))))
+
+(deftest infers-top-level-values-before-function-bodies
+  (let [a (alloc/malloc-allocator)
+        result (infer-source a "(def state 1) (defn update [] (set! state 2))")]
+    (assert (not (infer/inference-failed? result)))))
+
+(deftest infers-mutating-array-pop-back-result
+  (let [a (alloc/malloc-allocator)
+        result (infer-source a
+          "(defn pop-one [xs] (Array.pop-back! &xs))")]
+    (assert (not (infer/inference-failed? result)))))
+
+(deftest nested-registered-struct-accessors-use-qualified-owner-types
+  (let [a (alloc/malloc-allocator)
+        result (infer-source a
+          "(defmodule Pattern (register-type MatchResult [start Int]) (register make (Fn [] Pattern.MatchResult)) (defn find [] @(Pattern.MatchResult.start &(make))))")]
+    (assert (not (infer/inference-failed? result)))))
+
+(deftest overload-constrained-parameters-are-resolved-before-generalization
+  (let [a (alloc/malloc-allocator)
+        result (infer-source a
+          "(definterface > (Fn [a a] Bool)) (defmodule Int (register > (Fn [Int Int] Bool)) (defn positive? [x] (> x 0)) (implements > Int.>)) (defmodule Long (register > (Fn [Long Long] Bool)) (implements > Long.>))")]
+    (assert (not (infer/inference-failed? result)))
+    (let [module (infer/inferred-module result)
+          n (al/al-len [infer/InferredBinding] (.globals module))
+          (mut i) 0 (mut found) false]
+      (loop (if (or (>= (load i) n) (load found)) (break)
+                (let [binding (al/al-get [infer/InferredBinding]
+                                (.globals module) (load i))
+                      reference (.reference binding)]
+                  (if (= (.name reference) "Int.positive?")
+                      (match (load (.body (.scheme binding)))
+                        (types/TypeFunction [arguments _]
+                          (match (load (al/al-get [(ptr types/MonoType)]
+                                         (load arguments) 0))
+                            (types/TypeInteger [] (store! found true))
+                            (_ 0)))
+                        (_ 0)) 0)
+                  (store! i (+ (load i) 1)))))
+      (assert (load found)))))
+
+(deftest numeric-interface-implementations-constrain-upstream-shaped-sign-functions
+  (let [a (alloc/malloc-allocator)
+        result (infer-expanded-source a
+          "(definterface < (Fn [a a] Bool)) (definterface > (Fn [a a] Bool)) (definterface sign (Fn [a] a)) (defmodule Int (register < (Fn [Int Int] Bool)) (register > (Fn [Int Int] Bool)) (defn sign [x] (if (> x 0) 1 (if (< x 0) -1 0))) (implements < Int.<) (implements > Int.>) (implements sign Int.sign)) (defmodule IntRef (defn < [a b] (Int.< @a @b)) (defn > [a b] (Int.> @a @b)) (implements < IntRef.<) (implements > IntRef.>)) (defmodule Long (register < (Fn [Long Long] Bool)) (register > (Fn [Long Long] Bool)) (defn sign [x] (if (> x 0l) 1l (if (< x 0l) -1l 0l))) (implements < Long.<) (implements > Long.>) (implements sign Long.sign)) (defmodule Double (register < (Fn [Double Double] Bool)) (register > (Fn [Double Double] Bool)) (defn sign [x] (if (> x 0.0) 1.0 (if (< x 0.0) -1.0 0.0))) (implements < Double.<) (implements > Double.>) (implements sign Double.sign)) (defmodule Float (register < (Fn [Float Float] Bool)) (register > (Fn [Float Float] Bool)) (defn sign [x] (if (> x 0.0f) 1.0f (if (< x 0.0f) -1.0f 0.0f))) (implements < Float.<) (implements > Float.>) (implements sign Float.sign))")]
+    (assert (not (infer/inference-failed? result)))
+    (let [module (infer/inferred-module result)
+          n (al/al-len [infer/InferredBinding] (.globals module))
+          (mut i) 0 (mut concrete) 0]
+      (loop (if (>= (load i) n) (break)
+                (let [binding (al/al-get [infer/InferredBinding]
+                                (.globals module) (load i))
+                      reference (.reference binding)]
+                  (if (or (= (.name reference) "Int.sign")
+                          (or (= (.name reference) "Long.sign")
+                              (or (= (.name reference) "Double.sign")
+                                  (= (.name reference) "Float.sign"))))
+                      (match (load (.body (.scheme binding)))
+                        (types/TypeFunction [arguments _]
+                          (match (load (al/al-get [(ptr types/MonoType)]
+                                         (load arguments) 0))
+                            (types/TypeVariable [_] 0)
+                            (_ (store! concrete (+ (load concrete) 1)))))
+                        (_ 0)) 0)
+                  (store! i (+ (load i) 1)))))
+      (assert-eq (load concrete) 4))))
+
+(deftest generalized-functions-propagate-interface-constraints-to-callers
+  (let [a (alloc/malloc-allocator)
+        result (infer-expanded-source a
+          "(definterface str (Fn [a] String)) (defmodule Int (register str (Fn [Int] String)) (implements str Int.str)) (defn display [x] (str x)) (defn wrapper [x] (display x)) (defn main [] (wrapper 1))")]
+    (assert (not (infer/inference-failed? result)))
+    (let [module (infer/inferred-module result)]
+      (assert-eq (infer/inferred-overload-count module)
+                 (infer/inferred-resolved-overload-count module)))))
+
+(deftest pair-accessors-preserve-distinct-enum-key-and-string-value-types
+  (let [a (alloc/malloc-allocator)
+        result (infer-expanded-source a
+          "(deftype Id Black Red) (def pairs [(Pair.init (Black) \"30\")]) (defn key [] @(Pair.a (Array.unsafe-nth &pairs 0)))")]
+    (assert (not (infer/inference-failed? result)))
+    (let [module (infer/inferred-module result)
+          n (al/al-len [infer/InferredBinding] (.globals module))
+          (mut i) 0 (mut found) false]
+      (loop (if (or (>= (load i) n) (load found)) (break)
+                (let [binding (al/al-get [infer/InferredBinding]
+                                (.globals module) (load i))
+                      reference (.reference binding)]
+                  (if (= (.name reference) "key")
+                      (match (load (.body (.scheme binding)))
+                        (types/TypeFunction [_ result-type]
+                          (match (load result-type)
+                            (types/TypeNamed [name _]
+                              (if (= name "Id") (store! found true) 0))
+                            (_ 0)))
+                        (_ 0)) 0)
+                  (store! i (+ (load i) 1)))))
+      (assert (load found)))))
+
+(deftest qualified-constraints-preserve-two-parameter-container-roles
+  (let [a (alloc/malloc-allocator)
+        result (infer-expanded-source a
+          "(definterface = (Fn [(Ref a) (Ref a)] Bool)) (definterface zero (Fn [] a)) (deftype Id Black Red) (deftype (Store a b) [key a value b]) (defmodule Id (register = (Fn [(Ref Id) (Ref Id)] Bool)) (implements = Id.=)) (defmodule String (register zero (Fn [] String)) (implements zero String.zero)) (defn find [store key] (= (Store.key store) key)) (defn fetch-default [store key default] (if (find store key) @(Store.value store) @default)) (defn fetch [store key] (fetch-default store key &(zero))) (defn use [] (fetch &(Store.init (Black) \"value\") &(Black)))")]
+    (assert (not (infer/inference-failed? result)))
+    (let [module (infer/inferred-module result)
+          n (al/al-len [infer/InferredBinding] (.globals module))
+          (mut i) 0 (mut found) false]
+      (loop (if (or (>= (load i) n) (load found)) (break)
+                (let [binding (al/al-get [infer/InferredBinding]
+                                (.globals module) (load i))
+                      reference (.reference binding)]
+                  (if (= (.name reference) "fetch")
+                      (match (load (.body (.scheme binding)))
+                        (types/TypeFunction [arguments result-type]
+                          (match (load result-type)
+                            (types/TypeString []
+                              (match (load (al/al-get [(ptr types/MonoType)]
+                                             (load arguments) 1))
+                                (types/TypeReference [inner _]
+                                  (match (load inner)
+                                    (types/TypeNamed [name _]
+                                      (if (= name "Id") (store! found true) 0))
+                                    (_ 0)))
+                                (_ 0)))
+                            (_ 0)))
+                        (_ 0)) 0)
+                  (store! i (+ (load i) 1)))))
+      (assert (load found)))))

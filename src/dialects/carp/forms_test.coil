@@ -1,0 +1,118 @@
+(module experiments.carp.forms-test)
+
+(import "experiments.carp.surface" :as reader)
+(import "experiments.carp.forms" :as forms)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.assert" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+
+(defn lowered [(a (dyn alloc/Allocator)) (source (slice u8))] (-> forms/LowerResult)
+  (forms/lower a "test.carp" (reader/read a source)))
+
+(deftest lowers-literal-values-once
+  (let [a (alloc/malloc-allocator)
+        result (lowered a "42 255b -7l 1.5f 3.25 true \\space")]
+    (assert (not (forms/lower-failed? result)))
+    (assert-eq (forms/module-count (.module result)) 7)
+    (match (forms/form-of (forms/module-at (.module result) 0))
+      (forms/IntLit [value] (assert-eq value 42)) (_ (assert false)))
+    (match (forms/form-of (forms/module-at (.module result) 1))
+      (forms/ByteLit [value] (assert-eq value 255)) (_ (assert false)))
+    (match (forms/form-of (forms/module-at (.module result) 2))
+      (forms/LongLit [value] (assert-eq value -7)) (_ (assert false)))
+    (match (forms/form-of (forms/module-at (.module result) 5))
+      (forms/BoolLit [value] (assert value)) (_ (assert false)))
+    (match (forms/form-of (forms/module-at (.module result) 6))
+      (forms/CharLit [value] (assert-eq value 32)) (_ (assert false)))))
+
+(deftest decodes-strings-patterns-and-raw-strings
+  (let [a (alloc/malloc-allocator)
+        result (lowered a "\"a\\n\\x41\" r\"a\"\"b\" #\"a\\b\"")]
+    (assert (not (forms/lower-failed? result)))
+    (match (forms/form-of (forms/module-at (.module result) 0))
+      (forms/StringLit [value] (assert (str/str-eq value "a\nA"))) (_ (assert false)))
+    (match (forms/form-of (forms/module-at (.module result) 1))
+      (forms/StringLit [value] (assert (str/str-eq value "a\"b"))) (_ (assert false)))
+    (match (forms/form-of (forms/module-at (.module result) 2))
+      (forms/PatternLit [value] (assert (str/str-eq value "a\\b"))) (_ (assert false)))))
+
+(deftest preserves-reference-string-escape-quirks
+  (let [a (alloc/malloc-allocator)
+        result (lowered a "\"\\12\" \"\\123\" \"\\08\" \\ä")]
+    (assert (not (forms/lower-failed? result)))
+    (match (forms/form-of (forms/module-at (.module result) 0))
+      (forms/StringLit [value]
+        (assert-eq (primitive/cast i64 (slice-get value 0)) 18))
+      (_ (assert false)))
+    (match (forms/form-of (forms/module-at (.module result) 2))
+      (forms/StringLit [value] (assert (str/str-eq value "\\08")))
+      (_ (assert false)))
+    (match (forms/form-of (forms/module-at (.module result) 3))
+      (forms/CharLit [value] (assert-eq value 228))
+      (_ (assert false)))))
+
+(deftest segments-qualified-symbols-and-preserves-source-identity
+  (let [a (alloc/malloc-allocator)
+        result (lowered a "Foo.Bar.baz")
+        node (forms/module-at (.module result) 0)
+        span (forms/span-of node)]
+    (assert (str/str-eq (.source span) "test.carp"))
+    (match (forms/form-of node)
+      (forms/Symbol [segments]
+        (do (assert-eq (al/al-len [(slice u8)] (load segments)) 3)
+            (assert (str/str-eq (al/al-get [(slice u8)] (load segments) 0) "Foo"))
+            (assert (str/str-eq (al/al-get [(slice u8)] (load segments) 2) "baz"))))
+      (_ (assert false)))))
+
+(deftest recursively-lowers-reader-macro-forms
+  (let [a (alloc/malloc-allocator)
+        result (lowered a "&Foo.x")
+        root (forms/module-at (.module result) 0)]
+    (match (forms/form-of root)
+      (forms/ListForm [items]
+        (do (assert-eq (al/al-len [(ptr forms/CarpNode)] (load items)) 2)
+            (match (forms/form-of (al/al-get [(ptr forms/CarpNode)] (load items) 0))
+              (forms/Symbol [segments]
+                (assert (str/str-eq (al/al-get [(slice u8)] (load segments) 0) "ref")))
+              (_ (assert false)))))
+      (_ (assert false)))))
+
+(deftest dictionaries-lower-to-map-of-pairs-like-carp-reader
+  (let [a (alloc/malloc-allocator)
+        result (lowered a "{1 2 3 4}")
+        node (forms/module-at (.module result) 0)]
+    (match (forms/form-of node)
+      (forms/ListForm [call]
+        (do (assert-eq (al/al-len [(ptr forms/CarpNode)] (load call)) 2)
+            (match (forms/form-of
+                     (al/al-get [(ptr forms/CarpNode)] (load call) 1))
+              (forms/ArrayForm [pairs]
+                (assert-eq (al/al-len [(ptr forms/CarpNode)] (load pairs)) 2))
+              (_ (assert false)))))
+      (_ (assert false)))))
+
+(deftest cloned-generated-syntax-can-be-reanchored-without-mutating-input
+  (let [a (alloc/malloc-allocator)
+        result (lowered a "(x [y])")
+        original (forms/module-at (.module result) 0)
+        copied (forms/clone-node a original)
+        target (forms/synthetic-span)]
+    (forms/reanchor! copied target)
+    (let [copied-span (forms/span-of copied)
+          original-span (forms/span-of original)]
+      (assert-eq (.line (.start copied-span)) 0)
+      (assert-eq (.line (.start original-span)) 1))
+    (match (forms/form-of copied)
+      (forms/ListForm [items]
+        (let [child (al/al-get [(ptr forms/CarpNode)] (load items) 1)
+              child-span (forms/span-of child)]
+          (assert-eq (.line (.start child-span)) 0)))
+      (_ (assert false)))))
+
+(deftest rejects-invalid-named-characters-during-lowering
+  (let [a (alloc/malloc-allocator)
+        result (lowered a "\\not-a-character")]
+    (assert (forms/lower-failed? result))))

@@ -1,0 +1,215 @@
+(module experiments.carp.expand-test)
+
+(import "experiments.carp.surface" :as reader)
+(import "experiments.carp.forms" :as forms)
+(import "experiments.carp.expand" :as expand)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.assert" :use *)
+(import "coil.str" :as str)
+
+(defn expand-source [(a (dyn alloc/Allocator)) (source (slice u8))]
+  (-> expand/ExpandResult)
+  (let [lowered (forms/lower a "test.carp" (reader/read a source))]
+    (expand/expand-module a (.module lowered))))
+
+(defn expand-source-with-dynamic-prelude
+  [(a (dyn alloc/Allocator)) (source (slice u8))]
+  (-> expand/ExpandResult)
+  (let [lowered (forms/lower a "test.carp" (reader/read a source))
+        (mut config) (expand/config-new a)]
+    (expand/config-add-prelude! (mut config) "Dynamic")
+    (expand/expand-module-with a (.module lowered) (load config))))
+
+(deftest expands-direct-and-quoted-macro-results
+  (let [a (alloc/malloc-allocator)
+        result (expand-source a
+          "(defmacro identity [x] x) (defmacro seven [] (quote 7)) (identity (seven))")]
+    (assert (not (expand/expand-failed? result)))
+    (assert-eq (forms/module-count (expand/expanded-module result)) 1)
+    (match (forms/form-of (forms/module-at (expand/expanded-module result) 0))
+      (forms/IntLit [value] (assert-eq value 7)) (_ (assert false)))))
+
+(deftest macros-use-real-compile-time-evaluation
+  (let [a (alloc/malloc-allocator)
+        result (expand-source a
+          "(defmacro sum [] (let-do [acc 0] (for [i 0 10] (set! acc (+ acc i))) acc)) (sum)")]
+    (assert (not (expand/expand-failed? result)))
+    (match (forms/form-of (forms/module-at (expand/expanded-module result) 0))
+      (forms/IntLit [value] (assert-eq value 45)) (_ (assert false)))))
+
+(deftest dynamic-functions-and-values-are-source-ordered
+  (let [a (alloc/malloc-allocator)
+        result (expand-source a
+          "(defdynamic base 40) (defndynamic add-base [x] (+ base x)) (defmacro answer [] (add-base 2)) (answer)")]
+    (assert (not (expand/expand-failed? result)))
+    (match (forms/form-of (forms/module-at (expand/expanded-module result) 0))
+      (forms/IntLit [value] (assert-eq value 42)) (_ (assert false)))))
+
+(deftest runtime-use-materializes-a-prelude-dynamic-as-an-ordinary-definition
+  (let [a (alloc/malloc-allocator)
+        result (expand-source-with-dynamic-prelude a
+          "(defmodule Dynamic (defndynamic /= [a b] (not (= a b)))) (defn compare [a b] (/= a b))")]
+    (assert (not (expand/expand-failed? result)))
+    (let [module (expand/expanded-module result)]
+      (assert-eq (forms/module-count module) 3)
+      (match (forms/form-of (forms/module-at module 0))
+        (forms/ListForm [items]
+          (do (match (forms/form-of
+                       (al/al-get [(ptr forms/CarpNode)] (load items) 0))
+                (forms/Symbol [segments]
+                  (assert (str/str-eq
+                    (al/al-get [(slice u8)] (load segments) 0) "defn")))
+                (_ (assert false)))
+              (match (forms/form-of
+                       (al/al-get [(ptr forms/CarpNode)] (load items) 1))
+                (forms/Symbol [segments]
+                  (assert (str/str-eq
+                    (al/al-get [(slice u8)] (load segments) 0) "/=")))
+                (_ (assert false)))))
+        (_ (assert false))))))
+
+(deftest dynamic-mutual-recursion-resolves-at-call-time
+  (let [a (alloc/malloc-allocator)
+        result (expand-source a
+          "(defndynamic even? [n] (if (= n 0) true (odd? (dec n)))) (defndynamic odd? [n] (if (= n 0) false (even? (dec n)))) (defmacro four-even? [] (even? 4)) (four-even?)")]
+    (assert (not (expand/expand-failed? result)))
+    (match (forms/form-of (forms/module-at (expand/expanded-module result) 0))
+      (forms/BoolLit [value] (assert value)) (_ (assert false)))))
+
+(deftest compile-time-definitions-expand-macros-in-their-bodies
+  (let [a (alloc/malloc-allocator)
+        result (expand-source a
+          "(defmacro when [condition body] (list (quote if) condition body (quote ()))) (defndynamic choose [condition form] (when condition form)) (defmacro enabled [form] (choose true form)) (enabled (register safe-add (Fn [Int Int] Int)))")]
+    (assert (not (expand/expand-failed? result)))
+    (match (forms/form-of (forms/module-at (expand/expanded-module result) 0))
+      (forms/ListForm [items]
+        (match (forms/form-of (al/al-get [(ptr forms/CarpNode)] (load items) 0))
+          (forms/Symbol [segments]
+            (assert (str/str-eq (al/al-get [(slice u8)] (load segments) 0) "register")))
+          (_ (assert false))))
+      (_ (assert false)))))
+
+(deftest macro-can-compute-a-new-syntax-list
+  (let [a (alloc/malloc-allocator)
+        result (expand-source a
+          "(defmacro unless [condition body] (list (quote if) condition (quote ()) body)) (unless false (work))")
+        expanded (forms/module-at (expand/expanded-module result) 0)]
+    (assert (not (expand/expand-failed? result)))
+    (match (forms/form-of expanded)
+      (forms/ListForm [items]
+        (assert (str/str-eq
+          (match (forms/form-of (al/al-get [(ptr forms/CarpNode)] (load items) 0))
+            (forms/Symbol [segments] (al/al-get [(slice u8)] (load segments) 0))
+            (_ "")) "if")))
+      (_ (assert false)))))
+
+(deftest rest-macro-parameters-become-syntax-lists
+  (let [a (alloc/malloc-allocator)
+        result (expand-source a
+          "(defmacro collect [first :rest rest] rest) (collect 1 2 3)")]
+    (assert (not (expand/expand-failed? result)))
+    (match (forms/form-of (forms/module-at (expand/expanded-module result) 0))
+      (forms/ListForm [items]
+        (do (assert-eq (al/al-len [(ptr forms/CarpNode)] (load items)) 2)
+            (match (forms/form-of (al/al-get [(ptr forms/CarpNode)] (load items) 0))
+              (forms/IntLit [value] (assert-eq value 2)) (_ (assert false)))))
+      (_ (assert false)))))
+
+(deftest comments-inside-macro-calls-are-not-arguments
+  (let [a (alloc/malloc-allocator)
+        result (expand-source a
+          "(defmacro choose [condition alternative] (list (quote if) condition true alternative)) (choose false ; explanation\n 42)")]
+    (assert (not (expand/expand-failed? result)))
+    (match (forms/form-of (forms/module-at (expand/expanded-module result) 0))
+      (forms/ListForm [items]
+        (do (assert-eq (al/al-len [(ptr forms/CarpNode)] (load items)) 4)
+            (match (forms/form-of (al/al-get [(ptr forms/CarpNode)] (load items) 1))
+              (forms/BoolLit [value] (assert (not value))) (_ (assert false)))))
+      (_ (assert false)))))
+
+(deftest module-macros-resolve-qualified-and-through-use
+  (let [a (alloc/malloc-allocator)
+        result (expand-source a
+          "(defmodule Answers (defmacro answer [] 42)) (Answers.answer) (use Answers) (answer)")]
+    (assert (not (expand/expand-failed? result)))
+    ;; The empty runtime module declaration and use form are preserved.
+    (assert-eq (forms/module-count (expand/expanded-module result)) 4)
+    (match (forms/form-of (forms/module-at (expand/expanded-module result) 1))
+      (forms/IntLit [value] (assert-eq value 42)) (_ (assert false)))
+    (match (forms/form-of (forms/module-at (expand/expanded-module result) 3))
+      (forms/IntLit [value] (assert-eq value 42)) (_ (assert false)))))
+
+(deftest reopened-modules-share-dynamic-cells
+  (let [a (alloc/malloc-allocator)
+        result (expand-source a
+          "(defmodule Counter (defdynamic n 1)) (defmodule Counter (defmacro current [] n)) (Counter.current)")]
+    (assert (not (expand/expand-failed? result)))
+    (match (forms/form-of (forms/module-at (expand/expanded-module result) 2))
+      (forms/IntLit [value] (assert-eq value 1)) (_ (assert false)))))
+
+(deftest qualified-dynamic-calls-use-the-module-cell
+  (let [a (alloc/malloc-allocator)
+        result (expand-source a
+          "(defmodule Maybe (defndynamic id [x] x) (defmacro get [x] (Maybe.id x))) (Maybe.get 42)")]
+    (assert (not (expand/expand-failed? result)))
+    (match (forms/form-of (forms/module-at (expand/expanded-module result) 1))
+      (forms/IntLit [value] (assert-eq value 42)) (_ (assert false)))))
+
+(deftest runtime-module-binding-shadows-an-imported-macro
+  (let [a (alloc/malloc-allocator)
+        result (expand-source a
+          "(defmacro swap! [x y] x) (defmodule Array (defn swap! [a i j] a)) (Array.swap! xs 1 2)")]
+    (assert (not (expand/expand-failed? result)))
+    (match (forms/form-of (forms/module-at (expand/expanded-module result) 1))
+      (forms/ListForm [items]
+        (assert-eq (al/al-len [(ptr forms/CarpNode)] (load items)) 4))
+      (_ (assert false)))))
+
+(deftest ambiguous-imported-macros-are-errors
+  (let [a (alloc/malloc-allocator)
+        result (expand-source a
+          "(defmodule A (defmacro choose [] 1)) (defmodule B (defmacro choose [] 2)) (use A) (use B) (choose)")]
+    (assert (expand/expand-failed? result))))
+
+(deftest quoted-forms-remain-opaque-to-recursive-expansion
+  (let [a (alloc/malloc-allocator)
+        result (expand-source a
+          "(defmacro seven [] 7) (quote (seven))")
+        quoted (forms/module-at (expand/expanded-module result) 0)]
+    (match (forms/form-of quoted)
+      (forms/ListForm [items]
+        (match (forms/form-of (al/al-get [(ptr forms/CarpNode)] (load items) 1))
+          (forms/ListForm [inner]
+            (assert (str/str-eq
+              (match (forms/form-of (al/al-get [(ptr forms/CarpNode)] (load inner) 0))
+                (forms/Symbol [segments] (al/al-get [(slice u8)] (load segments) 0))
+                (_ "")) "seven")))
+          (_ (assert false))))
+      (_ (assert false)))))
+
+(deftest quasiquoted-macro-bodies-remain-opaque-until-invocation
+  (let [a (alloc/malloc-allocator)
+        result (expand-source a
+          "(defmacro seven [] 7) (defmacro wrapped [] `(quote (seven))) (wrapped)")
+        quoted (forms/module-at (expand/expanded-module result) 0)]
+    (assert (not (expand/expand-failed? result)))
+    (match (forms/form-of quoted)
+      (forms/ListForm [items]
+        (match (forms/form-of (al/al-get [(ptr forms/CarpNode)] (load items) 1))
+          (forms/ListForm [inner]
+            (match (forms/form-of
+                     (al/al-get [(ptr forms/CarpNode)] (load inner) 0))
+              (forms/Symbol [segments]
+                (assert (str/str-eq (al/al-get [(slice u8)] (load segments) 0)
+                                    "seven")))
+              (_ (assert false))))
+          (_ (assert false))))
+      (_ (assert false)))))
+
+(deftest reports-macro-arity-and-unbound-dynamic-errors
+  (let [a (alloc/malloc-allocator)]
+    (assert (expand/expand-failed?
+      (expand-source a "(defmacro one [x] x) (one)")))
+    (assert (expand/expand-failed?
+      (expand-source a "(defmacro bad [] missing) (bad)")))))

@@ -1,0 +1,317 @@
+(module experiments.carp.ownership)
+
+;; Flow state shared by Carp's ownership analyzer. Origins are immutable sets:
+;; a borrow may depend on multiple locals after a control-flow join, and using
+;; that borrow is invalid if any possible owner has moved. States are persistent
+;; values backed by compiler-arena arrays, which makes branch analysis explicit.
+
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+
+(defstruct BorrowOrigin
+  [(external bool)
+   (static bool)
+   (locals (ptr (al/ArrayList i64)))
+   (parameters (ptr (al/ArrayList i64)))
+   (temporaries (ptr (al/ArrayList i64)))])
+
+(defstruct OriginBinding [(binding i64) (origin (ptr BorrowOrigin))])
+
+(defstruct BorrowState
+  [(moved (al/ArrayList i64))
+   (origins (al/ArrayList OriginBinding))])
+
+(defsum BorrowCheck
+  (BorrowValid [])
+  (BorrowEscapes [])
+  (BorrowOwnerMoved [(owner i64)]))
+
+(defn id-list-new [(a (dyn alloc/Allocator))] (-> (ptr (al/ArrayList i64)))
+  (alloc/box! a (al/ArrayList i64) (al/al-new [i64] a)))
+
+(defn id-list-has? [(ids (ptr (al/ArrayList i64))) (id i64)] (-> bool)
+  (let [n (al/al-len [i64] (load ids))
+        (mut i) 0
+        (mut found) false]
+    (loop
+      (if (or (load found) (>= (load i) n))
+          (break)
+          (do
+            (if (= (al/al-get [i64] (load ids) (load i)) id)
+                (store! found true)
+                0)
+            (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn id-list-add! [(ids (ptr (al/ArrayList i64))) (id i64)] (-> i64)
+  (if (id-list-has? ids id) 0 (al/al-push! [i64] ids id)))
+
+(defn id-list-copy [(a (dyn alloc/Allocator)) (ids (ptr (al/ArrayList i64)))]
+  (-> (ptr (al/ArrayList i64)))
+  (let [result (id-list-new a)
+        n (al/al-len [i64] (load ids))
+        (mut i) 0]
+    (loop
+      (if (>= (load i) n)
+          (break)
+          (do
+            (al/al-push! [i64] result (al/al-get [i64] (load ids) (load i)))
+            (store! i (+ (load i) 1)))))
+    result))
+
+(defn id-list-union [(a (dyn alloc/Allocator))
+                     (left (ptr (al/ArrayList i64)))
+                     (right (ptr (al/ArrayList i64)))]
+  (-> (ptr (al/ArrayList i64)))
+  (let [result (id-list-copy a left)
+        n (al/al-len [i64] (load right))
+        (mut i) 0]
+    (loop
+      (if (>= (load i) n)
+          (break)
+          (do
+            (id-list-add! result (al/al-get [i64] (load right) (load i)))
+            (store! i (+ (load i) 1)))))
+    result))
+
+(defn borrow-origin [(a (dyn alloc/Allocator))
+                     (external bool)
+                     (static bool)] (-> (ptr BorrowOrigin))
+  (alloc/box! a BorrowOrigin
+              (BorrowOrigin :external external
+                            :static static
+                            :locals (id-list-new a)
+                            :parameters (id-list-new a)
+                            :temporaries (id-list-new a))))
+
+(defn borrow-origin-external [(a (dyn alloc/Allocator))] (-> (ptr BorrowOrigin))
+  (borrow-origin a true false))
+
+(defn borrow-origin-static [(a (dyn alloc/Allocator))] (-> (ptr BorrowOrigin))
+  (borrow-origin a false true))
+
+(defn borrow-origin-local [(a (dyn alloc/Allocator)) (binding i64)]
+  (-> (ptr BorrowOrigin))
+  (let [result (borrow-origin a false false)]
+    (id-list-add! (load (field result locals)) binding)
+    result))
+
+(defn borrow-origin-parameter [(a (dyn alloc/Allocator)) (binding i64)]
+  (-> (ptr BorrowOrigin))
+  (let [result (borrow-origin a false false)]
+    (id-list-add! (load (field result parameters)) binding)
+    result))
+
+(defn borrow-origin-temporary [(a (dyn alloc/Allocator)) (expression i64)]
+  (-> (ptr BorrowOrigin))
+  (let [result (borrow-origin a false false)]
+    (id-list-add! (load (field result temporaries)) expression)
+    result))
+
+(defn borrow-origin-join [(a (dyn alloc/Allocator))
+                          (left (ptr BorrowOrigin))
+                          (right (ptr BorrowOrigin))] (-> (ptr BorrowOrigin))
+  (alloc/box! a BorrowOrigin
+              (BorrowOrigin
+                :external (or (load (field left external)) (load (field right external)))
+                :static (or (load (field left static)) (load (field right static)))
+                :locals (id-list-union a
+                                       (load (field left locals))
+                                       (load (field right locals)))
+                :parameters (id-list-union a
+                                           (load (field left parameters))
+                                           (load (field right parameters)))
+                :temporaries (id-list-union a
+                                            (load (field left temporaries))
+                                            (load (field right temporaries))))))
+
+(defn borrow-origin-escapes? [(origin (ptr BorrowOrigin))] (-> bool)
+  (or (> (al/al-len [i64] (load (load (field origin locals)))) 0)
+      (> (al/al-len [i64] (load (load (field origin temporaries)))) 0)))
+
+(defn borrow-state-new [(a (dyn alloc/Allocator))] (-> BorrowState)
+  (BorrowState :moved (al/al-new [i64] a)
+               :origins (al/al-new [OriginBinding] a)))
+
+(defn moved-list-has? [(moved (ptr (al/ArrayList i64))) (binding i64)] (-> bool)
+  (id-list-has? moved binding))
+
+(defn borrow-state-moved? [(state (ptr BorrowState)) (binding i64)] (-> bool)
+  (moved-list-has? (field state moved) binding))
+
+(defn borrow-state-origin [(state (ptr BorrowState)) (binding i64)]
+  (-> (ptr BorrowOrigin))
+  (let [origins (field state origins)
+        (mut i) (al/al-len [OriginBinding] (load origins))
+        (mut result) (primitive/cast (ptr BorrowOrigin) 0)]
+    (loop
+      (if (or (= (load i) 0) (!= (primitive/cast i64 (load result)) 0))
+          (break)
+          (do
+            (store! i (- (load i) 1))
+            (let [entry (al/al-elem [OriginBinding] origins (load i))]
+              (if (= (load (field entry binding)) binding)
+                  (store! result (load (field entry origin)))
+                  0)))))
+    (load result)))
+
+(defn copy-moved-except [(a (dyn alloc/Allocator))
+                         (state (ptr BorrowState))
+                         (except i64)] (-> (al/ArrayList i64))
+  (let [(mut result) (al/al-new [i64] a)
+        moved (field state moved)
+        n (al/al-len [i64] (load moved))
+        (mut i) 0]
+    (loop
+      (if (>= (load i) n)
+          (break)
+          (let [id (al/al-get [i64] (load moved) (load i))]
+            (if (!= id except) (al/al-push! [i64] (mut result) id) 0)
+            (store! i (+ (load i) 1)))))
+    (load result)))
+
+(defn copy-moved [(a (dyn alloc/Allocator)) (state (ptr BorrowState))]
+  (-> (al/ArrayList i64))
+  (let [(mut result) (al/al-new [i64] a)
+        moved (field state moved)
+        n (al/al-len [i64] (load moved))
+        (mut i) 0]
+    (loop
+      (if (>= (load i) n)
+          (break)
+          (do
+            (al/al-push! [i64] (mut result) (al/al-get [i64] (load moved) (load i)))
+            (store! i (+ (load i) 1)))))
+    (load result)))
+
+(defn copy-origins-except [(a (dyn alloc/Allocator))
+                           (state (ptr BorrowState))
+                           (except i64)] (-> (al/ArrayList OriginBinding))
+  (let [(mut result) (al/al-new [OriginBinding] a)
+        origins (field state origins)
+        n (al/al-len [OriginBinding] (load origins))
+        (mut i) 0]
+    (loop
+      (if (>= (load i) n)
+          (break)
+          (let [entry (al/al-get [OriginBinding] (load origins) (load i))]
+            (if (!= (load (field entry binding)) except)
+                (al/al-push! [OriginBinding] (mut result) entry)
+                0)
+            (store! i (+ (load i) 1)))))
+    (load result)))
+
+(defn copy-origins [(a (dyn alloc/Allocator)) (state (ptr BorrowState))]
+  (-> (al/ArrayList OriginBinding))
+  (let [(mut result) (al/al-new [OriginBinding] a)
+        origins (field state origins)
+        n (al/al-len [OriginBinding] (load origins))
+        (mut i) 0]
+    (loop
+      (if (>= (load i) n)
+          (break)
+          (do
+            (al/al-push! [OriginBinding]
+                         (mut result)
+                         (al/al-get [OriginBinding] (load origins) (load i)))
+            (store! i (+ (load i) 1)))))
+    (load result)))
+
+(defn borrow-state-mark-moved [(a (dyn alloc/Allocator))
+                               (state (ptr BorrowState))
+                               (binding i64)] (-> BorrowState)
+  (let [(mut moved) (copy-moved a state)]
+    (if (not (moved-list-has? (mut moved) binding))
+        (al/al-push! [i64] (mut moved) binding)
+        0)
+    (BorrowState :moved (load moved)
+                 :origins (copy-origins a state))))
+
+(defn borrow-state-unmove [(a (dyn alloc/Allocator))
+                           (state (ptr BorrowState))
+                           (binding i64)] (-> BorrowState)
+  (BorrowState :moved (copy-moved-except a state binding)
+               :origins (copy-origins-except a state -1)))
+
+(defn borrow-state-set-origin [(a (dyn alloc/Allocator))
+                               (state (ptr BorrowState))
+                               (binding i64)
+                               (origin (ptr BorrowOrigin))] (-> BorrowState)
+  (let [(mut origins) (copy-origins-except a state binding)]
+    (al/al-push! [OriginBinding]
+                 (mut origins)
+                 (OriginBinding :binding binding :origin origin))
+    (BorrowState :moved (copy-moved a state)
+                 :origins (load origins))))
+
+(defn borrow-state-bindings-add! [(bindings (ptr (al/ArrayList i64)))
+                                  (state (ptr BorrowState))] (-> i64)
+  (let [origins (field state origins)
+        n (al/al-len [OriginBinding] (load origins))
+        (mut i) 0]
+    (loop
+      (if (>= (load i) n)
+          (break)
+          (do
+            (id-list-add! bindings
+                          (load (field (al/al-elem [OriginBinding] origins (load i)) binding)))
+            (store! i (+ (load i) 1)))))
+    0))
+
+(defn borrow-state-join [(a (dyn alloc/Allocator))
+                         (left (ptr BorrowState))
+                         (right (ptr BorrowState))] (-> BorrowState)
+  (let [moved (id-list-union a (field left moved) (field right moved))
+        bindings (id-list-new a)]
+    (borrow-state-bindings-add! bindings left)
+    (borrow-state-bindings-add! bindings right)
+    (let [(mut origins) (al/al-new [OriginBinding] a)
+          n (al/al-len [i64] (load bindings))
+          (mut i) 0]
+      (loop
+        (if (>= (load i) n)
+            (break)
+            (let [binding (al/al-get [i64] (load bindings) (load i))
+                  left-origin (borrow-state-origin left binding)
+                  right-origin (borrow-state-origin right binding)
+                  left-present (!= (primitive/cast i64 left-origin) 0)
+                  right-present (!= (primitive/cast i64 right-origin) 0)
+                  joined (if (and left-present right-present)
+                             (borrow-origin-join a left-origin right-origin)
+                             (if left-present left-origin right-origin))]
+              (al/al-push! [OriginBinding]
+                           (mut origins)
+                           (OriginBinding :binding binding :origin joined))
+              (store! i (+ (load i) 1)))))
+      (BorrowState :moved (load moved) :origins (load origins)))))
+
+(defn borrow-check-origin [(origin (ptr BorrowOrigin))
+                           (state (ptr BorrowState))
+                           (tail-position bool)] (-> BorrowCheck)
+  (if (and tail-position (borrow-origin-escapes? origin))
+      (BorrowEscapes)
+      (let [locals (load (field origin locals))
+            n (al/al-len [i64] (load locals))
+            (mut i) 0
+            (mut moved-owner) 0
+            (mut found) false]
+        (loop
+          (if (or (>= (load i) n) (load found))
+              (break)
+              (let [owner (al/al-get [i64] (load locals) (load i))]
+                (if (borrow-state-moved? state owner)
+                    (do
+                      (store! moved-owner owner)
+                      (store! found true))
+                    0)
+                (store! i (+ (load i) 1)))))
+        (if (load found)
+            (BorrowOwnerMoved (load moved-owner))
+            (BorrowValid)))))
+
+(defn borrow-valid? [(result BorrowCheck)] (-> bool)
+  (match result
+    (BorrowValid [] true)
+    (BorrowEscapes [] false)
+    (BorrowOwnerMoved [_] false)))

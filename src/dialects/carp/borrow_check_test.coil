@@ -1,0 +1,280 @@
+(module experiments.carp.borrow-check-test)
+
+(import "coil.alloc" :as alloc :use [malloc-allocator])
+(import "coil.assert" :use *)
+(import "experiments.carp.borrow-check" :as check)
+(import "experiments.carp.ir" :as ir)
+(import "experiments.carp.types" :as types)
+
+(defn widget-type [(a (dyn alloc/Allocator))] (-> (ptr types/MonoType))
+  (types/type-named a "Widget" (types/type-arguments-new a)))
+
+(defn reference-type [(a (dyn alloc/Allocator))
+                      (inner (ptr types/MonoType))
+                      (lifetime i64)] (-> (ptr types/MonoType))
+  (types/type-reference a inner (types/lifetime-variable lifetime)))
+
+(defn function-type-1 [(a (dyn alloc/Allocator))
+                       (argument (ptr types/MonoType))
+                       (result (ptr types/MonoType))] (-> (ptr types/MonoType))
+  (let [arguments (types/type-arguments-new a)]
+    (types/type-arguments-push! arguments argument)
+    (types/type-function a arguments result)))
+
+(defn function-type-2 [(a (dyn alloc/Allocator))
+                       (first (ptr types/MonoType))
+                       (second (ptr types/MonoType))
+                       (result (ptr types/MonoType))] (-> (ptr types/MonoType))
+  (let [arguments (types/type-arguments-new a)]
+    (types/type-arguments-push! arguments first)
+    (types/type-arguments-push! arguments second)
+    (types/type-function a arguments result)))
+
+(defn global-call [(a (dyn alloc/Allocator))
+                   (id i64)
+                   (result-type (ptr types/MonoType))
+                   (name (slice u8))
+                   (signature (ptr types/MonoType))
+                   (arguments (ptr (coil.arraylist.ArrayList (ptr ir/SpecializedExpr))))]
+  (-> (ptr ir/SpecializedExpr))
+  (ir/expression-box a
+                     (ir/ExprGlobalCall id
+                                        result-type
+                                        (ir/core-ref id name true)
+                                        signature
+                                        arguments)))
+
+(defn owned-facts [(a (dyn alloc/Allocator))] (-> check/OwnershipTypeFacts)
+  (let [(mut facts) (check/ownership-facts-new a)]
+    (check/ownership-facts-add-owned! (mut facts) "Widget")
+    (load facts)))
+
+(defn empty-parameters [(a (dyn alloc/Allocator))]
+  (-> (ptr (coil.arraylist.ArrayList ir/CoreRef)))
+  (ir/core-ref-list-new a))
+
+(deftest analyzer-rejects-escaped-local-borrow
+  (let [a (malloc-allocator)
+        widget (widget-type a)
+        ref-widget (reference-type a widget 0)
+        local (ir/core-ref -1 "local" false)
+        value (ir/expression-literal a 1 widget)
+        local-ref (ir/expression-reference a 2 widget local)
+        borrow (ir/expression-borrow a 3 ref-widget local-ref)
+        body (ir/expression-box a (ir/ExprLet 4 ref-widget local value borrow))
+        parameters (empty-parameters a)
+        (mut facts) (owned-facts a)
+        flags (check/check-borrows a body parameters (mut facts))]
+    (assert (load (field flags escaped)))
+    (assert (not (load (field flags after-move))))))
+
+(deftest analyzer-accepts-escaped-parameter-borrow
+  (let [a (malloc-allocator)
+        widget (widget-type a)
+        ref-widget (reference-type a widget 0)
+        parameter (ir/core-ref -1 "parameter" false)
+        parameters (empty-parameters a)]
+    (ir/core-ref-list-push! parameters parameter)
+    (let [parameter-ref (ir/expression-reference a 1 widget parameter)
+          borrow (ir/expression-borrow a 2 ref-widget parameter-ref)
+          (mut facts) (owned-facts a)
+          flags (check/check-borrows a borrow parameters (mut facts))]
+      (assert (not (load (field flags escaped))))
+      (assert (not (load (field flags after-move)))))))
+
+(defn borrow-move-program [(a (dyn alloc/Allocator)) (borrow-first bool)]
+  (-> (ptr ir/SpecializedExpr))
+  (let [widget (widget-type a)
+        unit (types/type-unit a)
+        ref-widget (reference-type a widget 0)
+        local (ir/core-ref -1 "s" false)
+        borrowed (ir/core-ref -2 "r" false)
+        value (ir/expression-literal a 1 widget)
+        local-for-borrow (ir/expression-reference a 2 widget local)
+        borrow (ir/expression-borrow a 3 ref-widget local-for-borrow)
+        consume-arguments (ir/expression-list-new a)
+        inspect-arguments (ir/expression-list-new a)]
+    (ir/expression-list-push! consume-arguments
+                              (ir/expression-reference a 4 widget local))
+    (ir/expression-list-push! inspect-arguments
+                              (ir/expression-reference a 5 ref-widget borrowed))
+    (let [consume (global-call a
+                               6
+                               unit
+                               "consume"
+                               (function-type-1 a widget unit)
+                               consume-arguments)
+          inspect (global-call a
+                               7
+                               unit
+                               "inspect"
+                               (function-type-1 a ref-widget unit)
+                               inspect-arguments)
+          sequence (ir/expression-list-new a)]
+      (if borrow-first
+          (do
+            (ir/expression-list-push! sequence inspect)
+            (ir/expression-list-push! sequence consume))
+          (do
+            (ir/expression-list-push! sequence consume)
+            (ir/expression-list-push! sequence inspect)))
+      (let [body (ir/expression-box a (ir/ExprDo 8 unit sequence))
+            bind-borrow (ir/expression-box a
+                                           (ir/ExprLet 9 unit borrowed borrow body))]
+        (ir/expression-box a (ir/ExprLet 10 unit local value bind-borrow))))))
+
+(deftest analyzer-rejects-borrow-after-move
+  (let [a (malloc-allocator)
+        program (borrow-move-program a false)
+        parameters (empty-parameters a)
+        (mut facts) (owned-facts a)
+        flags (check/check-borrows a program parameters (mut facts))]
+    (assert (load (field flags after-move)))))
+
+(deftest analyzer-accepts-borrow-before-move
+  (let [a (malloc-allocator)
+        program (borrow-move-program a true)
+        parameters (empty-parameters a)
+        (mut facts) (owned-facts a)
+        flags (check/check-borrows a program parameters (mut facts))]
+    (assert (not (load (field flags after-move))))))
+
+(deftest call-consumes-only-after-all-arguments-are-evaluated
+  (let [a (malloc-allocator)
+        widget (widget-type a)
+        ref-widget (reference-type a widget 0)
+        unit (types/type-unit a)
+        local (ir/core-ref -1 "s" false)
+        value (ir/expression-literal a 1 widget)
+        arguments (ir/expression-list-new a)]
+    (ir/expression-list-push! arguments
+                              (ir/expression-reference a 2 widget local))
+    (ir/expression-list-push! arguments
+                              (ir/expression-borrow
+                                a
+                                3
+                                ref-widget
+                                (ir/expression-reference a 4 widget local)))
+    (let [call (global-call a
+                            5
+                            unit
+                            "consume-and-inspect"
+                            (function-type-2 a widget ref-widget unit)
+                            arguments)
+          program (ir/expression-box a (ir/ExprLet 6 unit local value call))
+          parameters (empty-parameters a)
+          (mut facts) (owned-facts a)
+          flags (check/check-borrows a program parameters (mut facts))]
+      (assert (not (load (field flags after-move)))))))
+
+(deftest shared-lifetime-call-propagates-local-origin
+  (let [a (malloc-allocator)
+        widget (widget-type a)
+        ref-widget (reference-type a widget 7)
+        local (ir/core-ref -1 "local" false)
+        value (ir/expression-literal a 1 widget)
+        arguments (ir/expression-list-new a)]
+    (ir/expression-list-push! arguments
+                              (ir/expression-borrow
+                                a
+                                2
+                                ref-widget
+                                (ir/expression-reference a 3 widget local)))
+    (let [peek (global-call a
+                            4
+                            ref-widget
+                            "peek"
+                            (function-type-1 a ref-widget ref-widget)
+                            arguments)
+          program (ir/expression-box a (ir/ExprLet 5 ref-widget local value peek))
+          parameters (empty-parameters a)
+          (mut facts) (owned-facts a)
+          flags (check/check-borrows a program parameters (mut facts))]
+      (assert (load (field flags escaped))))))
+
+(deftest mutation-to-local-origin-is-rejected-on-return
+  (let [a (malloc-allocator)
+        widget (widget-type a)
+        ref-widget (reference-type a widget 0)
+        parameter (ir/core-ref -1 "parameter" false)
+        local (ir/core-ref -2 "local" false)
+        borrowed (ir/core-ref -3 "r" false)
+        parameters (empty-parameters a)]
+    (ir/core-ref-list-push! parameters parameter)
+    (let [local-value (ir/expression-literal a 1 widget)
+          initial-borrow (ir/expression-borrow
+                           a
+                           2
+                           ref-widget
+                           (ir/expression-reference a 3 widget parameter))
+          local-borrow (ir/expression-borrow
+                         a
+                         4
+                         ref-widget
+                         (ir/expression-reference a 5 widget local))
+          set-origin (ir/expression-box a
+                                        (ir/ExprSet 6 ref-widget borrowed local-borrow))
+          result (ir/expression-reference a 7 ref-widget borrowed)
+          sequence (ir/expression-list-new a)]
+      (ir/expression-list-push! sequence set-origin)
+      (ir/expression-list-push! sequence result)
+      (let [body (ir/expression-box a (ir/ExprDo 8 ref-widget sequence))
+            bind-r (ir/expression-box a
+                                      (ir/ExprLet 9 ref-widget borrowed initial-borrow body))
+            program (ir/expression-box a
+                                       (ir/ExprLet 10 ref-widget local local-value bind-r))
+            (mut facts) (owned-facts a)
+            flags (check/check-borrows a program parameters (mut facts))]
+        (assert (load (field flags escaped)))))))
+
+(deftest branch-move-poisons-following-borrow-use
+  (let [a (malloc-allocator)
+        widget (widget-type a)
+        ref-widget (reference-type a widget 0)
+        unit (types/type-unit a)
+        boolean (types/type-boolean a)
+        local (ir/core-ref -1 "s" false)
+        borrowed (ir/core-ref -2 "r" false)
+        value (ir/expression-literal a 1 widget)
+        borrow (ir/expression-borrow
+                 a
+                 2
+                 ref-widget
+                 (ir/expression-reference a 3 widget local))
+        consume-arguments (ir/expression-list-new a)]
+    (ir/expression-list-push! consume-arguments
+                              (ir/expression-reference a 4 widget local))
+    (let [consume (global-call a
+                               5
+                               unit
+                               "consume"
+                               (function-type-1 a widget unit)
+                               consume-arguments)
+          conditional (ir/expression-box a
+                         (ir/ExprIf 6
+                                    unit
+                                    (ir/expression-literal a 7 boolean)
+                                    consume
+                                    (ir/expression-literal a 8 unit)))
+          inspect-arguments (ir/expression-list-new a)]
+      (ir/expression-list-push! inspect-arguments
+                                (ir/expression-reference a 9 ref-widget borrowed))
+      (let [inspect (global-call a
+                                 10
+                                 unit
+                                 "inspect"
+                                 (function-type-1 a ref-widget unit)
+                                 inspect-arguments)
+            sequence (ir/expression-list-new a)]
+        (ir/expression-list-push! sequence conditional)
+        (ir/expression-list-push! sequence inspect)
+        (let [body (ir/expression-box a (ir/ExprDo 11 unit sequence))
+              bind-r (ir/expression-box a
+                                        (ir/ExprLet 12 unit borrowed borrow body))
+              program (ir/expression-box a
+                                         (ir/ExprLet 13 unit local value bind-r))
+              parameters (empty-parameters a)
+              (mut facts) (owned-facts a)
+              flags (check/check-borrows a program parameters (mut facts))]
+          (assert (load (field flags after-move))))))))
+

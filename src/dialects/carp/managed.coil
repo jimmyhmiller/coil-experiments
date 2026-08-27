@@ -1,0 +1,218 @@
+(module experiments.carp.managed)
+
+;; Builds Carp managedness facts for the exact runtime type representations
+;; reached by specialization. A concrete type is blit when its `blit`
+;; implementation matches `(Fn [T] T)`, and managed when a matching `delete`
+;; implementation exists and blit does not.
+
+(import "experiments.carp.borrow-check" :as borrow)
+(import "experiments.carp.infer" :as schemes)
+(import "experiments.carp.infer-engine" :as infer)
+(import "experiments.carp.ir" :as ir)
+(import "experiments.carp.types" :as types)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "coil.str" :as str)
+
+(export build-ownership-facts)
+
+(defn binding-scheme [(module (ptr infer/InferredModule)) (reference ir/CoreRef)]
+  (-> (ptr schemes/TypeScheme))
+  (let [n (al/al-len [infer/InferredBinding] (load (field module globals)))
+        (mut i) n (mut found) (primitive/cast (ptr schemes/TypeScheme) 0)]
+    (loop (if (or (<= (load i) 0)
+                  (!= (primitive/cast i64 (load found)) 0)) (break)
+              (do (store! i (- (load i) 1))
+              (let [entry (al/al-elem [infer/InferredBinding]
+                                      (field module globals) (load i))]
+                (if (ir/core-ref-same? (load (field entry reference)) reference)
+                    (store! found (field entry scheme)) 0)
+                0))))
+    (load found)))
+
+(defn interface-matches? [(a (dyn alloc/Allocator))
+                          (resolved (ptr ir/ResolvedModule))
+                          (inferred (ptr infer/InferredModule))
+                          (interface-name (slice u8))
+                          (expected (ptr types/MonoType))] (-> bool)
+  (let [n (al/al-len [ir/CoreImplementation]
+                     (load (field resolved implementations)))
+        (mut i) 0 (mut matched) false]
+    (loop (if (or (>= (load i) n) (load matched)) (break)
+              (let [edge (al/al-get [ir/CoreImplementation]
+                           (load (field resolved implementations)) (load i))]
+                (if (str/str-eq (.name (.interface edge)) interface-name)
+                    (let [scheme (binding-scheme inferred (.implementation edge))]
+                      (if (= (primitive/cast i64 scheme) 0) 0
+                          (let [next (alloc/box! a i64
+                                       (+ (types/type-max-variable-id expected) 1))
+                                candidate (schemes/instantiate-scheme a (load scheme) next)
+                                solver (alloc/box! a types/TypeSolver
+                                         (types/type-solver-new a))]
+                            (if (types/unify-success?
+                                  (types/type-unify! solver candidate expected))
+                                (store! matched true) 0)))) 0)
+                (store! i (+ (load i) 1)))))
+    (load matched)))
+
+(defn seen-type? [(seen (ptr (al/ArrayList (ptr types/MonoType))))
+                  (type (ptr types/MonoType))] (-> bool)
+  (let [n (al/al-len [(ptr types/MonoType)] (load seen))
+        (mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) n) (load found)) (break)
+              (do (if (types/type-same-representation?
+                        (al/al-get [(ptr types/MonoType)] (load seen) (load i)) type)
+                      (store! found true) 0)
+                  (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn consider-type! [(a (dyn alloc/Allocator))
+                      (resolved (ptr ir/ResolvedModule))
+                      (inferred (ptr infer/InferredModule))
+                      (facts (ptr borrow/OwnershipTypeFacts))
+                      (seen (ptr (al/ArrayList (ptr types/MonoType))))
+                      (type (ptr types/MonoType))] (-> i64)
+  (if (seen-type? seen type) 0
+      (do (al/al-push! [(ptr types/MonoType)] seen type)
+          (match (load type)
+            (types/TypeNamed [_ arguments]
+              (let [n (al/al-len [(ptr types/MonoType)] (load arguments))
+                    (mut i) 0]
+                (loop (if (>= (load i) n) (break)
+                          (do (consider-type! a resolved inferred facts seen
+                                (al/al-get [(ptr types/MonoType)]
+                                  (load arguments) (load i)))
+                              (store! i (+ (load i) 1)))))))
+            (types/TypeReference [inner _]
+              (consider-type! a resolved inferred facts seen inner))
+            (types/TypeFunction [arguments result]
+              (do (let [n (al/al-len [(ptr types/MonoType)] (load arguments))
+                        (mut i) 0]
+                    (loop (if (>= (load i) n) (break)
+                              (do (consider-type! a resolved inferred facts seen
+                                    (al/al-get [(ptr types/MonoType)]
+                                      (load arguments) (load i)))
+                                  (store! i (+ (load i) 1))))))
+                  (consider-type! a resolved inferred facts seen result)))
+            (_ 0))
+          (match (load type)
+            (types/TypeNamed [_ _]
+              (let [arguments (types/type-arguments-new a)]
+                (types/type-arguments-push! arguments type)
+                (let [blit-signature (types/type-function a arguments type)]
+                  (if (interface-matches? a resolved inferred "blit" blit-signature)
+                      (borrow/ownership-facts-add-blit-type! facts type)
+                      (let [delete-arguments (types/type-arguments-new a)]
+                        (types/type-arguments-push! delete-arguments type)
+                        (let [delete-signature (types/type-function
+                                                 a delete-arguments
+                                                 (types/type-unit a))]
+                          (if (interface-matches? a resolved inferred
+                                "delete" delete-signature)
+                              (borrow/ownership-facts-add-owned-type! facts type) 0)))))))
+            (_ 0))
+          0)))
+
+(defn collect-expression-types! [(a (dyn alloc/Allocator))
+                                 (resolved (ptr ir/ResolvedModule))
+                                 (inferred (ptr infer/InferredModule))
+                                 (facts (ptr borrow/OwnershipTypeFacts))
+                                 (seen (ptr (al/ArrayList (ptr types/MonoType))))
+                                 (expression (ptr ir/SpecializedExpr))] (-> i64)
+  (consider-type! a resolved inferred facts seen (ir/expression-type expression))
+  (match (load expression)
+    (ir/ExprBorrow [_ _ operand]
+      (collect-expression-types! a resolved inferred facts seen operand))
+    (ir/ExprGlobalCall [_ _ _ signature arguments]
+      (do (consider-type! a resolved inferred facts seen signature)
+          (collect-list-types! a resolved inferred facts seen arguments)))
+    (ir/ExprCall [_ _ callee arguments]
+      (do (collect-expression-types! a resolved inferred facts seen callee)
+          (collect-list-types! a resolved inferred facts seen arguments)))
+    (ir/ExprDo [_ _ expressions]
+      (collect-list-types! a resolved inferred facts seen expressions))
+    (ir/ExprIf [_ _ condition then-branch else-branch]
+      (do (collect-expression-types! a resolved inferred facts seen condition)
+          (collect-expression-types! a resolved inferred facts seen then-branch)
+          (collect-expression-types! a resolved inferred facts seen else-branch)))
+    (ir/ExprLet [_ _ _ value body]
+      (do (collect-expression-types! a resolved inferred facts seen value)
+          (collect-expression-types! a resolved inferred facts seen body)))
+    (ir/ExprSet [_ _ _ value]
+      (collect-expression-types! a resolved inferred facts seen value))
+    (ir/ExprWhile [_ _ condition body]
+      (do (collect-expression-types! a resolved inferred facts seen condition)
+          (collect-expression-types! a resolved inferred facts seen body)))
+    (ir/ExprLambda [_ type _ body]
+      (do (consider-type! a resolved inferred facts seen type)
+          (collect-expression-types! a resolved inferred facts seen body)))
+    (ir/ExprAnnotation [_ _ inner]
+      (collect-expression-types! a resolved inferred facts seen inner))
+    (ir/ExprArray [_ _ items _]
+      (collect-list-types! a resolved inferred facts seen items))
+    (ir/ExprMatch [_ _ _ scrutinee branches]
+      (do (collect-expression-types! a resolved inferred facts seen scrutinee)
+          (let [n (al/al-len [ir/SpecializedMatchBranch] (load branches))
+                (mut i) 0]
+            (loop (if (>= (load i) n) (break)
+                      (do (let [branch (al/al-get [ir/SpecializedMatchBranch]
+                                         (load branches) (load i))
+                                bn (al/al-len [(ptr types/MonoType)]
+                                     (load (.binding-types branch)))
+                                (mut j) 0]
+                            (loop (if (>= (load j) bn) (break)
+                                      (do (consider-type! a resolved inferred facts seen
+                                            (al/al-get [(ptr types/MonoType)]
+                                              (load (.binding-types branch)) (load j)))
+                                          (store! j (+ (load j) 1)))))
+                            (collect-expression-types! a resolved inferred facts seen
+                                                       (.body branch)))
+                          (store! i (+ (load i) 1))))))
+          0))
+    (_ 0)))
+
+(defn collect-list-types! [(a (dyn alloc/Allocator))
+                           (resolved (ptr ir/ResolvedModule))
+                           (inferred (ptr infer/InferredModule))
+                           (facts (ptr borrow/OwnershipTypeFacts))
+                           (seen (ptr (al/ArrayList (ptr types/MonoType))))
+                           (items (ptr (al/ArrayList (ptr ir/SpecializedExpr))))]
+  (-> i64)
+  (let [n (al/al-len [(ptr ir/SpecializedExpr)] (load items)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (collect-expression-types! a resolved inferred facts seen
+                    (al/al-get [(ptr ir/SpecializedExpr)] (load items) (load i)))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn build-ownership-facts [(a (dyn alloc/Allocator))
+                            (resolved (ptr ir/ResolvedModule))
+                            (inferred (ptr infer/InferredModule))
+                            (module (ptr ir/SpecializedModule))]
+  (-> borrow/OwnershipTypeFacts)
+  (let [facts (alloc/box! a borrow/OwnershipTypeFacts
+                (borrow/ownership-facts-new a))
+        seen (alloc/box! a (al/ArrayList (ptr types/MonoType))
+               (al/al-new [(ptr types/MonoType)] a))
+        n (al/al-len [ir/SpecializedFunction]
+                     (load (field module functions))) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (let [function (al/al-get [ir/SpecializedFunction]
+                                   (load (field module functions)) (load i))]
+                    (consider-type! a resolved inferred facts seen (.signature function))
+                    (collect-expression-types! a resolved inferred facts seen
+                                               (.body function)))
+                  (store! i (+ (load i) 1)))))
+    (let [vn (al/al-len [ir/SpecializedValue]
+               (load (field module values)))]
+      (store! i 0)
+      (loop (if (>= (load i) vn) (break)
+                (do (let [value (al/al-get [ir/SpecializedValue]
+                                 (load (field module values)) (load i))]
+                      (consider-type! a resolved inferred facts seen (.type value))
+                      (collect-expression-types! a resolved inferred facts seen
+                        (.body value)))
+                    (store! i (+ (load i) 1)))))
+      )
+    (load facts)))

@@ -1,0 +1,2722 @@
+(module experiments.carp.emit)
+
+;; Hygienic lowering from checked, monomorphic Carp IR to ordinary Coil Code.
+;; Unsupported semantic cases are compile-time errors; ownership actions are
+;; never silently discarded.
+
+(import "experiments.carp.check" :as check)
+(import "experiments.carp.ir" :as ir)
+(import "experiments.carp.ownership-plan" :as ownership)
+(import "experiments.carp.types" :as types)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Some None])
+(import "coil.slice" :as slice)
+(import "coil.str" :as str)
+(import "coil.time" :as time)
+
+(export emit-module emit-proof-program)
+
+(defstruct ForeignFunction
+  [(reference ir/CoreRef) (signature (ptr types/MonoType))])
+
+(defstruct LambdaCapture
+  [(reference ir/CoreRef) (type (ptr types/MonoType))])
+
+(defstruct LambdaCaptures
+  [(items (ptr (al/ArrayList LambdaCapture)))])
+
+(defn generated-function-name [(a (dyn alloc/Allocator)) (reference ir/CoreRef)]
+  (-> (slice u8))
+  (if (str/str-eq (.name reference) "main") "main"
+      (let [(mut out) (str/sb-new a)]
+        (str/sb-push-str! (mut out) "__carp_fn_")
+        (str/sb-push-i64! (mut out) (ir/core-ref-id reference))
+        (str/sb-finish! (mut out)))))
+
+(defn runtime-type-index [(module (ptr check/CheckedModule))
+                          (name (slice u8))] (-> i64)
+  (let [n (al/al-len [ir/ResolvedTypeDefinition] (load (field module types)))
+        (mut i) 0 (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0)) (break)
+              (let [entry (al/al-elem [ir/ResolvedTypeDefinition]
+                            (field module types) (load i))]
+                (if (str/str-eq (load (field entry name)) name)
+                    (store! found (load i)) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn mark-runtime-type! [(module (ptr check/CheckedModule))
+                          (reachable (ptr (al/ArrayList i64)))
+                          (name (slice u8))] (-> i64)
+  (let [index (runtime-type-index module name)]
+    (if (< index 0) 0
+        (al/al-set! [i64] reachable index 1))))
+
+(defn mark-mono-type! [(module (ptr check/CheckedModule))
+                       (reachable (ptr (al/ArrayList i64)))
+                       (type (ptr types/MonoType))] (-> i64)
+  (match (load type)
+    (types/TypeNamed [name arguments]
+      (do (mark-runtime-type! module reachable name)
+          (let [n (al/al-len [(ptr types/MonoType)] (load arguments)) (mut i) 0]
+            (loop (if (>= (load i) n) (break)
+                      (do (mark-mono-type! module reachable
+                            (al/al-get [(ptr types/MonoType)]
+                              (load arguments) (load i)))
+                          (store! i (+ (load i) 1))))))))
+    (types/TypeReference [inner _] (mark-mono-type! module reachable inner))
+    (types/TypeFunction [arguments result]
+      (do (let [n (al/al-len [(ptr types/MonoType)] (load arguments)) (mut i) 0]
+            (loop (if (>= (load i) n) (break)
+                      (do (mark-mono-type! module reachable
+                            (al/al-get [(ptr types/MonoType)]
+                              (load arguments) (load i)))
+                          (store! i (+ (load i) 1))))))
+          (mark-mono-type! module reachable result)))
+    (_ 0)))
+
+(defn mark-expression-list-types!
+  [(module (ptr check/CheckedModule)) (reachable (ptr (al/ArrayList i64)))
+   (items (ptr (al/ArrayList (ptr ir/SpecializedExpr))))] (-> i64)
+  (let [n (al/al-len [(ptr ir/SpecializedExpr)] (load items)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (mark-expression-types! module reachable
+                    (al/al-get [(ptr ir/SpecializedExpr)] (load items) (load i)))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn mark-expression-types!
+  [(module (ptr check/CheckedModule)) (reachable (ptr (al/ArrayList i64)))
+   (expression (ptr ir/SpecializedExpr))] (-> i64)
+  (mark-mono-type! module reachable (ir/expression-type expression))
+  (match (load expression)
+    (ir/ExprArray [_ _ items _] (mark-expression-list-types! module reachable items))
+    (ir/ExprBorrow [_ _ operand] (mark-expression-types! module reachable operand))
+    (ir/ExprGlobalCall [_ _ _ signature arguments]
+      (do (mark-mono-type! module reachable signature)
+          (mark-expression-list-types! module reachable arguments)))
+    (ir/ExprCall [_ _ callee arguments]
+      (do (mark-expression-types! module reachable callee)
+          (mark-expression-list-types! module reachable arguments)))
+    (ir/ExprDo [_ _ expressions]
+      (mark-expression-list-types! module reachable expressions))
+    (ir/ExprIf [_ _ condition then-branch else-branch]
+      (do (mark-expression-types! module reachable condition)
+          (mark-expression-types! module reachable then-branch)
+          (mark-expression-types! module reachable else-branch)))
+    (ir/ExprLet [_ _ _ value body]
+      (do (mark-expression-types! module reachable value)
+          (mark-expression-types! module reachable body)))
+    (ir/ExprSet [_ _ _ value] (mark-expression-types! module reachable value))
+    (ir/ExprWhile [_ _ condition body]
+      (do (mark-expression-types! module reachable condition)
+          (mark-expression-types! module reachable body)))
+    (ir/ExprLambda [_ _ _ body] (mark-expression-types! module reachable body))
+    (ir/ExprAnnotation [_ _ inner] (mark-expression-types! module reachable inner))
+    (ir/ExprMatch [_ _ _ scrutinee branches]
+      (do (mark-expression-types! module reachable scrutinee)
+          (let [n (al/al-len [ir/SpecializedMatchBranch] (load branches)) (mut i) 0]
+            (loop (if (>= (load i) n) (break)
+                      (let [branch (al/al-elem [ir/SpecializedMatchBranch]
+                                     branches (load i))]
+                        (mark-expression-types! module reachable
+                          (load (field branch body)))
+                        (store! i (+ (load i) 1))))))
+          0))
+    (_ 0)))
+
+(defn mark-resolved-type-dependencies!
+  [(module (ptr check/CheckedModule)) (reachable (ptr (al/ArrayList i64)))
+   (type (ptr ir/ResolvedType))] (-> i64)
+  (match (load type)
+    (ir/ResolvedTypeName [name] (mark-runtime-type! module reachable name))
+    (ir/ResolvedTypeApply [name arguments]
+      (do (mark-runtime-type! module reachable name)
+          (let [n (al/al-len [(ptr ir/ResolvedType)] (load arguments)) (mut i) 0]
+            (loop (if (>= (load i) n) (break)
+                      (do (mark-resolved-type-dependencies! module reachable
+                            (al/al-get [(ptr ir/ResolvedType)]
+                              (load arguments) (load i)))
+                          (store! i (+ (load i) 1))))))))))
+
+(defn build-reachable-types [(a (dyn alloc/Allocator))
+                             (module (ptr check/CheckedModule))]
+  (-> (al/ArrayList i64))
+  (let [(mut reachable) (al/al-new [i64] a)
+        tn (al/al-len [ir/ResolvedTypeDefinition] (load (field module types)))
+        fn (al/al-len [check/CheckedFunction] (load (field module functions)))
+        (mut i) 0]
+    (loop (if (>= (load i) tn) (break)
+              (do (al/al-push! [i64] (mut reachable) 0)
+                  (store! i (+ (load i) 1)))))
+    (store! i 0)
+    (loop (if (>= (load i) fn) (break)
+              (let [function (field (al/al-elem [check/CheckedFunction]
+                                      (field module functions) (load i)) function)]
+                (mark-mono-type! module (mut reachable)
+                  (load (field function signature)))
+                (mark-expression-types! module (mut reachable)
+                  (load (field function body)))
+                (store! i (+ (load i) 1)))))
+    ;; A marked definition can reveal more marked definitions through fields;
+    ;; repeat to a fixed point bounded by the number of definitions.
+    (let [(mut pass) 0]
+      (loop (if (>= (load pass) tn) (break)
+                (do (store! i 0)
+                    (loop (if (>= (load i) tn) (break)
+                              (do (if (= (al/al-get [i64] (load reachable) (load i)) 0) 0
+                                      (let [definition (al/al-elem [ir/ResolvedTypeDefinition]
+                                                             (field module types) (load i))
+                                            fields (field definition fields)
+                                            n (al/al-len [(ptr ir/ResolvedType)]
+                                                (load fields)) (mut fi) 0]
+                                        (loop (if (>= (load fi) n) (break)
+                                                  (do (mark-resolved-type-dependencies!
+                                                        module (mut reachable)
+                                                        (al/al-get [(ptr ir/ResolvedType)]
+                                                          (load fields) (load fi)))
+                                                      (store! fi (+ (load fi) 1)))))))
+                                  (store! i (+ (load i) 1)))))
+                    (store! pass (+ (load pass) 1))))))
+    (load reachable)))
+
+(defn type-code [(module (ptr check/CheckedModule)) (type-syntaxes Code)
+                 (type (ptr types/MonoType))] (-> Code)
+  (match (load type)
+    (types/TypeInteger [] `i64)
+    (types/TypeBoolean [] `bool)
+    ;; Coil currently has no zero-sized Unit value. The canonical representation
+    ;; at this boundary is integer zero, as it is throughout the specialized IR.
+    (types/TypeUnit [] `i64)
+    (types/TypeString [] `str/String)
+    (types/TypeReference [inner _] `(ref ~(type-code module type-syntaxes inner)))
+    (types/TypeNamed [name _]
+      (cond (str/str-eq name "Byte") `u8
+            (str/str-eq name "Long") `i64
+            (str/str-eq name "Uint64") `u64
+            (str/str-eq name "Float") `f32
+            (str/str-eq name "Double") `f64
+            (str/str-eq name "Char") `u32
+            (or (str/str-eq name "Array") (str/str-eq name "StaticArray"))
+              (match (load type)
+                (types/TypeNamed [_ arguments]
+                  `(al/ArrayList
+                     ~(type-code module type-syntaxes
+                        (al/al-get [(ptr types/MonoType)] (load arguments) 0))))
+                (_ (primitive/error "unreachable")))
+            (str/str-eq name "Ptr")
+              (match (load type)
+                (types/TypeNamed [_ arguments]
+                  `(ptr ~(type-code module type-syntaxes
+                           (al/al-get [(ptr types/MonoType)] (load arguments) 0))))
+                (_ (primitive/error "unreachable")))
+            :else
+              (let [index (runtime-type-index module name)]
+                (if (< index 0)
+                    (primitive/error "Carp emission: unresolved named runtime type")
+                    (let [syntax (primitive/code-nth type-syntaxes index)
+                          arguments (match (load type)
+                                      (types/TypeNamed [_ args] args)
+                                      (_ (primitive/error "unreachable")))
+                          n (al/al-len [(ptr types/MonoType)] (load arguments))]
+                      (if (= n 0) syntax
+                          (let [parts (primitive/code-list-new) (mut i) 0]
+                            (primitive/code-list-push! parts syntax)
+                            (loop (if (>= (load i) n) (break)
+                                      (do (primitive/code-list-push! parts
+                                            (type-code module type-syntaxes
+                                              (al/al-get [(ptr types/MonoType)]
+                                                (load arguments) (load i))))
+                                          (store! i (+ (load i) 1)))))
+                            (primitive/code-list-done parts))))))))
+    (types/TypeFunction [arguments result]
+      (let [parts (primitive/code-list-new)
+            n (al/al-len [(ptr types/MonoType)] (load arguments)) (mut i) 0]
+        (primitive/code-list-push! parts
+          (primitive/code-nth type-syntaxes
+            (al/al-len [ir/ResolvedTypeDefinition] (load (field module types)))))
+        (let [function-pointer (primitive/code-list-new)
+              args (primitive/code-list-new)]
+          (primitive/code-list-push! function-pointer `fnptr)
+          (primitive/code-list-push! function-pointer `c)
+          (primitive/code-list-push! args `(ptr i8))
+          (loop (if (>= (load i) n) (break)
+                    (do (primitive/code-list-push! args
+                          (type-code module type-syntaxes
+                            (al/al-get [(ptr types/MonoType)] (load arguments) (load i))))
+                        (store! i (+ (load i) 1)))))
+          (primitive/code-list-push! function-pointer
+            (let [finished-args (primitive/code-list-done args)]
+              `[~@finished-args]))
+          (primitive/code-list-push! function-pointer
+            (type-code module type-syntaxes result))
+          (primitive/code-list-push! parts
+            (primitive/code-list-done function-pointer)))
+        (primitive/code-list-done parts)))
+    (types/TypeVariable [id]
+      (let [allocator (alloc/malloc-allocator)
+            (mut message) (str/sb-new allocator)]
+        (str/sb-push-str! (mut message)
+          "Carp emission: unresolved monomorphic type variable ")
+        (str/sb-push-i64! (mut message) id)
+        (primitive/error (str/sb-finish! (mut message)))))
+    (_ (primitive/error "Carp emission: unsupported monomorphic type"))))
+
+(defn resolved-parameter-code
+  [(definition (ptr ir/ResolvedTypeDefinition)) (parameters Code)
+   (name (slice u8))] (-> Code)
+  (match (load (load (field definition type)))
+    (ir/ResolvedTypeApply [_ arguments]
+      (let [n (al/al-len [(ptr ir/ResolvedType)] (load arguments))
+            (mut i) 0 (mut found) -1]
+        (loop (if (or (>= (load i) n) (>= (load found) 0)) (break)
+                  (do (match (load (al/al-get [(ptr ir/ResolvedType)]
+                                      (load arguments) (load i)))
+                        (ir/ResolvedTypeName [candidate]
+                          (if (str/str-eq candidate name) (store! found (load i)) 0))
+                        (_ 0))
+                      (store! i (+ (load i) 1)))))
+        (if (< (load found) 0) (primitive/datum->syntax parameters name)
+            (primitive/code-nth parameters (load found)))))
+    (_ (primitive/datum->syntax parameters name))))
+
+(defn resolved-type-code
+  [(module (ptr check/CheckedModule)) (type-syntaxes Code)
+   (definition (ptr ir/ResolvedTypeDefinition)) (parameters Code)
+   (type (ptr ir/ResolvedType))] (-> Code)
+  (match (load type)
+    (ir/ResolvedTypeName [name]
+      (cond (str/str-eq name "Int") `i64
+            (str/str-eq name "Bool") `bool
+            (str/str-eq name "String") `str/String
+            (str/str-eq name "Unit") `i64
+            (str/str-eq name "Byte") `u8
+            (str/str-eq name "Long") `i64
+            (str/str-eq name "Uint64") `u64
+            (str/str-eq name "Float") `f32
+            (str/str-eq name "Double") `f64
+            (str/str-eq name "Char") `u32
+            :else
+              (let [index (runtime-type-index module name)]
+                (if (>= index 0)
+                    (primitive/code-nth type-syntaxes index)
+                    (resolved-parameter-code definition parameters name)))))
+    (ir/ResolvedTypeApply [name arguments]
+      (cond
+        (str/str-eq name "Ref")
+          `(ref ~(resolved-type-code module type-syntaxes definition parameters
+                   (al/al-get [(ptr ir/ResolvedType)] (load arguments) 0)))
+        (str/str-eq name "Fn")
+          (let [n (al/al-len [(ptr ir/ResolvedType)] (load arguments))]
+            (if (< n 2) (primitive/error "Carp emission: malformed Fn type")
+                (let [argument-node (al/al-get [(ptr ir/ResolvedType)]
+                                      (load arguments) 0)
+                      result-node (al/al-get [(ptr ir/ResolvedType)]
+                                    (load arguments) (- n 1))
+                      argument-code (primitive/code-list-new)]
+                  (match (load argument-node)
+                    (ir/ResolvedTypeApply [_ fn-arguments]
+                      (let [an (al/al-len [(ptr ir/ResolvedType)]
+                                 (load fn-arguments)) (mut i) 0]
+                        (loop (if (>= (load i) an) (break)
+                                  (do (primitive/code-list-push! argument-code
+                                        (resolved-type-code module type-syntaxes definition
+                                          parameters
+                                          (al/al-get [(ptr ir/ResolvedType)]
+                                            (load fn-arguments) (load i))))
+                                      (store! i (+ (load i) 1)))))))
+                    (_ 0))
+                  `(~(primitive/code-nth type-syntaxes
+                       (al/al-len [ir/ResolvedTypeDefinition]
+                         (load (field module types))))
+                    (fnptr c [(ptr i8) ~@(primitive/code-list-done argument-code)]
+                      ~(resolved-type-code module type-syntaxes definition parameters
+                         result-node))))))
+        (or (str/str-eq name "Array") (str/str-eq name "StaticArray"))
+          `(al/ArrayList
+             ~(resolved-type-code module type-syntaxes definition parameters
+                (al/al-get [(ptr ir/ResolvedType)] (load arguments) 0)))
+        (str/str-eq name "Ptr")
+          `(ptr ~(resolved-type-code module type-syntaxes definition parameters
+                   (al/al-get [(ptr ir/ResolvedType)] (load arguments) 0)))
+        :else
+          (let [index (runtime-type-index module name)]
+            (if (< index 0)
+                (let [allocator (alloc/malloc-allocator)
+                      (mut message) (str/sb-new allocator)]
+                  (str/sb-push-str! (mut message) "Carp emission: unresolved declared type '")
+                  (str/sb-push-str! (mut message) name)
+                  (str/sb-push-str! (mut message) "' while emitting '")
+                  (str/sb-push-str! (mut message) (load (field definition name)))
+                  (str/sb-push-str! (mut message) "'")
+                  (primitive/error (str/sb-finish! (mut message))))
+                (let [parts (primitive/code-list-new)
+                      n (al/al-len [(ptr ir/ResolvedType)] (load arguments))
+                      (mut i) 0]
+                  (primitive/code-list-push! parts
+                    (primitive/code-nth type-syntaxes index))
+                  (loop (if (>= (load i) n) (break)
+                            (do (primitive/code-list-push! parts
+                                  (resolved-type-code module type-syntaxes definition parameters
+                                    (al/al-get [(ptr ir/ResolvedType)]
+                                      (load arguments) (load i))))
+                                (store! i (+ (load i) 1)))))
+                  (primitive/code-list-done parts))))))))
+
+(defn build-type-syntaxes [(module (ptr check/CheckedModule))] (-> Code)
+  (let [result (primitive/code-list-new)
+        n (al/al-len [ir/ResolvedTypeDefinition] (load (field module types)))
+        (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (primitive/code-list-push! result
+                    (primitive/fresh-identifier "carp_type"))
+                  (store! i (+ (load i) 1)))))
+    (primitive/code-list-push! result
+      (primitive/fresh-identifier "carp_closure_type"))
+    (primitive/code-list-push! result
+      (primitive/fresh-identifier "carp_closure_copy_null"))
+    (primitive/code-list-push! result
+      (primitive/fresh-identifier "carp_closure_delete_null"))
+    (primitive/code-list-done result)))
+
+(defn build-member-syntaxes [(module (ptr check/CheckedModule))
+                             (constructors bool)] (-> Code)
+  (let [outer (primitive/code-list-new)
+        n (al/al-len [ir/ResolvedTypeDefinition] (load (field module types)))
+        (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (let [definition (al/al-elem [ir/ResolvedTypeDefinition]
+                                 (field module types) (load i))
+                    inner (primitive/code-list-new)]
+                (match (load (field definition shape))
+                  (ir/ResolvedStructShape [names _]
+                    (if constructors 0
+                        (let [count (al/al-len [(slice u8)] (load names)) (mut j) 0]
+                          (loop (if (>= (load j) count) (break)
+                                    (do (primitive/code-list-push! inner
+                                          (primitive/fresh-identifier "carp_field"))
+                                        (store! j (+ (load j) 1))))))))
+                  (ir/ResolvedSumShape [variants]
+                    (if (not constructors) 0
+                        (let [count (al/al-len [ir/ResolvedConstructor]
+                                      (load variants)) (mut j) 0]
+                          (loop (if (>= (load j) count) (break)
+                                    (do (primitive/code-list-push! inner
+                                          (primitive/fresh-identifier "carp_variant"))
+                                        (store! j (+ (load j) 1)))))))))
+                (primitive/code-list-push! outer (primitive/code-list-done inner))
+                (store! i (+ (load i) 1)))))
+    (primitive/code-list-done outer)))
+
+(defn emit-runtime-type
+  [(module (ptr check/CheckedModule)) (type-syntaxes Code)
+   (constructor-syntaxes Code) (field-syntaxes Code) (index i64)] (-> Code)
+  (let [definition (al/al-elem [ir/ResolvedTypeDefinition]
+                     (field module types) index)
+        syntax (primitive/code-nth type-syntaxes index)
+        parameters-builder (primitive/code-list-new)]
+    (match (load (load (field definition type)))
+      (ir/ResolvedTypeApply [_ arguments]
+        (let [n (al/al-len [(ptr ir/ResolvedType)] (load arguments)) (mut i) 0]
+          (loop (if (>= (load i) n) (break)
+                    (do (primitive/code-list-push! parameters-builder
+                          (primitive/fresh-identifier "carp_type_parameter"))
+                        (store! i (+ (load i) 1)))))))
+      (_ 0))
+    (let [parameters (primitive/code-list-done parameters-builder)]
+    (match (load (field definition shape))
+      (ir/ResolvedStructShape [_ _]
+        (let [members (primitive/code-list-new)
+              field-types (load (field definition fields))
+              fields (primitive/code-nth field-syntaxes index)
+              n (al/al-len [(ptr ir/ResolvedType)] (load field-types))
+              (mut i) 0]
+          (loop (if (>= (load i) n) (break)
+                    (do (primitive/code-list-push! members
+                          `(~(primitive/code-nth fields (load i))
+                            ~(resolved-type-code module type-syntaxes definition parameters
+                               (al/al-get [(ptr ir/ResolvedType)]
+                                 (load field-types) (load i)))))
+                        (store! i (+ (load i) 1)))))
+          (if (= (primitive/code-count parameters) 0)
+              `(defstruct ~syntax [~@(primitive/code-list-done members)])
+              `(defstruct ~syntax [~@parameters]
+                 [~@(primitive/code-list-done members)]))))
+      (ir/ResolvedSumShape [constructors]
+        (let [variants (primitive/code-list-new)
+              variants-syntax (primitive/code-nth constructor-syntaxes index)
+              n (al/al-len [ir/ResolvedConstructor] (load constructors))
+              (mut i) 0]
+          (loop (if (>= (load i) n) (break)
+                    (let [constructor (al/al-elem [ir/ResolvedConstructor]
+                                        constructors (load i))
+                          fields (load (field constructor fields))
+                          members (primitive/code-list-new)
+                          fn (al/al-len [(ptr ir/ResolvedType)] (load fields))
+                          (mut fi) 0]
+                      (loop (if (>= (load fi) fn) (break)
+                                (do (primitive/code-list-push! members
+                                      `(~(primitive/fresh-identifier "carp_payload")
+                                        ~(resolved-type-code module type-syntaxes definition parameters
+                                           (al/al-get [(ptr ir/ResolvedType)]
+                                             (load fields) (load fi)))))
+                                    (store! fi (+ (load fi) 1)))))
+                      (if (= fn 0)
+                          (primitive/code-list-push! variants
+                            `(~(primitive/code-nth variants-syntax (load i))))
+                          (primitive/code-list-push! variants
+                            `(~(primitive/code-nth variants-syntax (load i))
+                              [~@(primitive/code-list-done members)])))
+                      (store! i (+ (load i) 1)))))
+          (if (= (primitive/code-count parameters) 0)
+              `(defsum ~syntax ~@(primitive/code-list-done variants))
+              `(defsum ~syntax [~@parameters]
+                 ~@(primitive/code-list-done variants)))))))))
+
+(defn reference-code [(context Code)
+                      (references (ptr (al/ArrayList ir/CoreRef)))
+                      (syntaxes Code) (target ir/CoreRef)] (-> Code)
+  (let [n (al/al-len [ir/CoreRef] (load references))
+        (mut i) 0 (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0)) (break)
+              (do (if (ir/core-ref-same?
+                        (al/al-get [ir/CoreRef] (load references) (load i)) target)
+                      (store! found (load i)) 0)
+                  (store! i (+ (load i) 1)))))
+    (if (< (load found) 0)
+        (primitive/error (.name target))
+        (primitive/code-nth syntaxes (load found)))))
+
+(defn foreign-global [(reference ir/CoreRef)] (-> Code)
+  (let [name (.name reference)]
+    (cond (str/str-eq name "Int.MAX") `9223372036854775807
+          (str/str-eq name "Int.MIN") `-9223372036854775808
+          :else
+            (let [a (alloc/malloc-allocator) (mut out) (str/sb-new a)]
+              (str/sb-push-str! (mut out) "Carp emission: unresolved global ")
+              (str/sb-push-str! (mut out) name)
+              (str/sb-push-str! (mut out) " id=")
+              (str/sb-push-i64! (mut out) (ir/core-ref-id reference))
+              (str/sb-push-str! (mut out) " global=")
+              (str/sb-push-i64! (mut out)
+                (if (ir/core-ref-global? reference) 1 0))
+              (primitive/error (str/sb-finish! (mut out)))))))
+
+(defn managed-type? [(plan (ptr ownership/OwnershipPlan))
+                     (type (ptr types/MonoType))] (-> bool)
+  (let [requirements (field plan requirements)
+        n (al/al-len [ownership/OwnershipRequirement] (load requirements))
+        (mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) n) (load found)) (break)
+              (let [requirement (al/al-elem [ownership/OwnershipRequirement]
+                                  requirements (load i))]
+                (if (types/type-same-representation?
+                      (load (field requirement type)) type)
+                    (store! found true) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn module-cleanup-type? [(module (ptr check/CheckedModule))
+                            (type (ptr types/MonoType))] (-> bool)
+  (let [n (al/al-len [check/CleanupTarget] (load (field module cleanups)))
+        (mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) n) (load found)) (break)
+              (let [target (al/al-elem [check/CleanupTarget]
+                             (field module cleanups) (load i))]
+                (if (types/type-same-representation?
+                      (load (field target type)) type)
+                    (store! found true) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn resolved-parameter-managed?
+  [(module (ptr check/CheckedModule))
+   (definition (ptr ir/ResolvedTypeDefinition))
+   (concrete-arguments (ptr (al/ArrayList (ptr types/MonoType))))
+   (name (slice u8))] (-> bool)
+  (match (load (load (field definition type)))
+    (ir/ResolvedTypeApply [_ parameters]
+      (let [n (al/al-len [(ptr ir/ResolvedType)] (load parameters))
+            (mut i) 0 (mut found) false]
+        (loop (if (or (>= (load i) n) (load found)) (break)
+                  (do (match (load (al/al-get [(ptr ir/ResolvedType)]
+                                      (load parameters) (load i)))
+                        (ir/ResolvedTypeName [candidate]
+                          (if (and (str/str-eq candidate name)
+                                   (< (load i) (al/al-len [(ptr types/MonoType)]
+                                                  (load concrete-arguments))))
+                              (store! found
+                                (module-cleanup-type? module
+                                  (al/al-get [(ptr types/MonoType)]
+                                    (load concrete-arguments) (load i)))) 0))
+                        (_ 0))
+                      (store! i (+ (load i) 1)))))
+        (load found)))
+    (_ false)))
+
+(defn resolved-field-managed?
+  [(module (ptr check/CheckedModule))
+   (definition (ptr ir/ResolvedTypeDefinition))
+   (concrete-arguments (ptr (al/ArrayList (ptr types/MonoType))))
+   (field-type (ptr ir/ResolvedType))] (-> bool)
+  (match (load field-type)
+    (ir/ResolvedTypeName [name]
+      (cond (or (str/str-eq name "Int") (str/str-eq name "Bool")
+                (str/str-eq name "Unit") (str/str-eq name "Byte")
+                (str/str-eq name "Long") (str/str-eq name "Float")
+                (str/str-eq name "Double") (str/str-eq name "Char")) false
+            (str/str-eq name "String") true
+            :else (resolved-parameter-managed? module definition
+                    concrete-arguments name)))
+    (ir/ResolvedTypeApply [name _]
+      (not (or (str/str-eq name "Ref") (str/str-eq name "Ptr"))))))
+
+(defn nominal-trivially-deletable? [(module (ptr check/CheckedModule))
+                                    (type (ptr types/MonoType))] (-> bool)
+  (match (load type)
+    (types/TypeNamed [name concrete-arguments]
+      (let [index (runtime-type-index module name)]
+        (if (< index 0) false
+            (let [definition (al/al-elem [ir/ResolvedTypeDefinition]
+                               (field module types) index)
+                  fields (field definition fields)
+                  n (al/al-len [(ptr ir/ResolvedType)] (load fields))
+                  (mut i) 0 (mut managed) false]
+              (loop (if (or (>= (load i) n) (load managed)) (break)
+                        (do (if (resolved-field-managed? module definition
+                                  concrete-arguments
+                                  (al/al-get [(ptr ir/ResolvedType)]
+                                    (load fields) (load i)))
+                                (store! managed true) 0)
+                            (store! i (+ (load i) 1)))))
+              (not (load managed))))))
+    (_ false)))
+
+(defn reference-index [(references (ptr (al/ArrayList ir/CoreRef)))
+                       (target ir/CoreRef)] (-> i64)
+  (let [n (al/al-len [ir/CoreRef] (load references))
+        (mut i) 0 (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0)) (break)
+              (do (if (ir/core-ref-same?
+                        (al/al-get [ir/CoreRef] (load references) (load i)) target)
+                      (store! found (load i)) 0)
+                  (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn emit-delete-call
+  [(module (ptr check/CheckedModule)) (function-syntaxes Code)
+   (type (ptr types/MonoType)) (value Code)] (-> Code)
+  (let [n (al/al-len [check/CleanupTarget] (load (field module cleanups)))
+        (mut i) 0 (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0)) (break)
+              (let [target (al/al-elem [check/CleanupTarget]
+                             (field module cleanups) (load i))]
+                (if (types/type-same-representation?
+                      (load (field target type)) type)
+                    (store! found (load i)) 0)
+                (store! i (+ (load i) 1)))))
+    (if (< (load found) 0)
+        (primitive/error "Carp emission: cleanup target is absent")
+        (let [target (al/al-elem [check/CleanupTarget]
+                       (field module cleanups) (load found))
+              implementation (load (field target implementation))
+              signature (load (field target signature))
+              function (function-index module implementation signature)]
+          (cond
+            (>= function 0)
+              `(~(primitive/code-nth function-syntaxes (* function 2)) ~value)
+            (str/str-eq (.name implementation) "__carp_closure_delete")
+              (let [closure (primitive/fresh-identifier "carp_closure_delete")]
+                `(let [(mut ~closure) ~value]
+                   (primitive/call-ptr
+                     (load (field (mut ~closure) delete-environment))
+                     (load (field (mut ~closure) environment)))))
+            (str/str-eq (.name implementation) "String.delete")
+              (let [temporary (primitive/fresh-identifier "carp_string_delete")]
+                `(let [(mut ~temporary) ~value]
+                   (str/string-free! (mut ~temporary))))
+            (nominal-trivially-deletable? module type) `(do ~value 0)
+            :else (primitive/error (.name implementation)))))))
+
+(defn copy-function-index [(module (ptr check/CheckedModule))
+                           (type (ptr types/MonoType))] (-> i64)
+  (let [n (al/al-len [check/CheckedFunction] (load (field module functions)))
+        (mut i) 0 (mut found) -1]
+    (loop
+      (if (or (>= (load i) n) (>= (load found) 0)) (break)
+          (let [function (field (al/al-elem [check/CheckedFunction]
+                                  (field module functions) (load i)) function)
+                source (load (field function source))]
+            (if (not (string-ends-with? (.name source) ".copy")) 0
+                (match (load (load (field function signature)))
+                  (types/TypeFunction [parameters result]
+                    (if (and (= (al/al-len [(ptr types/MonoType)]
+                                      (load parameters)) 1)
+                             (types/type-same-representation? result type))
+                        (match (load (al/al-get [(ptr types/MonoType)]
+                                       (load parameters) 0))
+                          (types/TypeReference [inner _]
+                            (if (types/type-same-representation? inner type)
+                                (store! found (load i)) 0))
+                          (_ 0))
+                        0))
+                  (_ 0)))
+            (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn emit-copy-call
+  [(module (ptr check/CheckedModule)) (function-syntaxes Code)
+   (type (ptr types/MonoType)) (cell Code)] (-> Code)
+  (match (load type)
+    (types/TypeString []
+      `(str/string-clone (alloc/malloc-allocator) (load ~cell)))
+    (types/TypeFunction [_ _]
+      (let [closure (primitive/fresh-identifier "carp_closure_copy")]
+        `(let [(mut ~closure) (load ~cell)]
+           (let [copied-environment
+                   (primitive/call-ptr
+                     (load (field (mut ~closure) copy-environment))
+                     (load (field (mut ~closure) environment)))]
+             (store! (field (mut ~closure) environment) copied-environment)
+             (load ~closure)))))
+    (_
+      (if (nominal-trivially-deletable? module type) `(load ~cell)
+          (let [index (copy-function-index module type)]
+            (if (< index 0)
+                (primitive/error "Carp emission: managed closure capture copy target is absent")
+                `(~(primitive/code-nth function-syntaxes (* index 2)) ~cell)))))))
+
+(defn binding-delete-type
+  [(plan (ptr ownership/OwnershipPlan)) (site-id i64) (binding ir/CoreRef)]
+  (-> (ptr types/MonoType))
+  (let [actions (field plan actions)
+        n (al/al-len [ownership/OwnershipAction] (load actions))
+        (mut i) 0 (mut found) (primitive/cast (ptr types/MonoType) 0)]
+    (loop (if (or (>= (load i) n)
+                  (!= (primitive/cast i64 (load found)) 0)) (break)
+              (do (match (al/al-get [ownership/OwnershipAction]
+                           (load actions) (load i))
+                    (ownership/ActionDelete [action-site resource type]
+                      (if (= action-site site-id)
+                          (match resource
+                            (ownership/ResourceBinding [candidate]
+                              (if (ir/core-ref-same? candidate binding)
+                                  (store! found type) 0))
+                            (_ 0)) 0))
+                    (_ 0))
+                  (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn temporary-delete-type [(plan (ptr ownership/OwnershipPlan)) (site-id i64)]
+  (-> (ptr types/MonoType))
+  (let [actions (field plan actions)
+        n (al/al-len [ownership/OwnershipAction] (load actions))
+        (mut i) 0 (mut found) (primitive/cast (ptr types/MonoType) 0)]
+    (loop (if (or (>= (load i) n)
+                  (!= (primitive/cast i64 (load found)) 0)) (break)
+              (do (match (al/al-get [ownership/OwnershipAction]
+                           (load actions) (load i))
+                    (ownership/ActionDelete [action-site resource type]
+                      (if (= action-site site-id)
+                          (match resource
+                            (ownership/ResourceTemporary [expression-id]
+                              (if (= expression-id site-id) (store! found type) 0))
+                            (_ 0)) 0))
+                    (_ 0))
+                  (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn function-index [(module (ptr check/CheckedModule))
+                      (source ir/CoreRef) (signature (ptr types/MonoType))]
+  (-> i64)
+  (let [n (al/al-len [check/CheckedFunction] (load (field module functions)))
+        (mut i) 0 (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0)) (break)
+              (let [checked (al/al-get [check/CheckedFunction]
+                              (load (field module functions)) (load i))
+                    function (.function checked)]
+                (if (and (ir/core-ref-same? (.source function) source)
+                         (types/type-same-representation?
+                           (.signature function) signature))
+                    (store! found (load i)) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn function-code [(module (ptr check/CheckedModule)) (syntaxes Code)
+                     (source ir/CoreRef) (signature (ptr types/MonoType))]
+  (-> Code)
+  (let [index (function-index module source signature)]
+    (if (< index 0)
+        (primitive/error "Carp emission: specialized call target is absent")
+        (primitive/code-nth syntaxes (* index 2)))))
+
+(defn function-adapter-code [(module (ptr check/CheckedModule)) (syntaxes Code)
+                             (source ir/CoreRef)
+                             (signature (ptr types/MonoType))] (-> Code)
+  (let [index (function-index module source signature)]
+    (if (< index 0)
+        (primitive/error "Carp emission: specialized function adapter is absent")
+        (primitive/code-nth syntaxes (+ (* index 2) 1)))))
+
+(defn closure-value-code [(module (ptr check/CheckedModule))
+                          (type-syntaxes Code) (code Code)] (-> Code)
+  (let [index (al/al-len [ir/ResolvedTypeDefinition]
+                (load (field module types)))
+        closure-type (primitive/code-nth type-syntaxes index)
+        copy-environment (primitive/code-nth type-syntaxes (+ index 1))
+        delete-environment (primitive/code-nth type-syntaxes (+ index 2))]
+    `(~closure-type (primitive/fnptr-of ~code)
+       (primitive/cast (ptr i8) 0)
+       (primitive/fnptr-of ~copy-environment)
+       (primitive/fnptr-of ~delete-environment))))
+
+(defn foreign-function-index
+  [(functions (ptr (al/ArrayList ForeignFunction)))
+   (reference ir/CoreRef) (signature (ptr types/MonoType))] (-> i64)
+  (let [n (al/al-len [ForeignFunction] (load functions))
+        (mut i) 0 (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0)) (break)
+              (let [entry (al/al-elem [ForeignFunction] functions (load i))]
+                (if (and (ir/core-ref-same?
+                           (load (field entry reference)) reference)
+                         (types/type-same-representation?
+                           (load (field entry signature)) signature))
+                    (store! found (load i)) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn collect-foreign-list!
+  [(module (ptr check/CheckedModule))
+   (functions (ptr (al/ArrayList ForeignFunction)))
+   (items (ptr (al/ArrayList (ptr ir/SpecializedExpr))))] (-> i64)
+  (let [n (al/al-len [(ptr ir/SpecializedExpr)] (load items)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (collect-foreign-functions! module functions
+                    (al/al-get [(ptr ir/SpecializedExpr)] (load items) (load i)))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn collect-foreign-functions!
+  [(module (ptr check/CheckedModule))
+   (functions (ptr (al/ArrayList ForeignFunction)))
+   (expression (ptr ir/SpecializedExpr))] (-> i64)
+  (match (load expression)
+    (ir/ExprReference [_ type reference]
+      (match (load type)
+        (types/TypeFunction [_ _]
+          (if (or (not (ir/core-ref-global? reference))
+                  (>= (function-index module reference type) 0)
+                  (>= (foreign-function-index functions reference type) 0)) 0
+              (al/al-push! [ForeignFunction] functions
+                (ForeignFunction :reference reference :signature type))))
+        (_ 0)))
+    (ir/ExprBorrow [_ _ operand] (collect-foreign-functions! module functions operand))
+    (ir/ExprGlobalCall [_ _ _ _ arguments]
+      (collect-foreign-list! module functions arguments))
+    (ir/ExprCall [_ _ callee arguments]
+      (do (collect-foreign-functions! module functions callee)
+          (collect-foreign-list! module functions arguments)))
+    (ir/ExprDo [_ _ expressions] (collect-foreign-list! module functions expressions))
+    (ir/ExprIf [_ _ condition then-branch else-branch]
+      (do (collect-foreign-functions! module functions condition)
+          (collect-foreign-functions! module functions then-branch)
+          (collect-foreign-functions! module functions else-branch)))
+    (ir/ExprLet [_ _ _ value body]
+      (do (collect-foreign-functions! module functions value)
+          (collect-foreign-functions! module functions body)))
+    (ir/ExprSet [_ _ _ value] (collect-foreign-functions! module functions value))
+    (ir/ExprWhile [_ _ condition body]
+      (do (collect-foreign-functions! module functions condition)
+          (collect-foreign-functions! module functions body)))
+    (ir/ExprLambda [_ _ _ body] (collect-foreign-functions! module functions body))
+    (ir/ExprAnnotation [_ _ inner] (collect-foreign-functions! module functions inner))
+    (ir/ExprArray [_ _ items _] (collect-foreign-list! module functions items))
+    (ir/ExprMatch [_ _ _ scrutinee branches]
+      (do (collect-foreign-functions! module functions scrutinee)
+          (let [n (al/al-len [ir/SpecializedMatchBranch] (load branches)) (mut i) 0]
+            (loop (if (>= (load i) n) (break)
+                      (let [branch (al/al-elem [ir/SpecializedMatchBranch]
+                                     branches (load i))]
+                        (collect-foreign-functions! module functions
+                          (load (field branch body)))
+                        (store! i (+ (load i) 1))))))
+          0))
+    (_ 0)))
+
+(defn build-foreign-functions
+  [(a (dyn alloc/Allocator)) (module (ptr check/CheckedModule))]
+  (-> (al/ArrayList ForeignFunction))
+  (let [(mut result) (al/al-new [ForeignFunction] a)
+        n (al/al-len [check/CheckedFunction] (load (field module functions)))
+        (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (let [function (field (al/al-elem [check/CheckedFunction]
+                                      (field module functions) (load i)) function)]
+                (collect-foreign-functions! module (mut result)
+                  (load (field function body)))
+                (store! i (+ (load i) 1)))))
+    (let [vn (al/al-len [check/CheckedValue] (load (field module values)))]
+      (store! i 0)
+      (loop (if (>= (load i) vn) (break)
+                (do (collect-foreign-functions! module (mut result)
+                      (load (field (field (al/al-elem [check/CheckedValue]
+                                            (field module values) (load i)) value) body)))
+                    (store! i (+ (load i) 1))))))
+    (load result)))
+
+(defn constructor-code
+  [(context Code) (module (ptr check/CheckedModule)) (type-syntaxes Code)
+   (constructor-syntaxes Code) (callee ir/CoreRef) (arguments Code)
+   (found (ptr bool))] (-> Code)
+  (let [n (al/al-len [ir/ResolvedTypeDefinition] (load (field module types)))
+        (mut i) 0 (mut result) context]
+    (loop (if (or (>= (load i) n) (load found)) (break)
+              (let [definition (al/al-elem [ir/ResolvedTypeDefinition]
+                                 (field module types) (load i))]
+                (match (load (field definition shape))
+                  (ir/ResolvedStructShape [_ constructor]
+                    (if (ir/core-ref-same? constructor callee)
+                        (do (store! result
+                              `(~(primitive/code-nth type-syntaxes (load i)) ~@arguments))
+                            (store! found true)) 0))
+                  (ir/ResolvedSumShape [constructors]
+                    (let [cn (al/al-len [ir/ResolvedConstructor]
+                               (load constructors)) (mut ci) 0
+                          variants (primitive/code-nth constructor-syntaxes (load i))]
+                      (loop (if (or (>= (load ci) cn) (load found)) (break)
+                                (let [entry (al/al-elem [ir/ResolvedConstructor]
+                                              constructors (load ci))]
+                                  (if (ir/core-ref-same?
+                                        (load (field entry reference)) callee)
+                                      (do (store! result
+                                            `(~(primitive/code-nth variants (load ci))
+                                              ~@arguments))
+                                          (store! found true)) 0)
+                                  (store! ci (+ (load ci) 1))))))))
+                (store! i (+ (load i) 1)))))
+    (load result)))
+
+(defn constructor-syntax
+  [(context Code) (module (ptr check/CheckedModule))
+   (constructor-syntaxes Code) (reference ir/CoreRef)] (-> Code)
+  (let [n (al/al-len [ir/ResolvedTypeDefinition] (load (field module types)))
+        (mut i) 0 (mut found) false (mut result) context]
+    (loop (if (or (>= (load i) n) (load found)) (break)
+              (let [definition (al/al-elem [ir/ResolvedTypeDefinition]
+                                 (field module types) (load i))]
+                (match (load (field definition shape))
+                  (ir/ResolvedSumShape [constructors]
+                    (let [cn (al/al-len [ir/ResolvedConstructor]
+                               (load constructors))
+                          variants (primitive/code-nth constructor-syntaxes (load i))
+                          (mut ci) 0]
+                      (loop (if (or (>= (load ci) cn) (load found)) (break)
+                                (let [entry (al/al-elem [ir/ResolvedConstructor]
+                                              constructors (load ci))]
+                                  (if (ir/core-ref-same?
+                                        (load (field entry reference)) reference)
+                                      (do (store! result
+                                            (primitive/code-nth variants (load ci)))
+                                          (store! found true)) 0)
+                                  (store! ci (+ (load ci) 1)))))))
+                  (_ 0))
+                (store! i (+ (load i) 1)))))
+    (if (load found) (load result)
+        (primitive/error "Carp emission: pattern constructor is absent"))))
+
+(defn emit-pattern
+  [(context Code) (module (ptr check/CheckedModule)) (constructor-syntaxes Code)
+   (temporaries Code) (cursor (ptr i64))
+   (pattern (ptr ir/SpecializedPattern))] (-> Code)
+  (match (load pattern)
+    (ir/SpecializedPatternIgnore [] `_)
+    (ir/SpecializedPatternBind [_]
+      (let [result (primitive/code-nth temporaries (load cursor))]
+        (store! cursor (+ (load cursor) 1))
+        result))
+    (ir/SpecializedPatternInt [value] `~value)
+    (ir/SpecializedPatternBool [value] (if value `true `false))
+    (ir/SpecializedPatternConstructor [constructor arguments]
+      (let [variant (constructor-syntax context module constructor-syntaxes constructor)
+            items (primitive/code-list-new)
+            n (al/al-len [(ptr ir/SpecializedPattern)] (load arguments))
+            (mut i) 0]
+        (loop (if (>= (load i) n) (break)
+                  (do (primitive/code-list-push! items
+                        (emit-pattern context module constructor-syntaxes temporaries
+                          cursor (al/al-get [(ptr ir/SpecializedPattern)]
+                                   (load arguments) (load i))))
+                      (store! i (+ (load i) 1)))))
+        `(~variant [~@(primitive/code-list-done items)])))))
+
+(defn string-ends-with? [(value (slice u8)) (suffix (slice u8))] (-> bool)
+  (let [n (slice/slice-len value) m (slice/slice-len suffix)]
+    (if (> m n) false
+        (let [(mut i) 0 (mut same) true]
+          (loop (if (or (>= (load i) m) (not (load same))) (break)
+                    (do (if (= (slice/slice-get value (+ (- n m) (load i)))
+                               (slice/slice-get suffix (load i))) 0
+                            (store! same false))
+                        (store! i (+ (load i) 1)))))
+          (load same)))))
+
+(defn string-contains? [(value (slice u8)) (needle (slice u8))] (-> bool)
+  (let [n (slice/slice-len value) m (slice/slice-len needle)
+        (mut start) 0 (mut found) false]
+    (loop (if (or (load found) (> (+ (load start) m) n)) (break)
+              (let [(mut i) 0 (mut same) true]
+                (loop (if (or (>= (load i) m) (not (load same))) (break)
+                          (do (if (= (slice/slice-get value (+ (load start) (load i)))
+                                     (slice/slice-get needle (load i))) 0
+                                  (store! same false))
+                              (store! i (+ (load i) 1)))))
+                (if (load same) (store! found true)
+                    (store! start (+ (load start) 1))))))
+    (load found)))
+
+(defn string-ends-with-field-bang? [(value (slice u8)) (field-name (slice u8))]
+  (-> bool)
+  (let [n (slice/slice-len value) m (slice/slice-len field-name)]
+    (if (< n (+ m 1)) false
+        (if (!= (slice/slice-get value (- n 1)) (primitive/cast u8 33)) false
+            (let [(mut i) 0 (mut same) true (mut start) (- (- n m) 1)]
+              (loop (if (or (>= (load i) m) (not (load same))) (break)
+                        (do (if (= (slice/slice-get value (+ (load start) (load i)))
+                                   (slice/slice-get field-name (load i))) 0
+                                (store! same false))
+                            (store! i (+ (load i) 1)))))
+              (load same))))))
+
+(defn signature-owner-name [(signature (ptr types/MonoType))] (-> (slice u8))
+  (match (load signature)
+    (types/TypeFunction [arguments _]
+      (if (= (al/al-len [(ptr types/MonoType)] (load arguments)) 0) ""
+          (match (load (al/al-get [(ptr types/MonoType)] (load arguments) 0))
+            (types/TypeNamed [name _] name)
+            (types/TypeReference [inner _]
+              (match (load inner) (types/TypeNamed [name _] name) (_ "")))
+            (_ ""))))
+    (_ "")))
+
+(defn collection-element-type [(signature (ptr types/MonoType))]
+  (-> (ptr types/MonoType))
+  (match (load signature)
+    (types/TypeFunction [arguments result]
+      (if (= (al/al-len [(ptr types/MonoType)] (load arguments)) 0)
+          (collection-element-from-type result)
+          (let [first (al/al-get [(ptr types/MonoType)] (load arguments) 0)]
+            (let [from-first (match (load first)
+              (types/TypeReference [inner _]
+                (match (load inner)
+                  (types/TypeNamed [name items]
+                    (if (or (str/str-eq name "Array")
+                            (str/str-eq name "StaticArray"))
+                        (al/al-get [(ptr types/MonoType)] (load items) 0)
+                        (primitive/cast (ptr types/MonoType) 0)))
+                  (_ (primitive/cast (ptr types/MonoType) 0))))
+              (types/TypeNamed [name items]
+                (if (or (str/str-eq name "Array")
+                        (str/str-eq name "StaticArray"))
+                    (al/al-get [(ptr types/MonoType)] (load items) 0)
+                    (primitive/cast (ptr types/MonoType) 0)))
+              (_ (primitive/cast (ptr types/MonoType) 0)))]
+              (if (= (primitive/cast i64 from-first) 0)
+                  (collection-element-from-type result) from-first)))))
+    (_ (primitive/cast (ptr types/MonoType) 0))))
+
+(defn collection-element-from-type [(type (ptr types/MonoType))]
+  (-> (ptr types/MonoType))
+  (match (load type)
+    (types/TypeReference [inner _] (collection-element-from-type inner))
+    (types/TypeNamed [name items]
+      (if (or (str/str-eq name "Array") (str/str-eq name "StaticArray"))
+          (al/al-get [(ptr types/MonoType)] (load items) 0)
+          (primitive/cast (ptr types/MonoType) 0)))
+    (_ (primitive/cast (ptr types/MonoType) 0))))
+
+(defn nominal-name-from-type [(type (ptr types/MonoType))] (-> (slice u8))
+  (match (load type)
+    (types/TypeReference [inner _] (nominal-name-from-type inner))
+    (types/TypeNamed [name _] name)
+    (_ "")))
+
+(defn nominal-tag-code [(module (ptr check/CheckedModule))
+                        (constructor-syntaxes Code)
+                        (type (ptr types/MonoType)) (value Code)] (-> Code)
+  (let [name (nominal-name-from-type type)
+        index (runtime-type-index module name)]
+    (if (< index 0) (primitive/error "Carp emission: get-tag operand is not a sum type")
+        (let [definition (al/al-elem [ir/ResolvedTypeDefinition]
+                           (field module types) index)]
+          (match (load (field definition shape))
+            (ir/ResolvedSumShape [constructors]
+              (let [variants (primitive/code-nth constructor-syntaxes index)
+                    clauses (primitive/code-list-new)
+                    n (al/al-len [ir/ResolvedConstructor] (load constructors))
+                    (mut i) 0]
+                (loop (if (>= (load i) n) (break)
+                          (let [constructor (al/al-elem [ir/ResolvedConstructor]
+                                              constructors (load i))
+                                fn (al/al-len [(ptr ir/ResolvedType)]
+                                     (load (field constructor fields)))
+                                wildcards (primitive/code-list-new)
+                                (mut fi) 0]
+                            (loop (if (>= (load fi) fn) (break)
+                                      (do (primitive/code-list-push! wildcards `_)
+                                          (store! fi (+ (load fi) 1)))))
+                            (primitive/code-list-push! clauses
+                              `(~(primitive/code-nth variants (load i))
+                                [~@(primitive/code-list-done wildcards)] ~(load i)))
+                            (store! i (+ (load i) 1)))))
+                `(match ~(match (load type)
+                           (types/TypeReference [_ _] `(load ~value))
+                           (_ value))
+                   ~@(primitive/code-list-done clauses))))
+            (_ (primitive/error "Carp emission: get-tag operand is not a sum type")))))))
+
+(defn concrete-parameter-type
+  [(definition (ptr ir/ResolvedTypeDefinition))
+   (concrete-arguments (ptr (al/ArrayList (ptr types/MonoType))))
+   (name (slice u8))] (-> (ptr types/MonoType))
+  (match (load (load (field definition type)))
+    (ir/ResolvedTypeApply [_ parameters]
+      (let [n (al/al-len [(ptr ir/ResolvedType)] (load parameters))
+            (mut i) 0 (mut found) (primitive/cast (ptr types/MonoType) 0)]
+        (loop (if (or (>= (load i) n)
+                      (!= (primitive/cast i64 (load found)) 0)) (break)
+                  (do (match (load (al/al-get [(ptr ir/ResolvedType)]
+                                      (load parameters) (load i)))
+                        (ir/ResolvedTypeName [candidate]
+                          (if (and (str/str-eq candidate name)
+                                   (< (load i) (al/al-len [(ptr types/MonoType)]
+                                                  (load concrete-arguments))))
+                              (store! found (al/al-get [(ptr types/MonoType)]
+                                              (load concrete-arguments) (load i))) 0))
+                        (_ 0))
+                      (store! i (+ (load i) 1)))))
+        (load found)))
+    (_ (primitive/cast (ptr types/MonoType) 0))))
+
+(defn emit-mono-prn-append [(builder Code) (value Code)
+                            (type (ptr types/MonoType))] (-> Code)
+  (match (load type)
+    (types/TypeInteger [] `(str/sb-push-i64! ~builder ~value))
+    (types/TypeBoolean [] `(str/sb-push-str! ~builder (if ~value "true" "false")))
+    (types/TypeUnit [] `(str/sb-push-str! ~builder "()"))
+    (types/TypeString []
+      `(do (str/sb-push-str! ~builder "\"")
+           (str/sb-push-str! ~builder
+             (str/string-view-bytes (str/string-as-view ~value)))
+           (str/sb-push-str! ~builder "\"")))
+    (types/TypeNamed [name _]
+      (cond (or (str/str-eq name "Byte") (str/str-eq name "Long")
+                (str/str-eq name "Char"))
+              `(str/sb-push-i64! ~builder (primitive/cast i64 ~value))
+            :else (primitive/error "Carp emission: nominal prn dependency is not emitted")))
+    (_ (primitive/error "Carp emission: unsupported nominal prn field type"))))
+
+(defn emit-resolved-prn-append
+  [(definition (ptr ir/ResolvedTypeDefinition))
+   (concrete-arguments (ptr (al/ArrayList (ptr types/MonoType))))
+   (builder Code) (value Code) (type (ptr ir/ResolvedType))] (-> Code)
+  (match (load type)
+    (ir/ResolvedTypeName [name]
+      (cond (str/str-eq name "Int") `(str/sb-push-i64! ~builder ~value)
+            (str/str-eq name "Bool")
+              `(str/sb-push-str! ~builder (if ~value "true" "false"))
+            (str/str-eq name "Unit") `(str/sb-push-str! ~builder "()")
+            (str/str-eq name "String")
+              `(do (str/sb-push-str! ~builder "\"")
+                   (str/sb-push-str! ~builder
+                     (str/string-view-bytes (str/string-as-view ~value)))
+                   (str/sb-push-str! ~builder "\""))
+            (or (str/str-eq name "Byte") (str/str-eq name "Long")
+                (str/str-eq name "Char"))
+              `(str/sb-push-i64! ~builder (primitive/cast i64 ~value))
+            :else
+              (let [concrete (concrete-parameter-type definition concrete-arguments name)]
+                (if (= (primitive/cast i64 concrete) 0)
+                    (primitive/error "Carp emission: unresolved nominal prn parameter")
+                    (emit-mono-prn-append builder value concrete)))))
+    (_ (primitive/error "Carp emission: compound nominal prn field is not emitted"))))
+
+(defn nominal-sum-string-code
+  [(module (ptr check/CheckedModule)) (constructor-syntaxes Code)
+   (signature (ptr types/MonoType)) (argument Code) (found (ptr bool))] (-> Code)
+  (let [owner (signature-owner-name signature)
+        index (runtime-type-index module owner)
+        (mut result) argument]
+    (if (< index 0) 0
+        (let [definition (al/al-elem [ir/ResolvedTypeDefinition]
+                           (field module types) index)]
+          (match (load (field definition shape))
+            (ir/ResolvedSumShape [constructors]
+              (match (load signature)
+                (types/TypeFunction [parameter-types _]
+                  (match (load (al/al-get [(ptr types/MonoType)]
+                                 (load parameter-types) 0))
+                    (types/TypeReference [inner _]
+                      (match (load inner)
+                        (types/TypeNamed [_ concrete-arguments]
+                          (let [builder (primitive/fresh-identifier "carp_sum_string")
+                                clauses (primitive/code-list-new)
+                                variants (primitive/code-nth constructor-syntaxes index)
+                                n (al/al-len [ir/ResolvedConstructor] (load constructors))
+                                (mut i) 0]
+                            (loop
+                              (if (>= (load i) n) (break)
+                                  (let [constructor (al/al-elem [ir/ResolvedConstructor]
+                                                      constructors (load i))
+                                        constructor-reference
+                                          (load (field constructor reference))
+                                        constructor-name
+                                          (.name constructor-reference)
+                                        fields (load (field constructor fields))
+                                        fn (al/al-len [(ptr ir/ResolvedType)] fields)
+                                        temporaries (primitive/code-list-new)
+                                        body (primitive/code-list-new)
+                                        (mut fi) 0]
+                                    (primitive/code-list-push! body
+                                      `(str/sb-push-str! (mut ~builder) "("))
+                                    (primitive/code-list-push! body
+                                      `(str/sb-push-str! (mut ~builder)
+                                         ~constructor-name))
+                                    (loop (if (>= (load fi) fn) (break)
+                                              (let [temporary
+                                                      (primitive/fresh-identifier "carp_sum_field")]
+                                                (primitive/code-list-push! temporaries temporary)
+                                                (primitive/code-list-push! body
+                                                  `(str/sb-push-str! (mut ~builder) " "))
+                                                (primitive/code-list-push! body
+                                                  (emit-resolved-prn-append definition
+                                                    concrete-arguments `(mut ~builder) temporary
+                                                    (al/al-get [(ptr ir/ResolvedType)] fields
+                                                      (load fi))))
+                                                (store! fi (+ (load fi) 1)))))
+                                    (primitive/code-list-push! body
+                                      `(str/sb-push-str! (mut ~builder) ")"))
+                                    (primitive/code-list-push! body `0)
+                                    (primitive/code-list-push! clauses
+                                      `(~(primitive/code-nth variants (load i))
+                                        [~@(primitive/code-list-done temporaries)]
+                                        (do ~@(primitive/code-list-done body))))
+                                    (store! i (+ (load i) 1)))))
+                            (let [output (primitive/fresh-identifier "carp_sum_output")]
+                              (store! result
+                                `(let [(mut ~builder) (str/sb-new (alloc/malloc-allocator))
+                                       ~(primitive/fresh-identifier "carp_sum_render")
+                                         (match (load ~argument)
+                                           ~@(primitive/code-list-done clauses))
+                                       ~output
+                                         (str/string-from-view (alloc/malloc-allocator)
+                                           (str/string-view-unchecked
+                                             (str/sb-str (load ~builder))))]
+                                   (str/sb-free! (mut ~builder))
+                                   ~output)))
+                            (store! found true)))
+                        (_ 0)))
+                    (_ 0)))
+                (_ 0)))
+            (_ 0))))
+    (load result)))
+
+(defn struct-operation-code
+  [(context Code) (module (ptr check/CheckedModule)) (type-syntaxes Code)
+   (callee ir/CoreRef) (signature (ptr types/MonoType)) (arguments Code)
+   (found (ptr bool))] (-> Code)
+  (let [owner (signature-owner-name signature)
+        index (runtime-type-index module owner)
+        (mut result) context]
+    (if (< index 0) 0
+        (let [definition (al/al-elem [ir/ResolvedTypeDefinition]
+                           (field module types) index)]
+          (match (load (field definition shape))
+            (ir/ResolvedStructShape [field-names _]
+              (let [n (al/al-len [(slice u8)] (load field-names))
+                    (mut i) 0]
+                (if (and (string-ends-with? (.name callee) ".copy")
+                         (match (load signature)
+                           (types/TypeFunction [_ result-type]
+                             (nominal-trivially-deletable? module result-type))
+                           (_ false)))
+                    (do (store! result `(load ~(primitive/code-nth arguments 0)))
+                        (store! found true)) 0)
+                (loop (if (or (>= (load i) n) (load found)) (break)
+                          (let [field-name (al/al-get [(slice u8)]
+                                             (load field-names) (load i))]
+                            (if (not (or (string-ends-with? (.name callee) field-name)
+                                         (string-ends-with-field-bang?
+                                           (.name callee) field-name))) 0
+                                (match (load signature)
+                                  (types/TypeFunction [parameter-types result-type]
+                                    (let [first-type (al/al-get [(ptr types/MonoType)]
+                                                       (load parameter-types) 0)
+                                          field (primitive/code-symbol field-name)
+                                          a (primitive/code-nth arguments 0)
+                                          b (if (> (primitive/code-count arguments) 1)
+                                                (primitive/code-nth arguments 1) `0)]
+                                      (match (load first-type)
+                                        (types/TypeReference [_ _]
+                                          (match (load result-type)
+                                            (types/TypeReference [_ _]
+                                              (do (store! result `(field ~a ~field))
+                                                  (store! found true)))
+                                            (types/TypeUnit []
+                                              (do (store! result
+                                                    `(do (store! (field ~a ~field) ~b) 0))
+                                                  (store! found true)))
+                                            (_ 0)))
+                                        (types/TypeNamed [_ _]
+                                          (if (types/type-same-representation?
+                                                first-type result-type)
+                                              (let [temporary
+                                                      (primitive/fresh-identifier
+                                                        "carp_struct_update")]
+                                                (store! result
+                                                  `(let [~temporary
+                                                           (primitive/alloc-stack
+                                                             ~(type-code module type-syntaxes
+                                                                first-type))
+                                                         ~(primitive/fresh-identifier
+                                                            "carp_struct_init")
+                                                           (store! ~temporary ~a)]
+                                                     (store! (field ~temporary ~field)
+                                                       ~(if (string-contains? (.name callee) ".update-")
+                                                            `(primitive/call-ptr ~b
+                                                               (load (field ~temporary ~field)))
+                                                            b))
+                                                     (load ~temporary)))
+                                                (store! found true))
+                                              0))
+                                        (_ 0))))
+                                  (_ 0)))
+                            (store! i (+ (load i) 1)))))))
+            (_ 0))))
+    (load result)))
+
+(defn foreign-call [(context Code) (module (ptr check/CheckedModule))
+                    (type-syntaxes Code) (constructor-syntaxes Code)
+                    (callee ir/CoreRef) (signature (ptr types/MonoType))
+                    (actual-first-type (ptr types/MonoType))
+                    (arguments Code)] (-> Code)
+  (let [name (.name callee) n (primitive/code-count arguments)
+        a (if (> n 0) (primitive/code-nth arguments 0) `0)
+        b (if (> n 1) (primitive/code-nth arguments 1) `0)
+        c (if (> n 2) (primitive/code-nth arguments 2) `0)
+        actual-collection-element (collection-element-from-type actual-first-type)
+        collection-element
+          (if (= (primitive/cast i64 actual-collection-element) 0)
+              (collection-element-type signature) actual-collection-element)
+        found (primitive/alloc-stack bool)
+        _found-init (store! found false)
+        constructed (constructor-code context module type-syntaxes
+                      constructor-syntaxes callee arguments found)
+        structured (if (load found) context
+                     (struct-operation-code context module type-syntaxes callee
+                       signature arguments found))
+        nominal-string
+          (if (or (load found)
+                  (not (or (string-ends-with? name ".str")
+                           (string-ends-with? name ".prn")))) context
+              (nominal-sum-string-code module constructor-syntaxes signature a found))]
+    (if (load found)
+        (cond (not (primitive/code-eq constructed context)) constructed
+              (not (primitive/code-eq structured context)) structured
+              :else nominal-string)
+    (cond (str/str-eq name "Int.+") `(+ ~a ~b)
+          (str/str-eq name "Int.-") `(- ~a ~b)
+          (str/str-eq name "Int.*") `(* ~a ~b)
+          (str/str-eq name "Int./") `(/ ~a ~b)
+          (str/str-eq name "Int.mod") `(% ~a ~b)
+          (str/str-eq name "Int.<") `(< ~a ~b)
+          (str/str-eq name "Int.>") `(> ~a ~b)
+          (str/str-eq name "Int.=") `(= ~a ~b)
+          (str/str-eq name "Int.<=") `(<= ~a ~b)
+          (str/str-eq name "Int.>=") `(>= ~a ~b)
+          (str/str-eq name "Int./=") `(!= ~a ~b)
+          (str/str-eq name "Int.inc") `(+ ~a 1)
+          (str/str-eq name "Int.dec") `(- ~a 1)
+          (str/str-eq name "Int.neg") `(- 0 ~a)
+          (str/str-eq name "Int.bit-shift-left") `(<< ~a ~b)
+          (str/str-eq name "Int.bit-shift-right") `(>> ~a ~b)
+          (str/str-eq name "Int.bit-and") `(& ~a ~b)
+          (str/str-eq name "Int.bit-or") `(| ~a ~b)
+          (str/str-eq name "Int.bit-xor") `(^ ~a ~b)
+          (str/str-eq name "Int.bit-not") `(^ ~a -1)
+          (str/str-eq name "Int.abs") `(if (< ~a 0) (- 0 ~a) ~a)
+          (str/str-eq name "Int.copy") `(load ~a)
+          (str/str-eq name "Int.str")
+            (let [buffer (primitive/fresh-identifier "carp_integer_string_buffer")
+                  result (primitive/fresh-identifier "carp_integer_string")]
+              `(let [(mut ~buffer) (str/sb-new (alloc/malloc-allocator))
+                     ~(primitive/fresh-identifier "carp_integer_append")
+                       (str/sb-push-i64! (mut ~buffer) ~a)
+                     ~result
+                       (str/string-from-view (alloc/malloc-allocator)
+                         (str/string-view-unchecked (str/sb-str (load ~buffer))))]
+                 (str/sb-free! (mut ~buffer))
+                 ~result))
+          (str/str-eq name "Int.from-string-internal")
+            `(match (str/str-parse-int
+                      (str/string-view-bytes (str/string-as-view (load ~a))))
+               (Some [value] (do (store! ~b value) true))
+               (None [] false))
+          (str/str-eq name "Bool.=") `(= ~a ~b)
+          (str/str-eq name "Bool.not") `(not ~a)
+          (str/str-eq name "Bool.and") `(and ~a ~b)
+          (str/str-eq name "Bool.or") `(or ~a ~b)
+          (str/str-eq name "Bool.str")
+            `(str/string-from-view (alloc/malloc-allocator)
+               (str/string-view-unchecked (if ~a "true" "false")))
+          (str/str-eq name "Bool.prn")
+            `(str/string-from-view (alloc/malloc-allocator)
+               (str/string-view-unchecked (if ~a "true" "false")))
+          (str/str-eq name "Double.+") `(+ ~a ~b)
+          (str/str-eq name "Double.-") `(- ~a ~b)
+          (str/str-eq name "Double.*") `(* ~a ~b)
+          (str/str-eq name "Double./") `(/ ~a ~b)
+          (str/str-eq name "Double.<") `(< ~a ~b)
+          (str/str-eq name "Double.>") `(> ~a ~b)
+          (str/str-eq name "Double.=") `(= ~a ~b)
+          (str/str-eq name "Double.neg") `(- 0.0 ~a)
+          (str/str-eq name "Double.from-int") `(primitive/cast f64 ~a)
+          (str/str-eq name "Double.from-long") `(primitive/cast f64 ~a)
+          (str/str-eq name "Double.from-uint64") `(primitive/cast f64 ~a)
+          (str/str-eq name "Double.to-int") `(primitive/cast i64 ~a)
+          (str/str-eq name "Double.to-long") `(primitive/cast i64 ~a)
+          (str/str-eq name "Double.to-uint64") `(primitive/cast u64 ~a)
+          (str/str-eq name "Double.copy") `(load ~a)
+          (str/str-eq name "Array.length")
+            `(al/al-len [~(type-code module type-syntaxes collection-element)]
+               (load ~a))
+          (str/str-eq name "Array.unsafe-nth")
+            `(al/al-elem [~(type-code module type-syntaxes collection-element)] ~a ~b)
+          (str/str-eq name "Array.push-back!")
+            `(al/al-push! [~(type-code module type-syntaxes collection-element)] ~a ~b)
+          (str/str-eq name "Array.aset!")
+            `(do (store!
+                   (al/al-elem [~(type-code module type-syntaxes collection-element)] ~a ~b)
+                   ~c)
+                 0)
+          (str/str-eq name "Array.push-back")
+            (let [array (primitive/fresh-identifier "carp_array_push")]
+              `(let [(mut ~array) ~a]
+                 (al/al-push! [~(type-code module type-syntaxes collection-element)]
+                   (mut ~array) ~b)
+                 (load ~array)))
+          (str/str-eq name "Array.allocate")
+            (let [array (primitive/fresh-identifier "carp_array_allocate")]
+              `(let [(mut ~array)
+                       (al/al-new [~(type-code module type-syntaxes collection-element)]
+                         (alloc/malloc-allocator))]
+                 (al/al-reserve! [~(type-code module type-syntaxes collection-element)]
+                   (mut ~array) ~a)
+                 (store! (field (mut ~array) len) ~a)
+                 (load ~array)))
+          (str/str-eq name "Array.aset-uninitialized!")
+            `(do (store!
+                   (al/al-elem [~(type-code module type-syntaxes collection-element)] ~a ~b)
+                   ~c)
+                 0)
+          (str/str-eq name "IO.print")
+            `(do (print "{s}"
+                   (str/string-view-bytes (str/string-as-view (load ~a)))) 0)
+          (str/str-eq name "IO.println")
+            `(do (println "{s}"
+                   (str/string-view-bytes (str/string-as-view (load ~a)))) 0)
+          (str/str-eq name "String.allocate")
+            (let [text (primitive/fresh-identifier "carp_string")
+                  i (primitive/fresh-identifier "carp_string_index")]
+              `(let [(mut ~text) (str/string-new (alloc/malloc-allocator))
+                     (mut ~i) 0]
+                 (loop (if (>= (load ~i) ~a) (break)
+                           (do (str/string-push-rune! (mut ~text) (str/Rune ~b))
+                               (store! ~i (+ (load ~i) 1)))))
+                 (load ~text)))
+          (str/str-eq name "String.copy")
+            `(str/string-clone (alloc/malloc-allocator) (load ~a))
+          (str/str-eq name "String.str")
+            `(str/string-clone (alloc/malloc-allocator) (load ~a))
+          (str/str-eq name "String.prn")
+            `(str/string-clone (alloc/malloc-allocator) (load ~a))
+          (str/str-eq name "String.length") `(str/string-byte-len (load ~a))
+          (str/str-eq name "String.=")
+            `(str/str-eq
+               (str/string-view-bytes (str/string-as-view (load ~a)))
+               (str/string-view-bytes (str/string-as-view (load ~b))))
+          (str/str-eq name "String.<")
+            `(< (str/str-cmp
+                  (str/string-view-bytes (str/string-as-view (load ~a)))
+                  (str/string-view-bytes (str/string-as-view (load ~b)))) 0)
+          (str/str-eq name "String.>")
+            `(> (str/str-cmp
+                  (str/string-view-bytes (str/string-as-view (load ~a)))
+                  (str/string-view-bytes (str/string-as-view (load ~b)))) 0)
+          (str/str-eq name "String.append")
+            (let [text (primitive/fresh-identifier "carp_string_append")]
+              `(let [(mut ~text)
+                       (str/string-clone (alloc/malloc-allocator) (load ~a))]
+                 (str/string-push-view! (mut ~text)
+                   (str/string-as-view (load ~b)))
+                 (load ~text)))
+          (str/str-eq name "System.nanotime")
+            `(match (time/monotonic-now-ms)
+               (Ok [milliseconds] (* milliseconds 1000000))
+               (Err [_] 0))
+          (str/str-eq name "ignore") `(do ~a 0)
+          (str/str-eq name "deref") `(load ~a)
+          (str/str-eq name "get-tag")
+            (nominal-tag-code module constructor-syntaxes actual-first-type a)
+          :else
+            (let [allocator (alloc/malloc-allocator)
+                  (mut message) (str/sb-new allocator)]
+              (str/sb-push-str! (mut message) "Carp emission: unresolved foreign call '")
+              (str/sb-push-str! (mut message) name)
+              (str/sb-push-str! (mut message) "' length=")
+              (str/sb-push-i64! (mut message) (slice/slice-len name))
+              (str/sb-push-str! (mut message) " id=")
+              (str/sb-push-i64! (mut message) (ir/core-ref-id callee))
+              (primitive/error (str/sb-finish! (mut message))))))))
+
+(defn emit-foreign-wrapper
+  [(context Code) (module (ptr check/CheckedModule)) (type-syntaxes Code)
+   (constructor-syntaxes Code) (entry (ptr ForeignFunction)) (syntax Code)]
+  (-> Code)
+  (match (load (load (field entry signature)))
+    (types/TypeFunction [argument-types result-type]
+      (let [parameters (primitive/code-list-new)
+            arguments (primitive/code-list-new)
+            n (al/al-len [(ptr types/MonoType)] (load argument-types))
+            (mut i) 0]
+        (primitive/code-list-push! parameters
+          `(~(primitive/fresh-identifier "carp_closure_environment") (ptr i8)))
+        (loop (if (>= (load i) n) (break)
+                  (let [parameter (primitive/fresh-identifier "carp_foreign_argument")]
+                    (primitive/code-list-push! parameters
+                      `(~parameter
+                        ~(type-code module type-syntaxes
+                           (al/al-get [(ptr types/MonoType)]
+                             (load argument-types) (load i)))))
+                    (primitive/code-list-push! arguments parameter)
+                    (store! i (+ (load i) 1)))))
+        (let [args (primitive/code-list-done arguments)]
+          `(defn ~syntax [~@(primitive/code-list-done parameters)]
+             (-> ~(type-code module type-syntaxes result-type))
+             ~(foreign-call context module type-syntaxes constructor-syntaxes
+                (load (field entry reference)) (load (field entry signature))
+                (if (= (al/al-len [(ptr types/MonoType)] (load argument-types)) 0)
+                    result-type
+                    (al/al-get [(ptr types/MonoType)] (load argument-types) 0))
+                args)))))
+    (_ (primitive/error "Carp emission: foreign wrapper is not a function"))))
+
+(defn collect-expression-list-bindings!
+  [(references (ptr (al/ArrayList ir/CoreRef)))
+   (items (ptr (al/ArrayList (ptr ir/SpecializedExpr))))] (-> i64)
+  (let [n (al/al-len [(ptr ir/SpecializedExpr)] (load items)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (collect-expression-bindings! references
+                    (al/al-get [(ptr ir/SpecializedExpr)] (load items) (load i)))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn collect-expression-bindings!
+  [(references (ptr (al/ArrayList ir/CoreRef)))
+   (expression (ptr ir/SpecializedExpr))] (-> i64)
+  (match (load expression)
+    (ir/ExprBorrow [_ _ operand] (collect-expression-bindings! references operand))
+    (ir/ExprGlobalCall [_ _ _ _ arguments]
+      (collect-expression-list-bindings! references arguments))
+    (ir/ExprCall [_ _ callee arguments]
+      (do (collect-expression-bindings! references callee)
+          (collect-expression-list-bindings! references arguments)))
+    (ir/ExprDo [_ _ expressions]
+      (collect-expression-list-bindings! references expressions))
+    (ir/ExprIf [_ _ condition then-branch else-branch]
+      (do (collect-expression-bindings! references condition)
+          (collect-expression-bindings! references then-branch)
+          (collect-expression-bindings! references else-branch)))
+    (ir/ExprLet [_ _ binding value body]
+      (do (collect-expression-bindings! references value)
+          (al/al-push! [ir/CoreRef] references binding)
+          (collect-expression-bindings! references body)))
+    (ir/ExprSet [_ _ _ value]
+      (collect-expression-bindings! references value))
+    (ir/ExprWhile [_ _ condition body]
+      (do (collect-expression-bindings! references condition)
+          (collect-expression-bindings! references body)))
+    (ir/ExprLambda [_ _ parameters body]
+      (do (let [n (al/al-len [ir/CoreRef] (load parameters)) (mut i) 0]
+            (loop (if (>= (load i) n) (break)
+                      (do (al/al-push! [ir/CoreRef] references
+                            (al/al-get [ir/CoreRef] (load parameters) (load i)))
+                          (store! i (+ (load i) 1))))))
+          (collect-expression-bindings! references body)))
+    (ir/ExprAnnotation [_ _ inner]
+      (collect-expression-bindings! references inner))
+    (ir/ExprArray [_ _ items _]
+      (collect-expression-list-bindings! references items))
+    (ir/ExprMatch [_ _ _ scrutinee branches]
+      (do (collect-expression-bindings! references scrutinee)
+          (let [n (al/al-len [ir/SpecializedMatchBranch] (load branches))
+                (mut i) 0]
+            (loop (if (>= (load i) n) (break)
+                      (do (let [branch (al/al-get [ir/SpecializedMatchBranch]
+                                         (load branches) (load i))
+                                bindings (.bindings branch)
+                                bn (al/al-len [ir/CoreRef] (load bindings))
+                                (mut j) 0]
+                            (loop (if (>= (load j) bn) (break)
+                                      (do (al/al-push! [ir/CoreRef] references
+                                            (al/al-get [ir/CoreRef]
+                                              (load bindings) (load j)))
+                                          (store! j (+ (load j) 1)))))
+                            (collect-expression-bindings! references (.body branch)))
+                          (store! i (+ (load i) 1))))))
+          0))
+    (_ 0)))
+
+(defn capture-index [(captures (ptr (al/ArrayList LambdaCapture)))
+                     (reference ir/CoreRef)] (-> i64)
+  (let [n (al/al-len [LambdaCapture] (load captures)) (mut i) 0 (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0)) (break)
+              (let [capture (al/al-elem [LambdaCapture] captures (load i))]
+                (if (ir/core-ref-same? (load (field capture reference)) reference)
+                    (store! found (load i)) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn collect-capture-list!
+  [(bound (ptr (al/ArrayList ir/CoreRef)))
+   (captures (ptr (al/ArrayList LambdaCapture)))
+   (items (ptr (al/ArrayList (ptr ir/SpecializedExpr))))] (-> i64)
+  (let [n (al/al-len [(ptr ir/SpecializedExpr)] (load items)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (collect-capture-references! bound captures
+                    (al/al-get [(ptr ir/SpecializedExpr)] (load items) (load i)))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn collect-capture-references!
+  [(bound (ptr (al/ArrayList ir/CoreRef)))
+   (captures (ptr (al/ArrayList LambdaCapture)))
+   (expression (ptr ir/SpecializedExpr))] (-> i64)
+  (match (load expression)
+    (ir/ExprReference [_ type reference]
+      (if (or (ir/core-ref-global? reference)
+              (>= (reference-index bound reference) 0)
+              (>= (capture-index captures reference) 0)) 0
+          (do (al/al-push! [LambdaCapture] captures
+                (LambdaCapture :reference reference :type type))
+              0)))
+    (ir/ExprBorrow [_ _ operand] (collect-capture-references! bound captures operand))
+    (ir/ExprGlobalCall [_ _ _ _ arguments]
+      (collect-capture-list! bound captures arguments))
+    (ir/ExprCall [_ _ callee arguments]
+      (do (collect-capture-references! bound captures callee)
+          (collect-capture-list! bound captures arguments)))
+    (ir/ExprDo [_ _ expressions] (collect-capture-list! bound captures expressions))
+    (ir/ExprIf [_ _ condition then-branch else-branch]
+      (do (collect-capture-references! bound captures condition)
+          (collect-capture-references! bound captures then-branch)
+          (collect-capture-references! bound captures else-branch)))
+    (ir/ExprLet [_ _ _ value body]
+      (do (collect-capture-references! bound captures value)
+          (collect-capture-references! bound captures body)))
+    (ir/ExprSet [_ _ binding value]
+      (do (if (or (ir/core-ref-global? binding)
+                  (>= (reference-index bound binding) 0)
+                  (>= (capture-index captures binding) 0)) 0
+              (do (al/al-push! [LambdaCapture] captures
+                    (LambdaCapture :reference binding
+                      :type (ir/expression-type value)))
+                  0))
+          (collect-capture-references! bound captures value)))
+    (ir/ExprWhile [_ _ condition body]
+      (do (collect-capture-references! bound captures condition)
+          (collect-capture-references! bound captures body)))
+    (ir/ExprLambda [_ _ _ body]
+      (collect-capture-references! bound captures body))
+    (ir/ExprAnnotation [_ _ inner] (collect-capture-references! bound captures inner))
+    (ir/ExprArray [_ _ items _] (collect-capture-list! bound captures items))
+    (ir/ExprMatch [_ _ _ scrutinee branches]
+      (do (collect-capture-references! bound captures scrutinee)
+          (let [n (al/al-len [ir/SpecializedMatchBranch] (load branches)) (mut i) 0]
+            (loop (if (>= (load i) n) (break)
+                      (do (collect-capture-references! bound captures
+                            (load (field (al/al-elem [ir/SpecializedMatchBranch]
+                                           branches (load i)) body)))
+                          (store! i (+ (load i) 1))))))
+          0))
+    (_ 0)))
+
+(defn lambda-captures [(a (dyn alloc/Allocator))
+                       (parameters (ptr (al/ArrayList ir/CoreRef)))
+                       (body (ptr ir/SpecializedExpr))]
+  (-> (al/ArrayList LambdaCapture))
+  (let [(mut bound) (al/al-new [ir/CoreRef] a)
+        (mut captures) (al/al-new [LambdaCapture] a)
+        n (al/al-len [ir/CoreRef] (load parameters)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (al/al-push! [ir/CoreRef] (mut bound)
+                    (al/al-get [ir/CoreRef] (load parameters) (load i)))
+                  (store! i (+ (load i) 1)))))
+    (collect-expression-bindings! (mut bound) body)
+    (collect-capture-references! (mut bound) (mut captures) body)
+    (load captures)))
+
+(defn collect-lambda-list!
+  [(out (ptr (al/ArrayList (ptr ir/SpecializedExpr))))
+   (items (ptr (al/ArrayList (ptr ir/SpecializedExpr))))] (-> i64)
+  (let [n (al/al-len [(ptr ir/SpecializedExpr)] (load items)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (collect-lambda-expressions! out
+                    (al/al-get [(ptr ir/SpecializedExpr)] (load items) (load i)))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn collect-lambda-expressions!
+  [(out (ptr (al/ArrayList (ptr ir/SpecializedExpr))))
+   (expression (ptr ir/SpecializedExpr))] (-> i64)
+  (match (load expression)
+    (ir/ExprBorrow [_ _ operand] (collect-lambda-expressions! out operand))
+    (ir/ExprGlobalCall [_ _ _ _ arguments] (collect-lambda-list! out arguments))
+    (ir/ExprCall [_ _ callee arguments]
+      (do (collect-lambda-expressions! out callee) (collect-lambda-list! out arguments)))
+    (ir/ExprDo [_ _ expressions] (collect-lambda-list! out expressions))
+    (ir/ExprIf [_ _ condition then-branch else-branch]
+      (do (collect-lambda-expressions! out condition)
+          (collect-lambda-expressions! out then-branch)
+          (collect-lambda-expressions! out else-branch)))
+    (ir/ExprLet [_ _ _ value body]
+      (do (collect-lambda-expressions! out value) (collect-lambda-expressions! out body)))
+    (ir/ExprSet [_ _ _ value] (collect-lambda-expressions! out value))
+    (ir/ExprWhile [_ _ condition body]
+      (do (collect-lambda-expressions! out condition) (collect-lambda-expressions! out body)))
+    (ir/ExprLambda [_ _ _ body]
+      (do (al/al-push! [(ptr ir/SpecializedExpr)] out expression)
+          (collect-lambda-expressions! out body)))
+    (ir/ExprAnnotation [_ _ inner] (collect-lambda-expressions! out inner))
+    (ir/ExprArray [_ _ items _] (collect-lambda-list! out items))
+    (ir/ExprMatch [_ _ _ scrutinee branches]
+      (do (collect-lambda-expressions! out scrutinee)
+          (let [n (al/al-len [ir/SpecializedMatchBranch] (load branches)) (mut i) 0]
+            (loop (if (>= (load i) n) (break)
+                      (do (collect-lambda-expressions! out
+                            (load (field (al/al-elem [ir/SpecializedMatchBranch]
+                                           branches (load i)) body)))
+                          (store! i (+ (load i) 1))))))
+          0))
+    (_ 0)))
+
+(defn build-lambda-expressions [(a (dyn alloc/Allocator))
+                                (module (ptr check/CheckedModule))]
+  (-> (al/ArrayList (ptr ir/SpecializedExpr)))
+  (let [(mut result) (al/al-new [(ptr ir/SpecializedExpr)] a)
+        fn (al/al-len [check/CheckedFunction] (load (field module functions)))
+        vn (al/al-len [check/CheckedValue] (load (field module values)))
+        (mut i) 0]
+    (loop (if (>= (load i) fn) (break)
+              (do (collect-lambda-expressions! (mut result)
+                    (load (field (field (al/al-elem [check/CheckedFunction]
+                                          (field module functions) (load i)) function) body)))
+                  (store! i (+ (load i) 1)))))
+    (store! i 0)
+    (loop (if (>= (load i) vn) (break)
+              (do (collect-lambda-expressions! (mut result)
+                    (load (field (field (al/al-elem [check/CheckedValue]
+                                          (field module values) (load i)) value) body)))
+                  (store! i (+ (load i) 1)))))
+    (load result)))
+
+(defn lambda-index [(a (dyn alloc/Allocator)) (module (ptr check/CheckedModule))
+                    (id i64)] (-> i64)
+  (let [(mut lambdas) (build-lambda-expressions a module)
+        n (al/al-len [(ptr ir/SpecializedExpr)] (load lambdas))
+        (mut i) 0 (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0)) (break)
+              (do (if (= (ir/expression-id
+                            (al/al-get [(ptr ir/SpecializedExpr)]
+                              (load lambdas) (load i))) id)
+                      (store! found (load i)) 0)
+                  (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn lambda-syntax [(a (dyn alloc/Allocator))
+                     (module (ptr check/CheckedModule)) (syntaxes Code)
+                     (id i64) (part i64)] (-> Code)
+  (let [index (lambda-index a module id)
+        base (* (al/al-len [check/CheckedFunction]
+                   (load (field module functions))) 2)]
+    (if (< index 0) (primitive/error "Carp emission: lambda syntax is absent")
+        (primitive/code-nth syntaxes (+ base (+ (* index 5) part))))))
+
+(defn emit-expression-list
+  [(context Code) (module (ptr check/CheckedModule)) (type-syntaxes Code)
+   (constructor-syntaxes Code) (function-syntaxes Code)
+   (foreign-functions (ptr (al/ArrayList ForeignFunction)))
+   (foreign-syntaxes Code)
+   (plan (ptr ownership/OwnershipPlan))
+   (local-references (ptr (al/ArrayList ir/CoreRef))) (local-syntaxes Code)
+   (live-syntaxes Code)
+   (items (ptr (al/ArrayList (ptr ir/SpecializedExpr))))] (-> Code)
+  (let [forms (primitive/code-list-new)
+        n (al/al-len [(ptr ir/SpecializedExpr)] (load items)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (let [expression (al/al-get [(ptr ir/SpecializedExpr)]
+                                 (load items) (load i))
+                    emitted (emit-expression context module type-syntaxes
+                              constructor-syntaxes function-syntaxes
+                              foreign-functions foreign-syntaxes plan
+                              local-references local-syntaxes live-syntaxes expression)
+                    cleanup-type (temporary-delete-type plan
+                                   (ir/expression-id expression))]
+                (if (= (primitive/cast i64 cleanup-type) 0)
+                    (primitive/code-list-push! forms emitted)
+                    (let [temporary (primitive/fresh-identifier "carp_temporary")]
+                      (primitive/code-list-push! forms
+                        `(let [~temporary ~emitted]
+                           ~(emit-delete-call module function-syntaxes
+                              cleanup-type temporary)))))
+                  (store! i (+ (load i) 1)))))
+    (primitive/code-list-done forms)))
+
+(defn emit-expression
+  [(context Code) (module (ptr check/CheckedModule)) (type-syntaxes Code)
+   (constructor-syntaxes Code) (function-syntaxes Code)
+   (foreign-functions (ptr (al/ArrayList ForeignFunction)))
+   (foreign-syntaxes Code)
+   (plan (ptr ownership/OwnershipPlan))
+   (local-references (ptr (al/ArrayList ir/CoreRef))) (local-syntaxes Code)
+   (live-syntaxes Code)
+   (expression (ptr ir/SpecializedExpr))] (-> Code)
+  (match (load expression)
+    (ir/ExprInt [_ _ value] `~value)
+    (ir/ExprByte [_ _ value] `(primitive/cast u8 ~value))
+    (ir/ExprLong [_ _ value] `~value)
+    (ir/ExprFloat [_ _ value] `~value)
+    (ir/ExprDouble [_ _ value] `~value)
+    (ir/ExprBool [_ _ value] (if value `true `false))
+    (ir/ExprChar [_ _ value] `(primitive/cast u32 ~value))
+    (ir/ExprString [_ _ value]
+      `(str/string-from-view (alloc/malloc-allocator)
+         (str/string-view-unchecked ~value)))
+    (ir/ExprUnit [_ _] `0)
+    (ir/ExprReference [_ type reference]
+      (if (>= (function-index module reference type) 0)
+          (let [adapter (function-adapter-code module function-syntaxes reference type)]
+            (closure-value-code module type-syntaxes adapter))
+          (let [foreign (foreign-function-index foreign-functions reference type)
+                index (reference-index local-references reference)]
+            (if (>= foreign 0)
+                (let [wrapper (primitive/code-nth foreign-syntaxes foreign)]
+                  (closure-value-code module type-syntaxes wrapper))
+            (if (< index 0) (foreign-global reference)
+                (let [cell (reference-code context local-references local-syntaxes reference)
+                      value `(load ~cell)]
+                  (if (or (ir/core-ref-global? reference)
+                          (not (managed-type? plan type))) value
+                      `(do (store! ~(primitive/code-nth live-syntaxes index) false)
+                           ~value))))))))
+    (ir/ExprBorrow [_ _ operand]
+      (match (load operand)
+        (ir/ExprReference [_ _ reference]
+          (let [index (reference-index local-references reference)]
+            (if (>= index 0)
+                (primitive/code-nth local-syntaxes index)
+                (emit-expression context module type-syntaxes constructor-syntaxes
+                  function-syntaxes foreign-functions foreign-syntaxes plan
+                  local-references local-syntaxes live-syntaxes operand))))
+        (_ (emit-expression context module type-syntaxes constructor-syntaxes
+             function-syntaxes foreign-functions foreign-syntaxes plan
+             local-references local-syntaxes live-syntaxes
+             operand))))
+    (ir/ExprGlobalCall [_ _ source signature arguments]
+      (let [args (emit-expression-list context module type-syntaxes
+                   constructor-syntaxes function-syntaxes
+                   foreign-functions foreign-syntaxes
+                   plan local-references local-syntaxes live-syntaxes arguments)]
+        (if (>= (function-index module source signature) 0)
+            (let [callee (function-code module function-syntaxes source signature)]
+              `(~callee ~@args))
+            (foreign-call context module type-syntaxes constructor-syntaxes
+              source signature
+              (if (= (al/al-len [(ptr ir/SpecializedExpr)] (load arguments)) 0)
+                  (ir/expression-type expression)
+                  (ir/expression-type
+                    (al/al-get [(ptr ir/SpecializedExpr)] (load arguments) 0)))
+              args))))
+    (ir/ExprCall [_ _ callee arguments]
+      (let [callee-code
+              (match (load callee)
+                (ir/ExprReference [_ _ reference]
+                  (let [index (reference-index local-references reference)]
+                    (if (< index 0)
+                        (emit-expression context module type-syntaxes
+                          constructor-syntaxes function-syntaxes foreign-functions
+                          foreign-syntaxes plan local-references local-syntaxes
+                          live-syntaxes callee)
+                        `(load ~(primitive/code-nth local-syntaxes index)))))
+                (_ (emit-expression context module type-syntaxes
+                     constructor-syntaxes function-syntaxes foreign-functions
+                     foreign-syntaxes plan local-references local-syntaxes
+                     live-syntaxes callee)))
+            args (emit-expression-list context module type-syntaxes
+                   constructor-syntaxes function-syntaxes foreign-functions
+                   foreign-syntaxes plan local-references local-syntaxes
+                   live-syntaxes arguments)]
+        (let [closure (primitive/fresh-identifier "carp_closure_call")]
+          `(let [(mut ~closure) ~callee-code]
+             (primitive/call-ptr (load (field (mut ~closure) code))
+               (load (field (mut ~closure) environment)) ~@args)))))
+    (ir/ExprDo [_ _ expressions]
+      (let [forms (emit-expression-list context module type-syntaxes
+                    constructor-syntaxes function-syntaxes
+                    foreign-functions foreign-syntaxes
+                    plan local-references local-syntaxes live-syntaxes expressions)]
+        `(do ~@forms)))
+    (ir/ExprIf [_ _ condition then-branch else-branch]
+      (let [condition-code (emit-expression context module type-syntaxes
+                             constructor-syntaxes function-syntaxes
+                             foreign-functions foreign-syntaxes
+                             plan local-references local-syntaxes live-syntaxes condition)
+            then-code (emit-expression context module type-syntaxes
+                        constructor-syntaxes function-syntaxes
+                        foreign-functions foreign-syntaxes
+                        plan local-references local-syntaxes live-syntaxes then-branch)
+            else-code (emit-expression context module type-syntaxes
+                        constructor-syntaxes function-syntaxes
+                        foreign-functions foreign-syntaxes
+                        plan local-references local-syntaxes live-syntaxes else-branch)]
+        `(if ~condition-code ~then-code ~else-code)))
+    (ir/ExprLet [id _ binding value body]
+      (let [name (reference-code context local-references local-syntaxes binding)
+            index (reference-index local-references binding)
+            live (primitive/code-nth live-syntaxes index)
+            value-code (emit-expression context module type-syntaxes
+                         constructor-syntaxes function-syntaxes
+                         foreign-functions foreign-syntaxes
+                         plan local-references local-syntaxes live-syntaxes value)
+            body-code (emit-expression context module type-syntaxes
+                        constructor-syntaxes function-syntaxes
+                        foreign-functions foreign-syntaxes
+                        plan local-references local-syntaxes live-syntaxes body)
+            cleanup-type (binding-delete-type plan id binding)]
+        (if (managed-type? plan (ir/expression-type value))
+            (if (= (primitive/cast i64 cleanup-type) 0)
+                `(let [~name (primitive/alloc-stack
+                               ~(type-code module type-syntaxes
+                                  (ir/expression-type value)))
+                       (mut ~live) true
+                       ~(primitive/fresh-identifier "carp_init")
+                         (store! ~name ~value-code)]
+                   ~body-code)
+                (let [result (primitive/fresh-identifier "carp_scope_result")]
+                  `(let [~name (primitive/alloc-stack
+                                 ~(type-code module type-syntaxes
+                                    (ir/expression-type value)))
+                         (mut ~live) true
+                         ~(primitive/fresh-identifier "carp_init")
+                           (store! ~name ~value-code)
+                         ~result ~body-code]
+                     (if (load ~live)
+                         ~(emit-delete-call module function-syntaxes cleanup-type `(load ~name))
+                         0)
+                     ~result)))
+            `(let [~name (primitive/alloc-stack
+                           ~(type-code module type-syntaxes
+                              (ir/expression-type value)))
+                   ~(primitive/fresh-identifier "carp_init")
+                     (store! ~name ~value-code)]
+               ~body-code))))
+    (ir/ExprSet [id _ binding value]
+      (let [cell (reference-code context local-references local-syntaxes binding)
+            index (reference-index local-references binding)
+            live (primitive/code-nth live-syntaxes index)
+            value-code (emit-expression context module type-syntaxes
+                         constructor-syntaxes function-syntaxes
+                         foreign-functions foreign-syntaxes plan
+                         local-references local-syntaxes live-syntaxes value)
+            cleanup-type (binding-delete-type plan id binding)]
+        `(do
+           ~(if (= (primitive/cast i64 cleanup-type) 0) `0
+                `(if (load ~live)
+                     ~(emit-delete-call module function-syntaxes cleanup-type `(load ~cell))
+                     0))
+           (store! ~cell ~value-code)
+           ~(if (managed-type? plan (ir/expression-type value))
+                `(store! ~live true) `0)
+           0)))
+    (ir/ExprWhile [_ _ condition body]
+      (let [condition-code (emit-expression context module type-syntaxes
+                             constructor-syntaxes function-syntaxes foreign-functions
+                             foreign-syntaxes plan local-references local-syntaxes
+                             live-syntaxes condition)
+            body-code (emit-expression context module type-syntaxes
+                        constructor-syntaxes function-syntaxes foreign-functions
+                        foreign-syntaxes plan local-references local-syntaxes
+                        live-syntaxes body)]
+        `(do (loop (if ~condition-code ~body-code (break))) 0)))
+    (ir/ExprBreak [_ _] `(break))
+    (ir/ExprAnnotation [_ _ inner]
+      (emit-expression context module type-syntaxes constructor-syntaxes
+        function-syntaxes foreign-functions foreign-syntaxes
+        plan local-references local-syntaxes live-syntaxes inner))
+    (ir/ExprLiteral [_ _] (primitive/error "Carp emission: unsupported ExprLiteral"))
+    (ir/ExprPattern [_ _ _] (primitive/error "Carp emission: unsupported ExprPattern"))
+    (ir/ExprLambda [id type parameters body]
+      (let [a (alloc/malloc-allocator)
+            (mut captures) (lambda-captures a parameters body)
+            env-syntax (lambda-syntax a module function-syntaxes id 0)
+            code-syntax (lambda-syntax a module function-syntaxes id 1)
+            copy-syntax (lambda-syntax a module function-syntaxes id 2)
+            delete-syntax (lambda-syntax a module function-syntaxes id 3)
+            fields (lambda-syntax a module function-syntaxes id 4)
+            environment (primitive/fresh-identifier "carp_lambda_environment")
+            forms (primitive/code-list-new)
+            n (al/al-len [LambdaCapture] (load captures)) (mut i) 0]
+        (loop (if (>= (load i) n) (break)
+                  (let [capture (al/al-elem [LambdaCapture] (mut captures) (load i))
+                        reference (load (field capture reference))
+                        capture-type (load (field capture type))
+                        index (reference-index local-references reference)
+                        cell (primitive/code-nth local-syntaxes index)
+                        captured-value `(load ~cell)]
+                    (if (managed-type? plan capture-type)
+                        (do (primitive/code-list-push! forms
+                              `(store! ~(primitive/code-nth live-syntaxes index) false))
+                            0) 0)
+                    (primitive/code-list-push! forms
+                      `(store! (field ~environment
+                                  ~(primitive/code-nth fields (* (load i) 2)))
+                         ~captured-value))
+                    (primitive/code-list-push! forms
+                      `(store! (field ~environment
+                                  ~(primitive/code-nth fields (+ (* (load i) 2) 1)))
+                         ~(if (managed-type? plan capture-type) `true `false)))
+                    (store! i (+ (load i) 1)))))
+        (let [closure-type (primitive/code-nth type-syntaxes
+                             (al/al-len [ir/ResolvedTypeDefinition]
+                               (load (field module types))))]
+          `(let [~environment
+                   (alloc/box! (alloc/malloc-allocator) ~env-syntax (zeroed ~env-syntax))]
+             ~@(primitive/code-list-done forms)
+             (~closure-type (primitive/fnptr-of ~code-syntax)
+               (primitive/cast (ptr i8) ~environment)
+               (primitive/fnptr-of ~copy-syntax)
+               (primitive/fnptr-of ~delete-syntax))))))
+    (ir/ExprMatch [_ _ by-reference scrutinee branches]
+      (let [scrutinee-code (emit-expression context module type-syntaxes
+                             constructor-syntaxes function-syntaxes
+                             foreign-functions foreign-syntaxes plan
+                             local-references local-syntaxes live-syntaxes scrutinee)
+            clauses (primitive/code-list-new)
+            n (al/al-len [ir/SpecializedMatchBranch] (load branches))
+            (mut i) 0]
+        (loop
+          (if (>= (load i) n) (break)
+              (let [branch (al/al-elem [ir/SpecializedMatchBranch] branches (load i))
+                    bindings (load (field branch bindings))
+                    binding-types (load (field branch binding-types))
+                    bn (al/al-len [ir/CoreRef] bindings)
+                    temporaries-builder (primitive/code-list-new)
+                    definitions (primitive/code-list-new)
+                    (mut bi) 0]
+                (loop (if (>= (load bi) bn) (break)
+                          (do (primitive/code-list-push! temporaries-builder
+                                (primitive/fresh-identifier "carp_pattern"))
+                              (store! bi (+ (load bi) 1)))))
+                (let [temporaries (primitive/code-list-done temporaries-builder)
+                      (mut cursor) 0
+                      emitted-pattern (emit-pattern context module constructor-syntaxes
+                                temporaries (mut cursor) (load (field branch pattern)))]
+                  (store! bi 0)
+                  (loop
+                    (if (>= (load bi) bn) (break)
+                        (let [binding (al/al-get [ir/CoreRef] bindings (load bi))
+                              binding-type (al/al-get [(ptr types/MonoType)] binding-types (load bi))
+                              index (reference-index local-references binding)
+                              cell (primitive/code-nth local-syntaxes index)
+                              live (primitive/code-nth live-syntaxes index)
+                              temporary (primitive/code-nth temporaries (load bi))]
+                          (match (load binding-type)
+                            (types/TypeReference [inner _]
+                              (let [payload (primitive/fresh-identifier "carp_pattern_ref")]
+                                (primitive/code-list-push! definitions `(mut ~payload))
+                                (primitive/code-list-push! definitions temporary)
+                                (primitive/code-list-push! definitions `(mut ~cell))
+                                (primitive/code-list-push! definitions payload)
+                                0))
+                            (_
+                              (do (primitive/code-list-push! definitions `(mut ~cell))
+                                  (primitive/code-list-push! definitions temporary)
+                                  (if (managed-type? plan binding-type)
+                                      (do (primitive/code-list-push! definitions `(mut ~live))
+                                          (primitive/code-list-push! definitions `true)
+                                          0) 0))))
+                          (store! bi (+ (load bi) 1)))))
+                  (let [body (load (field branch body))
+                        body-code (emit-expression context module type-syntaxes
+                                    constructor-syntaxes function-syntaxes
+                                    foreign-functions foreign-syntaxes plan
+                                    local-references local-syntaxes live-syntaxes body)
+                        result (primitive/fresh-identifier "carp_match_result")]
+                    (primitive/code-list-push! definitions result)
+                    (primitive/code-list-push! definitions body-code)
+                    (let [cleanup (primitive/code-list-new) (mut ci) 0]
+                      (loop
+                        (if (>= (load ci) bn) (break)
+                            (let [binding (al/al-get [ir/CoreRef] bindings (load ci))
+                                  index (reference-index local-references binding)
+                                  cleanup-type (binding-delete-type plan
+                                                 (ir/expression-id body) binding)]
+                              (if (= (primitive/cast i64 cleanup-type) 0) 0
+                                  (do (primitive/code-list-push! cleanup
+                                        `(if (load ~(primitive/code-nth live-syntaxes index))
+                                             ~(emit-delete-call module function-syntaxes cleanup-type
+                                                `(load ~(primitive/code-nth local-syntaxes index)))
+                                             0))
+                                      0))
+                              (store! ci (+ (load ci) 1)))))
+                      (primitive/code-list-push! cleanup result)
+                      (let [clause (primitive/code-list-new)]
+                        (if (primitive/code-list? emitted-pattern)
+                            (do (primitive/code-list-push! clause
+                                  (primitive/code-nth emitted-pattern 0))
+                                (primitive/code-list-push! clause
+                                  (primitive/code-nth emitted-pattern 1))
+                                0)
+                            (do (primitive/code-list-push! clause emitted-pattern) 0))
+                        (primitive/code-list-push! clause
+                          `(let [~@(primitive/code-list-done definitions)]
+                             ~@(primitive/code-list-done cleanup)))
+                        (primitive/code-list-push! clauses
+                          (primitive/code-list-done clause)))))
+                  (store! i (+ (load i) 1))))))
+        `(match ~(if by-reference `(load ~scrutinee-code) scrutinee-code)
+           ~@(primitive/code-list-done clauses))))
+    (ir/ExprArray [_ type items _]
+      (match (load type)
+        (types/TypeNamed [_ arguments]
+          (let [element-type (al/al-get [(ptr types/MonoType)] (load arguments) 0)
+                element-code (type-code module type-syntaxes element-type)
+                values (emit-expression-list context module type-syntaxes
+                         constructor-syntaxes function-syntaxes foreign-functions
+                         foreign-syntaxes plan local-references local-syntaxes
+                         live-syntaxes items)
+                array (primitive/fresh-identifier "carp_array")
+                forms (primitive/code-list-new)
+                n (primitive/code-count values) (mut i) 0]
+            (loop (if (>= (load i) n) (break)
+                      (do (primitive/code-list-push! forms
+                            `(al/al-push! [~element-code] (mut ~array)
+                               ~(primitive/code-nth values (load i))))
+                          (store! i (+ (load i) 1)))))
+            `(let [(mut ~array) (al/al-new [~element-code]
+                                  (alloc/malloc-allocator))]
+               ~@(primitive/code-list-done forms)
+               (load ~array))))
+        (_ (primitive/error "Carp emission: array expression has non-array type"))))
+    (_ (primitive/error "Carp emission: unsupported specialized expression"))))
+
+(defn emit-lambda-declaration
+  [(a (dyn alloc/Allocator)) (context Code) (module (ptr check/CheckedModule))
+   (type-syntaxes Code) (constructor-syntaxes Code)
+   (foreign-functions (ptr (al/ArrayList ForeignFunction)))
+   (foreign-syntaxes Code) (function-syntaxes Code)
+   (plan (ptr ownership/OwnershipPlan))
+   (expression (ptr ir/SpecializedExpr))] (-> Code)
+  (match (load expression)
+    (ir/ExprLambda [id type parameters body]
+      (match (load type)
+        (types/TypeFunction [parameter-types result-type]
+          (let [(mut captures) (lambda-captures a parameters body)
+                env-syntax (lambda-syntax a module function-syntaxes id 0)
+                code-syntax (lambda-syntax a module function-syntaxes id 1)
+                copy-syntax (lambda-syntax a module function-syntaxes id 2)
+                delete-syntax (lambda-syntax a module function-syntaxes id 3)
+                fields (lambda-syntax a module function-syntaxes id 4)
+                env-fields (primitive/code-list-new)
+                copy-forms (primitive/code-list-new)
+                delete-forms (primitive/code-list-new)
+                local-references (alloc/box! a (al/ArrayList ir/CoreRef)
+                                   (al/al-new [ir/CoreRef] a))
+                local-syntaxes-builder (primitive/code-list-new)
+                live-syntaxes-builder (primitive/code-list-new)
+                parameter-bindings (primitive/code-list-new)
+                parameters-code (primitive/code-list-new)
+                raw-environment (primitive/fresh-identifier "carp_lambda_raw_environment")
+                environment (primitive/fresh-identifier "carp_lambda_typed_environment")
+                copied-environment (primitive/fresh-identifier "carp_lambda_copied_environment")
+                cn (al/al-len [LambdaCapture] (load captures)) (mut i) 0]
+            (loop
+              (if (>= (load i) cn) (break)
+                  (let [capture (al/al-elem [LambdaCapture] (mut captures) (load i))
+                        capture-type (load (field capture type))
+                        value-field (primitive/code-nth fields (* (load i) 2))
+                        live-field (primitive/code-nth fields (+ (* (load i) 2) 1))]
+                    (primitive/code-list-push! env-fields
+                      `(~value-field ~(type-code module type-syntaxes capture-type)))
+                    (primitive/code-list-push! env-fields `(~live-field bool))
+                    (al/al-push! [ir/CoreRef] local-references
+                      (load (field capture reference)))
+                    (primitive/code-list-push! local-syntaxes-builder
+                      `(field ~environment ~value-field))
+                    (primitive/code-list-push! live-syntaxes-builder
+                      `(field ~environment ~live-field))
+                    (if (managed-type? plan capture-type)
+                        (do (primitive/code-list-push! copy-forms
+                              `(if (load (field ~environment ~live-field))
+                                   (do
+                                     (store! (field ~copied-environment ~value-field)
+                                       ~(emit-copy-call module function-syntaxes capture-type
+                                          `(field ~environment ~value-field)))
+                                     (store! (field ~copied-environment ~live-field) true))
+                                   (store! (field ~copied-environment ~live-field) false)))
+                            0)
+                        (do (primitive/code-list-push! copy-forms
+                              `(store! (field ~copied-environment ~value-field)
+                                 (load (field ~environment ~value-field))))
+                            (primitive/code-list-push! copy-forms
+                              `(store! (field ~copied-environment ~live-field)
+                                 (load (field ~environment ~live-field))))
+                            0))
+                    (let [cleanup-type (if (managed-type? plan capture-type)
+                                         capture-type
+                                         (primitive/cast (ptr types/MonoType) 0))]
+                      (if (= (primitive/cast i64 cleanup-type) 0) 0
+                          (do (primitive/code-list-push! delete-forms
+                                `(if (load (field ~environment ~live-field))
+                                     ~(emit-delete-call module function-syntaxes cleanup-type
+                                        `(load (field ~environment ~value-field)))
+                                     0))
+                              0)))
+                    (store! i (+ (load i) 1)))))
+            (let [pn (al/al-len [ir/CoreRef] (load parameters))]
+              (store! i 0)
+              (loop
+                (if (>= (load i) pn) (break)
+                    (let [reference (al/al-get [ir/CoreRef] (load parameters) (load i))
+                          parameter-type (al/al-get [(ptr types/MonoType)]
+                                           (load parameter-types) (load i))
+                          incoming (primitive/fresh-identifier "carp_lambda_argument")
+                          cell (primitive/fresh-identifier "carp_lambda_argument_cell")
+                          live (primitive/fresh-identifier "carp_lambda_argument_live")]
+                      (al/al-push! [ir/CoreRef] local-references reference)
+                      (primitive/code-list-push! local-syntaxes-builder cell)
+                      (primitive/code-list-push! live-syntaxes-builder live)
+                      (primitive/code-list-push! parameters-code
+                        `(~incoming ~(type-code module type-syntaxes parameter-type)))
+                      (primitive/code-list-push! parameter-bindings cell)
+                      (primitive/code-list-push! parameter-bindings
+                        `(primitive/alloc-stack ~(type-code module type-syntaxes parameter-type)))
+                      (primitive/code-list-push! parameter-bindings
+                        (primitive/fresh-identifier "carp_lambda_argument_init"))
+                      (primitive/code-list-push! parameter-bindings `(store! ~cell ~incoming))
+                      (if (managed-type? plan parameter-type)
+                          (do (primitive/code-list-push! parameter-bindings `(mut ~live))
+                              (primitive/code-list-push! parameter-bindings `true)
+                              0) 0)
+                      (store! i (+ (load i) 1))))))
+            (let [prebound (+ cn (al/al-len [ir/CoreRef] (load parameters)))]
+              (collect-expression-bindings! local-references body)
+              (let [bn (al/al-len [ir/CoreRef] (load local-references))]
+                (store! i prebound)
+                (loop (if (>= (load i) bn) (break)
+                          (do (primitive/code-list-push! local-syntaxes-builder
+                                (primitive/fresh-identifier "carp_lambda_local"))
+                              (primitive/code-list-push! live-syntaxes-builder
+                                (primitive/fresh-identifier "carp_lambda_local_live"))
+                              (store! i (+ (load i) 1)))))))
+            (let [local-syntaxes (primitive/code-list-done local-syntaxes-builder)
+                  live-syntaxes (primitive/code-list-done live-syntaxes-builder)
+                  body-code (emit-expression context module type-syntaxes
+                              constructor-syntaxes function-syntaxes foreign-functions
+                              foreign-syntaxes plan local-references local-syntaxes
+                              live-syntaxes body)
+                  parameter-cleanups (primitive/code-list-new)
+                  pn (al/al-len [ir/CoreRef] (load parameters))]
+              (store! i 0)
+              (loop
+                (if (>= (load i) pn) (break)
+                    (let [binding (al/al-get [ir/CoreRef] (load parameters) (load i))
+                          local-index (+ cn (load i))
+                          cleanup-type (binding-delete-type plan
+                                         (ir/expression-id body) binding)]
+                      (if (= (primitive/cast i64 cleanup-type) 0) 0
+                          (do (primitive/code-list-push! parameter-cleanups
+                                `(if (load ~(primitive/code-nth live-syntaxes local-index))
+                                     ~(emit-delete-call module function-syntaxes cleanup-type
+                                        `(load ~(primitive/code-nth local-syntaxes local-index)))
+                                     0))
+                              0))
+                      (store! i (+ (load i) 1)))))
+              (let [cleanup-code (primitive/code-list-done parameter-cleanups)
+                    result (primitive/fresh-identifier "carp_lambda_result")
+                    lowered-body
+                      (if (= (primitive/code-count cleanup-code) 0) body-code
+                          `(let [~result ~body-code]
+                             ~@cleanup-code
+                             ~result))]
+              `(do
+                 (defstruct ~env-syntax [~@(primitive/code-list-done env-fields)])
+                 (defn ~code-syntax
+                   [(~raw-environment (ptr i8)) ~@(primitive/code-list-done parameters-code)]
+                   (-> ~(type-code module type-syntaxes result-type))
+                   (let [~environment (primitive/cast (ptr ~env-syntax) ~raw-environment)
+                         ~@(primitive/code-list-done parameter-bindings)]
+                     ~lowered-body))
+                 (defn ~copy-syntax [(~raw-environment (ptr i8))] (-> (ptr i8))
+                   (let [~environment (primitive/cast (ptr ~env-syntax) ~raw-environment)
+                         ~copied-environment
+                           (alloc/box! (alloc/malloc-allocator) ~env-syntax
+                             (zeroed ~env-syntax))]
+                     ~@(primitive/code-list-done copy-forms)
+                     (primitive/cast (ptr i8) ~copied-environment)))
+                 (defn ~delete-syntax [(~raw-environment (ptr i8))] (-> i64)
+                   (let [~environment (primitive/cast (ptr ~env-syntax) ~raw-environment)]
+                     ~@(primitive/code-list-done delete-forms)
+                     (alloc/destroy (alloc/malloc-allocator) ~environment))))))))
+        (_ (primitive/error "Carp emission: lambda has non-function type"))))
+    (_ (primitive/error "Carp emission: expected lambda expression"))))
+
+(defn emit-function
+  [(a (dyn alloc/Allocator)) (context Code) (module (ptr check/CheckedModule))
+   (type-syntaxes Code) (constructor-syntaxes Code)
+   (foreign-functions (ptr (al/ArrayList ForeignFunction)))
+   (foreign-syntaxes Code)
+   (function-syntaxes Code) (global-cells Code) (global-inits Code)
+   (checked (ptr check/CheckedFunction))
+   (syntax Code)] (-> Code)
+  (let [function (field checked function)
+        plan (field checked plan)]
+        (let [parameters (primitive/code-list-new)
+              local-syntaxes-builder (primitive/code-list-new)
+              live-syntaxes-builder (primitive/code-list-new)
+              parameter-live-bindings (primitive/code-list-new)
+              local-references (alloc/box! a (al/ArrayList ir/CoreRef)
+                                 (al/al-new [ir/CoreRef] a))
+              parameter-count (al/al-len [ir/CoreRef]
+                                (load (field function parameters)))
+              global-count (al/al-len [check/CheckedValue]
+                             (load (field module values)))
+              (mut i) 0]
+          (loop (if (>= (load i) parameter-count) (break)
+                    (let [reference (al/al-get [ir/CoreRef]
+                                      (load (field function parameters)) (load i))
+                          parameter-type (al/al-get [(ptr types/MonoType)]
+                                           (load (field function parameter-types)) (load i))
+                          incoming (primitive/fresh-identifier "carp_parameter")
+                          cell (primitive/fresh-identifier "carp_parameter_cell")]
+                      (al/al-push! [ir/CoreRef] local-references reference)
+                      (primitive/code-list-push! local-syntaxes-builder cell)
+                      (primitive/code-list-push! parameter-live-bindings cell)
+                      (primitive/code-list-push! parameter-live-bindings
+                        `(primitive/alloc-stack
+                           ~(type-code module type-syntaxes parameter-type)))
+                      (primitive/code-list-push! parameter-live-bindings
+                        (primitive/fresh-identifier "carp_parameter_init"))
+                      (primitive/code-list-push! parameter-live-bindings
+                        `(store! ~cell ~incoming))
+                      (let [live (primitive/fresh-identifier "carp_live")]
+                        (primitive/code-list-push! live-syntaxes-builder live)
+                        (if (managed-type? plan parameter-type)
+                            (do (primitive/code-list-push! parameter-live-bindings
+                                  `(mut ~live))
+                                (primitive/code-list-push! parameter-live-bindings `true)
+                                0)
+                            0))
+                      (primitive/code-list-push! parameters
+                        `(~incoming ~(type-code module type-syntaxes parameter-type)))
+                      (store! i (+ (load i) 1)))))
+          (let [(mut gi) 0]
+            (loop (if (>= (load gi) global-count) (break)
+                      (let [value (field (al/al-elem [check/CheckedValue]
+                                           (field module values) (load gi)) value)]
+                        (al/al-push! [ir/CoreRef] local-references
+                          (load (field value reference)))
+                        (primitive/code-list-push! local-syntaxes-builder
+                          (primitive/code-nth global-cells (load gi)))
+                        (primitive/code-list-push! live-syntaxes-builder
+                          (primitive/fresh-identifier "carp_global_live_unused"))
+                        (store! gi (+ (load gi) 1))))))
+          (collect-expression-bindings! local-references
+            (load (field function body)))
+          (let [binding-count (al/al-len [ir/CoreRef] (load local-references))]
+            (store! i (+ parameter-count global-count))
+            (loop (if (>= (load i) binding-count) (break)
+                      (do (primitive/code-list-push! local-syntaxes-builder
+                            (primitive/fresh-identifier "carp_local"))
+                          (primitive/code-list-push! live-syntaxes-builder
+                            (primitive/fresh-identifier "carp_live"))
+                          (store! i (+ (load i) 1))))))
+          (let [local-syntaxes (primitive/code-list-done local-syntaxes-builder)
+                live-syntaxes (primitive/code-list-done live-syntaxes-builder)
+                live-bindings (primitive/code-list-done parameter-live-bindings)
+                parameter-code (primitive/code-list-done parameters)
+                body (emit-expression context module type-syntaxes
+                       constructor-syntaxes function-syntaxes
+                       foreign-functions foreign-syntaxes plan
+                       local-references local-syntaxes live-syntaxes
+                       (load (field function body)))
+                result-type (match (load (load (field function signature)))
+                              (types/TypeFunction [_ result] result)
+                              (_ (primitive/error
+                                   "Carp emission: definition is not a function")))
+                cleanup-builder (primitive/code-list-new)]
+            (store! i 0)
+            (loop (if (>= (load i) parameter-count) (break)
+                      (let [binding (al/al-get [ir/CoreRef]
+                                      (load (field function parameters)) (load i))
+                            cleanup-type (binding-delete-type plan
+                                           (ir/expression-id
+                                             (load (field function body))) binding)]
+                        (if (= (primitive/cast i64 cleanup-type) 0) 0
+                            (do (primitive/code-list-push! cleanup-builder
+                                  `(if (load ~(primitive/code-nth live-syntaxes (load i)))
+                                   ~(emit-delete-call module function-syntaxes cleanup-type
+                                          `(load ~(primitive/code-nth local-syntaxes (load i))))
+                                       0))
+                                0))
+                        (store! i (+ (load i) 1)))))
+            (let [cleanups (primitive/code-list-done cleanup-builder)
+                  result (primitive/fresh-identifier "carp_function_result")
+                  source-reference (load (field function source))
+                  lowered-body
+                    (if (and (= (primitive/code-count live-bindings) 0)
+                             (= (primitive/code-count cleanups) 0)) body
+                        `(let [~@live-bindings ~result ~body]
+                           ~@cleanups
+                           ~result))
+                  initialized-body
+                    (if (not (str/str-eq (.name source-reference) "main"))
+                        lowered-body
+                        (let [initializers (primitive/code-list-new)
+                              gn (primitive/code-count global-inits) (mut gi) 0]
+                          (loop (if (>= (load gi) gn) (break)
+                                    (do (primitive/code-list-push! initializers
+                                          `(~(primitive/code-nth global-inits (load gi))))
+                                        (store! gi (+ (load gi) 1)))))
+                          `(do ~@(primitive/code-list-done initializers) ~lowered-body)))]
+              `(defn ~syntax [~@parameter-code]
+                 (-> ~(type-code module type-syntaxes result-type)) ~initialized-body))))))
+
+(defn emit-function-adapter
+  [(module (ptr check/CheckedModule)) (type-syntaxes Code)
+   (checked (ptr check/CheckedFunction)) (direct-syntax Code)
+   (adapter-syntax Code)] (-> Code)
+  (let [function (field checked function)]
+    (match (load (load (field function signature)))
+      (types/TypeFunction [argument-types result-type]
+        (let [parameters (primitive/code-list-new)
+              arguments (primitive/code-list-new)
+              n (al/al-len [(ptr types/MonoType)] (load argument-types))
+              (mut i) 0]
+          (primitive/code-list-push! parameters
+            `(~(primitive/fresh-identifier "carp_adapter_environment") (ptr i8)))
+          (loop (if (>= (load i) n) (break)
+                    (let [argument (primitive/fresh-identifier "carp_adapter_argument")]
+                      (primitive/code-list-push! parameters
+                        `(~argument ~(type-code module type-syntaxes
+                                      (al/al-get [(ptr types/MonoType)]
+                                        (load argument-types) (load i)))))
+                      (primitive/code-list-push! arguments argument)
+                      (store! i (+ (load i) 1)))))
+          `(defn ~adapter-syntax [~@(primitive/code-list-done parameters)]
+             (-> ~(type-code module type-syntaxes result-type))
+             (~direct-syntax ~@(primitive/code-list-done arguments)))))
+      (_ (primitive/error "Carp emission: adapter target is not a function")))))
+
+(defn emit-value
+  [(a (dyn alloc/Allocator)) (context Code) (module (ptr check/CheckedModule))
+   (type-syntaxes Code) (constructor-syntaxes Code)
+   (foreign-functions (ptr (al/ArrayList ForeignFunction)))
+   (foreign-syntaxes Code) (function-syntaxes Code)
+   (global-cells Code) (cell-syntax Code) (init-syntax Code)
+   (checked (ptr check/CheckedValue))] (-> Code)
+  (let [value (field checked value) plan (field checked plan)
+        local-references (alloc/box! a (al/ArrayList ir/CoreRef)
+                           (al/al-new [ir/CoreRef] a))
+        local-syntaxes-builder (primitive/code-list-new)
+        live-syntaxes-builder (primitive/code-list-new)
+        global-count (al/al-len [check/CheckedValue]
+                       (load (field module values)))
+        (mut i) 0]
+    (loop (if (>= (load i) global-count) (break)
+              (let [global-value (field (al/al-elem [check/CheckedValue]
+                                          (field module values) (load i)) value)]
+                (al/al-push! [ir/CoreRef] local-references
+                  (load (field global-value reference)))
+                (primitive/code-list-push! local-syntaxes-builder
+                  (primitive/code-nth global-cells (load i)))
+                (primitive/code-list-push! live-syntaxes-builder
+                  (primitive/fresh-identifier "carp_global_live_unused"))
+                (store! i (+ (load i) 1)))))
+    (collect-expression-bindings! local-references (load (field value body)))
+    (let [binding-count (al/al-len [ir/CoreRef] (load local-references))]
+      (store! i global-count)
+      (loop (if (>= (load i) binding-count) (break)
+                (do (primitive/code-list-push! local-syntaxes-builder
+                      (primitive/fresh-identifier "carp_global_local"))
+                    (primitive/code-list-push! live-syntaxes-builder
+                      (primitive/fresh-identifier "carp_global_live"))
+                    (store! i (+ (load i) 1))))))
+    (let [local-syntaxes (primitive/code-list-done local-syntaxes-builder)
+          live-syntaxes (primitive/code-list-done live-syntaxes-builder)
+          body-code (emit-expression context module type-syntaxes
+                      constructor-syntaxes function-syntaxes
+                      foreign-functions foreign-syntaxes plan
+                      local-references local-syntaxes live-syntaxes
+                      (load (field value body)))
+          value-type (load (field value type))]
+      `(do
+         (defn ~cell-syntax [] (-> (ptr ~(type-code module type-syntaxes value-type)))
+           (primitive/alloc-static ~(type-code module type-syntaxes value-type)))
+         (defn ~init-syntax [] (-> i64)
+           (do (store! (~cell-syntax) ~body-code) 0))))))
+
+(defn emit-module [(a (dyn alloc/Allocator)) (context Code)
+                   (module (ptr check/CheckedModule))] (-> Code)
+  (let [type-syntaxes (build-type-syntaxes module)
+        constructor-syntaxes (build-member-syntaxes module true)
+        field-syntaxes (build-member-syntaxes module false)
+        reachable-types (alloc/box! a (al/ArrayList i64)
+                          (build-reachable-types a module))
+        foreign-functions (alloc/box! a (al/ArrayList ForeignFunction)
+                            (build-foreign-functions a module))
+        foreign-syntaxes-builder (primitive/code-list-new)
+        syntaxes-builder (primitive/code-list-new)
+        global-cell-syntaxes-builder (primitive/code-list-new)
+        global-cell-calls-builder (primitive/code-list-new)
+        global-init-syntaxes-builder (primitive/code-list-new)
+        lambdas (alloc/box! a (al/ArrayList (ptr ir/SpecializedExpr))
+                  (build-lambda-expressions a module))
+        forms (primitive/code-list-new)
+        n (al/al-len [check/CheckedFunction] (load (field module functions)))
+        value-count (al/al-len [check/CheckedValue] (load (field module values)))
+        (mut i) 0]
+    (let [closure-index (al/al-len [ir/ResolvedTypeDefinition]
+                          (load (field module types)))
+          closure-type (primitive/code-nth type-syntaxes closure-index)
+          copy-null (primitive/code-nth type-syntaxes (+ closure-index 1))
+          delete-null (primitive/code-nth type-syntaxes (+ closure-index 2))]
+      (primitive/code-list-push! forms
+        `(defstruct ~closure-type [F]
+           [(code F)
+            (environment (ptr i8))
+            (copy-environment (fnptr c [(ptr i8)] (ptr i8)))
+            (delete-environment (fnptr c [(ptr i8)] i64))]))
+      (primitive/code-list-push! forms
+        `(defn ~copy-null [(environment (ptr i8))] (-> (ptr i8)) environment))
+      (primitive/code-list-push! forms
+        `(defn ~delete-null [(environment (ptr i8))] (-> i64) 0)))
+    (let [type-count (al/al-len [ir/ResolvedTypeDefinition]
+                       (load (field module types)))]
+      (loop (if (>= (load i) type-count) (break)
+                (do (if (= (al/al-get [i64] (load reachable-types) (load i)) 0) 0
+                        (do (primitive/code-list-push! forms
+                              (emit-runtime-type module type-syntaxes constructor-syntaxes
+                                field-syntaxes (load i)))
+                            0))
+                    (store! i (+ (load i) 1))))))
+    (let [foreign-count (al/al-len [ForeignFunction] (load foreign-functions))]
+      (store! i 0)
+      (loop (if (>= (load i) foreign-count) (break)
+                (do (primitive/code-list-push! foreign-syntaxes-builder
+                      (primitive/fresh-identifier "carp_foreign_function"))
+                    (store! i (+ (load i) 1))))))
+    (let [foreign-syntaxes (primitive/code-list-done foreign-syntaxes-builder)
+          foreign-count (al/al-len [ForeignFunction] (load foreign-functions))]
+      (store! i 0)
+      (loop (if (>= (load i) foreign-count) (break)
+                (do (primitive/code-list-push! forms
+                      (emit-foreign-wrapper context module type-syntaxes
+                        constructor-syntaxes
+                        (al/al-elem [ForeignFunction] foreign-functions (load i))
+                        (primitive/code-nth foreign-syntaxes (load i))))
+                    (store! i (+ (load i) 1)))))
+    (store! i 0)
+    (loop (if (>= (load i) value-count) (break)
+              (let [cell (primitive/fresh-identifier "carp_global_cell")
+                    init (primitive/fresh-identifier "carp_global_init")]
+                (primitive/code-list-push! global-cell-syntaxes-builder cell)
+                (primitive/code-list-push! global-cell-calls-builder `(~cell))
+                (primitive/code-list-push! global-init-syntaxes-builder init)
+                (store! i (+ (load i) 1)))))
+    (store! i 0)
+    ;; Allocate every declaration identifier first so recursion and forward
+    ;; calls splice the exact syntax object bound by the emitted definition.
+    (loop (if (>= (load i) n) (break)
+              (let [checked (al/al-get [check/CheckedFunction]
+                              (load (field module functions)) (load i))
+                    function (.function checked)
+                    name (generated-function-name a (.reference function))]
+                (primitive/code-list-push! syntaxes-builder
+                  (primitive/datum->syntax context name))
+                (primitive/code-list-push! syntaxes-builder
+                  (primitive/fresh-identifier "carp_function_adapter"))
+                (store! i (+ (load i) 1)))))
+    (let [lambda-count (al/al-len [(ptr ir/SpecializedExpr)] (load lambdas))]
+      (store! i 0)
+      (loop
+        (if (>= (load i) lambda-count) (break)
+            (let [expression (al/al-get [(ptr ir/SpecializedExpr)]
+                               (load lambdas) (load i))]
+              (match (load expression)
+                (ir/ExprLambda [_ _ parameters body]
+                  (let [(mut captures) (lambda-captures a parameters body)
+                        fields (primitive/code-list-new)
+                        cn (al/al-len [LambdaCapture] (load captures))
+                        (mut ci) 0]
+                    (primitive/code-list-push! syntaxes-builder
+                      (primitive/fresh-identifier "carp_lambda_environment_type"))
+                    (primitive/code-list-push! syntaxes-builder
+                      (primitive/fresh-identifier "carp_lambda_code"))
+                    (primitive/code-list-push! syntaxes-builder
+                      (primitive/fresh-identifier "carp_lambda_copy"))
+                    (primitive/code-list-push! syntaxes-builder
+                      (primitive/fresh-identifier "carp_lambda_delete"))
+                    (loop (if (>= (load ci) cn) (break)
+                              (do (primitive/code-list-push! fields
+                                    (primitive/fresh-identifier "carp_lambda_capture"))
+                                  (primitive/code-list-push! fields
+                                    (primitive/fresh-identifier "carp_lambda_capture_live"))
+                                  (store! ci (+ (load ci) 1)))))
+                    (primitive/code-list-push! syntaxes-builder
+                      (primitive/code-list-done fields))
+                    0))
+                (_ 0))
+              (store! i (+ (load i) 1))))))
+    (let [syntaxes (primitive/code-list-done syntaxes-builder)
+          global-cell-syntaxes (primitive/code-list-done global-cell-syntaxes-builder)
+          global-cells (primitive/code-list-done global-cell-calls-builder)
+          global-inits (primitive/code-list-done global-init-syntaxes-builder)]
+    (store! i 0)
+    (loop (if (>= (load i) n) (break)
+              (let [checked (al/al-elem [check/CheckedFunction]
+                              (field module functions) (load i))
+                    (mut owned-lambdas) (al/al-new [(ptr ir/SpecializedExpr)] a)]
+                (collect-lambda-expressions! (mut owned-lambdas)
+                  (load (field (field checked function) body)))
+                (let [ln (al/al-len [(ptr ir/SpecializedExpr)]
+                           (load owned-lambdas)) (mut li) 0]
+                  (loop (if (>= (load li) ln) (break)
+                            (do (primitive/code-list-push! forms
+                                  (emit-lambda-declaration a context module type-syntaxes
+                                    constructor-syntaxes foreign-functions foreign-syntaxes
+                                    syntaxes (field checked plan)
+                                    (al/al-get [(ptr ir/SpecializedExpr)]
+                                      (load owned-lambdas) (load li))))
+                                (store! li (+ (load li) 1)))))
+                  )
+                (store! i (+ (load i) 1)))))
+    (store! i 0)
+    (loop (if (>= (load i) value-count) (break)
+              (let [checked (al/al-elem [check/CheckedValue]
+                              (field module values) (load i))
+                    (mut owned-lambdas) (al/al-new [(ptr ir/SpecializedExpr)] a)]
+                (collect-lambda-expressions! (mut owned-lambdas)
+                  (load (field (field checked value) body)))
+                (let [ln (al/al-len [(ptr ir/SpecializedExpr)]
+                           (load owned-lambdas)) (mut li) 0]
+                  (loop (if (>= (load li) ln) (break)
+                            (do (primitive/code-list-push! forms
+                                  (emit-lambda-declaration a context module type-syntaxes
+                                    constructor-syntaxes foreign-functions foreign-syntaxes
+                                    syntaxes (field checked plan)
+                                    (al/al-get [(ptr ir/SpecializedExpr)]
+                                      (load owned-lambdas) (load li))))
+                                (store! li (+ (load li) 1)))))
+                  )
+                (store! i (+ (load i) 1)))))
+    (store! i 0)
+    (loop (if (>= (load i) value-count) (break)
+              (do (primitive/code-list-push! forms
+                    (emit-value a context module type-syntaxes constructor-syntaxes
+                      foreign-functions foreign-syntaxes syntaxes global-cells
+                      (primitive/code-nth global-cell-syntaxes (load i))
+                      (primitive/code-nth global-inits (load i))
+                      (al/al-elem [check/CheckedValue]
+                        (field module values) (load i))))
+                  (store! i (+ (load i) 1)))))
+    (store! i 0)
+    (loop (if (>= (load i) n) (break)
+              (do (primitive/code-list-push! forms
+                    (emit-function a context module type-syntaxes constructor-syntaxes
+                      foreign-functions foreign-syntaxes syntaxes
+                      global-cells global-inits
+                      (al/al-elem [check/CheckedFunction]
+                        (field module functions) (load i))
+                      (primitive/code-nth syntaxes (* (load i) 2))))
+                  (primitive/code-list-push! forms
+                    (emit-function-adapter module type-syntaxes
+                      (al/al-elem [check/CheckedFunction]
+                        (field module functions) (load i))
+                      (primitive/code-nth syntaxes (* (load i) 2))
+                      (primitive/code-nth syntaxes (+ (* (load i) 2) 1))))
+                  (store! i (+ (load i) 1)))))
+    (let [finished-forms (primitive/code-list-done forms)]
+      `(do ~@finished-forms))))))
+
+;; A direct same-module provider fixture. Keeping this beside the emitter makes
+;; the ordinary-Coil boundary independently testable even when Coil cannot yet
+;; retain transitive imported helpers in a reader-provider image.
+(defn emit-proof-program [(context Code)] (-> Code)
+  (let [a (alloc/malloc-allocator)
+        integer (types/type-integer a)
+        boolean (types/type-boolean a)
+        arguments (types/type-arguments-new a)
+        signature (types/type-function a arguments integer)
+        binary-arguments (types/type-arguments-new a)
+        _arg-a (types/type-arguments-push! binary-arguments integer)
+        _arg-b (types/type-arguments-push! binary-arguments integer)
+        add-signature (types/type-function a binary-arguments integer)
+        compare-arguments (types/type-arguments-new a)
+        _cmp-a (types/type-arguments-push! compare-arguments integer)
+        _cmp-b (types/type-arguments-push! compare-arguments integer)
+        equal-signature (types/type-function a compare-arguments boolean)
+        reference (ir/core-ref 1 "main" true)
+        parameters (alloc/box! a (al/ArrayList ir/CoreRef)
+                     (al/al-new [ir/CoreRef] a))
+        parameter-types (types/type-arguments-new a)
+        add-arguments (ir/expression-list-new a)
+        _twenty (ir/expression-list-push! add-arguments
+                  (ir/expression-box a (ir/ExprInt :id 1 :type integer :value 20)))
+        _twenty-two (ir/expression-list-push! add-arguments
+                      (ir/expression-box a
+                        (ir/ExprInt :id 2 :type integer :value 22)))
+        sum (ir/expression-box a
+              (ir/ExprGlobalCall :id 3 :type integer
+                :callee (ir/core-ref 200 "Int.+" true)
+                :signature add-signature :arguments add-arguments))
+        equal-arguments (ir/expression-list-new a)
+        _sum (ir/expression-list-push! equal-arguments sum)
+        _answer (ir/expression-list-push! equal-arguments
+                  (ir/expression-box a (ir/ExprInt :id 4 :type integer :value 42)))
+        condition (ir/expression-box a
+                    (ir/ExprGlobalCall :id 5 :type boolean
+                      :callee (ir/core-ref 201 "Int.=" true)
+                      :signature equal-signature :arguments equal-arguments))
+        body (ir/expression-box a
+               (ir/ExprIf :id 6 :type integer :condition condition
+                 :then-branch (ir/expression-box a
+                                (ir/ExprInt :id 7 :type integer :value 0))
+                 :else-branch (ir/expression-box a
+                                (ir/ExprInt :id 8 :type integer :value 1))))
+        function (ir/SpecializedFunction :source reference :reference reference
+                   :signature signature :parameters parameters
+                   :parameter-types parameter-types :body body)
+        plan (ownership/OwnershipPlan
+               :actions (al/al-new [ownership/OwnershipAction] a)
+               :requirements (al/al-new [ownership/OwnershipRequirement] a))
+        (mut functions) (al/al-new [check/CheckedFunction] a)]
+    (al/al-push! [check/CheckedFunction] (mut functions)
+      (check/CheckedFunction :function function :plan plan))
+    (let [module (alloc/box! a check/CheckedModule
+                   (check/CheckedModule :functions (load functions)
+                     :values (al/al-new [check/CheckedValue] a)
+                     :cleanups (al/al-new [check/CleanupTarget] a)
+                     :types (al/al-new [ir/ResolvedTypeDefinition] a)))]
+      (emit-module a context module))))

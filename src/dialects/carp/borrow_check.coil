@@ -1,0 +1,626 @@
+(module experiments.carp.borrow-check)
+
+;; Flow-sensitive ownership validation over specialized IR. Evaluation order is
+;; explicit, by-value call arguments move only after every argument expression
+;; has been evaluated, and control-flow joins conservatively retain any possible
+;; move and every possible borrow owner.
+
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "coil.str" :as str)
+(import "experiments.carp.ir" :as ir)
+(import "experiments.carp.ownership" :as own)
+(import "experiments.carp.types" :as types)
+
+(defsum OwnershipClass
+  (OwnershipUnmanaged [])
+  (OwnershipOwned [])
+  (OwnershipBorrowed []))
+
+(defstruct OwnershipTypeFacts
+  [(owned-names (ptr (al/ArrayList (slice u8))))
+   (blit-names (ptr (al/ArrayList (slice u8))))
+   (owned-types (ptr (al/ArrayList (ptr types/MonoType))))
+   (blit-types (ptr (al/ArrayList (ptr types/MonoType))))])
+
+(defstruct BorrowFlags
+  [(escaped bool)
+   (after-move bool)
+   (captured-move bool)])
+
+(defn ownership-facts-new [(a (dyn alloc/Allocator))] (-> OwnershipTypeFacts)
+  (OwnershipTypeFacts
+    :owned-names (alloc/box! a
+                             (al/ArrayList (slice u8))
+                             (al/al-new [(slice u8)] a))
+    :blit-names (alloc/box! a
+                            (al/ArrayList (slice u8))
+                            (al/al-new [(slice u8)] a))
+    :owned-types (alloc/box! a (al/ArrayList (ptr types/MonoType))
+                   (al/al-new [(ptr types/MonoType)] a))
+    :blit-types (alloc/box! a (al/ArrayList (ptr types/MonoType))
+                  (al/al-new [(ptr types/MonoType)] a))))
+
+(defn ownership-facts-add-owned! [(facts (ptr OwnershipTypeFacts))
+                                  (name (slice u8))] (-> i64)
+  (al/al-push! [(slice u8)] (load (field facts owned-names)) name))
+
+(defn ownership-facts-add-blit! [(facts (ptr OwnershipTypeFacts))
+                                 (name (slice u8))] (-> i64)
+  (al/al-push! [(slice u8)] (load (field facts blit-names)) name))
+
+(defn ownership-facts-add-owned-type! [(facts (ptr OwnershipTypeFacts))
+                                       (type (ptr types/MonoType))] (-> i64)
+  (al/al-push! [(ptr types/MonoType)] (load (field facts owned-types)) type))
+
+(defn ownership-facts-add-blit-type! [(facts (ptr OwnershipTypeFacts))
+                                      (type (ptr types/MonoType))] (-> i64)
+  (al/al-push! [(ptr types/MonoType)] (load (field facts blit-types)) type))
+
+(defn name-list-has? [(names (ptr (al/ArrayList (slice u8))))
+                      (name (slice u8))] (-> bool)
+  (let [n (al/al-len [(slice u8)] (load names))
+        (mut i) 0
+        (mut found) false]
+    (loop
+      (if (or (load found) (>= (load i) n))
+          (break)
+          (do
+            (if (str/str-eq (al/al-get [(slice u8)] (load names) (load i)) name)
+                (store! found true)
+                0)
+            (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn type-list-has? [(items (ptr (al/ArrayList (ptr types/MonoType))))
+                      (type (ptr types/MonoType))] (-> bool)
+  (let [n (al/al-len [(ptr types/MonoType)] (load items))
+        (mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) n) (load found)) (break)
+              (do (if (types/type-same-representation?
+                        (al/al-get [(ptr types/MonoType)] (load items) (load i)) type)
+                      (store! found true) 0)
+                  (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn ownership-classify [(type (ptr types/MonoType))
+                          (facts (ptr OwnershipTypeFacts))] (-> OwnershipClass)
+  (if (type-list-has? (load (field facts blit-types)) type)
+      (OwnershipUnmanaged)
+      (if (type-list-has? (load (field facts owned-types)) type)
+          (OwnershipOwned)
+  (match (load type)
+    (types/TypeReference [_ _] (OwnershipBorrowed))
+    (types/TypeString [] (OwnershipOwned))
+    (types/TypeFunction [_ _] (OwnershipOwned))
+    (types/TypeNamed [name _]
+      (if (name-list-has? (load (field facts blit-names)) name)
+          (OwnershipUnmanaged)
+          (if (name-list-has? (load (field facts owned-names)) name)
+              (OwnershipOwned)
+              (OwnershipUnmanaged))))
+    (_ (OwnershipUnmanaged))))))
+
+(defn ownership-owned? [(type (ptr types/MonoType))
+                        (facts (ptr OwnershipTypeFacts))] (-> bool)
+  (match (ownership-classify type facts)
+    (OwnershipOwned [] true)
+    (_ false)))
+
+(defn type-reference? [(type (ptr types/MonoType))] (-> bool)
+  (match (load type) (types/TypeReference [_ _] true) (_ false)))
+
+(defn ref-list-has? [(references (ptr (al/ArrayList ir/CoreRef)))
+                     (target ir/CoreRef)] (-> bool)
+  (let [n (al/al-len [ir/CoreRef] (load references))
+        (mut i) 0
+        (mut found) false]
+    (loop
+      (if (or (load found) (>= (load i) n))
+          (break)
+          (do
+            (if (ir/core-ref-same? (al/al-get [ir/CoreRef] (load references) (load i))
+                                  target)
+                (store! found true)
+                0)
+            (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn collect-lifetimes! [(type (ptr types/MonoType))
+                          (lifetimes (ptr (al/ArrayList i64)))] (-> i64)
+  (match (load type)
+    (types/TypeReference [inner lifetime]
+      (do
+        (match lifetime
+          (types/LifetimeVariable [id] (own/id-list-add! lifetimes id))
+          (types/LifetimeStatic [] 0))
+        (collect-lifetimes! inner lifetimes)))
+    (types/TypeNamed [_ arguments]
+      (let [n (al/al-len [(ptr types/MonoType)] (load arguments))
+            (mut i) 0]
+        (loop
+          (if (>= (load i) n)
+              (break)
+              (do
+                (collect-lifetimes!
+                  (al/al-get [(ptr types/MonoType)] (load arguments) (load i))
+                  lifetimes)
+                (store! i (+ (load i) 1)))))
+        0))
+    (types/TypeFunction [arguments result]
+      (let [n (al/al-len [(ptr types/MonoType)] (load arguments))
+            (mut i) 0]
+        (loop
+          (if (>= (load i) n)
+              (break)
+              (do
+                (collect-lifetimes!
+                  (al/al-get [(ptr types/MonoType)] (load arguments) (load i))
+                  lifetimes)
+                (store! i (+ (load i) 1)))))
+        (collect-lifetimes! result lifetimes)))
+    (_ 0)))
+
+(defn lifetimes-overlap? [(left (ptr (al/ArrayList i64)))
+                          (right (ptr (al/ArrayList i64)))] (-> bool)
+  (let [n (al/al-len [i64] (load left))
+        (mut i) 0
+        (mut found) false]
+    (loop
+      (if (or (load found) (>= (load i) n))
+          (break)
+          (do
+            (if (own/id-list-has? right (al/al-get [i64] (load left) (load i)))
+                (store! found true)
+                0)
+            (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn borrow-flags-new [] (-> BorrowFlags)
+  (BorrowFlags :escaped false :after-move false :captured-move false))
+
+(defn flag-check! [(flags (ptr BorrowFlags)) (check own/BorrowCheck)] (-> i64)
+  (match check
+    (own/BorrowValid [] 0)
+    (own/BorrowEscapes [] (do (store! (field flags escaped) true) 0))
+    (own/BorrowOwnerMoved [_] (do (store! (field flags after-move) true) 0))))
+
+(defn expression-origin [(a (dyn alloc/Allocator))
+                         (expression (ptr ir/SpecializedExpr))
+                         (state (ptr own/BorrowState))
+                         (parameters (ptr (al/ArrayList ir/CoreRef)))]
+  (-> (ptr own/BorrowOrigin))
+  (match (load expression)
+    (ir/ExprBorrow [_ _ operand]
+      (match (load operand)
+        (ir/ExprReference [_ _ binding]
+          (cond (ir/core-ref-global? binding) (own/borrow-origin-static a)
+                (ref-list-has? parameters binding)
+                  (own/borrow-origin-parameter a (ir/core-ref-id binding))
+                :else (own/borrow-origin-local a (ir/core-ref-id binding))))
+        (_ (own/borrow-origin-temporary a (ir/expression-id operand)))))
+    (ir/ExprReference [_ type binding]
+      (cond (ir/core-ref-global? binding) (own/borrow-origin-static a)
+            (ref-list-has? parameters binding)
+              (if (type-reference? type)
+                  (own/borrow-origin-external a)
+                  (own/borrow-origin a false false))
+            :else
+              (let [origin (own/borrow-state-origin state (ir/core-ref-id binding))]
+                (if (= (primitive/cast i64 origin) 0)
+                    (own/borrow-origin a false false)
+                    origin))))
+    (ir/ExprGlobalCall [_ _ _ signature arguments]
+      (call-result-origin a signature arguments state parameters))
+    (ir/ExprAnnotation [_ _ inner]
+      (expression-origin a inner state parameters))
+    (_ (own/borrow-origin a false false))))
+
+(defn call-result-origin [(a (dyn alloc/Allocator))
+                          (signature (ptr types/MonoType))
+                          (arguments (ptr (al/ArrayList (ptr ir/SpecializedExpr))))
+                          (state (ptr own/BorrowState))
+                          (parameters (ptr (al/ArrayList ir/CoreRef)))]
+  (-> (ptr own/BorrowOrigin))
+  (match (load signature)
+    (types/TypeFunction [argument-types result-type]
+      (let [result-lifetimes (own/id-list-new a)]
+        (collect-lifetimes! result-type result-lifetimes)
+        (if (= (al/al-len [i64] (load result-lifetimes)) 0)
+            (match (load result-type)
+              (types/TypeReference [_ lifetime]
+                (match lifetime
+                  (types/LifetimeStatic [] (own/borrow-origin-static a))
+                  (_ (own/borrow-origin a false false))))
+              (_ (own/borrow-origin a false false)))
+            (let [(mut result) (own/borrow-origin a false false)
+                  n (let [an (al/al-len [(ptr ir/SpecializedExpr)] (load arguments))
+                          tn (al/al-len [(ptr types/MonoType)] (load argument-types))]
+                      (if (< an tn) an tn))
+                  (mut i) 0]
+              (loop
+                (if (>= (load i) n)
+                    (break)
+                    (let [argument-lifetimes (own/id-list-new a)]
+                      (collect-lifetimes!
+                        (al/al-get [(ptr types/MonoType)] (load argument-types) (load i))
+                        argument-lifetimes)
+                      (if (lifetimes-overlap? argument-lifetimes result-lifetimes)
+                          (store! result
+                                  (own/borrow-origin-join
+                                    a
+                                    (load result)
+                                    (expression-origin
+                                      a
+                                      (al/al-get [(ptr ir/SpecializedExpr)]
+                                                 (load arguments)
+                                                 (load i))
+                                      state
+                                      parameters)))
+                          0)
+                      (store! i (+ (load i) 1)))))
+              (load result)))))
+    (_ (own/borrow-origin a false false))))
+
+(defn mark-reference-moved! [(a (dyn alloc/Allocator))
+                             (state (ptr own/BorrowState))
+                             (expression (ptr ir/SpecializedExpr))
+                             (facts (ptr OwnershipTypeFacts))]
+  (-> own/BorrowState)
+  (match (load expression)
+    (ir/ExprReference [_ type binding]
+      (if (and (not (ir/core-ref-global? binding))
+               (ownership-owned? type facts))
+          (own/borrow-state-mark-moved a state (ir/core-ref-id binding))
+          (load state)))
+    (_ (load state))))
+
+(defn analyze-call-arguments [(a (dyn alloc/Allocator))
+                              (signature (ptr types/MonoType))
+                              (arguments (ptr (al/ArrayList (ptr ir/SpecializedExpr))))
+                              (state (ptr own/BorrowState))
+                              (parameters (ptr (al/ArrayList ir/CoreRef)))
+                              (facts (ptr OwnershipTypeFacts))
+                              (flags (ptr BorrowFlags))]
+  (-> own/BorrowState)
+  (match (load signature)
+    (types/TypeFunction [argument-types _]
+      (let [(mut current) (load state)
+            pending (own/id-list-new a)
+            n (al/al-len [(ptr ir/SpecializedExpr)] (load arguments))
+            (mut i) 0]
+        (loop
+          (if (>= (load i) n)
+              (break)
+              (let [argument (al/al-get [(ptr ir/SpecializedExpr)]
+                                        (load arguments)
+                                        (load i))]
+                (store! current
+                        (analyze-expression a
+                                            argument
+                                            (mut current)
+                                            parameters
+                                            facts
+                                            flags
+                                            false))
+                (if (and (< (load i)
+                            (al/al-len [(ptr types/MonoType)] (load argument-types)))
+                         (type-reference?
+                           (al/al-get [(ptr types/MonoType)]
+                                      (load argument-types)
+                                      (load i))))
+                    (flag-check! flags
+                                 (own/borrow-check-origin
+                                   (expression-origin a argument (mut current) parameters)
+                                   (mut current)
+                                   false))
+                    (match (load argument)
+                      (ir/ExprReference [_ type binding]
+                        (if (and (not (ir/core-ref-global? binding))
+                                 (ownership-owned? type facts))
+                            (own/id-list-add! pending (ir/core-ref-id binding))
+                            0))
+                      (_ 0)))
+                (store! i (+ (load i) 1)))))
+        ;; The call consumes by-value arguments after all argument expressions
+        ;; have been evaluated, matching C/Carp call semantics.
+        (store! i 0)
+        (loop
+          (if (>= (load i) (al/al-len [i64] (load pending)))
+              (break)
+              (do
+                (store! current
+                        (own/borrow-state-mark-moved
+                          a
+                          (mut current)
+                          (al/al-get [i64] (load pending) (load i))))
+                (store! i (+ (load i) 1)))))
+        (load current)))
+    (_ (load state))))
+
+(defn analyze-expression [(a (dyn alloc/Allocator))
+                          (expression (ptr ir/SpecializedExpr))
+                          (state (ptr own/BorrowState))
+                          (parameters (ptr (al/ArrayList ir/CoreRef)))
+                          (facts (ptr OwnershipTypeFacts))
+                          (flags (ptr BorrowFlags))
+                          (tail-position bool)] (-> own/BorrowState)
+  (match (load expression)
+    (ir/ExprLiteral [_ _] (load state))
+    (ir/ExprInt [_ _ _] (load state))
+    (ir/ExprByte [_ _ _] (load state))
+    (ir/ExprLong [_ _ _] (load state))
+    (ir/ExprFloat [_ _ _] (load state))
+    (ir/ExprDouble [_ _ _] (load state))
+    (ir/ExprBool [_ _ _] (load state))
+    (ir/ExprChar [_ _ _] (load state))
+    (ir/ExprString [_ _ _] (load state))
+    (ir/ExprPattern [_ _ _] (load state))
+    (ir/ExprUnit [_ _] (load state))
+    (ir/ExprBreak [_ _] (load state))
+    (ir/ExprArray [_ _ items _]
+      (let [argument-types (types/type-arguments-new a)
+            n (al/al-len [(ptr ir/SpecializedExpr)] (load items)) (mut i) 0]
+        (loop (if (>= (load i) n) (break)
+                  (do (types/type-arguments-push! argument-types
+                        (ir/expression-type
+                          (al/al-get [(ptr ir/SpecializedExpr)]
+                            (load items) (load i))))
+                      (store! i (+ (load i) 1)))))
+        (let [signature (types/type-function a argument-types (types/type-unit a))]
+          (analyze-call-arguments a signature items state parameters facts flags))))
+    (ir/ExprReference [_ type binding]
+      (do
+        (if (and (not (ir/core-ref-global? binding))
+                 (own/borrow-state-moved? state (ir/core-ref-id binding)))
+            (store! (field flags after-move) true)
+            0)
+        (if (or tail-position (type-reference? type))
+            (flag-check! flags
+                         (own/borrow-check-origin
+                           (expression-origin a expression state parameters)
+                           state
+                           tail-position))
+            0)
+        (load state)))
+    (ir/ExprBorrow [_ _ operand]
+      (let [(mut current) (analyze-expression a
+                                              operand
+                                              state
+                                              parameters
+                                              facts
+                                              flags
+                                              false)
+            origin (expression-origin a expression (mut current) parameters)]
+        (flag-check! flags
+                     (own/borrow-check-origin origin (mut current) tail-position))
+        (load current)))
+    (ir/ExprAnnotation [_ _ inner]
+      (analyze-expression a inner state parameters facts flags tail-position))
+    (ir/ExprLet [_ _ binding value body]
+      (let [(mut after-value) (analyze-expression a
+                                                  value
+                                                  state
+                                                  parameters
+                                                  facts
+                                                  flags
+                                                  false)
+            value-origin (expression-origin a value (mut after-value) parameters)
+            (mut fresh) (own/borrow-state-unmove
+                          a
+                          (mut after-value)
+                          (ir/core-ref-id binding))
+            (mut bound) (own/borrow-state-set-origin
+                          a
+                          (mut fresh)
+                          (ir/core-ref-id binding)
+                          value-origin)
+            (mut after-body) (analyze-expression a
+                                                 body
+                                                 (mut bound)
+                                                 parameters
+                                                 facts
+                                                 flags
+                                                 tail-position)]
+        (own/borrow-state-mark-moved a
+                                     (mut after-body)
+                                     (ir/core-ref-id binding))))
+    (ir/ExprSet [_ _ binding value]
+      (let [(mut after-value) (analyze-expression a
+                                                  value
+                                                  state
+                                                  parameters
+                                                  facts
+                                                  flags
+                                                  false)
+            value-origin (expression-origin a value (mut after-value) parameters)
+            (mut fresh) (own/borrow-state-unmove
+                          a
+                          (mut after-value)
+                          (ir/core-ref-id binding))]
+        (own/borrow-state-set-origin a
+                                     (mut fresh)
+                                     (ir/core-ref-id binding)
+                                     value-origin)))
+    (ir/ExprDo [_ _ expressions]
+      (let [(mut current) (load state)
+            n (al/al-len [(ptr ir/SpecializedExpr)] (load expressions))
+            (mut i) 0]
+        (loop
+          (if (>= (load i) n)
+              (break)
+              (do
+                (store! current
+                        (analyze-expression
+                          a
+                          (al/al-get [(ptr ir/SpecializedExpr)]
+                                     (load expressions)
+                                     (load i))
+                          (mut current)
+                          parameters
+                          facts
+                          flags
+                          (and tail-position (= (load i) (- n 1)))))
+                (store! i (+ (load i) 1)))))
+        (load current)))
+    (ir/ExprIf [_ _ condition then-branch else-branch]
+      (let [(mut after-condition) (analyze-expression a
+                                                      condition
+                                                      state
+                                                      parameters
+                                                      facts
+                                                      flags
+                                                      false)
+            (mut then-state) (analyze-expression a
+                                                 then-branch
+                                                 (mut after-condition)
+                                                 parameters
+                                                 facts
+                                                 flags
+                                                 tail-position)
+            (mut else-state) (analyze-expression a
+                                                 else-branch
+                                                 (mut after-condition)
+                                                 parameters
+                                                 facts
+                                                 flags
+                                                 tail-position)]
+        (own/borrow-state-join a (mut then-state) (mut else-state))))
+    (ir/ExprWhile [_ _ condition body]
+      (let [(mut after-condition) (analyze-expression a
+                                                      condition
+                                                      state
+                                                      parameters
+                                                      facts
+                                                      flags
+                                                      false)
+            (mut once) (analyze-expression a
+                                           body
+                                           (mut after-condition)
+                                           parameters
+                                           facts
+                                           flags
+                                           false)
+            (mut merged) (own/borrow-state-join a (mut after-condition) (mut once))
+            (mut twice) (analyze-expression a
+                                            body
+                                            (mut merged)
+                                            parameters
+                                            facts
+                                            flags
+                                            false)]
+        (own/borrow-state-join a (mut after-condition) (mut twice))))
+    (ir/ExprGlobalCall [_ _ _ signature arguments]
+      (let [(mut current) (analyze-call-arguments a
+                                                 signature
+                                                 arguments
+                                                 state
+                                                 parameters
+                                                 facts
+                                                 flags)
+            origin (expression-origin a expression (mut current) parameters)]
+        (flag-check! flags
+                     (own/borrow-check-origin origin (mut current) tail-position))
+        (load current)))
+    (ir/ExprCall [_ _ callee arguments]
+      (let [(mut current) (analyze-expression a
+                                              callee
+                                              state
+                                              parameters
+                                              facts
+                                              flags
+                                              false)
+            n (al/al-len [(ptr ir/SpecializedExpr)] (load arguments))
+            (mut i) 0]
+        (flag-check! flags
+                     (own/borrow-check-origin
+                       (expression-origin a callee (mut current) parameters)
+                       (mut current)
+                       false))
+        (loop
+          (if (>= (load i) n)
+              (break)
+              (do
+                (store! current
+                        (analyze-expression
+                          a
+                          (al/al-get [(ptr ir/SpecializedExpr)]
+                                     (load arguments)
+                                     (load i))
+                          (mut current)
+                          parameters
+                          facts
+                          flags
+                          false))
+                (store! i (+ (load i) 1)))))
+        (load current)))
+    (ir/ExprLambda [_ _ _ body]
+      (analyze-expression a body state parameters facts flags false))
+    (ir/ExprMatch [_ _ by-reference scrutinee branches]
+      (let [(mut entry) (analyze-expression a
+                                            scrutinee
+                                            state
+                                            parameters
+                                            facts
+                                            flags
+                                            false)]
+        (if by-reference
+            0
+            (store! entry (mark-reference-moved! a (mut entry) scrutinee facts)))
+        (let [n (al/al-len [ir/SpecializedMatchBranch] (load branches))
+              (mut i) 0
+              (mut seen) false
+              (mut joined) (load entry)]
+          (loop
+            (if (>= (load i) n)
+                (break)
+                (let [branch (al/al-elem [ir/SpecializedMatchBranch]
+                                         branches
+                                         (load i))
+                      bindings (load (field branch bindings))
+                      bn (al/al-len [ir/CoreRef] (load bindings))
+                      (mut bi) 0
+                      (mut branch-entry) (load entry)]
+                  (loop
+                    (if (>= (load bi) bn)
+                        (break)
+                        (let [binding (al/al-get [ir/CoreRef] (load bindings) (load bi))]
+                          (store! branch-entry
+                                  (own/borrow-state-unmove
+                                    a
+                                    (mut branch-entry)
+                                    (ir/core-ref-id binding)))
+                          (store! bi (+ (load bi) 1)))))
+                  (let [(mut branch-state)
+                          (analyze-expression a
+                                              (load (field branch body))
+                                              (mut branch-entry)
+                                              parameters
+                                              facts
+                                              flags
+                                              tail-position)]
+                    (if (load seen)
+                        (store! joined
+                                (own/borrow-state-join a
+                                                       (mut joined)
+                                                       (mut branch-state)))
+                        (do (store! joined (load branch-state))
+                            (store! seen true))))
+                  (store! i (+ (load i) 1)))))
+          (load joined))))))
+
+(defn check-borrows [(a (dyn alloc/Allocator))
+                     (body (ptr ir/SpecializedExpr))
+                     (parameters (ptr (al/ArrayList ir/CoreRef)))
+                     (facts (ptr OwnershipTypeFacts))] (-> BorrowFlags)
+  (let [(mut flags) (borrow-flags-new)
+        (mut state) (own/borrow-state-new a)]
+    (let [(mut final-state) (analyze-expression a
+                                                body
+                                                (mut state)
+                                                parameters
+                                                facts
+                                                (mut flags)
+                                                true)]
+      (load flags))))

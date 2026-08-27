@@ -1,0 +1,1318 @@
+(module experiments.carp.infer-engine)
+
+;; Expression inference over resolved Carp. Global signatures are polymorphic;
+;; unsignatured recursive definitions receive monomorphic placeholders before
+;; any body is visited. Every expression type and overload choice is retained
+;; for specialization rather than reconstructed from spelling later.
+
+(import "experiments.carp.infer" :as schemes)
+(import "experiments.carp.ir" :as ir)
+(import "experiments.carp.types" :as types)
+(import "experiments.carp.primitive-types" :as primitive-types)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Option Some None])
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+
+(export InferredNodeType InferredCall InferredOverloadConstraint InferredDefinition
+        InferredBinding
+        InferredPatternBinding
+        InferredModule InferenceResult
+        infer-module inference-failed? inferred-module inference-error
+        inferred-call-count inferred-overload-count inferred-resolved-overload-count)
+
+(defstruct InferredNodeType [(id i64) (type (ptr types/MonoType))])
+(defstruct InferredCall [(id i64) (callee ir/CoreRef)
+                         (signature (ptr types/MonoType))])
+(defstruct InferredDefinition
+  [(reference ir/CoreRef) (signature (ptr types/MonoType))])
+(defstruct InferredPatternBinding
+  [(reference ir/CoreRef) (type (ptr types/MonoType))])
+(defstruct InferredOverloadConstraint
+  [(id i64) (name (slice u8))
+   (owner ir/CoreRef)
+   (candidates (ptr (al/ArrayList ir/CoreRef)))
+   (expected (ptr types/MonoType))
+   (selected ir/CoreRef) (resolved bool)])
+(defstruct InferredBinding
+  [(reference ir/CoreRef) (scheme schemes/TypeScheme)
+   (constraints (ptr (al/ArrayList InferredOverloadConstraint)))])
+(defstruct InferredModule
+  [(globals (al/ArrayList InferredBinding))
+   (definitions (al/ArrayList InferredDefinition))
+   (pattern-bindings (al/ArrayList InferredPatternBinding))
+   (node-types (al/ArrayList InferredNodeType))
+   (calls (al/ArrayList InferredCall))
+   (overloads (al/ArrayList InferredOverloadConstraint))
+   (solver types/TypeSolver)])
+(defstruct InferenceResult
+  [(module InferredModule) (failed i64) (message (slice u8))])
+(defstruct SolverSnapshot
+  [(types i64) (lifetimes i64) (constructors i64) (next i64)])
+(defstruct InferState
+  [(a (dyn alloc/Allocator))
+   (solver (ptr types/TypeSolver))
+   (next (ptr i64))
+   (globals (ptr (al/ArrayList InferredBinding)))
+   (function-references (ptr (al/ArrayList ir/CoreRef)))
+   (definitions (ptr (al/ArrayList InferredDefinition)))
+   (pattern-bindings (ptr (al/ArrayList InferredPatternBinding)))
+   (locals (ptr (al/ArrayList InferredBinding)))
+   (node-types (ptr (al/ArrayList InferredNodeType)))
+   (calls (ptr (al/ArrayList InferredCall)))
+   (overloads (ptr (al/ArrayList InferredOverloadConstraint)))
+   (current-owner (ptr ir/CoreRef))
+   (failed (ptr i64))
+   (message (ptr (slice u8)))])
+
+(defn reference-in-list? [(references (ptr (al/ArrayList ir/CoreRef)))
+                          (reference ir/CoreRef)] (-> bool)
+  (let [n (al/al-len [ir/CoreRef] (load references))
+        (mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) n) (load found)) (break)
+              (do (if (ir/core-ref-same?
+                        (al/al-get [ir/CoreRef] (load references) (load i)) reference)
+                      (store! found true) 0)
+                  (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn definition-inferred? [(state (ptr InferState)) (reference ir/CoreRef)]
+  (-> bool)
+  (let [n (al/al-len [InferredDefinition]
+            (load (load (field state definitions))))
+        (mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) n) (load found)) (break)
+              (let [entry (al/al-get [InferredDefinition]
+                            (load (load (field state definitions))) (load i))]
+                (if (ir/core-ref-same? (.reference entry) reference)
+                    (store! found true) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn inferred-definition-signature [(state (ptr InferState))
+                                     (reference ir/CoreRef)]
+  (-> (ptr types/MonoType))
+  (let [n (al/al-len [InferredDefinition]
+            (load (load (field state definitions))))
+        (mut i) n (mut found) (primitive/cast (ptr types/MonoType) 0)]
+    (loop (if (or (<= (load i) 0)
+                  (!= (primitive/cast i64 (load found)) 0)) (break)
+              (do (store! i (- (load i) 1))
+                  (let [entry (al/al-get [InferredDefinition]
+                                (load (load (field state definitions))) (load i))]
+                    (if (ir/core-ref-same? (.reference entry) reference)
+                        (store! found (.signature entry)) 0)))))
+    (load found)))
+
+(defn candidate-ready? [(state (ptr InferState)) (reference ir/CoreRef)] (-> bool)
+  (or (not (reference-in-list? (load (field state function-references)) reference))
+      (definition-inferred? state reference)))
+
+(defn inference-failed? [(result InferenceResult)] (-> bool)
+  (!= (.failed result) 0))
+(defn inferred-module [(result InferenceResult)] (-> InferredModule)
+  (.module result))
+(defn inference-error [(result InferenceResult)] (-> (slice u8))
+  (.message result))
+
+(defn inferred-call-count [(module InferredModule)] (-> i64)
+  (al/al-len [InferredCall] (.calls module)))
+
+(defn inferred-overload-count [(module InferredModule)] (-> i64)
+  (al/al-len [InferredOverloadConstraint] (.overloads module)))
+
+(defn inferred-resolved-overload-count [(module InferredModule)] (-> i64)
+  (let [n (al/al-len [InferredOverloadConstraint] (.overloads module))
+        (mut i) 0 (mut count) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (let [constraint (al/al-get [InferredOverloadConstraint]
+                                     (.overloads module) (load i))]
+                    (if (.resolved constraint)
+                        (store! count (+ (load count) 1)) 0))
+                  (store! i (+ (load i) 1)))))
+    (load count)))
+
+(defn empty-variables [(a (dyn alloc/Allocator))] (-> (ptr (al/ArrayList i64)))
+  (alloc/box! a (al/ArrayList i64) (al/al-new [i64] a)))
+
+(defn empty-overloads [(a (dyn alloc/Allocator))]
+  (-> (ptr (al/ArrayList InferredOverloadConstraint)))
+  (alloc/box! a (al/ArrayList InferredOverloadConstraint)
+    (al/al-new [InferredOverloadConstraint] a)))
+
+(defn mono-scheme [(a (dyn alloc/Allocator)) (body (ptr types/MonoType))]
+  (-> schemes/TypeScheme)
+  (schemes/TypeScheme :type-variables (empty-variables a)
+                      :lifetime-variables (empty-variables a)
+                      :body body))
+
+(defn fail! [(state (mut InferState)) (message (slice u8))] (-> i64)
+  (if (= (load (load (field state failed))) 0)
+      (do (store! (load (field state failed)) 1)
+          (store! (load (field state message)) message)
+          0) 0))
+
+(defn contextualize-function-error! [(state (mut InferState))
+                                     (reference ir/CoreRef)] (-> i64)
+  (if (= (load (load (field state failed))) 0) 0
+      (let [(mut out) (str/sb-new (load (field state a)))]
+        (str/sb-push-str! (mut out) "inference in ")
+        (str/sb-push-str! (mut out) (.name reference))
+        (str/sb-push-str! (mut out) ": ")
+        (str/sb-push-str! (mut out) (load (load (field state message))))
+        (store! (load (field state message)) (str/sb-finish! (mut out)))
+        0)))
+
+(defn contextualize-call-error! [(state (mut InferState))
+                                 (reference ir/CoreRef)] (-> i64)
+  (if (= (load (load (field state failed))) 0) 0
+      (let [(mut out) (str/sb-new (load (field state a)))]
+        (str/sb-push-str! (mut out) "call to ")
+        (str/sb-push-str! (mut out) (.name reference))
+        (str/sb-push-str! (mut out) ": ")
+        (str/sb-push-str! (mut out) (load (load (field state message))))
+        (store! (load (field state message)) (str/sb-finish! (mut out)))
+        0)))
+
+(defn fresh! [(state (mut InferState))] (-> (ptr types/MonoType))
+  (let [id (load (load (field state next)))]
+    (store! (load (field state next)) (+ id 1))
+    (types/type-variable (load (field state a)) id)))
+
+(defn same-reference? [(left ir/CoreRef) (right ir/CoreRef)] (-> bool)
+  (ir/core-ref-same? left right))
+
+(defn binding-index [(bindings (ptr (al/ArrayList InferredBinding)))
+                     (reference ir/CoreRef)] (-> i64)
+  (let [(mut i) (al/al-len [InferredBinding] (load bindings))
+        (mut found) -1]
+    (loop (if (or (= (load i) 0) (>= (load found) 0)) (break)
+              (do (store! i (- (load i) 1))
+                  (let [binding (al/al-get [InferredBinding]
+                                           (load bindings) (load i))]
+                    (if (same-reference? (.reference binding) reference)
+                        (store! found (load i)) 0)))))
+    (load found)))
+
+(defn lookup-scheme [(state (mut InferState)) (reference ir/CoreRef)]
+  (-> (ptr schemes/TypeScheme))
+  (let [local (binding-index (load (field state locals)) reference)]
+    (if (>= local 0)
+        (field (al/al-elem [InferredBinding]
+                 (load (field state locals)) local) scheme)
+        (let [global (binding-index (load (field state globals)) reference)]
+          (if (>= global 0)
+              (field (al/al-elem [InferredBinding]
+                       (load (field state globals)) global) scheme)
+              (primitive/cast (ptr schemes/TypeScheme) 0))))))
+
+(defn lookup-binding [(state (mut InferState)) (reference ir/CoreRef)]
+  (-> (ptr InferredBinding))
+  (let [local (binding-index (load (field state locals)) reference)]
+    (if (>= local 0)
+        (al/al-elem [InferredBinding] (load (field state locals)) local)
+        (let [global (binding-index (load (field state globals)) reference)]
+          (if (>= global 0)
+              (al/al-elem [InferredBinding] (load (field state globals)) global)
+              (primitive/cast (ptr InferredBinding) 0))))))
+
+(defn instantiate-binding! [(state (mut InferState)) (reference ir/CoreRef)
+                            (propagate bool)] (-> (ptr types/MonoType))
+  (let [binding (lookup-binding (mut state) reference)]
+    (if (= (primitive/cast i64 binding) 0)
+        (let [(mut out) (str/sb-new (load (field state a)))]
+          (str/sb-push-str! (mut out) "inference: binding has no type declaration: ")
+          (str/sb-push-str! (mut out) (.name reference))
+          (fail! (mut state) (str/sb-finish! (mut out)))
+          (types/type-unit (load (field state a))))
+        (let [instantiation
+               (schemes/instantiate-scheme-full (load (field state a))
+                 (load (field binding scheme)) (load (field state next)))]
+          (if propagate
+              (let [constraints (load (field binding constraints))
+                    n (al/al-len [InferredOverloadConstraint] (load constraints))
+                    (mut i) 0]
+                (loop (if (>= (load i) n) (break)
+                          (let [constraint (al/al-get [InferredOverloadConstraint]
+                                             (load constraints) (load i))]
+                            (al/al-push! [InferredOverloadConstraint]
+                              (load (field state overloads))
+                              (InferredOverloadConstraint
+                                :id -1 :name (.name constraint)
+                                :owner (load (load (field state current-owner)))
+                                :candidates (copy-overload-candidates
+                                              state (.candidates constraint))
+                                :expected (schemes/instantiate-from-scheme
+                                            (load (field state a)) instantiation
+                                            (.expected constraint))
+                                :selected (ir/core-ref 0 (.name constraint) true)
+                                :resolved false))
+                            (store! i (+ (load i) 1)))))
+                0)
+              0)
+          (.body instantiation)))))
+
+(defn lookup-type! [(state (mut InferState)) (reference ir/CoreRef)]
+  (-> (ptr types/MonoType))
+  (instantiate-binding! (mut state) reference true))
+
+(defn lookup-candidate-type! [(state (mut InferState)) (reference ir/CoreRef)]
+  (-> (ptr types/MonoType))
+  (instantiate-binding! (mut state) reference false))
+
+(defn lookup-interface-type! [(state (mut InferState)) (name (slice u8))]
+  (-> (ptr types/MonoType))
+  (let [bindings (load (field state globals))
+        n (al/al-len [InferredBinding] (load bindings))
+        (mut i) 0 (mut found) (primitive/cast (ptr types/MonoType) 0)]
+    (loop (if (or (>= (load i) n)
+                  (!= (primitive/cast i64 (load found)) 0)) (break)
+              (let [binding (al/al-get [InferredBinding]
+                              (load bindings) (load i))
+                    reference (.reference binding)]
+                (if (str/str-eq (.name reference) name)
+                    (store! found
+                      (schemes/instantiate-scheme (load (field state a))
+                        (.scheme binding) (load (field state next)))) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn unify! [(state (mut InferState)) (left (ptr types/MonoType))
+              (right (ptr types/MonoType))] (-> bool)
+  (let [result (types/type-unify! (load (field state solver)) left right)]
+    (if (types/unify-success? result) true
+        (do (match result
+              (types/UnifyError [message] (fail! (mut state) message))
+              (_ 0))
+            false))))
+
+(defn record-node! [(state (mut InferState)) (id i64)
+                    (type (ptr types/MonoType))] (-> (ptr types/MonoType))
+  (al/al-push! [InferredNodeType] (load (field state node-types))
+               (InferredNodeType :id id :type type))
+  type)
+
+(defn snapshot [(state (ptr InferState))] (-> SolverSnapshot)
+  (let [solver (load (field state solver))]
+    (SolverSnapshot
+      :types (al/al-len [types/TypeBinding] (load (field solver bindings)))
+      :lifetimes (al/al-len [types/LifetimeBinding]
+                   (load (field solver lifetime-bindings)))
+      :constructors (al/al-len [types/ConstructorBinding]
+                      (load (field solver constructor-bindings)))
+      :next (load (load (field state next))))))
+
+(defn pop-type-binding! [(items (mut (al/ArrayList types/TypeBinding)))] (-> i64)
+  (match (al/al-pop! [types/TypeBinding] (mut items))
+    (Some [_] 0) (None [] 0)))
+(defn pop-lifetime-binding! [(items (mut (al/ArrayList types/LifetimeBinding)))]
+  (-> i64)
+  (match (al/al-pop! [types/LifetimeBinding] (mut items))
+    (Some [_] 0) (None [] 0)))
+(defn pop-constructor-binding!
+  [(items (mut (al/ArrayList types/ConstructorBinding)))] (-> i64)
+  (match (al/al-pop! [types/ConstructorBinding] (mut items))
+    (Some [_] 0) (None [] 0)))
+
+(defn rollback! [(state (mut InferState)) (saved SolverSnapshot)] (-> i64)
+  (let [solver (load (field state solver))]
+    (loop (if (<= (al/al-len [types/TypeBinding]
+                       (load (field solver bindings))) (.types saved)) (break)
+              (pop-type-binding! (mut (field solver bindings)))))
+    (loop (if (<= (al/al-len [types/LifetimeBinding]
+                       (load (field solver lifetime-bindings))) (.lifetimes saved)) (break)
+              (pop-lifetime-binding! (mut (field solver lifetime-bindings)))))
+    (loop (if (<= (al/al-len [types/ConstructorBinding]
+                       (load (field solver constructor-bindings))) (.constructors saved)) (break)
+              (pop-constructor-binding! (mut (field solver constructor-bindings)))))
+    ;; Type identities escape trial solvers into retained schemes, node types,
+    ;; and deferred constraints. Solver bindings may roll back, but fresh IDs
+    ;; must remain globally monotonic or a later instantiation can alias an
+    ;; unrelated retained variable.
+    0))
+
+(defn expected-function [(state (mut InferState))
+                         (arguments (ptr (al/ArrayList (ptr types/MonoType))))]
+  (-> (ptr types/MonoType))
+  (types/type-function (load (field state a)) arguments (fresh! (mut state))))
+
+(defn unify-call-signature! [(state (mut InferState))
+                             (signature (ptr types/MonoType))
+                             (expected (ptr types/MonoType))] (-> bool)
+  (let [result (types/type-unify-call! (load (field state solver))
+                                       signature expected)]
+    (if (types/unify-success? result) true
+        (do (match result
+              (types/UnifyError [message]
+                (let [(mut out) (str/sb-new (load (field state a)))]
+                  (str/sb-push-str! (mut out) message)
+                  (str/sb-push-str! (mut out) "; callee=")
+                  (str/sb-push-str! (mut out) (expected-call-label state signature))
+                  (str/sb-push-str! (mut out) "; call=")
+                  (str/sb-push-str! (mut out) (expected-call-label state expected))
+                  (fail! (mut state) (str/sb-finish! (mut out)))))
+              (_ 0))
+            false))))
+
+(defn try-call! [(state (mut InferState)) (reference ir/CoreRef)
+                 (argument-types (ptr (al/ArrayList (ptr types/MonoType))))]
+  (-> (ptr types/MonoType))
+  (let [callee-type (lookup-type! (mut state) reference)
+        expected (expected-function (mut state) argument-types)]
+    (if (unify-call-signature! (mut state) callee-type expected)
+        (match (load expected)
+          (types/TypeFunction [_ result] result)
+          (_ (types/type-unit (load (field state a)))))
+        (types/type-unit (load (field state a))))))
+
+(defn infer-arguments [(state (mut InferState))
+                       (arguments (ptr (al/ArrayList (ptr ir/ResolvedExpr))))]
+  (-> (ptr (al/ArrayList (ptr types/MonoType))))
+  (let [a (load (field state a)) result (types/type-arguments-new a)
+        n (al/al-len [(ptr ir/ResolvedExpr)] (load arguments)) (mut i) 0]
+    (loop (if (or (>= (load i) n) (!= (load (load (field state failed))) 0)) (break)
+              (do (types/type-arguments-push! result
+                    (infer-expression (mut state)
+                      (al/al-get [(ptr ir/ResolvedExpr)] (load arguments) (load i))))
+                  (store! i (+ (load i) 1)))))
+    result))
+
+(defn copy-overload-candidates
+  [(state (ptr InferState)) (source (ptr (al/ArrayList ir/CoreRef)))]
+  (-> (ptr (al/ArrayList ir/CoreRef)))
+  (let [result (ir/core-ref-list-new (load (field state a)))
+        n (al/al-len [ir/CoreRef] (load source)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (al/al-push! [ir/CoreRef] result
+                    (al/al-get [ir/CoreRef] (load source) (load i)))
+                  (store! i (+ (load i) 1)))))
+    result))
+
+(defn infer-overload-call [(state (mut InferState)) (id i64) (name (slice u8))
+                           (candidates (ptr (al/ArrayList ir/CoreRef)))
+                           (argument-types (ptr (al/ArrayList (ptr types/MonoType))))]
+  (-> (ptr types/MonoType))
+  (let [expected (expected-function (mut state) argument-types)]
+    (let [interface-type (lookup-interface-type! (mut state) name)]
+      (if (= (primitive/cast i64 interface-type) 0) 0
+          (if (unify-call-signature! (mut state) interface-type expected) 0 0)))
+    (al/al-push! [InferredOverloadConstraint] (load (field state overloads))
+      (InferredOverloadConstraint
+        :id id :name name :owner (load (load (field state current-owner)))
+        :candidates (copy-overload-candidates state candidates) :expected expected
+        :selected (ir/core-ref 0 name true) :resolved false))
+    (match (load expected)
+      (types/TypeFunction [_ result] result)
+      (_ (types/type-unit (load (field state a)))))))
+
+(defn infer-overload-value [(state (mut InferState)) (id i64) (name (slice u8))
+                            (candidates (ptr (al/ArrayList ir/CoreRef)))]
+  (-> (ptr types/MonoType))
+  (let [interface-type (lookup-interface-type! (mut state) name)
+        expected (if (= (primitive/cast i64 interface-type) 0)
+                   (fresh! (mut state)) interface-type)]
+    (al/al-push! [InferredOverloadConstraint] (load (field state overloads))
+      (InferredOverloadConstraint
+        :id id :name name :owner (load (load (field state current-owner)))
+        :candidates (copy-overload-candidates state candidates) :expected expected
+        :selected (ir/core-ref 0 name true) :resolved false))
+    expected))
+
+(defn infer-sequence [(state (mut InferState))
+                      (expressions (ptr (al/ArrayList (ptr ir/ResolvedExpr))))]
+  (-> (ptr types/MonoType))
+  (let [n (al/al-len [(ptr ir/ResolvedExpr)] (load expressions))
+        (mut i) 0 (mut result) (types/type-unit (load (field state a)))]
+    (loop (if (or (>= (load i) n) (!= (load (load (field state failed))) 0)) (break)
+              (do (store! result
+                    (infer-expression (mut state)
+                      (al/al-get [(ptr ir/ResolvedExpr)] (load expressions) (load i))))
+                  (store! i (+ (load i) 1)))))
+    (load result)))
+
+(defn fresh-lifetime! [(state (mut InferState))] (-> types/MonoLifetime)
+  (let [id (load (load (field state next)))]
+    (store! (load (field state next)) (+ id 1))
+    (types/lifetime-variable id)))
+
+(defn infer-pattern! [(state (mut InferState))
+                      (pattern (ptr ir/ResolvedPattern))
+                      (expected (ptr types/MonoType))
+                      (borrowed bool) (lifetime types/MonoLifetime)] (-> i64)
+  (let [a (load (field state a))]
+    (match (load pattern)
+      (ir/ResolvedPatternIgnore [] 0)
+      (ir/ResolvedPatternBind [binding]
+        (let [binding-type (if borrowed
+                             (types/type-reference a expected lifetime) expected)]
+          (al/al-push! [InferredBinding] (load (field state locals))
+            (InferredBinding :reference binding
+              :scheme (mono-scheme a binding-type) :constraints (empty-overloads a)))
+          (al/al-push! [InferredPatternBinding]
+            (load (field state pattern-bindings))
+            (InferredPatternBinding :reference binding :type binding-type))))
+      (ir/ResolvedPatternInt [_]
+        (do (unify! (mut state) expected (types/type-integer a)) 0))
+      (ir/ResolvedPatternBool [_]
+        (do (unify! (mut state) expected (types/type-boolean a)) 0))
+      (ir/ResolvedPatternConstructor [constructor patterns]
+        (let [signature (lookup-type! (mut state) constructor)]
+          (match (load signature)
+            (types/TypeFunction [arguments result]
+              (let [n (al/al-len [(ptr ir/ResolvedPattern)] (load patterns))]
+                (if (!= n (al/al-len [(ptr types/MonoType)] (load arguments)))
+                    (fail! (mut state) "inference: pattern constructor arity does not match")
+                    (do (unify! (mut state) result expected)
+                        (let [(mut i) 0]
+                          (loop (if (or (>= (load i) n)
+                                        (!= (load (load (field state failed))) 0))
+                                    (break)
+                                    (do (infer-pattern! (mut state)
+                                          (al/al-get [(ptr ir/ResolvedPattern)]
+                                            (load patterns) (load i))
+                                          (al/al-get [(ptr types/MonoType)]
+                                            (load arguments) (load i))
+                                          borrowed lifetime)
+                                        (store! i (+ (load i) 1))))))
+                        0))))
+            (_ (fail! (mut state) "inference: pattern constructor is not callable"))))))))
+
+(defn restore-locals! [(state (mut InferState)) (length i64)] (-> i64)
+  (loop (if (<= (al/al-len [InferredBinding]
+                   (load (load (field state locals)))) length) (break)
+            (match (al/al-pop! [InferredBinding] (load (field state locals)))
+              (Some [_] 0) (None [] 0))))
+  0)
+
+(defn infer-expression [(state (mut InferState)) (expression (ptr ir/ResolvedExpr))]
+  (-> (ptr types/MonoType))
+  (let [a (load (field state a)) id (ir/resolved-expression-id expression)
+        (mut inferred) (types/type-unit a)]
+    (match (load expression)
+      (ir/ResolvedInt [_ _] (store! inferred (types/type-integer a)))
+      (ir/ResolvedByte [_ _]
+        (store! inferred (types/type-named a "Byte" (types/type-arguments-new a))))
+      (ir/ResolvedLong [_ _]
+        (store! inferred (types/type-named a "Long" (types/type-arguments-new a))))
+      (ir/ResolvedFloat [_ _]
+        (store! inferred (types/type-named a "Float" (types/type-arguments-new a))))
+      (ir/ResolvedDouble [_ _]
+        (store! inferred (types/type-named a "Double" (types/type-arguments-new a))))
+      (ir/ResolvedBool [_ _] (store! inferred (types/type-boolean a)))
+      (ir/ResolvedChar [_ _]
+        (store! inferred (types/type-named a "Char" (types/type-arguments-new a))))
+      (ir/ResolvedString [_ _] (store! inferred (types/type-string a)))
+      (ir/ResolvedPattern [_ _]
+        (store! inferred
+          (types/type-named a "Pattern" (types/type-arguments-new a))))
+      (ir/ResolvedUnit [_] (store! inferred (types/type-unit a)))
+      (ir/ResolvedReference [_ reference]
+        (store! inferred (lookup-type! (mut state) reference)))
+      (ir/ResolvedOverload [overload-id name candidates]
+        (store! inferred
+          (infer-overload-value (mut state) overload-id name candidates)))
+      (ir/ResolvedCall [call-expression-id callee arguments]
+        (let [argument-types (infer-arguments (mut state) arguments)]
+          (match (load callee)
+            (ir/ResolvedOverload [_ name candidates]
+              (store! inferred
+                (infer-overload-call (mut state) call-expression-id name
+                                     candidates argument-types)))
+            (ir/ResolvedReference [_ reference]
+              (let [signature (lookup-type! (mut state) reference)
+                    expected (expected-function (mut state) argument-types)]
+                (if (unify-call-signature! (mut state) signature expected)
+                    (do (al/al-push! [InferredCall] (load (field state calls))
+                          (InferredCall :id call-expression-id
+                                        :callee reference :signature signature))
+                        (match (load expected)
+                          (types/TypeFunction [_ result] (store! inferred result))
+                          (_ 0)))
+                    (contextualize-call-error! (mut state) reference))))
+            (_ (let [callee-type (infer-expression (mut state) callee)
+                     expected (expected-function (mut state) argument-types)]
+                 (if (unify-call-signature! (mut state) callee-type expected)
+                     (match (load expected)
+                       (types/TypeFunction [_ result] (store! inferred result))
+                       (_ 0)) 0))))))
+      (ir/ResolvedDo [_ expressions]
+        (store! inferred (infer-sequence (mut state) expressions)))
+      (ir/ResolvedIf [_ condition then-branch else-branch]
+        (let [condition-type (infer-expression (mut state) condition)
+              then-type (infer-expression (mut state) then-branch)
+              else-type (infer-expression (mut state) else-branch)]
+          (unify! (mut state) condition-type (types/type-boolean a))
+          (unify! (mut state) then-type else-type)
+          (store! inferred then-type)))
+      (ir/ResolvedLet [_ binding value body]
+        (let [value-type (infer-expression (mut state) value)
+              original (al/al-len [InferredBinding]
+                         (load (load (field state locals))))]
+          (al/al-push! [InferredBinding] (load (field state locals))
+            (InferredBinding :reference binding :scheme (mono-scheme a value-type)
+              :constraints (empty-overloads a)))
+          (store! inferred (infer-expression (mut state) body))
+          (restore-locals! (mut state) original)))
+      (ir/ResolvedSet [_ binding value]
+        (do (unify! (mut state) (lookup-type! (mut state) binding)
+                    (infer-expression (mut state) value))
+            (store! inferred (types/type-unit a))))
+      (ir/ResolvedWhile [_ condition body]
+        (do (unify! (mut state) (infer-expression (mut state) condition)
+                    (types/type-boolean a))
+            (infer-expression (mut state) body)
+            (store! inferred (types/type-unit a))))
+      (ir/ResolvedBreak [_] (store! inferred (types/type-unit a)))
+      (ir/ResolvedLambda [_ parameters body]
+        (let [original (al/al-len [InferredBinding]
+                         (load (load (field state locals))))
+              argument-types (types/type-arguments-new a)
+              n (al/al-len [ir/CoreRef] (load parameters)) (mut i) 0]
+          (loop (if (>= (load i) n) (break)
+                    (let [type (fresh! (mut state))
+                          reference (al/al-get [ir/CoreRef] (load parameters) (load i))]
+                      (types/type-arguments-push! argument-types type)
+                      (al/al-push! [InferredBinding] (load (field state locals))
+                        (InferredBinding :reference reference :scheme (mono-scheme a type)
+                          :constraints (empty-overloads a)))
+                      (store! i (+ (load i) 1)))))
+          (let [result (infer-expression (mut state) body)]
+            (restore-locals! (mut state) original)
+            (store! inferred (types/type-function a argument-types result)))))
+      (ir/ResolvedAnnotation [_ inner annotation]
+        (let [converted (schemes/declaration-scheme a annotation)]
+          (if (schemes/scheme-failed? converted)
+              (fail! (mut state) (schemes/scheme-error converted))
+              (let [annotated (schemes/instantiate-scheme a
+                                (schemes/scheme-value converted)
+                                (load (field state next)))]
+                (unify! (mut state) (infer-expression (mut state) inner) annotated)
+                (store! inferred annotated)))))
+      (ir/ResolvedMatch [_ by-reference scrutinee branches]
+        (let [scrutinee-type (infer-expression (mut state) scrutinee)
+              (mut matched-type) scrutinee-type
+              (mut matched-lifetime) (fresh-lifetime! (mut state))
+              result (fresh! (mut state))
+              n (al/al-len [ir/ResolvedMatchBranch] (load branches)) (mut i) 0]
+          (if by-reference
+              (let [resolved-scrutinee
+                      (types/type-resolve (load (field state solver)) scrutinee-type)]
+                (match (load resolved-scrutinee)
+                  (types/TypeReference [inner lifetime]
+                    (do (store! matched-type inner)
+                        (store! matched-lifetime lifetime)))
+                  (types/TypeVariable [_]
+                    (let [inner (fresh! (mut state))
+                          lifetime (fresh-lifetime! (mut state))]
+                      (unify! (mut state) scrutinee-type
+                        (types/type-reference a inner lifetime))
+                      (store! matched-type inner)
+                      (store! matched-lifetime lifetime)))
+                  (_ (fail! (mut state) "inference: match-ref requires a reference")))) 0)
+          (loop (if (or (>= (load i) n)
+                        (!= (load (load (field state failed))) 0)) (break)
+                    (let [branch (al/al-get [ir/ResolvedMatchBranch]
+                                            (load branches) (load i))
+                          original (al/al-len [InferredBinding]
+                                     (load (load (field state locals))))]
+                      (infer-pattern! (mut state) (.pattern branch)
+                                      (load matched-type) by-reference
+                                      (load matched-lifetime))
+                      (unify! (mut state) result
+                              (infer-expression (mut state) (.body branch)))
+                      (restore-locals! (mut state) original)
+                      (store! i (+ (load i) 1)))))
+          (store! inferred result)))
+      (ir/ResolvedArray [_ items static]
+        (let [element (fresh! (mut state))
+              n (al/al-len [(ptr ir/ResolvedExpr)] (load items)) (mut i) 0]
+          (loop (if (or (>= (load i) n)
+                        (!= (load (load (field state failed))) 0)) (break)
+                    (do (unify! (mut state) element
+                          (infer-expression (mut state)
+                            (al/al-get [(ptr ir/ResolvedExpr)] (load items) (load i))))
+                        (store! i (+ (load i) 1)))))
+          (let [arguments (types/type-arguments-new a)]
+            (types/type-arguments-push! arguments element)
+            (store! inferred
+              (types/type-named a (if static "StaticArray" "Array") arguments))))))
+    (record-node! (mut state) id (load inferred))))
+
+(defn add-global! [(state (mut InferState)) (reference ir/CoreRef)
+                   (scheme schemes/TypeScheme)] (-> i64)
+  (al/al-push! [InferredBinding] (load (field state globals))
+               (InferredBinding :reference reference :scheme scheme
+                 :constraints (empty-overloads (load (field state a))))))
+
+(defn predeclare! [(state (mut InferState)) (module ir/ResolvedModule)] (-> i64)
+  (let [primitive-bindings (primitive-types/bindings (load (field state a)))
+        primitive-count (al/al-len [primitive-types/PrimitiveSchemeBinding]
+                          primitive-bindings)
+        signature-count (al/al-len [ir/ResolvedSignature] (.signatures module))
+        (mut i) 0]
+    (loop
+      (if (>= (load i) primitive-count) (break)
+          (let [binding (al/al-get [primitive-types/PrimitiveSchemeBinding]
+                                   primitive-bindings (load i))]
+            (add-global! (mut state) (.reference binding) (.scheme binding))
+            (store! i (+ (load i) 1)))))
+    (store! i 0)
+    (loop
+      (if (or (>= (load i) signature-count)
+              (!= (load (load (field state failed))) 0))
+          (break)
+          (let [signature (al/al-get [ir/ResolvedSignature]
+                                     (.signatures module) (load i))
+                converted (schemes/declaration-scheme
+                            (load (field state a)) (.type signature))]
+            (if (schemes/scheme-failed? converted)
+                (fail! (mut state) (schemes/scheme-error converted))
+                (add-global! (mut state) (.reference signature)
+                             (schemes/scheme-value converted)))
+            (store! i (+ (load i) 1)))))
+    (let [value-count (al/al-len [ir/ResolvedValue] (.values module))]
+      (store! i 0)
+      (loop
+        (if (>= (load i) value-count) (break)
+            (let [value (al/al-get [ir/ResolvedValue] (.values module) (load i))]
+              (if (= (primitive/cast i64
+                       (lookup-scheme (mut state) (.reference value))) 0)
+                  (add-global! (mut state) (.reference value)
+                    (mono-scheme (load (field state a)) (fresh! (mut state))))
+                  0)
+              (store! i (+ (load i) 1))))))
+    (let [function-count (al/al-len [ir/ResolvedFunction] (.functions module))]
+      (store! i 0)
+      (loop
+        (if (>= (load i) function-count)
+            (break)
+            (let [function (al/al-get [ir/ResolvedFunction]
+                                     (.functions module) (load i))]
+              (if (= (primitive/cast i64
+                       (lookup-scheme (mut state) (.reference function))) 0)
+                  (let [arguments (types/type-arguments-new (load (field state a)))
+                        n (al/al-len [ir/CoreRef] (load (.parameters function)))
+                        (mut j) 0]
+                    (loop
+                      (if (>= (load j) n)
+                          (break)
+                          (do (types/type-arguments-push! arguments
+                                (fresh! (mut state)))
+                              (store! j (+ (load j) 1)))))
+                    (add-global! (mut state) (.reference function)
+                      (mono-scheme (load (field state a))
+                        (types/type-function (load (field state a)) arguments
+                                             (fresh! (mut state))))))
+                  0)
+              (store! i (+ (load i) 1))))))
+    0))
+
+(defn global-binding-body [(state (ptr InferState)) (index i64)]
+  (-> (ptr types/MonoType))
+  (let [binding (al/al-get [InferredBinding]
+                  (load (field state globals)) index)
+        scheme (.scheme binding)]
+    (.body scheme)))
+
+(defn infer-value! [(state (mut InferState)) (value ir/ResolvedValue)] (-> i64)
+  (store! (load (field state current-owner)) (.reference value))
+  (let [index (binding-index (load (field state globals)) (.reference value))
+        value-type (if (< index 0)
+                     (lookup-type! (mut state) (.reference value))
+                     (global-binding-body (mut state) index))]
+    (al/al-push! [InferredDefinition] (load (field state definitions))
+      (InferredDefinition :reference (.reference value) :signature value-type))
+    (unify! (mut state) value-type (infer-expression (mut state) (.body value))))
+  (contextualize-function-error! (mut state) (.reference value))
+  0)
+
+(defn infer-function! [(state (mut InferState)) (function ir/ResolvedFunction)]
+  (-> i64)
+  (store! (load (field state current-owner)) (.reference function))
+  (let [index (binding-index (load (field state globals)) (.reference function))
+        function-type (if (< index 0)
+                        (lookup-type! (mut state) (.reference function))
+                        (global-binding-body (mut state) index))
+        original (al/al-len [InferredBinding] (load (load (field state locals))))]
+    (al/al-push! [InferredDefinition] (load (field state definitions))
+      (InferredDefinition :reference (.reference function) :signature function-type))
+    (match (load function-type)
+      (types/TypeFunction [arguments result]
+        (let [n (al/al-len [ir/CoreRef] (load (.parameters function)))]
+          (if (!= n (al/al-len [(ptr types/MonoType)] (load arguments)))
+              (do (fail! (mut state)
+                    "inference: declared function arity does not match definition") 0)
+              (let [(mut i) 0]
+                (loop (if (>= (load i) n) (break)
+                          (do (al/al-push! [InferredBinding]
+                                (load (field state locals))
+                                (InferredBinding
+                                  :reference (al/al-get [ir/CoreRef]
+                                               (load (.parameters function)) (load i))
+                                  :scheme (mono-scheme (load (field state a))
+                                            (al/al-get [(ptr types/MonoType)]
+                                              (load arguments) (load i)))
+                                  :constraints
+                                    (empty-overloads (load (field state a)))))
+                              (store! i (+ (load i) 1)))))
+                (unify! (mut state) result
+                        (infer-expression (mut state) (.body function)))
+                0))))
+      (_ (fail! (mut state) "inference: function binding is not callable")))
+    (contextualize-function-error! (mut state) (.reference function))
+    (restore-locals! (mut state) original)
+    0))
+
+(defn zonk-type [(state (ptr InferState)) (source (ptr types/MonoType))]
+  (-> (ptr types/MonoType))
+  (let [a (load (field state a))
+        resolved (types/type-resolve (load (field state solver)) source)]
+    (match (load resolved)
+      (types/TypeVariable [id] (types/type-variable a id))
+      (types/TypeInteger [] (types/type-integer a))
+      (types/TypeString [] (types/type-string a))
+      (types/TypeBoolean [] (types/type-boolean a))
+      (types/TypeUnit [] (types/type-unit a))
+      (types/TypeNamed [name arguments]
+        (let [converted (types/type-arguments-new a)
+              n (al/al-len [(ptr types/MonoType)] (load arguments)) (mut i) 0]
+          (loop (if (>= (load i) n) (break)
+                    (do (types/type-arguments-push! converted
+                          (zonk-type state (al/al-get [(ptr types/MonoType)]
+                                             (load arguments) (load i))))
+                        (store! i (+ (load i) 1)))))
+          (types/type-named a
+            (types/constructor-resolve (load (field state solver)) name) converted)))
+      (types/TypeReference [inner lifetime]
+        (types/type-reference a (zonk-type state inner)
+          (types/lifetime-resolve (load (field state solver)) lifetime)))
+      (types/TypeFunction [arguments result]
+        (let [converted (types/type-arguments-new a)
+              n (al/al-len [(ptr types/MonoType)] (load arguments)) (mut i) 0]
+          (loop (if (>= (load i) n) (break)
+                    (do (types/type-arguments-push! converted
+                          (zonk-type state (al/al-get [(ptr types/MonoType)]
+                                             (load arguments) (load i))))
+                        (store! i (+ (load i) 1)))))
+          (types/type-function a converted (zonk-type state result)))))))
+
+(defn push-id-unique! [(items (ptr (al/ArrayList i64))) (id i64)] (-> i64)
+  (let [n (al/al-len [i64] (load items)) (mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) n) (load found)) (break)
+              (do (if (= (al/al-get [i64] (load items) (load i)) id)
+                      (store! found true) 0)
+                  (store! i (+ (load i) 1)))))
+    (if (load found) 0 (al/al-push! [i64] items id))))
+
+(defn collect-quantified! [(type (ptr types/MonoType))
+                           (type-ids (ptr (al/ArrayList i64)))
+                           (lifetime-ids (ptr (al/ArrayList i64)))] (-> i64)
+  (match (load type)
+    (types/TypeVariable [id] (push-id-unique! type-ids id))
+    (types/TypeNamed [_ arguments]
+      (let [n (al/al-len [(ptr types/MonoType)] (load arguments)) (mut i) 0]
+        (loop (if (>= (load i) n) (break)
+                  (do (collect-quantified!
+                        (al/al-get [(ptr types/MonoType)] (load arguments) (load i))
+                        type-ids lifetime-ids)
+                      (store! i (+ (load i) 1))))) 0))
+    (types/TypeReference [inner lifetime]
+      (do (collect-quantified! inner type-ids lifetime-ids)
+          (match lifetime
+            (types/LifetimeVariable [id] (push-id-unique! lifetime-ids id))
+            (_ 0))))
+    (types/TypeFunction [arguments result]
+      (let [n (al/al-len [(ptr types/MonoType)] (load arguments)) (mut i) 0]
+        (loop (if (>= (load i) n) (break)
+                  (do (collect-quantified!
+                        (al/al-get [(ptr types/MonoType)] (load arguments) (load i))
+                        type-ids lifetime-ids)
+                      (store! i (+ (load i) 1)))))
+        (collect-quantified! result type-ids lifetime-ids)))
+    (_ 0)))
+
+(defn has-declared-signature? [(module ir/ResolvedModule)
+                               (reference ir/CoreRef)] (-> bool)
+  (let [n (al/al-len [ir/ResolvedSignature] (.signatures module))
+        (mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) n) (load found)) (break)
+              (let [signature (al/al-get [ir/ResolvedSignature]
+                                         (.signatures module) (load i))]
+                (if (same-reference? (.reference signature) reference)
+                    (store! found true) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn id-listed? [(ids (ptr (al/ArrayList i64))) (id i64)] (-> bool)
+  (let [n (al/al-len [i64] (load ids)) (mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) n) (load found)) (break)
+              (do (if (= (al/al-get [i64] (load ids) (load i)) id)
+                      (store! found true) 0)
+                  (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn type-shares-quantified? [(type (ptr types/MonoType))
+                               (type-ids (ptr (al/ArrayList i64)))
+                               (lifetime-ids (ptr (al/ArrayList i64)))] (-> bool)
+  (match (load type)
+    (types/TypeVariable [id] (id-listed? type-ids id))
+    (types/TypeNamed [_ arguments]
+      (let [n (al/al-len [(ptr types/MonoType)] (load arguments))
+            (mut i) 0 (mut found) false]
+        (loop (if (or (>= (load i) n) (load found)) (break)
+                  (do (if (type-shares-quantified?
+                            (al/al-get [(ptr types/MonoType)]
+                              (load arguments) (load i)) type-ids lifetime-ids)
+                          (store! found true) 0)
+                      (store! i (+ (load i) 1)))))
+        (load found)))
+    (types/TypeReference [inner lifetime]
+      (or (type-shares-quantified? inner type-ids lifetime-ids)
+          (match lifetime
+            (types/LifetimeVariable [id] (id-listed? lifetime-ids id))
+            (_ false))))
+    (types/TypeFunction [arguments result]
+      (let [n (al/al-len [(ptr types/MonoType)] (load arguments))
+            (mut i) 0
+            (mut found) (type-shares-quantified? result type-ids lifetime-ids)]
+        (loop (if (or (>= (load i) n) (load found)) (break)
+                  (do (if (type-shares-quantified?
+                            (al/al-get [(ptr types/MonoType)]
+                              (load arguments) (load i)) type-ids lifetime-ids)
+                          (store! found true) 0)
+                      (store! i (+ (load i) 1)))))
+        (load found)))
+    (_ false)))
+
+(defn generalized-overloads [(state (ptr InferState)) (reference ir/CoreRef)
+                             (type-ids (ptr (al/ArrayList i64)))
+                             (lifetime-ids (ptr (al/ArrayList i64)))]
+  (-> (ptr (al/ArrayList InferredOverloadConstraint)))
+  (let [result (empty-overloads (load (field state a)))
+        source (load (field state overloads))
+        n (al/al-len [InferredOverloadConstraint] (load source))
+        (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (let [constraint (al/al-get [InferredOverloadConstraint]
+                                 (load source) (load i))]
+                (if (and (and (ir/core-ref-same? (.owner constraint) reference)
+                              (not (.resolved constraint)))
+                         (type-shares-quantified? (.expected constraint)
+                           type-ids lifetime-ids))
+                    (al/al-push! [InferredOverloadConstraint] result
+                      (InferredOverloadConstraint
+                        :id (.id constraint) :name (.name constraint) :owner reference
+                        :candidates (copy-overload-candidates
+                                      state (.candidates constraint))
+                        :expected (zonk-type state (.expected constraint))
+                        :selected (ir/core-ref 0 (.name constraint) true)
+                        :resolved false)) 0)
+                (store! i (+ (load i) 1)))))
+    result))
+
+(defn generalize-global! [(state (mut InferState)) (reference ir/CoreRef)] (-> i64)
+  (let [index (binding-index (load (field state globals)) reference)]
+    (if (< index 0) 0
+        (let [binding (al/al-elem [InferredBinding]
+                                  (load (field state globals)) index)
+              old-scheme (load (field binding scheme))
+              definition-signature (inferred-definition-signature state reference)
+              source (if (= (primitive/cast i64 definition-signature) 0)
+                       (.body old-scheme) definition-signature)
+              body (zonk-type state source)
+              type-ids (empty-variables (load (field state a)))
+              lifetime-ids (empty-variables (load (field state a)))]
+          (collect-quantified! body type-ids lifetime-ids)
+          (let [constraints
+                 (generalized-overloads state reference type-ids lifetime-ids)]
+          (let [n (al/al-len [InferredOverloadConstraint] (load constraints))
+                (mut i) 0]
+            (loop (if (>= (load i) n) (break)
+                      (do (let [constraint
+                                 (al/al-get [InferredOverloadConstraint]
+                                   (load constraints) (load i))]
+                            (collect-quantified! (.expected constraint)
+                              type-ids lifetime-ids))
+                          (store! i (+ (load i) 1))))))
+          (store! (field binding scheme)
+            (schemes/TypeScheme :type-variables type-ids
+                                :lifetime-variables lifetime-ids :body body))
+          (store! (field binding constraints) constraints)
+          0)))))
+
+(defn type-unresolved? [(state (ptr InferState))
+                        (type (ptr types/MonoType))] (-> bool)
+  (let [resolved (types/type-resolve (load (field state solver)) type)]
+    (match (load resolved)
+      (types/TypeVariable [_] true)
+      (types/TypeNamed [_ arguments]
+        (let [n (al/al-len [(ptr types/MonoType)] (load arguments))
+              (mut i) 0 (mut unresolved) false]
+          (loop (if (or (>= (load i) n) (load unresolved)) (break)
+                    (do (if (type-unresolved? state
+                              (al/al-get [(ptr types/MonoType)]
+                                (load arguments) (load i)))
+                            (store! unresolved true) 0)
+                        (store! i (+ (load i) 1)))))
+          (load unresolved)))
+      (types/TypeReference [inner _] (type-unresolved? state inner))
+      (types/TypeFunction [arguments result]
+        (let [n (al/al-len [(ptr types/MonoType)] (load arguments))
+              (mut i) 0 (mut unresolved) false]
+          (loop (if (or (>= (load i) n) (load unresolved)) (break)
+                    (do (if (type-unresolved? state
+                              (al/al-get [(ptr types/MonoType)]
+                                (load arguments) (load i)))
+                            (store! unresolved true) 0)
+                        (store! i (+ (load i) 1)))))
+          (or (load unresolved) (type-unresolved? state result))))
+      (_ false))))
+
+(defn inferred-type-label [(state (ptr InferState))
+                           (type (ptr types/MonoType))] (-> (slice u8))
+  (match (load (types/type-resolve (load (field state solver)) type))
+    (types/TypeVariable [_] "variable")
+    (types/TypeInteger [] "Int")
+    (types/TypeString [] "String")
+    (types/TypeBoolean [] "Bool")
+    (types/TypeUnit [] "Unit")
+    (types/TypeNamed [name _] name)
+    (types/TypeReference [_ _] "Ref")
+    (types/TypeFunction [_ _] "Fn")))
+
+(defn expected-call-label [(state (ptr InferState))
+                           (expected (ptr types/MonoType))] (-> (slice u8))
+  (match (load (types/type-resolve (load (field state solver)) expected))
+    (types/TypeFunction [arguments _]
+      (if (= (al/al-len [(ptr types/MonoType)] (load arguments)) 0) "none"
+          (inferred-type-label state
+            (al/al-get [(ptr types/MonoType)] (load arguments) 0))))
+    (_ (inferred-type-label state expected))))
+
+(defn overload-ready? [(state (ptr InferState))
+                       (expected (ptr types/MonoType))] (-> bool)
+  (let [resolved (types/type-resolve (load (field state solver)) expected)]
+    (match (load resolved)
+      (types/TypeFunction [arguments result]
+        (let [n (al/al-len [(ptr types/MonoType)] (load arguments))
+              (mut i) 0 (mut unresolved) false]
+          (loop (if (or (>= (load i) n) (load unresolved)) (break)
+                    (do (if (type-unresolved? state
+                              (al/al-get [(ptr types/MonoType)]
+                                (load arguments) (load i)))
+                            (store! unresolved true) 0)
+                        (store! i (+ (load i) 1)))))
+          (and (not (load unresolved))
+               (not (type-unresolved? state result)))))
+      (_ (not (type-unresolved? state resolved))))))
+
+(defn owner-ready? [(state (ptr InferState)) (reference ir/CoreRef)] (-> bool)
+  (let [signature (inferred-definition-signature state reference)]
+    (or (= (primitive/cast i64 signature) 0)
+        (not (type-unresolved? state signature)))))
+
+(defn type-variable-count [(type (ptr types/MonoType))] (-> i64)
+  (match (load type)
+    (types/TypeVariable [_] 1)
+    (types/TypeNamed [_ arguments]
+      (let [n (al/al-len [(ptr types/MonoType)] (load arguments))
+            (mut i) 0 (mut count) 0]
+        (loop (if (>= (load i) n) (break)
+                  (do (store! count (+ (load count)
+                        (type-variable-count
+                          (al/al-get [(ptr types/MonoType)]
+                            (load arguments) (load i)))))
+                      (store! i (+ (load i) 1)))))
+        (load count)))
+    (types/TypeReference [inner _] (type-variable-count inner))
+    (types/TypeFunction [arguments result]
+      (let [n (al/al-len [(ptr types/MonoType)] (load arguments))
+            (mut i) 0 (mut count) (type-variable-count result)]
+        (loop (if (>= (load i) n) (break)
+                  (do (store! count (+ (load count)
+                        (type-variable-count
+                          (al/al-get [(ptr types/MonoType)]
+                            (load arguments) (load i)))))
+                      (store! i (+ (load i) 1)))))
+        (load count)))
+    (_ 0)))
+
+(defn finalize-overload! [(state (mut InferState)) (index i64)] (-> i64)
+  (let [constraint (al/al-elem [InferredOverloadConstraint]
+                               (load (field state overloads)) index)
+        candidates (load (field constraint candidates))
+        expected (load (field constraint expected))
+        base (snapshot state)
+        n (al/al-len [ir/CoreRef] (load candidates))
+        (mut i) 0 (mut exact-matches) 0 (mut compatible-matches) 0
+        (mut ready-candidates) 0 (mut pending-candidates) 0
+        (mut exact-score) 2147483647 (mut compatible-score) 2147483647
+        (mut exact-selected) (ir/core-ref 0 (load (field constraint name)) true)
+        (mut compatible-selected) (ir/core-ref 0 (load (field constraint name)) true)]
+    (if (load (field constraint resolved)) 0
+    (do
+    (loop (if (>= (load i) n) (break)
+              (let [candidate (al/al-get [ir/CoreRef] (load candidates) (load i))]
+                (if (candidate-ready? (mut state) candidate)
+                    (do (store! ready-candidates (+ (load ready-candidates) 1))
+                        (rollback! (mut state) base)
+                        (store! (load (field state failed)) 0)
+                        (let [signature (lookup-candidate-type! (mut state) candidate)]
+                          (if (= (load (load (field state failed))) 0)
+                              (if (types/unify-success?
+                                    (types/type-unify! (load (field state solver))
+                                                       signature expected))
+                                  (let [score (type-variable-count signature)]
+                                    (if (< score (load exact-score))
+                                        (do (store! exact-score score)
+                                            (store! exact-matches 1)
+                                            (store! exact-selected candidate) 0)
+                                        (if (= score (load exact-score))
+                                            (store! exact-matches
+                                              (+ (load exact-matches) 1)) 0)))
+                                  (do (rollback! (mut state) base)
+                                      (store! (load (field state failed)) 0)
+                                      (let [compatible-signature
+                                             (lookup-candidate-type! (mut state) candidate)]
+                                        (if (and (= (load (load (field state failed))) 0)
+                                                 (unify-call-signature!
+                                                   (mut state) compatible-signature expected))
+                                            (let [score
+                                                   (type-variable-count compatible-signature)]
+                                              (if (< score (load compatible-score))
+                                                  (do (store! compatible-score score)
+                                                      (store! compatible-matches 1)
+                                                      (store! compatible-selected candidate) 0)
+                                                  (if (= score (load compatible-score))
+                                                      (store! compatible-matches
+                                                        (+ (load compatible-matches) 1)) 0)))
+                                            0))
+                                      0))
+                              0)))
+                    (store! pending-candidates (+ (load pending-candidates) 1)))
+                (store! i (+ (load i) 1)))))
+    (rollback! (mut state) base)
+    (store! (load (field state failed)) 0)
+    (let [matches (if (> (load exact-matches) 0)
+                    (load exact-matches) (load compatible-matches))
+          selected (if (> (load exact-matches) 0)
+                     (load exact-selected) (load compatible-selected))]
+    (if (> (load pending-candidates) 0) 0
+    (if (= matches 0)
+        (if (or (not (overload-ready? state expected))
+                (not (owner-ready? state (load (field constraint owner))))) 0
+        (let [(mut out) (str/sb-new (load (field state a)))]
+          (str/sb-push-str! (mut out) "inference: no implementation of overload ")
+          (str/sb-push-str! (mut out) (load (field constraint name)))
+          (str/sb-push-str! (mut out) " matches call; candidates: ")
+          (str/sb-push-str! (mut out) "expected=")
+          (str/sb-push-str! (mut out) (expected-call-label state expected))
+          (str/sb-push-str! (mut out) "; ")
+          (str/sb-push-str! (mut out) "ready=")
+          (str/sb-push-i64! (mut out) (load ready-candidates))
+          (str/sb-push-str! (mut out) "; ")
+          (let [(mut j) 0]
+            (loop (if (>= (load j) n) (break)
+                      (do (if (> (load j) 0) (str/sb-push-str! (mut out) ", ") 0)
+                          (let [listed (al/al-get [ir/CoreRef]
+                                         (load candidates) (load j))]
+                            (str/sb-push-str! (mut out) (.name listed)))
+                          (store! j (+ (load j) 1))))))
+          (do (fail! (mut state) (str/sb-finish! (mut out)))
+              (contextualize-function-error!
+                (mut state) (load (field constraint owner)))
+              0)))
+        (if (= matches 1)
+            (let [signature (lookup-candidate-type! (mut state) selected)
+                  committed (if (> (load exact-matches) 0)
+                              (types/unify-success?
+                                (types/type-unify! (load (field state solver))
+                                                   signature expected))
+                              (unify-call-signature! (mut state) signature expected))]
+              (if committed
+                  (do (store! (field constraint selected) selected)
+                      (store! (field constraint resolved) true)
+                      (if (>= (load (field constraint id)) 0)
+                          (al/al-push! [InferredCall] (load (field state calls))
+                            (InferredCall :id (load (field constraint id))
+                                          :callee selected
+                                          :signature signature)) 0)) 0))
+            0))))))))
+
+(defn finalize-overloads! [(state (mut InferState))] (-> i64)
+  (let [n (al/al-len [InferredOverloadConstraint]
+                     (load (load (field state overloads))))
+        (mut i) 0 (mut previous-resolved) -1 (mut resolved) 0]
+    (loop
+      (store! resolved 0)
+      (store! i 0)
+      (loop (if (or (>= (load i) n)
+                    (!= (load (load (field state failed))) 0)) (break)
+                (do (finalize-overload! (mut state) (load i))
+                    (if (load (field
+                                (al/al-elem [InferredOverloadConstraint]
+                                  (load (field state overloads)) (load i)) resolved))
+                        (store! resolved (+ (load resolved) 1)) 0)
+                    (store! i (+ (load i) 1)))))
+      (if (or (!= (load (load (field state failed))) 0)
+              (= (load resolved) n)
+              (= (load resolved) (load previous-resolved)))
+          (break)
+          (store! previous-resolved (load resolved))))
+    0))
+
+(defn finalize-overloads-from! [(state (mut InferState)) (start i64)] (-> i64)
+  (let [n (al/al-len [InferredOverloadConstraint]
+                     (load (load (field state overloads)))) (mut i) start]
+    (loop (if (or (>= (load i) n)
+                  (!= (load (load (field state failed))) 0)) (break)
+              (do (finalize-overload! (mut state) (load i))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn overloads-resolved-from? [(state (ptr InferState)) (start i64)] (-> bool)
+  (let [items (load (field state overloads))
+        n (al/al-len [InferredOverloadConstraint] (load items))
+        (mut i) start (mut resolved) true]
+    (loop (if (or (>= (load i) n) (not (load resolved))) (break)
+              (do (if (not (load (field
+                              (al/al-elem [InferredOverloadConstraint]
+                                items (load i)) resolved)))
+                      (store! resolved false) 0)
+                  (store! i (+ (load i) 1)))))
+    (load resolved)))
+
+(defn generalize-references! [(state (mut InferState))
+                              (references (ptr (al/ArrayList ir/CoreRef)))]
+  (-> i64)
+  (let [n (al/al-len [ir/CoreRef] (load references)) (mut i) 0]
+    (loop (if (or (>= (load i) n)
+                  (!= (load (load (field state failed))) 0)) (break)
+              (do (generalize-global! (mut state)
+                    (al/al-get [ir/CoreRef] (load references) (load i)))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn owner-overloads-resolved? [(state (ptr InferState))
+                                 (reference ir/CoreRef)] (-> bool)
+  (let [items (load (field state overloads))
+        n (al/al-len [InferredOverloadConstraint] (load items))
+        (mut i) 0 (mut resolved) true]
+    (loop (if (or (>= (load i) n) (not (load resolved))) (break)
+              (let [constraint (al/al-get [InferredOverloadConstraint]
+                                 (load items) (load i))]
+                (if (and (ir/core-ref-same? (.owner constraint) reference)
+                         (not (.resolved constraint)))
+                    (store! resolved false) 0)
+                (store! i (+ (load i) 1)))))
+    (load resolved)))
+
+(defn regeneralize-module! [(state (mut InferState))
+                            (module ir/ResolvedModule)] (-> i64)
+  (let [value-count (al/al-len [ir/ResolvedValue] (.values module))
+        function-count (al/al-len [ir/ResolvedFunction] (.functions module))
+        (mut i) 0]
+    (loop (if (or (>= (load i) value-count)
+                  (!= (load (load (field state failed))) 0)) (break)
+              (do (let [value (al/al-get [ir/ResolvedValue]
+                                (.values module) (load i))]
+                    (if (and (not (has-declared-signature?
+                                    module (.reference value)))
+                             (owner-overloads-resolved? state (.reference value)))
+                        (generalize-global! (mut state) (.reference value)) 0))
+                  (store! i (+ (load i) 1)))))
+    (store! i 0)
+    (loop (if (or (>= (load i) function-count)
+                  (!= (load (load (field state failed))) 0)) (break)
+              (do (let [function (al/al-get [ir/ResolvedFunction]
+                                   (.functions module) (load i))]
+                    (if (and (not (has-declared-signature?
+                                    module (.reference function)))
+                             (owner-overloads-resolved? state (.reference function)))
+                        (generalize-global! (mut state) (.reference function)) 0))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn collect-function-references [(a (dyn alloc/Allocator))
+                                   (module ir/ResolvedModule)]
+  (-> (ptr (al/ArrayList ir/CoreRef)))
+  (let [result (alloc/box! a (al/ArrayList ir/CoreRef)
+                 (al/al-new [ir/CoreRef] a))
+        n (al/al-len [ir/ResolvedFunction] (.functions module)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (let [function (al/al-get [ir/ResolvedFunction]
+                                   (.functions module) (load i))]
+                    (al/al-push! [ir/CoreRef] result (.reference function)))
+                  (store! i (+ (load i) 1)))))
+    result))
+
+(defn infer-module [(a (dyn alloc/Allocator)) (module ir/ResolvedModule)]
+  (-> InferenceResult)
+  (let [solver (alloc/box! a types/TypeSolver (types/type-solver-new a))
+        next (alloc/box! a i64 1)
+        globals (alloc/box! a (al/ArrayList InferredBinding)
+                  (al/al-new [InferredBinding] a))
+        function-references (collect-function-references a module)
+        definitions (alloc/box! a (al/ArrayList InferredDefinition)
+                      (al/al-new [InferredDefinition] a))
+        pattern-bindings (alloc/box! a (al/ArrayList InferredPatternBinding)
+                           (al/al-new [InferredPatternBinding] a))
+        locals (alloc/box! a (al/ArrayList InferredBinding)
+                 (al/al-new [InferredBinding] a))
+        node-types (alloc/box! a (al/ArrayList InferredNodeType)
+                     (al/al-new [InferredNodeType] a))
+        calls (alloc/box! a (al/ArrayList InferredCall)
+                (al/al-new [InferredCall] a))
+        overloads (alloc/box! a (al/ArrayList InferredOverloadConstraint)
+                    (al/al-new [InferredOverloadConstraint] a))
+        current-owner (alloc/box! a ir/CoreRef (ir/core-ref 0 "" true))
+        failed (alloc/box! a i64 0) message (alloc/box! a (slice u8) "")
+        (mut state) (load (InferState :a a :solver solver :next next
+                           :globals globals :function-references function-references
+                           :definitions definitions
+                           :pattern-bindings pattern-bindings
+                           :locals locals :node-types node-types
+                           :calls calls :overloads overloads
+                           :current-owner current-owner
+                           :failed failed :message message))]
+    (predeclare! (mut state) module)
+    (let [n (al/al-len [ir/ResolvedValue] (.values module)) (mut i) 0]
+      (loop (if (or (>= (load i) n) (!= (load failed) 0)) (break)
+                    (do (let [value (al/al-get [ir/ResolvedValue]
+                                           (.values module) (load i))
+                              overload-start (al/al-len [InferredOverloadConstraint]
+                                               (load overloads))]
+                      (infer-value! (mut state) value)
+                      (if (= (load failed) 0)
+                          (finalize-overloads-from! (mut state) overload-start) 0)
+                      (if (and (= (load failed) 0)
+                               (not (has-declared-signature?
+                                      module (.reference value))))
+                          (generalize-global! (mut state) (.reference value)) 0))
+                    (store! i (+ (load i) 1))))))
+    (let [n (al/al-len [ir/ResolvedFunction] (.functions module)) (mut i) 0]
+      (loop (if (or (>= (load i) n) (!= (load failed) 0)) (break)
+                    (do (let [function (al/al-get [ir/ResolvedFunction]
+                                              (.functions module) (load i))
+                              overload-start (al/al-len [InferredOverloadConstraint]
+                                               (load overloads))]
+                      (infer-function! (mut state) function)
+                      (if (= (load failed) 0)
+                          (finalize-overloads-from! (mut state) overload-start) 0)
+                      (if (and (= (load failed) 0)
+                               (not (has-declared-signature?
+                                      module (.reference function))))
+                          (generalize-global! (mut state) (.reference function)) 0))
+                    (store! i (+ (load i) 1))))))
+    (if (= (load failed) 0) (finalize-overloads! (mut state)) 0)
+    (if (= (load failed) 0) (regeneralize-module! (mut state) module) 0)
+    (InferenceResult
+      :module (InferredModule :globals (load globals)
+                              :definitions (load definitions)
+                              :pattern-bindings (load pattern-bindings)
+                              :node-types (load node-types)
+                              :calls (load calls) :overloads (load overloads)
+                              :solver (load solver))
+      :failed (load failed) :message (load message))))

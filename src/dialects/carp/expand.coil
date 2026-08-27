@@ -1,0 +1,812 @@
+(module experiments.carp.expand)
+
+;; Source-ordered compile-time definition and macro expansion. Macro calls pass
+;; syntax values to ordinary ct-eval closures; returned values are converted
+;; back to syntax and recursively expanded. Quoted forms remain opaque.
+
+(import "experiments.carp.forms" :as forms)
+(import "experiments.carp.ct-env" :as env)
+(import "experiments.carp.ct-eval" :as eval)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+
+(export MacroBinding ExpandConfig config-new config-add-prelude! config-set-host!
+        ExpandResult expand-module expand-module-with expand-failed? expanded-module
+        expand-error)
+
+(defstruct MacroBinding
+  [(name (slice u8)) (frame env/FrameId) (cell env/CellId)])
+(defstruct DynamicBinding
+  [(name (slice u8)) (path (slice u8)) (frame env/FrameId)
+   (cell env/CellId) (definition (ptr forms/CarpNode)) (materialized bool)])
+(defstruct RuntimeDynamicShadow [(frame env/FrameId) (name (slice u8))])
+(defstruct ModuleBinding [(path (slice u8)) (frame env/FrameId)])
+(defstruct ExpandConfig
+  [(preludes (al/ArrayList (slice u8)))
+   (host-arch (slice u8))
+   (host-os (slice u8))
+   (project-target (slice u8))])
+(defstruct ExpandResult
+  [(module forms/CarpModule) (failed i64) (error eval/CtError)])
+(defstruct Expander
+  [(a (dyn alloc/Allocator))
+   (evaluator eval/CtEvaluator)
+   (macros (al/ArrayList MacroBinding))
+   (dynamics (al/ArrayList DynamicBinding))
+   (dynamic-shadows (al/ArrayList RuntimeDynamicShadow))
+   (modules (al/ArrayList ModuleBinding))
+   (preludes (al/ArrayList (slice u8)))
+   (failed i64)
+   (error eval/CtError)])
+
+(defn expand-failed? [(result ExpandResult)] (-> bool) (!= (.failed result) 0))
+(defn expanded-module [(result ExpandResult)] (-> forms/CarpModule) (.module result))
+(defn expand-error [(result ExpandResult)] (-> eval/CtError) (.error result))
+(defn config-new [(a (dyn alloc/Allocator))] (-> ExpandConfig)
+  (ExpandConfig :preludes (al/al-new [(slice u8)] a)
+                :host-arch "unknown" :host-os "unknown"
+                :project-target "native"))
+(defn config-add-prelude! [(config (mut ExpandConfig)) (path (slice u8))] (-> i64)
+  (al/al-push! [(slice u8)] (mut (field config preludes)) path))
+(defn config-set-host! [(config (mut ExpandConfig))
+                        (host-arch (slice u8)) (host-os (slice u8))
+                        (project-target (slice u8))] (-> i64)
+  (do (store! (field config host-arch) host-arch)
+      (store! (field config host-os) host-os)
+      (store! (field config project-target) project-target)
+      0))
+
+(defn configured-prelude? [(x (ptr Expander)) (path (slice u8))] (-> bool)
+  (let [n (al/al-len [(slice u8)] (load (field x preludes)))
+        (mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) n) (load found)) (break)
+              (do (if (str/str-eq (al/al-get [(slice u8)]
+                                             (load (field x preludes)) (load i)) path)
+                      (store! found true) 0)
+                  (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn simple-name [(node (ptr forms/CarpNode))] (-> (slice u8))
+  (match (forms/form-of node)
+    (forms/Symbol [segments]
+      (if (= (al/al-len [(slice u8)] (load segments)) 1)
+          (al/al-get [(slice u8)] (load segments) 0) ""))
+    (_ "")))
+(defn named? [(node (ptr forms/CarpNode)) (name (slice u8))] (-> bool)
+  (str/str-eq (simple-name node) name))
+
+(defn load-marker-kind [(node (ptr forms/CarpNode))] (-> i64)
+  (match (forms/form-of node)
+    (forms/ListForm [items]
+      (if (= (al/al-len [(ptr forms/CarpNode)] (load items)) 0) 0
+          (match (forms/form-of
+                   (al/al-get [(ptr forms/CarpNode)] (load items) 0))
+            (forms/Symbol [segments]
+              (if (= (al/al-len [(slice u8)] (load segments)) 2)
+                  (let [module-name (al/al-get [(slice u8)] (load segments) 0)
+                        name (al/al-get [(slice u8)] (load segments) 1)]
+                    (if (not (str/str-eq module-name "Unsafe")) 0
+                        (cond (str/str-eq name "load-stack-push!") 1
+                              (str/str-eq name "load-stack-pop!") 2
+                              :else 0))) 0))
+            (_ 0))))
+    (_ 0)))
+
+(defn load-marker-file [(node (ptr forms/CarpNode))] (-> (slice u8))
+  (match (forms/form-of node)
+    (forms/ListForm [items]
+      (if (!= (al/al-len [(ptr forms/CarpNode)] (load items)) 2) ""
+          (match (forms/form-of
+                   (al/al-get [(ptr forms/CarpNode)] (load items) 1))
+            (forms/StringLit [path] path)
+            (_ ""))))
+    (_ "")))
+
+(defn list-items [(node (ptr forms/CarpNode))]
+  (-> (ptr (al/ArrayList (ptr forms/CarpNode))))
+  (match (forms/form-of node)
+    (forms/ListForm [items] items)
+    (_ (primitive/cast (ptr (al/ArrayList (ptr forms/CarpNode))) 0))))
+
+(defn definition-kind [(node (ptr forms/CarpNode))] (-> i64)
+  (match (forms/form-of node)
+    (forms/ListForm [items]
+      (if (= (al/al-len [(ptr forms/CarpNode)] (load items)) 0) 0
+          (let [head (al/al-get [(ptr forms/CarpNode)] (load items) 0)]
+            (cond (named? head "defmacro") 1
+                  (named? head "defndynamic") 2
+                  (named? head "defdynamic") 3
+                  (named? head "defmodule") 4
+                  (or (named? head "use") (named? head "use-all")) 5
+                  (or (named? head "defn")
+                      (or (named? head "def")
+                          (or (named? head "deftype")
+                              (named? head "definterface")))) 6
+                  :else 0))))
+    (_ 0)))
+
+(defn macro-index-by-cell [(x (ptr Expander)) (cell env/CellId)] (-> i64)
+  (let [n (al/al-len [MacroBinding] (load (field x macros)))
+        (mut i) n
+        (mut found) -1]
+    (loop (if (or (= (load i) 0) (!= (load found) -1)) (break)
+              (do (store! i (- (load i) 1))
+                  (let [binding (al/al-get [MacroBinding]
+                                          (load (field x macros)) (load i))]
+                    (if (= (.index (.cell binding)) (.index cell))
+                        (store! found (load i)) 0)))))
+    (load found)))
+
+(defn dynamic-index-by-cell [(x (ptr Expander)) (cell-index i64)] (-> i64)
+  (let [n (al/al-len [DynamicBinding] (load (field x dynamics)))
+        (mut i) n (mut found) -1]
+    (loop (if (or (= (load i) 0) (!= (load found) -1)) (break)
+              (do (store! i (- (load i) 1))
+                  (let [binding (al/al-get [DynamicBinding]
+                                          (load (field x dynamics)) (load i))]
+                    (if (= (.index (.cell binding)) cell-index)
+                        (store! found (load i)) 0)))))
+    (load found)))
+
+(defn runtime-dynamic-shadow? [(x (ptr Expander)) (frame env/FrameId)
+                               (name (slice u8))] (-> bool)
+  (let [n (al/al-len [RuntimeDynamicShadow]
+            (load (field x dynamic-shadows)))
+        root (eval/evaluator-root (field x evaluator))
+        (mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) n) (load found)) (break)
+              (let [entry (al/al-get [RuntimeDynamicShadow]
+                            (load (field x dynamic-shadows)) (load i))
+                    entry-frame (.frame entry)]
+                (if (and (or (= (.index entry-frame) (.index frame))
+                             (= (.index entry-frame) (.index root)))
+                         (str/str-eq (.name entry) name))
+                    (store! found true) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn module-index [(x (ptr Expander)) (path (slice u8))] (-> i64)
+  (let [n (al/al-len [ModuleBinding] (load (field x modules)))
+        (mut i) 0 (mut found) -1]
+    (loop (if (or (>= (load i) n) (!= (load found) -1)) (break)
+              (let [binding (al/al-get [ModuleBinding]
+                                      (load (field x modules)) (load i))]
+                (if (str/str-eq (.path binding) path) (store! found (load i)) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn qualified-parts [(x (mut Expander)) (node (ptr forms/CarpNode))]
+  (-> (ptr (al/ArrayList (slice u8))))
+  (match (forms/form-of node)
+    (forms/Symbol [segments] segments)
+    (_ (primitive/cast (ptr (al/ArrayList (slice u8))) 0))))
+
+(defn join-segments [(x (mut Expander))
+                     (segments (ptr (al/ArrayList (slice u8)))) (until i64)]
+  (-> (slice u8))
+  (let [(mut out) (str/sb-new (load (field x a))) (mut i) 0]
+    (loop (if (>= (load i) until) (break)
+              (do (if (> (load i) 0)
+                      (str/sb-push-byte! (mut out) (primitive/cast u8 46)) 0)
+                  (str/sb-push-str! (mut out)
+                    (al/al-get [(slice u8)] (load segments) (load i)))
+                  (store! i (+ (load i) 1)))))
+    (str/sb-finish! (mut out))))
+
+(defn fail-at! [(x (mut Expander)) (node (ptr forms/CarpNode))
+                (message (slice u8))] (-> i64)
+  (store! (field x failed) 1)
+  (store! (field x error)
+          (eval/CtError :message message :span (forms/span-of node)))
+  0)
+
+(defn macro-index [(x (mut Expander)) (scope env/FrameId)
+                   (node (ptr forms/CarpNode))] (-> i64)
+  (let [segments (qualified-parts (mut x) node)]
+    (if (= (primitive/cast i64 segments) 0) -1
+        (let [n (al/al-len [(slice u8)] (load segments))]
+          (if (= n 1)
+              (let [name (al/al-get [(slice u8)] (load segments) 0)]
+                (match (eval/lookup-status (field x evaluator) scope name)
+                  (env/LookupFound [cell] (macro-index-by-cell (mut x) cell))
+                  (env/LookupAmbiguous []
+                    (do (fail-at! (mut x) node "ambiguous imported compile-time name") -1))
+                  (_ -1)))
+              (let [path (join-segments (mut x) segments (- n 1))
+                    name (al/al-get [(slice u8)] (load segments) (- n 1))
+                    index (module-index (mut x) path)]
+                (if (= index -1) -1
+                    (let [module (al/al-get [ModuleBinding]
+                                           (load (field x modules)) index)]
+                      (match (eval/lookup-status (field x evaluator)
+                                                (.frame module) name)
+                        (env/LookupFound [cell] (macro-index-by-cell (mut x) cell))
+                        (_ -1))))))))))
+
+(defn top-level-dynamic-cell [(x (mut Expander)) (scope env/FrameId)
+                              (node (ptr forms/CarpNode))] (-> i64)
+  (let [segments (qualified-parts (mut x) node)]
+    (if (= (primitive/cast i64 segments) 0) -1
+        (let [n (al/al-len [(slice u8)] (load segments))]
+          (if (= n 0) -1
+              (let [name (join-segments (mut x) segments n)]
+                (match (eval/lookup-status (field x evaluator) scope name)
+                  (env/LookupFound [cell]
+                    (if (!= (macro-index-by-cell (mut x) cell) -1) -1
+                        (match (eval/lookup-value (field x evaluator) cell)
+                          (eval/ValueClosure [_]
+                            (let [found cell] (.index found)))
+                          (_ -1))))
+                  (_ -1))))))))
+
+(defn mark-runtime-dynamic-list!
+  [(x (mut Expander)) (scope env/FrameId)
+   (items (ptr (al/ArrayList (ptr forms/CarpNode)))) (start i64)] (-> i64)
+  (let [n (al/al-len [(ptr forms/CarpNode)] (load items)) (mut i) start]
+    (loop (if (or (>= (load i) n) (!= (load (field x failed)) 0)) (break)
+              (do (mark-runtime-dynamics! (mut x) scope
+                    (al/al-get [(ptr forms/CarpNode)] (load items) (load i)))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn mark-runtime-dynamics! [(x (mut Expander)) (scope env/FrameId)
+                              (node (ptr forms/CarpNode))] (-> i64)
+  (match (forms/form-of node)
+    (forms/ListForm [items]
+      (let [n (al/al-len [(ptr forms/CarpNode)] (load items))]
+        (if (= n 0) 0
+            (let [head (al/al-get [(ptr forms/CarpNode)] (load items) 0)]
+              (if (named? head "quote") 0
+                  (let [head-name (simple-name head)
+                        shadowed (and (> (slice-len head-name) 0)
+                                     (runtime-dynamic-shadow?
+                                       (mut x) scope head-name))
+                        cell-index (if shadowed -1
+                                     (top-level-dynamic-cell (mut x) scope head))
+                        dynamic-index (if (< cell-index 0) -1
+                                        (dynamic-index-by-cell (mut x) cell-index))]
+                    (if (< dynamic-index 0) 0
+                        (let [binding (al/al-elem [DynamicBinding]
+                                        (field x dynamics) dynamic-index)]
+                          (if (or (= (slice-len (load (field binding path))) 0)
+                                  (configured-prelude?
+                                    (mut x) (load (field binding path))))
+                              (store! (field binding materialized) true)
+                              (fail-at! (mut x) head
+                                "static use of module-scoped defndynamic is not yet materialized"))))
+                    (mark-runtime-dynamic-list! (mut x) scope items 1)))))))
+    (forms/ArrayForm [items]
+      (mark-runtime-dynamic-list! (mut x) scope items 0))
+    (forms/StaticArrayForm [items]
+      (mark-runtime-dynamic-list! (mut x) scope items 0))
+    (forms/DictionaryForm [items]
+      (mark-runtime-dynamic-list! (mut x) scope items 0))
+    (_ 0)))
+
+(defn process-runtime-or-dynamic! [(x (mut Expander)) (scope env/FrameId)
+                                   (node (ptr forms/CarpNode))
+                                   (output (mut (al/ArrayList (ptr forms/CarpNode))))]
+  (-> i64)
+  (match (forms/form-of node)
+    (forms/ListForm [items]
+      (if (= (al/al-len [(ptr forms/CarpNode)] (load items)) 0)
+          (al/al-push! [(ptr forms/CarpNode)] (mut output)
+                       (forms/clone-node (load (field x a)) node))
+          (let [head (al/al-get [(ptr forms/CarpNode)] (load items) 0)
+                cell (top-level-dynamic-cell (mut x) scope head)]
+            (if (< cell 0)
+                (al/al-push! [(ptr forms/CarpNode)] (mut output)
+                             (expand-node (mut x) scope node))
+                (set-error! (mut x)
+                  (eval/eval-in (mut (field x evaluator)) scope node))))))
+    (_ (al/al-push! [(ptr forms/CarpNode)] (mut output)
+                    (expand-node (mut x) scope node))))
+  0)
+
+(defn set-error! [(x (mut Expander)) (result eval/CtEvalResult)] (-> i64)
+  (if (eval/eval-failed? result)
+      (do (store! (field x failed) 1)
+          (store! (field x error) (eval/result-error result))) 0)
+  0)
+
+(defn function-node [(x (mut Expander)) (definition (ptr forms/CarpNode))]
+  (-> (ptr forms/CarpNode))
+  (let [source-items (list-items definition)
+        n (al/al-len [(ptr forms/CarpNode)] (load source-items))
+        a (load (field x a))
+        span (forms/span-of definition)
+        items (alloc/box! a (al/ArrayList (ptr forms/CarpNode))
+                          (al/al-new [(ptr forms/CarpNode)] a))]
+    (al/al-push! [(ptr forms/CarpNode)] items (forms/symbol-new a span "fn"))
+    ;; definition: head, name, parameters, body...
+    (let [(mut i) 2]
+      (loop (if (>= (load i) n) (break)
+                (do (al/al-push! [(ptr forms/CarpNode)] items
+                                 (forms/clone-node a
+                                   (al/al-get [(ptr forms/CarpNode)]
+                                              (load source-items) (load i))))
+                    (store! i (+ (load i) 1))))))
+    (forms/list-new a span items)))
+
+(defn register-function! [(x (mut Expander)) (scope env/FrameId)
+                          (path (slice u8))
+                          (definition (ptr forms/CarpNode)) (macro bool)] (-> i64)
+  (let [items (list-items definition)
+        n (al/al-len [(ptr forms/CarpNode)] (load items))]
+    (if (< n 4)
+        (set-error! (mut x)
+          (eval/EvalError
+            (eval/CtError :message "compile-time definition requires name, parameters, and body"
+                          :span (forms/span-of definition))))
+        (let [name-node (al/al-get [(ptr forms/CarpNode)] (load items) 1)
+              name (simple-name name-node)]
+          (if (= (slice-len name) 0)
+              (set-error! (mut x)
+                (eval/EvalError
+                  (eval/CtError :message "compile-time definition name must be a symbol"
+                                :span (forms/span-of name-node))))
+              (let [callable-node (expand-node (mut x) scope
+                                    (function-node (mut x) definition))
+                    callable (eval/eval-in (mut (field x evaluator)) scope
+                                           callable-node)]
+                (if (eval/eval-failed? callable)
+                    (set-error! (mut x) callable)
+                    (let [cell (eval/define! (mut (field x evaluator)) scope name
+                                             (eval/result-value callable))]
+                      (if (> (slice-len path) 0)
+                          (eval/bind-cell! (mut (field x evaluator))
+                                           (eval/evaluator-root (field x evaluator))
+                                           (append-path (mut x) path name) cell) false)
+                      (if macro
+                          (al/al-push! [MacroBinding] (mut (field x macros))
+                                       (MacroBinding :name name :frame scope :cell cell))
+                          (al/al-push! [DynamicBinding] (mut (field x dynamics))
+                            (DynamicBinding :name name :path path :frame scope
+                              :cell cell :definition definition
+                              :materialized false))))))))))
+  0)
+
+(defn register-value! [(x (mut Expander)) (scope env/FrameId)
+                       (path (slice u8))
+                       (definition (ptr forms/CarpNode))]
+  (-> i64)
+  (let [items (list-items definition)
+        n (al/al-len [(ptr forms/CarpNode)] (load items))]
+    (if (!= n 3)
+        (set-error! (mut x)
+          (eval/EvalError
+            (eval/CtError :message "defdynamic expects a name and value"
+                          :span (forms/span-of definition))))
+        (let [name-node (al/al-get [(ptr forms/CarpNode)] (load items) 1)
+              name (simple-name name-node)
+              value-node (expand-node (mut x) scope
+                           (al/al-get [(ptr forms/CarpNode)] (load items) 2))
+              value (eval/eval-in (mut (field x evaluator)) scope value-node)]
+          (if (= (slice-len name) 0)
+              (set-error! (mut x)
+                (eval/EvalError
+                  (eval/CtError :message "defdynamic name must be a symbol"
+                                :span (forms/span-of name-node))))
+              (if (eval/eval-failed? value)
+                  (set-error! (mut x) value)
+                  (do (eval/define! (mut (field x evaluator)) scope
+                                    name (eval/result-value value))
+                      (if (> (slice-len path) 0)
+                          (match (eval/lookup-status (field x evaluator) scope name)
+                            (env/LookupFound [cell]
+                              (eval/bind-cell! (mut (field x evaluator))
+                                (eval/evaluator-root (field x evaluator))
+                                (append-path (mut x) path name) cell))
+                            (_ false)) false)
+                      0))))))
+  0)
+
+(defn register-runtime-shadow! [(x (mut Expander)) (scope env/FrameId)
+                                (definition (ptr forms/CarpNode))] (-> i64)
+  (let [items (list-items definition)]
+    (if (< (al/al-len [(ptr forms/CarpNode)] (load items)) 2) 0
+        (let [name-node (al/al-get [(ptr forms/CarpNode)] (load items) 1)
+              name (simple-name name-node)]
+          (if (= (slice-len name) 0) 0
+              (do (al/al-push! [RuntimeDynamicShadow]
+                    (mut (field x dynamic-shadows))
+                    (RuntimeDynamicShadow :frame scope :name name))
+              (match (eval/lookup-status (field x evaluator) scope name)
+                (env/LookupFound [cell]
+                  (let [found-cell cell]
+                    (if (!= (macro-index-by-cell (mut x) found-cell) -1)
+                        (do (eval/define! (mut (field x evaluator)) scope name
+                                          (eval/ValueUnit)) 0)
+                        0)))
+                (_ 0))))))))
+
+(defn declared-runtime-type-name [(node (ptr forms/CarpNode))]
+  (-> (slice u8))
+  (let [items (list-items node)]
+    (if (< (al/al-len [(ptr forms/CarpNode)] (load items)) 2) ""
+        (let [declaration (al/al-get [(ptr forms/CarpNode)] (load items) 1)]
+          (match (forms/form-of declaration)
+            (forms/Symbol [_] (simple-name declaration))
+            (forms/ListForm [parts]
+              (if (= (al/al-len [(ptr forms/CarpNode)] (load parts)) 0) ""
+                  (simple-name (al/al-get [(ptr forms/CarpNode)]
+                                 (load parts) 0))))
+            (_ ""))))))
+
+(defn register-runtime-type-module! [(x (mut Expander))
+                                     (path (slice u8))
+                                     (definition (ptr forms/CarpNode))] (-> i64)
+  (let [items (list-items definition)]
+    (if (= (al/al-len [(ptr forms/CarpNode)] (load items)) 0) 0
+        (let [head (al/al-get [(ptr forms/CarpNode)] (load items) 0)]
+          (if (or (named? head "deftype") (named? head "register-type"))
+              (let [name (declared-runtime-type-name definition)]
+                (if (= (slice-len name) 0) 0
+                    (do (ensure-module-frame! (mut x)
+                          (append-path (mut x) path name)) 0)))
+              0)))))
+
+(defn fail-undefined-use! [(x (mut Expander))
+                           (node (ptr forms/CarpNode))
+                           (target (slice u8))] (-> i64)
+  (let [(mut out) (str/sb-new (load (field x a)))]
+    (str/sb-push-str! (mut out) "used compile-time module is not defined: ")
+    (str/sb-push-str! (mut out) target)
+    (fail-at! (mut x) node (str/sb-finish! (mut out)))))
+
+(defn value-to-syntax [(x (mut Expander)) (span forms/SurfaceSpan)
+                       (value eval/CtValue)] (-> (ptr forms/CarpNode))
+  (let [a (load (field x a))]
+    (match value
+      (eval/ValueUnit []
+        (let [items (alloc/box! a (al/ArrayList (ptr forms/CarpNode))
+                                (al/al-new [(ptr forms/CarpNode)] a))]
+          (forms/list-new a span items)))
+      (eval/ValueInt [value] (forms/node-new-at a span (forms/IntLit value)))
+      (eval/ValueDouble [value] (forms/node-new-at a span (forms/DoubleLit value)))
+      (eval/ValueBool [value] (forms/node-new-at a span (forms/BoolLit value)))
+      (eval/ValueChar [value] (forms/node-new-at a span (forms/CharLit value)))
+      (eval/ValueString [value] (forms/node-new-at a span (forms/StringLit value)))
+      (eval/ValueSyntax [syntax]
+        (let [copy (forms/clone-node a syntax)] (forms/reanchor! copy span) copy))
+      (eval/ValueList [values array]
+        (let [items (alloc/box! a (al/ArrayList (ptr forms/CarpNode))
+                                (al/al-new [(ptr forms/CarpNode)] a))
+              n (al/al-len [eval/CtValue] (load values))
+              (mut i) 0]
+          (loop (if (>= (load i) n) (break)
+                    (do (al/al-push! [(ptr forms/CarpNode)] items
+                                     (value-to-syntax (mut x) span
+                                       (al/al-get [eval/CtValue]
+                                                  (load values) (load i))))
+                        (store! i (+ (load i) 1)))))
+          (forms/node-new-at a span
+            (if array (forms/ArrayForm items) (forms/ListForm items)))))
+      (_ (do
+           (store! (field x failed) 1)
+           (store! (field x error)
+                   (eval/CtError :message "macro returned a non-syntax value"
+                                 :span span))
+           (forms/node-new-at a span (forms/Comment "invalid macro result")))))))
+
+(defn expand-children [(x (mut Expander)) (scope env/FrameId)
+                       (node (ptr forms/CarpNode))
+                       (items (ptr (al/ArrayList (ptr forms/CarpNode)))) (kind i64)]
+  (-> (ptr forms/CarpNode))
+  (let [a (load (field x a))
+        span (forms/span-of node)
+        expanded (alloc/box! a (al/ArrayList (ptr forms/CarpNode))
+                             (al/al-new [(ptr forms/CarpNode)] a))
+        n (al/al-len [(ptr forms/CarpNode)] (load items))
+        (mut i) 0]
+    (loop (if (or (>= (load i) n) (!= (load (field x failed)) 0)) (break)
+              (do (al/al-push! [(ptr forms/CarpNode)] expanded
+                               (expand-node (mut x) scope
+                                 (al/al-get [(ptr forms/CarpNode)]
+                                            (load items) (load i))))
+                  (store! i (+ (load i) 1)))))
+    (forms/node-new-at a span
+      (cond (= kind 1) (forms/ListForm expanded)
+            (= kind 2) (forms/ArrayForm expanded)
+            (= kind 3) (forms/StaticArrayForm expanded)
+            :else (forms/DictionaryForm expanded)))))
+
+(defn rebuild-quasiquoted-collection
+  [(x (mut Expander)) (scope env/FrameId) (node (ptr forms/CarpNode))
+   (items (ptr (al/ArrayList (ptr forms/CarpNode))))
+   (kind i64) (depth i64)] (-> (ptr forms/CarpNode))
+  (let [a (load (field x a)) span (forms/span-of node)
+        output (alloc/box! a (al/ArrayList (ptr forms/CarpNode))
+                           (al/al-new [(ptr forms/CarpNode)] a))
+        n (al/al-len [(ptr forms/CarpNode)] (load items))
+        head (if (> n 0) (al/al-get [(ptr forms/CarpNode)] (load items) 0)
+                 (primitive/cast (ptr forms/CarpNode) 0))
+        active-unquote (and (= kind 1) (and (> n 0) (= depth 1)
+          (or (named? head "unquote") (named? head "unquote-splicing"))))
+        next-depth (if (and (= kind 1) (> n 0))
+          (cond (named? head "quasiquote") (+ depth 1)
+                (and (> depth 1)
+                     (or (named? head "unquote")
+                         (named? head "unquote-splicing"))) (- depth 1)
+                :else depth)
+          depth)
+        (mut i) 0]
+    (loop (if (or (>= (load i) n) (!= (load (field x failed)) 0)) (break)
+              (let [item (al/al-get [(ptr forms/CarpNode)] (load items) (load i))]
+                (al/al-push! [(ptr forms/CarpNode)] output
+                  (if (and active-unquote (> (load i) 0))
+                      (expand-node (mut x) scope item)
+                      (if (and (= kind 1) (> n 0)
+                               (and (named? head "quote") (> (load i) 0)))
+                          (forms/clone-node a item)
+                          (expand-quasiquoted-node
+                            (mut x) scope item next-depth))))
+                (store! i (+ (load i) 1)))))
+    (forms/node-new-at a span
+      (cond (= kind 1) (forms/ListForm output)
+            (= kind 2) (forms/ArrayForm output)
+            (= kind 3) (forms/StaticArrayForm output)
+            :else (forms/DictionaryForm output)))))
+
+(defn expand-quasiquoted-node [(x (mut Expander)) (scope env/FrameId)
+                               (node (ptr forms/CarpNode)) (depth i64)]
+  (-> (ptr forms/CarpNode))
+  (match (forms/form-of node)
+    (forms/ListForm [items]
+      (rebuild-quasiquoted-collection (mut x) scope node items 1 depth))
+    (forms/ArrayForm [items]
+      (rebuild-quasiquoted-collection (mut x) scope node items 2 depth))
+    (forms/StaticArrayForm [items]
+      (rebuild-quasiquoted-collection (mut x) scope node items 3 depth))
+    (forms/DictionaryForm [items]
+      (rebuild-quasiquoted-collection (mut x) scope node items 4 depth))
+    (_ (forms/clone-node (load (field x a)) node))))
+
+(defn expand-macro-call [(x (mut Expander)) (scope env/FrameId)
+                         (node (ptr forms/CarpNode))
+                         (items (ptr (al/ArrayList (ptr forms/CarpNode))))
+                         (binding MacroBinding)] (-> (ptr forms/CarpNode))
+  (let [a (load (field x a))
+        arguments (alloc/box! a (al/ArrayList eval/CtValue)
+                              (al/al-new [eval/CtValue] a))
+        n (al/al-len [(ptr forms/CarpNode)] (load items))
+        (mut i) 1]
+    (loop (if (>= (load i) n) (break)
+              (do (let [argument (al/al-get [(ptr forms/CarpNode)]
+                                             (load items) (load i))]
+                    (match (forms/form-of argument)
+                      (forms/Comment [_] 0)
+                      (_ (al/al-push! [eval/CtValue] arguments
+                           (eval/ValueSyntax (forms/clone-node a argument))))))
+                  (store! i (+ (load i) 1)))))
+    (let [result (eval/apply-value (mut (field x evaluator))
+                                  scope node
+                                  (eval/lookup-value (field x evaluator)
+                                                     (.cell binding)) arguments)]
+      (if (eval/eval-failed? result)
+          (do (set-error! (mut x) result) (forms/clone-node a node))
+          (expand-node (mut x) scope
+            (value-to-syntax (mut x) (forms/span-of node)
+                             (eval/result-value result)))))))
+
+(defn expand-node [(x (mut Expander)) (scope env/FrameId)
+                   (node (ptr forms/CarpNode))]
+  (-> (ptr forms/CarpNode))
+  (match (forms/form-of node)
+    (forms/ListForm [items]
+      (let [n (al/al-len [(ptr forms/CarpNode)] (load items))]
+        (if (= n 0) (forms/clone-node (load (field x a)) node)
+            (let [head (al/al-get [(ptr forms/CarpNode)] (load items) 0)]
+              (if (named? head "quote")
+                  (forms/clone-node (load (field x a)) node)
+                  (if (named? head "quasiquote")
+                      (expand-quasiquoted-node (mut x) scope node 0)
+                  (let [index (macro-index (mut x) scope head)]
+                    (if (= index -1)
+                        (expand-children (mut x) scope node items 1)
+                        (expand-macro-call (mut x) scope node items
+                          (al/al-get [MacroBinding]
+                                     (load (field x macros)) index))))))))))
+    (forms/ArrayForm [items] (expand-children (mut x) scope node items 2))
+    (forms/StaticArrayForm [items] (expand-children (mut x) scope node items 3))
+    (forms/DictionaryForm [items] (expand-children (mut x) scope node items 4))
+    (_ (forms/clone-node (load (field x a)) node))))
+
+(defn append-path [(x (mut Expander)) (parent (slice u8)) (name (slice u8))]
+  (-> (slice u8))
+  (if (= (slice-len parent) 0) name
+      (let [(mut out) (str/sb-new (load (field x a)))]
+        (str/sb-push-str! (mut out) parent)
+        (str/sb-push-byte! (mut out) (primitive/cast u8 46))
+        (str/sb-push-str! (mut out) name)
+        (str/sb-finish! (mut out)))))
+
+(defn ensure-module-frame! [(x (mut Expander)) (path (slice u8))]
+  (-> env/FrameId)
+  (let [index (module-index (mut x) path)]
+    (if (!= index -1)
+        (let [existing (al/al-get [ModuleBinding]
+                                  (load (field x modules)) index)]
+          (.frame existing))
+        (let [frame (eval/child-frame! (mut (field x evaluator))
+                                      (eval/evaluator-root (field x evaluator)))]
+          (al/al-push! [ModuleBinding] (mut (field x modules))
+                       (ModuleBinding :path path :frame frame))
+          (if (configured-prelude? (mut x) path)
+              (do (eval/import-frame! (mut (field x evaluator))
+                                      (eval/evaluator-root (field x evaluator)) frame)
+                  0) 0)
+          frame))))
+
+(defn use-symbol-target [(x (mut Expander)) (target (ptr forms/CarpNode))]
+  (-> (slice u8))
+  (match (forms/form-of target)
+            (forms/Symbol [segments]
+              (let [n (al/al-len [(slice u8)] (load segments))]
+                (if (= n 0) ""
+                    (let [(mut out) (str/sb-new (load (field x a)))
+                          (mut i) 0]
+                      (loop (if (>= (load i) n) (break)
+                                (do (if (> (load i) 0)
+                                        (str/sb-push-str! (mut out) ".") 0)
+                                    (str/sb-push-str! (mut out)
+                                      (al/al-get [(slice u8)]
+                                        (load segments) (load i)))
+                                    (store! i (+ (load i) 1)))))
+                      (str/sb-finish! (mut out))))))
+            (_ "")))
+
+(defn use-target [(x (mut Expander)) (node (ptr forms/CarpNode))] (-> (slice u8))
+  (let [items (list-items node)]
+    (if (or (= (primitive/cast i64 items) 0)
+            (< (al/al-len [(ptr forms/CarpNode)] (load items)) 2))
+        ""
+        (use-symbol-target (mut x)
+          (al/al-get [(ptr forms/CarpNode)] (load items) 1)))))
+
+(defn process-body! [(x (mut Expander)) (scope env/FrameId)
+                     (path (slice u8))
+                     (items (ptr (al/ArrayList (ptr forms/CarpNode))))
+                     (start i64)
+                     (output (mut (al/ArrayList (ptr forms/CarpNode))))] (-> i64)
+  (let [n (al/al-len [(ptr forms/CarpNode)] (load items))
+        (mut i) start]
+    (loop (if (or (>= (load i) n) (!= (load (field x failed)) 0)) (break)
+              (let [node (al/al-get [(ptr forms/CarpNode)] (load items) (load i))
+                    kind (definition-kind node)
+                    marker (load-marker-kind node)]
+                (cond
+                  (= marker 1)
+                    (eval/evaluator-push-load! (mut (field x evaluator))
+                                               (load-marker-file node))
+                  (= marker 2)
+                    (eval/evaluator-pop-load! (mut (field x evaluator)))
+                  (= kind 1) (register-function! (mut x) scope path node true)
+                  (= kind 2) (register-function! (mut x) scope path node false)
+                  (= kind 3) (register-value! (mut x) scope path node)
+                  (= kind 4)
+                    (let [module-items (list-items node)]
+                      (if (< (al/al-len [(ptr forms/CarpNode)] (load module-items)) 2)
+                          (fail-at! (mut x) node "defmodule expects a name")
+                          (let [name-node (al/al-get [(ptr forms/CarpNode)]
+                                                    (load module-items) 1)
+                                name (simple-name name-node)]
+                            (if (= (slice-len name) 0)
+                                (fail-at! (mut x) name-node
+                                          "defmodule name must be a symbol")
+                                (let [module-path (append-path (mut x) path name)
+                                      module-frame (ensure-module-frame! (mut x) module-path)
+                                      a (load (field x a))
+                                      body (alloc/box! a
+                                             (al/ArrayList (ptr forms/CarpNode))
+                                             (al/al-new [(ptr forms/CarpNode)] a))]
+                                  (al/al-push! [(ptr forms/CarpNode)] body
+                                    (forms/clone-node a
+                                      (al/al-get [(ptr forms/CarpNode)]
+                                                 (load module-items) 0)))
+                                  (al/al-push! [(ptr forms/CarpNode)] body
+                                               (forms/clone-node a name-node))
+                                  (process-body! (mut x) module-frame module-path
+                                                 module-items 2 (mut body))
+                                  (al/al-push! [(ptr forms/CarpNode)] (mut output)
+                                    (forms/list-new a (forms/span-of node) body)))))))
+                  (= kind 5)
+                    (let [use-items (list-items node)
+                          use-count (al/al-len [(ptr forms/CarpNode)]
+                                      (load use-items))
+                          (mut ui) 1]
+                      (loop (if (or (>= (load ui) use-count)
+                                    (!= (load (field x failed)) 0)) (break)
+                                (let [target (use-symbol-target (mut x)
+                                               (al/al-get [(ptr forms/CarpNode)]
+                                                 (load use-items) (load ui)))
+                                      direct-index (module-index (mut x) target)
+                                      index (if (!= direct-index -1) direct-index
+                                              (module-index (mut x)
+                                                (append-path (mut x) path target)))]
+                                  (if (= index -1)
+                                      (fail-undefined-use! (mut x) node target)
+                                      (let [module-binding (al/al-get [ModuleBinding]
+                                                             (load (field x modules)) index)]
+                                        (do (eval/import-frame! (mut (field x evaluator)) scope
+                                                                (.frame module-binding))
+                                            0)))
+                                  (store! ui (+ (load ui) 1)))))
+                      (if (= (load (field x failed)) 0)
+                          (al/al-push! [(ptr forms/CarpNode)] (mut output)
+                            (forms/clone-node (load (field x a)) node)) 0))
+                  (= kind 6)
+                    (do (register-runtime-shadow! (mut x) scope node)
+                        (register-runtime-type-module! (mut x) path node)
+                        (let [expanded (expand-node (mut x) scope node)]
+                          (mark-runtime-dynamics! (mut x) scope expanded)
+                          (al/al-push! [(ptr forms/CarpNode)] (mut output) expanded)))
+                  :else (process-runtime-or-dynamic! (mut x) scope node (mut output)))
+                (store! i (+ (load i) 1))))))
+  0)
+
+(defn runtime-definition [(x (mut Expander)) (definition (ptr forms/CarpNode))]
+  (-> (ptr forms/CarpNode))
+  (let [source (list-items definition)
+        a (load (field x a)) span (forms/span-of definition)
+        output (alloc/box! a (al/ArrayList (ptr forms/CarpNode))
+                 (al/al-new [(ptr forms/CarpNode)] a))
+        n (al/al-len [(ptr forms/CarpNode)] (load source)) (mut i) 1]
+    (al/al-push! [(ptr forms/CarpNode)] output (forms/symbol-new a span "defn"))
+    (loop (if (>= (load i) n) (break)
+              (do (al/al-push! [(ptr forms/CarpNode)] output
+                    (forms/clone-node a
+                      (al/al-get [(ptr forms/CarpNode)] (load source) (load i))))
+                  (store! i (+ (load i) 1)))))
+    (forms/list-new a span output)))
+
+(defn append-materialized-dynamics!
+  [(x (mut Expander)) (output (mut (al/ArrayList (ptr forms/CarpNode))))]
+  (-> i64)
+  (let [n (al/al-len [DynamicBinding] (load (field x dynamics))) (mut i) 0]
+    (loop (if (or (>= (load i) n) (!= (load (field x failed)) 0)) (break)
+              (let [binding (al/al-elem [DynamicBinding]
+                              (field x dynamics) (load i))]
+                (if (load (field binding materialized))
+                    (al/al-push! [(ptr forms/CarpNode)] (mut output)
+                      (runtime-definition (mut x)
+                        (load (field binding definition)))) 0)
+                (store! i (+ (load i) 1)))))
+    0))
+
+(defn expand-module-with [(a (dyn alloc/Allocator)) (module forms/CarpModule)
+                          (config ExpandConfig)]
+  (-> ExpandResult)
+  (let [(mut x) (load (Expander :a a :evaluator (eval/evaluator-new a)
+                                :macros (al/al-new [MacroBinding] a)
+                                :dynamics (al/al-new [DynamicBinding] a)
+                                :dynamic-shadows
+                                  (al/al-new [RuntimeDynamicShadow] a)
+                                :modules (al/al-new [ModuleBinding] a)
+                                :preludes (.preludes config)
+                                :failed 0
+                                :error (eval/CtError :message ""
+                                                     :span (forms/synthetic-span))))
+        (mut output) (al/al-new [(ptr forms/CarpNode)] a)
+        (mut input) (.forms module)
+        root (eval/evaluator-root (field x evaluator))]
+    (eval/evaluator-configure-host! (mut (field x evaluator))
+                                    (.host-arch config) (.host-os config)
+                                    (.project-target config))
+    (process-body! (mut x) root "" (mut input) 0 (mut output))
+    (let [(mut final) (al/al-new [(ptr forms/CarpNode)] a)]
+      (append-materialized-dynamics! (mut x) (mut final))
+      (let [n (al/al-len [(ptr forms/CarpNode)] (load output)) (mut i) 0]
+        (loop (if (>= (load i) n) (break)
+                  (do (al/al-push! [(ptr forms/CarpNode)] (mut final)
+                        (al/al-get [(ptr forms/CarpNode)] (load output) (load i)))
+                      (store! i (+ (load i) 1))))))
+      (ExpandResult :module (forms/CarpModule :forms (load final))
+                    :failed (load (field x failed)) :error (load (field x error))))))
+
+(defn expand-module [(a (dyn alloc/Allocator)) (module forms/CarpModule)]
+  (-> ExpandResult)
+  (expand-module-with a module (config-new a)))

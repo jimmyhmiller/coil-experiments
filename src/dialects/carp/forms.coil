@@ -1,0 +1,496 @@
+(module experiments.carp.forms)
+
+;; Lossless semantic surface forms. This is the boundary consumed by macro
+;; expansion and resolution: literal values are decoded once, qualified names
+;; are segmented once, while every node retains its originating source span.
+
+(import "experiments.carp.surface" :as reader)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+
+(extern strtod :cc c [(ptr i8) (ptr (ptr i8))] (-> f64))
+
+(export SurfaceSpan CarpForm CarpNode CarpModule LowerResult lower lower-failed?
+        form-of span-of module-count module-at symbol-segments collection-items
+        synthetic-span node-new-at symbol-new list-new clone-node reanchor!
+        IntLit ByteLit LongLit FloatLit DoubleLit BoolLit CharLit StringLit
+        PatternLit Symbol ListForm ArrayForm StaticArrayForm DictionaryForm Comment)
+
+(defstruct SurfaceSpan
+  [(start reader/SourceInfo) (end reader/SourceInfo) (source (slice u8))])
+
+(defsum CarpForm
+  (IntLit [(value i64)])
+  (ByteLit [(value i64)])
+  (LongLit [(value i64)])
+  ;; Float values are rounded through f32 and stored as f64, so the compiler IR
+  ;; has one host floating representation without losing Carp's distinction.
+  (FloatLit [(value f64)])
+  (DoubleLit [(value f64)])
+  (BoolLit [(value bool)])
+  (CharLit [(value i64)])
+  (StringLit [(value (slice u8))])
+  (PatternLit [(value (slice u8))])
+  (Symbol [(segments (ptr (al/ArrayList (slice u8))))])
+  (ListForm [(items (ptr (al/ArrayList (ptr CarpNode))))])
+  (ArrayForm [(items (ptr (al/ArrayList (ptr CarpNode))))])
+  (StaticArrayForm [(items (ptr (al/ArrayList (ptr CarpNode))))])
+  (DictionaryForm [(items (ptr (al/ArrayList (ptr CarpNode))))])
+  (Comment [(value (slice u8))]))
+
+(defstruct CarpNode [(span SurfaceSpan) (form CarpForm)])
+(defstruct CarpModule [(forms (al/ArrayList (ptr CarpNode)))])
+(defstruct LowerResult
+  [(module CarpModule) (failed i64) (message (slice u8)) (at SurfaceSpan)])
+
+(defstruct Lowerer
+  [(a (dyn alloc/Allocator))
+   (source-id (slice u8))
+   (failed i64)
+   (message (slice u8))
+   (at SurfaceSpan)])
+
+(defn lower-failed? [(result LowerResult)] (-> bool) (!= (.failed result) 0))
+(defn form-of [(node (ptr CarpNode))] (-> CarpForm) (load (field node form)))
+(defn span-of [(node (ptr CarpNode))] (-> SurfaceSpan) (load (field node span)))
+(defn module-count [(module CarpModule)] (-> i64)
+  (al/al-len [(ptr CarpNode)] (.forms module)))
+(defn module-at [(module CarpModule) (index i64)] (-> (ptr CarpNode))
+  (al/al-get [(ptr CarpNode)] (.forms module) index))
+(defn symbol-segments [(form CarpForm)] (-> (ptr (al/ArrayList (slice u8))))
+  (match form
+    (Symbol [segments] segments)
+    (_ (primitive/cast (ptr (al/ArrayList (slice u8))) 0))))
+(defn collection-items [(form CarpForm)] (-> (ptr (al/ArrayList (ptr CarpNode))))
+  (match form
+    (ListForm [items] items)
+    (ArrayForm [items] items)
+    (StaticArrayForm [items] items)
+    (DictionaryForm [items] items)
+    (_ (primitive/cast (ptr (al/ArrayList (ptr CarpNode))) 0))))
+
+(defn synthetic-span [] (-> SurfaceSpan)
+  (let [info (reader/SourceInfo :offset 0 :line 0 :column 0)]
+    (SurfaceSpan :start info :end info :source "")))
+
+(defn node-new-at [(a (dyn alloc/Allocator)) (span SurfaceSpan) (form CarpForm)]
+  (-> (ptr CarpNode))
+  (alloc/box! a CarpNode (CarpNode :span span :form form)))
+
+(defn symbol-new [(a (dyn alloc/Allocator)) (span SurfaceSpan) (name (slice u8))]
+  (-> (ptr CarpNode))
+  (let [segments (alloc/box! a (al/ArrayList (slice u8))
+                             (al/al-new [(slice u8)] a))]
+    (al/al-push! [(slice u8)] segments name)
+    (node-new-at a span (Symbol segments))))
+
+(defn list-new [(a (dyn alloc/Allocator)) (span SurfaceSpan)
+                (items (ptr (al/ArrayList (ptr CarpNode))))] (-> (ptr CarpNode))
+  (node-new-at a span (ListForm items)))
+
+(defn clone-items [(a (dyn alloc/Allocator))
+                   (items (ptr (al/ArrayList (ptr CarpNode))))]
+  (-> (ptr (al/ArrayList (ptr CarpNode))))
+  (let [copied (alloc/box! a (al/ArrayList (ptr CarpNode))
+                           (al/al-new [(ptr CarpNode)] a))
+        n (al/al-len [(ptr CarpNode)] (load items))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do (al/al-push! [(ptr CarpNode)] copied
+                               (clone-node a (al/al-get [(ptr CarpNode)]
+                                                       (load items) (load i))))
+                  (store! i (+ (load i) 1)))))
+    copied))
+
+(defn clone-node [(a (dyn alloc/Allocator)) (node (ptr CarpNode))] (-> (ptr CarpNode))
+  (let [span (span-of node)]
+    (match (form-of node)
+      (IntLit [value] (node-new-at a span (IntLit value)))
+      (ByteLit [value] (node-new-at a span (ByteLit value)))
+      (LongLit [value] (node-new-at a span (LongLit value)))
+      (FloatLit [value] (node-new-at a span (FloatLit value)))
+      (DoubleLit [value] (node-new-at a span (DoubleLit value)))
+      (BoolLit [value] (node-new-at a span (BoolLit value)))
+      (CharLit [value] (node-new-at a span (CharLit value)))
+      (StringLit [value] (node-new-at a span (StringLit value)))
+      (PatternLit [value] (node-new-at a span (PatternLit value)))
+      (Symbol [segments] (let [copied (alloc/box! a (al/ArrayList (slice u8))
+                                                  (al/al-new [(slice u8)] a))
+                               n (al/al-len [(slice u8)] (load segments))
+                               (mut i) 0]
+                           (loop (if (>= (load i) n) (break)
+                                     (do (al/al-push! [(slice u8)] copied
+                                                      (al/al-get [(slice u8)]
+                                                                 (load segments) (load i)))
+                                         (store! i (+ (load i) 1)))))
+                           (node-new-at a span (Symbol copied))))
+      (ListForm [items] (node-new-at a span (ListForm (clone-items a items))))
+      (ArrayForm [items] (node-new-at a span (ArrayForm (clone-items a items))))
+      (StaticArrayForm [items]
+        (node-new-at a span (StaticArrayForm (clone-items a items))))
+      (DictionaryForm [items]
+        (node-new-at a span (DictionaryForm (clone-items a items))))
+      (Comment [value] (node-new-at a span (Comment value))))))
+
+(defn reanchor-items! [(items (ptr (al/ArrayList (ptr CarpNode))))
+                       (span SurfaceSpan)] (-> i64)
+  (let [n (al/al-len [(ptr CarpNode)] (load items))
+        (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (reanchor! (al/al-get [(ptr CarpNode)] (load items) (load i)) span)
+                  (store! i (+ (load i) 1))))))
+  0)
+
+(defn reanchor! [(node (ptr CarpNode)) (span SurfaceSpan)] (-> i64)
+  (store! (field node span) span)
+  (match (form-of node)
+    (ListForm [items] (reanchor-items! items span))
+    (ArrayForm [items] (reanchor-items! items span))
+    (StaticArrayForm [items] (reanchor-items! items span))
+    (DictionaryForm [items] (reanchor-items! items span))
+    (_ 0))
+  0)
+
+(defn span-for [(lowerer (mut Lowerer)) (node (ptr reader/SurfaceNode))] (-> SurfaceSpan)
+  (SurfaceSpan :start (reader/node-start node) :end (reader/node-end node)
+               :source (load (field lowerer source-id))))
+
+(defn fail! [(lowerer (mut Lowerer)) (node (ptr reader/SurfaceNode))
+             (message (slice u8))] (-> i64)
+  (if (= (load (field lowerer failed)) 0)
+      (do (store! (field lowerer failed) 1)
+          (store! (field lowerer message) message)
+          (store! (field lowerer at) (span-for (mut lowerer) node)))
+      0)
+  0)
+
+(defn digit-value [(c i64)] (-> i64)
+  (cond
+    (and (>= c 48) (<= c 57)) (- c 48)
+    (and (>= c 65) (<= c 70)) (+ 10 (- c 65))
+    (and (>= c 97) (<= c 102)) (+ 10 (- c 97))
+    :else -1))
+
+(defn parse-integer [(text (slice u8))] (-> i64)
+  (let [n (slice-len text)
+        (mut at) 0
+        (mut sign) 1
+        (mut base) 10
+        (mut end) n
+        (mut value) 0]
+    (if (and (> n 0) (= (primitive/cast i64 (slice-get text 0)) 45))
+        (do (store! sign -1) (store! at 1)) 0)
+    (if (and (< (+ (load at) 1) n)
+             (= (primitive/cast i64 (slice-get text (load at))) 48))
+        (let [marker (primitive/cast i64 (slice-get text (+ (load at) 1)))]
+          (cond (= marker 120) (do (store! base 16) (store! at (+ (load at) 2)))
+                (= marker 98) (do (store! base 2) (store! at (+ (load at) 2)))
+                :else 0)) 0)
+    (if (> (load end) (load at))
+        (let [last (primitive/cast i64 (slice-get text (- (load end) 1)))]
+          (if (or (= last 98) (= last 108)) (store! end (- (load end) 1)) 0)) 0)
+    (loop (if (>= (load at) (load end))
+              (break)
+              (do
+                (store! value (+ (* (load value) (load base))
+                                 (digit-value (primitive/cast i64
+                                                (slice-get text (load at))))))
+                (store! at (+ (load at) 1)))))
+    (* (load sign) (load value))))
+
+(defn parse-float [(a (dyn alloc/Allocator)) (text (slice u8))] (-> f64)
+  (strtod (str/str->cstr a text) (primitive/cast (ptr (ptr i8)) 0)))
+
+(defn bytes-new [(lowerer (mut Lowerer))] (-> (ptr (al/ArrayList u8)))
+  (alloc/box! (load (field lowerer a)) (al/ArrayList u8)
+              (al/al-new [u8] (load (field lowerer a)))))
+(defn byte-push! [(bytes (ptr (al/ArrayList u8))) (value i64)] (-> i64)
+  (al/al-push! [u8] bytes (primitive/cast u8 value)))
+(defn bytes-slice [(bytes (ptr (al/ArrayList u8)))] (-> (slice u8))
+  (slice-new [u8] (load (field bytes data)) (al/al-len [u8] (load bytes))))
+
+(defn hex-run [(text (slice u8)) (at i64) (count i64)] (-> i64)
+  (let [(mut i) 0 (mut value) 0]
+    (loop (if (>= (load i) count)
+              (break)
+              (do (store! value (+ (* (load value) 16)
+                                   (digit-value (primitive/cast i64
+                                                  (slice-get text (+ at (load i)))))))
+                  (store! i (+ (load i) 1)))))
+    (load value)))
+
+(defn push-utf8! [(bytes (ptr (al/ArrayList u8))) (codepoint i64)] (-> i64)
+  (cond
+    (<= codepoint 127) (byte-push! bytes codepoint)
+    (<= codepoint 2047)
+      (do (byte-push! bytes (+ 192 (/ codepoint 64)))
+          (byte-push! bytes (+ 128 (% codepoint 64))))
+    (<= codepoint 65535)
+      (do (byte-push! bytes (+ 224 (/ codepoint 4096)))
+          (byte-push! bytes (+ 128 (% (/ codepoint 64) 64)))
+          (byte-push! bytes (+ 128 (% codepoint 64))))
+    :else
+      (do (byte-push! bytes (+ 240 (/ codepoint 262144)))
+          (byte-push! bytes (+ 128 (% (/ codepoint 4096) 64)))
+          (byte-push! bytes (+ 128 (% (/ codepoint 64) 64)))
+          (byte-push! bytes (+ 128 (% codepoint 64)))))
+  0)
+
+(defn valid-hex-run? [(text (slice u8)) (at i64) (count i64)] (-> bool)
+  (let [(mut i) 0 (mut valid) (<= (+ at count) (slice-len text))]
+    (loop (if (or (>= (load i) count) (not (load valid)))
+              (break)
+              (do (if (< (digit-value (primitive/cast i64
+                                         (slice-get text (+ at (load i))))) 0)
+                      (store! valid false) 0)
+                  (store! i (+ (load i) 1)))))
+    (load valid)))
+
+(defn decode-string [(lowerer (mut Lowerer)) (text (slice u8)) (raw bool)]
+  (-> (slice u8))
+  (let [bytes (bytes-new (mut lowerer))
+        n (slice-len text)
+        (mut at) (if raw 2 1)
+        end (- n 1)]
+    (loop
+      (if (>= (load at) end)
+          (break)
+          (let [c (primitive/cast i64 (slice-get text (load at)))]
+            (if raw
+                (if (and (= c 34) (< (+ (load at) 1) end)
+                         (= (primitive/cast i64 (slice-get text (+ (load at) 1))) 34))
+                    (do (byte-push! bytes 34) (store! at (+ (load at) 2)))
+                    (do (byte-push! bytes c) (store! at (+ (load at) 1))))
+                (if (and (= c 92) (< (+ (load at) 1) end))
+                    (let [escape (primitive/cast i64 (slice-get text (+ (load at) 1)))]
+                      (cond
+                        (= escape 110) (do (byte-push! bytes 10) (store! at (+ (load at) 2)))
+                        (= escape 116) (do (byte-push! bytes 9) (store! at (+ (load at) 2)))
+                        (= escape 114) (do (byte-push! bytes 13) (store! at (+ (load at) 2)))
+                        (= escape 98) (do (byte-push! bytes 8) (store! at (+ (load at) 2)))
+                        (= escape 102) (do (byte-push! bytes 12) (store! at (+ (load at) 2)))
+                        (= escape 118) (do (byte-push! bytes 11) (store! at (+ (load at) 2)))
+                        (= escape 97) (do (byte-push! bytes 7) (store! at (+ (load at) 2)))
+                        (or (= escape 92) (or (= escape 34) (= escape 39)))
+                          (do (byte-push! bytes escape) (store! at (+ (load at) 2)))
+                        (and (= escape 120) (valid-hex-run? text (+ (load at) 2) 1))
+                          (let [(mut count) 1]
+                            (if (and (< (+ (load at) 3) end)
+                                     (>= (digit-value (primitive/cast i64
+                                                        (slice-get text (+ (load at) 3)))) 0))
+                                (store! count 2) 0)
+                            (byte-push! bytes (hex-run text (+ (load at) 2) (load count)))
+                            (store! at (+ (+ (load at) 2) (load count))))
+                        (and (= escape 117) (valid-hex-run? text (+ (load at) 2) 4))
+                          (do (push-utf8! bytes (hex-run text (+ (load at) 2) 4))
+                              (store! at (+ (load at) 6)))
+                        (and (= escape 85) (valid-hex-run? text (+ (load at) 2) 8))
+                          (do (push-utf8! bytes (hex-run text (+ (load at) 2) 8))
+                              (store! at (+ (load at) 10)))
+                        (and (>= escape 48) (<= escape 55)
+                             (< (+ (load at) 2) end)
+                             (let [second (primitive/cast i64
+                                            (slice-get text (+ (load at) 2)))]
+                               (and (>= second 48) (<= second 55))))
+                          (let [(mut run-end) (+ (load at) 2)]
+                            (loop
+                              (if (>= (load run-end) end)
+                                  (break)
+                                  (let [digit (primitive/cast i64
+                                                (slice-get text (load run-end)))]
+                                    (if (and (>= digit 48) (<= digit 55))
+                                        (store! run-end (+ (load run-end) 1))
+                                        (break)))))
+                            ;; Carp's reference reader intentionally feeds this
+                            ;; octal-looking run through its hexadecimal reader.
+                            (push-utf8! bytes
+                              (hex-run text (+ (load at) 1)
+                                       (- (load run-end) (+ (load at) 1))))
+                            (store! at (load run-end)))
+                        :else
+                          (do (byte-push! bytes 92) (byte-push! bytes escape)
+                              (store! at (+ (load at) 2)))))
+                    (do (byte-push! bytes c) (store! at (+ (load at) 1))))))))
+    (bytes-slice bytes)))
+
+(defn utf8-codepoint [(text (slice u8))] (-> i64)
+  (let [n (slice-len text)
+        first (if (> n 0) (primitive/cast i64 (slice-get text 0)) 0)]
+    (cond
+      (and (= n 1) (< first 128)) first
+      (and (= n 2) (and (>= first 194) (<= first 223)))
+        (+ (* (- first 192) 64)
+           (- (primitive/cast i64 (slice-get text 1)) 128))
+      (and (= n 3) (and (>= first 224) (<= first 239)))
+        (+ (* (- first 224) 4096)
+           (+ (* (- (primitive/cast i64 (slice-get text 1)) 128) 64)
+              (- (primitive/cast i64 (slice-get text 2)) 128)))
+      (and (= n 4) (and (>= first 240) (<= first 244)))
+        (+ (* (- first 240) 262144)
+           (+ (* (- (primitive/cast i64 (slice-get text 1)) 128) 4096)
+              (+ (* (- (primitive/cast i64 (slice-get text 2)) 128) 64)
+                 (- (primitive/cast i64 (slice-get text 3)) 128))))
+      :else -1)))
+
+(defn decode-char [(lowerer (mut Lowerer)) (node (ptr reader/SurfaceNode))]
+  (-> i64)
+  (let [text (reader/node-text node)
+        body (subslice text 1 (slice-len text))]
+    (cond
+      (str/str-eq body "space") 32
+      (str/str-eq body "tab") 9
+      (str/str-eq body "newline") 10
+      (str/str-eq body "return") 13
+      (str/str-eq body "backspace") 8
+      (str/str-eq body "formfeed") 12
+      (and (= (slice-len body) 5)
+           (= (primitive/cast i64 (slice-get body 0)) 117)
+           (valid-hex-run? body 1 4)) (hex-run body 1 4)
+      (and (= (slice-len body) 9)
+           (= (primitive/cast i64 (slice-get body 0)) 85)
+           (valid-hex-run? body 1 8)) (hex-run body 1 8)
+      (>= (utf8-codepoint body) 0) (utf8-codepoint body)
+      :else (do (fail! (mut lowerer) node "invalid character literal") 0))))
+
+(defn split-symbol [(lowerer (mut Lowerer)) (text (slice u8))]
+  (-> (ptr (al/ArrayList (slice u8))))
+  (let [segments (alloc/box! (load (field lowerer a)) (al/ArrayList (slice u8))
+                             (al/al-new [(slice u8)] (load (field lowerer a))))
+        n (slice-len text)
+        (mut start) 0
+        (mut at) 0]
+    (loop (if (>= (load at) n)
+              (break)
+              (do
+                (if (= (primitive/cast i64 (slice-get text (load at))) 46)
+                    (do (al/al-push! [(slice u8)] segments
+                                     (subslice text (load start) (load at)))
+                        (store! start (+ (load at) 1)))
+                    0)
+                (store! at (+ (load at) 1)))))
+    (al/al-push! [(slice u8)] segments (subslice text (load start) n))
+    segments))
+
+(defn node-new [(lowerer (mut Lowerer)) (raw (ptr reader/SurfaceNode)) (form CarpForm)]
+  (-> (ptr CarpNode))
+  (let [span (span-for (mut lowerer) raw)]
+    (alloc/box! (load (field lowerer a)) CarpNode (CarpNode :span span :form form))))
+
+(defn lower-children [(lowerer (mut Lowerer)) (raw (ptr reader/SurfaceNode))]
+  (-> (ptr (al/ArrayList (ptr CarpNode))))
+  (let [items (alloc/box! (load (field lowerer a)) (al/ArrayList (ptr CarpNode))
+                          (al/al-new [(ptr CarpNode)] (load (field lowerer a))))
+        n (reader/child-count raw)
+        (mut i) 0]
+    (loop (if (or (>= (load i) n) (!= (load (field lowerer failed)) 0))
+              (break)
+              (do (al/al-push! [(ptr CarpNode)] items
+                               (lower-node (mut lowerer) (reader/child-at raw (load i))))
+                  (store! i (+ (load i) 1)))))
+    items))
+
+(defn qualified-symbol-at [(lowerer (mut Lowerer))
+                           (raw (ptr reader/SurfaceNode))
+                           (owner (slice u8)) (name (slice u8))]
+  (-> (ptr CarpNode))
+  (let [segments (alloc/box! (load (field lowerer a))
+                   (al/ArrayList (slice u8))
+                   (al/al-new [(slice u8)] (load (field lowerer a))))]
+    (al/al-push! [(slice u8)] segments owner)
+    (al/al-push! [(slice u8)] segments name)
+    (node-new (mut lowerer) raw (Symbol segments))))
+
+(defn lower-dictionary [(lowerer (mut Lowerer))
+                        (raw (ptr reader/SurfaceNode))] (-> (ptr CarpNode))
+  (let [a (load (field lowerer a))
+        values (lower-children (mut lowerer) raw)
+        value-count (al/al-len [(ptr CarpNode)] (load values))
+        pairs (alloc/box! a (al/ArrayList (ptr CarpNode))
+                (al/al-new [(ptr CarpNode)] a))
+        (mut i) 0]
+    ;; Carp deliberately drops an unmatched final dictionary form.
+    (loop (if (>= (+ (load i) 1) value-count) (break)
+              (let [pair-items (alloc/box! a (al/ArrayList (ptr CarpNode))
+                                 (al/al-new [(ptr CarpNode)] a))]
+                (al/al-push! [(ptr CarpNode)] pair-items
+                  (qualified-symbol-at (mut lowerer) raw "Pair" "init"))
+                (al/al-push! [(ptr CarpNode)] pair-items
+                  (al/al-get [(ptr CarpNode)] (load values) (load i)))
+                (al/al-push! [(ptr CarpNode)] pair-items
+                  (al/al-get [(ptr CarpNode)] (load values) (+ (load i) 1)))
+                (al/al-push! [(ptr CarpNode)] pairs
+                  (node-new (mut lowerer) raw (ListForm pair-items)))
+                (store! i (+ (load i) 2)))))
+    (let [array (node-new (mut lowerer) raw (ArrayForm pairs))
+          call (alloc/box! a (al/ArrayList (ptr CarpNode))
+                 (al/al-new [(ptr CarpNode)] a))]
+      (al/al-push! [(ptr CarpNode)] call
+        (qualified-symbol-at (mut lowerer) raw "Map" "from-array"))
+      (al/al-push! [(ptr CarpNode)] call array)
+      (node-new (mut lowerer) raw (ListForm call)))))
+
+(defn lower-node [(lowerer (mut Lowerer)) (raw (ptr reader/SurfaceNode))]
+  (-> (ptr CarpNode))
+  (let [kind (reader/node-kind raw)
+        text (reader/node-text raw)]
+    (cond
+      (= kind reader/KIND-INT) (node-new (mut lowerer) raw (IntLit (parse-integer text)))
+      (= kind reader/KIND-BYTE) (node-new (mut lowerer) raw (ByteLit (parse-integer text)))
+      (= kind reader/KIND-LONG) (node-new (mut lowerer) raw (LongLit (parse-integer text)))
+      (= kind reader/KIND-FLOAT)
+        (node-new (mut lowerer) raw
+                  (FloatLit (primitive/cast f64
+                              (primitive/cast f32 (parse-float (load (field lowerer a)) text)))))
+      (= kind reader/KIND-DOUBLE)
+        (node-new (mut lowerer) raw (DoubleLit (parse-float (load (field lowerer a)) text)))
+      (= kind reader/KIND-BOOL) (node-new (mut lowerer) raw (BoolLit (str/str-eq text "true")))
+      (= kind reader/KIND-CHAR) (node-new (mut lowerer) raw (CharLit (decode-char (mut lowerer) raw)))
+      (= kind reader/KIND-STRING)
+        (node-new (mut lowerer) raw
+                  (StringLit (decode-string (mut lowerer) text
+                                            (and (> (slice-len text) 1)
+                                                 (= (primitive/cast i64 (slice-get text 0)) 114)))))
+      (= kind reader/KIND-PATTERN)
+        (node-new (mut lowerer) raw (PatternLit (subslice text 2 (- (slice-len text) 1))))
+      (= kind reader/KIND-SYMBOL)
+        (node-new (mut lowerer) raw (Symbol (split-symbol (mut lowerer) text)))
+      (= kind reader/KIND-LIST)
+        (node-new (mut lowerer) raw (ListForm (lower-children (mut lowerer) raw)))
+      (= kind reader/KIND-ARRAY)
+        (node-new (mut lowerer) raw (ArrayForm (lower-children (mut lowerer) raw)))
+      (= kind reader/KIND-STATIC-ARRAY)
+        (node-new (mut lowerer) raw (StaticArrayForm (lower-children (mut lowerer) raw)))
+      (= kind reader/KIND-DICT)
+        (lower-dictionary (mut lowerer) raw)
+      :else (node-new (mut lowerer) raw (Comment (subslice text 1 (slice-len text)))))))
+
+(defn lower [(a (dyn alloc/Allocator)) (source-id (slice u8))
+             (read-result reader/ReadResult)] (-> LowerResult)
+  (let [zero-info (reader/SourceInfo :offset 0 :line 0 :column 0)
+        zero-span (SurfaceSpan :start zero-info :end zero-info :source source-id)
+        (mut lowerer) (load (Lowerer :a a :source-id source-id :failed 0
+                                    :message "" :at zero-span))
+        (mut forms) (al/al-new [(ptr CarpNode)] a)
+        raw-forms (.forms read-result)
+        n (al/al-len [(ptr reader/SurfaceNode)] raw-forms)
+        (mut i) 0]
+    (if (reader/read-failed? read-result)
+        (do (store! (field lowerer failed) 1)
+            (store! (field lowerer message) (.message read-result))
+            (store! (field lowerer at)
+                    (SurfaceSpan :start (.at read-result) :end (.at read-result)
+                                 :source source-id)))
+        (loop (if (or (>= (load i) n) (!= (load (field lowerer failed)) 0))
+                  (break)
+                  (do (al/al-push! [(ptr CarpNode)] (mut forms)
+                                   (lower-node (mut lowerer)
+                                     (al/al-get [(ptr reader/SurfaceNode)] raw-forms (load i))))
+                      (store! i (+ (load i) 1))))))
+    (LowerResult :module (CarpModule :forms (load (mut forms)))
+                 :failed (load (field lowerer failed))
+                 :message (load (field lowerer message))
+                 :at (load (field lowerer at)))))

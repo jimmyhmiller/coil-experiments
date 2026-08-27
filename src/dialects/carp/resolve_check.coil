@@ -1,0 +1,108 @@
+(module experiments.carp.resolve-check)
+
+;; Diagnostic driver for the real Core expansion -> resolution boundary.
+
+(import "experiments.carp.module" :as module)
+(import "experiments.carp.expand" :as expand)
+(import "experiments.carp.ct-eval" :as eval)
+(import "experiments.carp.forms" :as forms)
+(import "experiments.carp.resolve" :as resolve)
+(import "experiments.carp.infer" :as infer)
+(import "experiments.carp.infer-engine" :as infer-engine)
+(import "coil.alloc" :as alloc)
+(import "coil.args" :as args)
+(import "coil.fs" :as fs)
+(import "coil.io" :use [stderr print-str])
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+
+(defn print-source-forms [(a (dyn alloc/Allocator)) (module forms/CarpModule)
+                          (source (slice u8))] (-> i64)
+  (let [n (forms/module-count module) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (let [node (forms/module-at module (load i))
+                    span (forms/span-of node)]
+                (if (str/str-eq (.source span) source)
+                    (do (println "expanded: {s}" (eval/render-node a node)) 0) 0)
+                (store! i (+ (load i) 1)))))
+    0))
+
+(defn basename [(path (slice u8))] (-> (slice u8))
+  (let [n (slice-len path) (mut start) 0 (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (if (= (slice-get path (load i)) (primitive/cast u8 47))
+                      (store! start (+ (load i) 1)) 0)
+                  (store! i (+ (load i) 1)))))
+    (subslice path (load start) n)))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (do
+    (args/args-set! argc argv)
+    (if (< (args/args-count) 3)
+        (do (print-str (stderr)
+              "usage: carp-resolve-check ROOT.carp REGISTRY-FILE.carp...\n") 2)
+        (let [a (alloc/malloc-allocator)
+              root-path (args/args-nth 1)
+              root-key (basename root-path)
+              (mut loader) (module/loader-new a)
+              (mut i) 2 (mut failed) false]
+          (match (fs/read-file a root-path)
+            (Ok [text] (module/add-source! (mut loader) root-key root-path text))
+            (Err [_] (store! failed true)))
+          (loop (if (or (>= (load i) (args/args-count)) (load failed)) (break)
+                    (let [path (args/args-nth (load i))]
+                      (match (fs/read-file a path)
+                        (Ok [text]
+                          (module/add-source! (mut loader) (basename path) path text))
+                        (Err [_] (store! failed true)))
+                      (store! i (+ (load i) 1)))))
+          (if (load failed) (do (print-str (stderr) "cannot read Core registry input\n") 1)
+              (let [loaded (module/load-module (mut loader) root-key)]
+                (if (module/load-failed? loaded)
+                    (do (println "loader: {s}: {s}"
+                                 (module/error-path (.error loaded))
+                                 (module/error-message (.error loaded))) 1)
+                    (let [(mut config) (expand/config-new a)]
+                      (expand/config-add-prelude! (mut config) "Dynamic")
+                      (expand/config-set-host! (mut config) "arm64" "macos" "native")
+                      (let [expanded (expand/expand-module-with a (.module loaded)
+                                                                 (load (mut config)))]
+                        (if (expand/expand-failed? expanded)
+                            (let [error (expand/expand-error expanded)
+                                  span (.span error) start (.start span)]
+                              (println "{s}:{d}:{d}: expansion: {s}"
+                                       (.source span) (.line start) (.column start)
+                                       (.message error)) 1)
+                            (let [resolved (resolve/resolve a
+                                             (expand/expanded-module expanded))]
+                              (if (resolve/resolve-failed? resolved)
+                                  (let [error (resolve/resolve-error resolved)
+                                        span (.span error) start (.start span)]
+                                    (println "{s}:{d}:{d}: resolve: {s}"
+                                             (.source span) (.line start) (.column start)
+                                             (.message error))
+                                    (print-source-forms a (expand/expanded-module expanded)
+                                                        (.source span))
+                                    1)
+                                  (let [audit (infer/audit-signatures
+                                                a (resolve/resolved-module resolved))]
+                                    (if (.failed audit)
+                                        (do (println "signature inference boundary: {s}"
+                                                     (.message audit)) 1)
+                                        (let [inferred (infer-engine/infer-module
+                                                         a (resolve/resolved-module resolved))]
+                                          (if (infer-engine/inference-failed? inferred)
+                                              (do (println "converted {d} signatures; expression inference: {s}"
+                                                           (.count audit)
+                                                           (infer-engine/inference-error inferred)) 1)
+                                              (do (println "resolved {d} globals; converted {d} signatures; inferred expressions"
+                                                           (resolve/global-count resolved)
+                                                           (.count audit))
+                                                  (let [typed (infer-engine/inferred-module inferred)]
+                                                    (println "inferred {d} calls; overloads {d} total, {d} resolved"
+                                                      (infer-engine/inferred-call-count typed)
+                                                      (infer-engine/inferred-overload-count typed)
+                                                      (infer-engine/inferred-resolved-overload-count typed)))
+                                                  0)))))))))))))))))

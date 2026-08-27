@@ -1,0 +1,165 @@
+(module experiments.carp.ct-env)
+
+;; Stable-cell compile-time environments. Frames, imports, and bindings refer
+;; to integer IDs rather than interior ArrayList pointers, so later growth can
+;; never invalidate a closure's captured environment or an alias's target.
+
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "coil.str" :as str)
+
+(export FrameId CellId CtLookup LookupMissing LookupFound LookupAmbiguous
+        CtBinding CtFrame CtCell CtEnv env-new root!
+        child! define! bind-cell! add-import! lookup-status lookup-cell read-cell
+        lookup write-cell! set! frame-count cell-count local-binding-count)
+
+(defstruct FrameId [(index i64)])
+(defstruct CellId [(index i64)])
+(defsum CtLookup
+  (LookupMissing [])
+  (LookupFound [(cell CellId)])
+  (LookupAmbiguous []))
+(defstruct CtBinding [(name (slice u8)) (cell CellId)])
+(defstruct CtFrame
+  [(parent i64)
+   (imports (ptr (al/ArrayList FrameId)))
+   (bindings (ptr (al/ArrayList CtBinding)))])
+(defstruct CtCell [T] [(value T)])
+(defstruct CtEnv [T]
+  [(a (dyn alloc/Allocator))
+   (frames (al/ArrayList CtFrame))
+   (cells (al/ArrayList (CtCell T)))])
+
+(defn env-new [T] [(a (dyn alloc/Allocator))] (-> (CtEnv T))
+  (CtEnv :a a :frames (al/al-new [CtFrame] a)
+         :cells (al/al-new [(CtCell T)] a)))
+(defn frame-count [T] [(env (ptr (CtEnv T)))] (-> i64)
+  (al/al-len [CtFrame] (load (field env frames))))
+(defn cell-count [T] [(env (ptr (CtEnv T)))] (-> i64)
+  (al/al-len [(CtCell T)] (load (field env cells))))
+(defn valid-frame? [T] [(env (ptr (CtEnv T))) (frame FrameId)] (-> bool)
+  (and (>= (.index frame) 0) (< (.index frame) (frame-count [T] env))))
+(defn valid-cell? [T] [(env (ptr (CtEnv T))) (cell CellId)] (-> bool)
+  (and (>= (.index cell) 0) (< (.index cell) (cell-count [T] env))))
+
+(defn frame-new [T] [(env (mut (CtEnv T))) (parent i64)] (-> FrameId)
+  (let [id (FrameId :index (frame-count [T] (mut env))
+                    )
+        a (load (field env a))
+        imports (alloc/box! a (al/ArrayList FrameId) (al/al-new [FrameId] a))
+        bindings (alloc/box! a (al/ArrayList CtBinding) (al/al-new [CtBinding] a))]
+    (al/al-push! [CtFrame] (mut (field env frames))
+                 (CtFrame :parent parent :imports imports :bindings bindings))
+    id))
+
+(defn root! [T] [(env (mut (CtEnv T)))] (-> FrameId)
+  (frame-new [T] (mut env) -1))
+(defn child! [T] [(env (mut (CtEnv T))) (parent FrameId)] (-> FrameId)
+  (if (valid-frame? [T] (mut env) parent)
+      (frame-new [T] (mut env) (.index parent))
+      (FrameId :index -1)))
+
+(defn local-cell [T] [(env (ptr (CtEnv T))) (frame FrameId) (name (slice u8))]
+  (-> i64)
+  (if (not (valid-frame? [T] env frame))
+      -1
+      (let [stored (al/al-elem [CtFrame] (field env frames) (.index frame))
+            bindings (load (field stored bindings))
+            (mut i) (al/al-len [CtBinding] (load bindings))
+            (mut found) -1]
+        (loop (if (or (= (load i) 0) (!= (load found) -1))
+                  (break)
+                  (do
+                    (store! i (- (load i) 1))
+                    (let [binding (al/al-get [CtBinding] (load bindings) (load i))]
+                      (if (str/str-eq (.name binding) name)
+                          (store! found (.index (.cell binding))) 0)))))
+        (load found))))
+
+(defn bind-cell! [T] [(env (mut (CtEnv T))) (frame FrameId)
+                      (name (slice u8)) (cell CellId)] (-> bool)
+  (if (and (valid-frame? [T] (mut env) frame) (valid-cell? [T] (mut env) cell))
+      (let [stored (al/al-elem [CtFrame] (field env frames) (.index frame))]
+        (al/al-push! [CtBinding] (load (field stored bindings))
+                     (CtBinding :name name :cell cell))
+        true)
+      false))
+
+(defn define! [T] [(env (mut (CtEnv T))) (frame FrameId)
+                   (name (slice u8)) (value T)] (-> CellId)
+  (if (not (valid-frame? [T] (mut env) frame))
+      (CellId :index -1)
+      (let [cell (CellId :index (cell-count [T] (mut env)))]
+        (al/al-push! [(CtCell T)] (mut (field env cells)) (CtCell :value value))
+        (bind-cell! [T] (mut env) frame name cell)
+        cell)))
+
+(defn add-import! [T] [(env (mut (CtEnv T))) (frame FrameId) (imported FrameId)]
+  (-> bool)
+  (if (and (valid-frame? [T] (mut env) frame) (valid-frame? [T] (mut env) imported))
+      (let [stored (al/al-elem [CtFrame] (field env frames) (.index frame))]
+        (al/al-push! [FrameId] (load (field stored imports)) imported)
+        true)
+      false))
+
+(defn lookup-depth [T] [(env (ptr (CtEnv T))) (frame FrameId)
+                        (name (slice u8)) (depth i64)] (-> CtLookup)
+  (if (or (not (valid-frame? [T] env frame)) (> depth (frame-count [T] env)))
+      (LookupMissing)
+      (let [local (local-cell [T] env frame name)]
+        (if (!= local -1)
+            (LookupFound (CellId :index local))
+            (let [stored (al/al-elem [CtFrame] (field env frames) (.index frame))
+                  imports (load (field stored imports))
+                  n (al/al-len [FrameId] (load imports))
+                  (mut i) 0
+                  (mut found) -1
+                  (mut ambiguous) false]
+              (loop (if (or (>= (load i) n) (load ambiguous))
+                        (break)
+                        (let [imported (al/al-get [FrameId] (load imports) (load i))
+                              candidate (local-cell [T] env imported name)]
+                          (if (!= candidate -1)
+                              (if (= (load found) -1)
+                                  (store! found candidate)
+                                  (if (!= (load found) candidate)
+                                      (store! ambiguous true) 0)) 0)
+                          (store! i (+ (load i) 1)))))
+              (cond
+                (load ambiguous) (LookupAmbiguous)
+                (!= (load found) -1) (LookupFound (CellId :index (load found)))
+                (>= (load (field stored parent)) 0)
+                  (lookup-depth [T] env
+                    (FrameId :index (load (field stored parent))) name (+ depth 1))
+                :else (LookupMissing)))))))
+
+(defn lookup-status [T] [(env (ptr (CtEnv T))) (frame FrameId) (name (slice u8))]
+  (-> CtLookup) (lookup-depth [T] env frame name 0))
+(defn lookup-cell [T] [(env (ptr (CtEnv T))) (frame FrameId) (name (slice u8))]
+  (-> i64)
+  (match (lookup-status [T] env frame name)
+    (LookupFound [cell] (let [held cell] (.index held)))
+    (_ -1)))
+(defn read-cell [T] [(env (ptr (CtEnv T))) (cell CellId)] (-> T)
+  (if (valid-cell? [T] env cell)
+      (load (field (al/al-elem [(CtCell T)] (field env cells) (.index cell)) value))
+      (primitive/zeroed T)))
+(defn lookup [T] [(env (ptr (CtEnv T))) (frame FrameId) (name (slice u8))] (-> T)
+  (read-cell [T] env (CellId :index (lookup-cell [T] env frame name))))
+(defn write-cell! [T] [(env (mut (CtEnv T))) (cell CellId) (value T)] (-> bool)
+  (if (valid-cell? [T] (mut env) cell)
+      (do (store! (field (al/al-elem [(CtCell T)] (field env cells) (.index cell)) value)
+                  value)
+          true)
+      false))
+(defn set! [T] [(env (mut (CtEnv T))) (frame FrameId)
+                (name (slice u8)) (value T)] (-> bool)
+  (let [cell (lookup-cell [T] (mut env) frame name)]
+    (if (= cell -1) false
+        (write-cell! [T] (mut env) (CellId :index cell) value))))
+(defn local-binding-count [T] [(env (ptr (CtEnv T))) (frame FrameId)] (-> i64)
+  (if (valid-frame? [T] env frame)
+      (let [stored (al/al-elem [CtFrame] (field env frames) (.index frame))]
+        (al/al-len [CtBinding] (load (load (field stored bindings)))))
+      0))

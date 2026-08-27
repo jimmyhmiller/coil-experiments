@@ -1,0 +1,1623 @@
+(module experiments.carp.ct-eval)
+
+;; Carp compile-time evaluation over stable lexical frame/cell IDs. This is a
+;; real evaluator shared by dynamic definitions and macros, not template text
+;; substitution: closures retain frames, aliases retain cells, and mutation is
+;; visible through every captured reference.
+
+(import "experiments.carp.surface" :as reader)
+(import "experiments.carp.forms" :as forms)
+(import "experiments.carp.ct-env" :as env)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+
+(export CtClosure CtValue CtError CtEvalResult CtEvaluator evaluator-new
+        evaluator-configure-host!
+        evaluator-push-load! evaluator-pop-load!
+        evaluator-root child-frame! import-frame! lookup-status lookup-value
+        eval eval-in define! bind-cell! apply-value eval-failed? result-value result-error
+        render-node
+        ValueUnit ValueInt ValueDouble ValueBool ValueChar ValueString ValueSyntax
+        ValueList ValueClosure ValueBuiltin EvalOk EvalError)
+
+(const BUILTIN-ADD 1)
+(const BUILTIN-SUB 2)
+(const BUILTIN-MUL 3)
+(const BUILTIN-DIV 4)
+(const BUILTIN-EQUAL 5)
+(const BUILTIN-LESS 6)
+(const BUILTIN-GREATER 7)
+(const BUILTIN-LESS-EQUAL 8)
+(const BUILTIN-GREATER-EQUAL 9)
+(const BUILTIN-INC 10)
+(const BUILTIN-DEC 11)
+(const BUILTIN-NEG 12)
+(const BUILTIN-NOT 13)
+(const BUILTIN-LIST 14)
+(const BUILTIN-ARRAY 15)
+(const BUILTIN-PARSE 16)
+(const BUILTIN-ROUND 17)
+(const BUILTIN-STRING-TO-LIST 18)
+(const BUILTIN-STRING-TO-ARRAY 19)
+(const BUILTIN-STRING-HEAD 20)
+(const BUILTIN-LENGTH 21)
+(const BUILTIN-CAR 22)
+(const BUILTIN-CDR 23)
+(const BUILTIN-CADR 24)
+(const BUILTIN-CONS-LAST 25)
+(const BUILTIN-APPEND 26)
+(const BUILTIN-DYNAMIC-TYPE 27)
+(const BUILTIN-STRING-CONCAT 28)
+(const BUILTIN-HOST-ARCH 29)
+(const BUILTIN-HOST-OS 30)
+(const BUILTIN-PROJECT-GET-CONFIG 31)
+(const BUILTIN-CADDR 32)
+(const BUILTIN-CONS 33)
+(const BUILTIN-SYMBOL-PREFIX 34)
+(const BUILTIN-SYMBOL-CONCAT 35)
+(const BUILTIN-STR 36)
+(const BUILTIN-SYMBOL-FROM 37)
+(const BUILTIN-STRING-INDEX-OF 38)
+(const BUILTIN-STRING-CHAR-AT 39)
+(const BUILTIN-STRING-SLICE 40)
+(const BUILTIN-CADDDR 41)
+(const BUILTIN-CDDR 42)
+(const BUILTIN-LAST 43)
+(const BUILTIN-ALL-BUT-LAST 44)
+
+(defstruct CtClosure
+  [(parameters (ptr (al/ArrayList (slice u8))))
+   (rest-name (slice u8))
+   (body (ptr (al/ArrayList (ptr forms/CarpNode))))
+   (frame env/FrameId)])
+
+(defsum CtValue
+  (ValueUnit [])
+  (ValueInt [(value i64)])
+  (ValueDouble [(value f64)])
+  (ValueBool [(value bool)])
+  (ValueChar [(value i64)])
+  (ValueString [(value (slice u8))])
+  (ValueSyntax [(value (ptr forms/CarpNode))])
+  (ValueList [(values (ptr (al/ArrayList CtValue))) (array bool)])
+  (ValueClosure [(closure (ptr CtClosure))])
+  (ValueBuiltin [(id i64)]))
+
+(defstruct CtError [(message (slice u8)) (span forms/SurfaceSpan)])
+(defsum CtEvalResult
+  (EvalOk [(value CtValue)])
+  (EvalError [(error CtError)]))
+(defstruct CtEvaluator
+  [(a (dyn alloc/Allocator))
+   (environment (env/CtEnv CtValue))
+   (root env/FrameId)
+   (fuel i64)
+   (host-arch (slice u8))
+   (host-os (slice u8))
+   (project-target (slice u8))
+   (load-stack (al/ArrayList (slice u8)))])
+
+(defn eval-failed? [(result CtEvalResult)] (-> bool)
+  (match result (EvalError [_] true) (_ false)))
+(defn result-value [(result CtEvalResult)] (-> CtValue)
+  (match result (EvalOk [value] value) (_ (ValueUnit))))
+(defn result-error [(result CtEvalResult)] (-> CtError)
+  (match result (EvalError [error] error)
+        (_ (CtError :message "" :span (forms/synthetic-span)))))
+(defn evaluator-root [(e (ptr CtEvaluator))] (-> env/FrameId)
+  (load (field e root)))
+
+(defn error-at [(node (ptr forms/CarpNode)) (message (slice u8))] (-> CtEvalResult)
+  (EvalError (CtError :message message :span (forms/span-of node))))
+(defn error-span [(span forms/SurfaceSpan) (message (slice u8))] (-> CtEvalResult)
+  (EvalError (CtError :message message :span span)))
+
+(defn simple-name [(node (ptr forms/CarpNode))] (-> (slice u8))
+  (match (forms/form-of node)
+    (forms/Symbol [segments]
+      (if (= (al/al-len [(slice u8)] (load segments)) 1)
+          (al/al-get [(slice u8)] (load segments) 0) ""))
+    (_ "")))
+(defn named? [(node (ptr forms/CarpNode)) (name (slice u8))] (-> bool)
+  (str/str-eq (simple-name node) name))
+
+(defn symbol-key [(e (mut CtEvaluator)) (node (ptr forms/CarpNode))] (-> (slice u8))
+  (match (forms/form-of node)
+    (forms/Symbol [segments]
+      (let [n (al/al-len [(slice u8)] (load segments))]
+        (if (= n 0) ""
+            (if (= n 1) (al/al-get [(slice u8)] (load segments) 0)
+                (let [(mut out) (str/sb-new (load (field e a)))
+                      (mut i) 0]
+                  (loop (if (>= (load i) n) (break)
+                            (do (if (> (load i) 0)
+                                    (str/sb-push-byte! (mut out) (primitive/cast u8 46)) 0)
+                                (str/sb-push-str! (mut out)
+                                  (al/al-get [(slice u8)] (load segments) (load i)))
+                                (store! i (+ (load i) 1)))))
+                  (str/sb-finish! (mut out)))))))
+    (_ "")))
+
+(defn bind-builtin! [(e (mut CtEvaluator)) (name (slice u8)) (id i64)] (-> i64)
+  (env/define! [CtValue] (mut (field e environment))
+               (load (field e root)) name (ValueBuiltin id))
+  0)
+
+(defn evaluator-new [(a (dyn alloc/Allocator))] (-> CtEvaluator)
+  (let [(mut environment) (env/env-new [CtValue] a)
+        root (env/root! [CtValue] (mut environment))
+        (mut evaluator) (load (CtEvaluator :a a :environment (load (mut environment))
+                                          :root root :fuel 1000000
+                                          :host-arch "unknown"
+                                          :host-os "unknown"
+                                          :project-target "native"
+                                          :load-stack (al/al-new [(slice u8)] a)))]
+    (bind-builtin! (mut evaluator) "+" BUILTIN-ADD)
+    (bind-builtin! (mut evaluator) "-" BUILTIN-SUB)
+    (bind-builtin! (mut evaluator) "*" BUILTIN-MUL)
+    (bind-builtin! (mut evaluator) "/" BUILTIN-DIV)
+    (bind-builtin! (mut evaluator) "=" BUILTIN-EQUAL)
+    (bind-builtin! (mut evaluator) "<" BUILTIN-LESS)
+    (bind-builtin! (mut evaluator) ">" BUILTIN-GREATER)
+    (bind-builtin! (mut evaluator) "<=" BUILTIN-LESS-EQUAL)
+    (bind-builtin! (mut evaluator) ">=" BUILTIN-GREATER-EQUAL)
+    (bind-builtin! (mut evaluator) "inc" BUILTIN-INC)
+    (bind-builtin! (mut evaluator) "dec" BUILTIN-DEC)
+    (bind-builtin! (mut evaluator) "neg" BUILTIN-NEG)
+    (bind-builtin! (mut evaluator) "not" BUILTIN-NOT)
+    (bind-builtin! (mut evaluator) "list" BUILTIN-LIST)
+    (bind-builtin! (mut evaluator) "array" BUILTIN-ARRAY)
+    (bind-builtin! (mut evaluator) "parse" BUILTIN-PARSE)
+    (bind-builtin! (mut evaluator) "round" BUILTIN-ROUND)
+    (bind-builtin! (mut evaluator) "String.to-list" BUILTIN-STRING-TO-LIST)
+    (bind-builtin! (mut evaluator) "String.to-array" BUILTIN-STRING-TO-ARRAY)
+    (bind-builtin! (mut evaluator) "String.head" BUILTIN-STRING-HEAD)
+    (bind-builtin! (mut evaluator) "length" BUILTIN-LENGTH)
+    (bind-builtin! (mut evaluator) "car" BUILTIN-CAR)
+    (bind-builtin! (mut evaluator) "cdr" BUILTIN-CDR)
+    (bind-builtin! (mut evaluator) "cadr" BUILTIN-CADR)
+    (bind-builtin! (mut evaluator) "cons-last" BUILTIN-CONS-LAST)
+    (bind-builtin! (mut evaluator) "append" BUILTIN-APPEND)
+    (bind-builtin! (mut evaluator) "dynamic-type" BUILTIN-DYNAMIC-TYPE)
+    (bind-builtin! (mut evaluator) "Dynamic.String.concat" BUILTIN-STRING-CONCAT)
+    (bind-builtin! (mut evaluator) "host-arch" BUILTIN-HOST-ARCH)
+    (bind-builtin! (mut evaluator) "host-os" BUILTIN-HOST-OS)
+    (bind-builtin! (mut evaluator) "Project.get-config" BUILTIN-PROJECT-GET-CONFIG)
+    (bind-builtin! (mut evaluator) "caddr" BUILTIN-CADDR)
+    (bind-builtin! (mut evaluator) "cons" BUILTIN-CONS)
+    (bind-builtin! (mut evaluator) "Symbol.prefix" BUILTIN-SYMBOL-PREFIX)
+    (bind-builtin! (mut evaluator) "Symbol.concat" BUILTIN-SYMBOL-CONCAT)
+    (bind-builtin! (mut evaluator) "str" BUILTIN-STR)
+    (bind-builtin! (mut evaluator) "Symbol.from" BUILTIN-SYMBOL-FROM)
+    (bind-builtin! (mut evaluator) "String.length" BUILTIN-LENGTH)
+    (bind-builtin! (mut evaluator) "String.index-of" BUILTIN-STRING-INDEX-OF)
+    (bind-builtin! (mut evaluator) "String.char-at" BUILTIN-STRING-CHAR-AT)
+    (bind-builtin! (mut evaluator) "String.slice" BUILTIN-STRING-SLICE)
+    (bind-builtin! (mut evaluator) "cadddr" BUILTIN-CADDDR)
+    (bind-builtin! (mut evaluator) "cddr" BUILTIN-CDDR)
+    (bind-builtin! (mut evaluator) "last" BUILTIN-LAST)
+    (bind-builtin! (mut evaluator) "all-but-last" BUILTIN-ALL-BUT-LAST)
+    (load (mut evaluator))))
+
+(defn evaluator-configure-host! [(e (mut CtEvaluator))
+                                 (host-arch (slice u8))
+                                 (host-os (slice u8))
+                                 (project-target (slice u8))] (-> i64)
+  (do (store! (field e host-arch) host-arch)
+      (store! (field e host-os) host-os)
+      (store! (field e project-target) project-target)
+      0))
+
+(defn evaluator-push-load! [(e (mut CtEvaluator)) (path (slice u8))] (-> i64)
+  (al/al-push! [(slice u8)] (mut (field e load-stack)) path))
+
+(defn evaluator-pop-load! [(e (mut CtEvaluator))] (-> i64)
+  (if (= (al/al-len [(slice u8)] (load (field e load-stack))) 0) 0
+      (do (al/al-pop! [(slice u8)] (mut (field e load-stack))) 0)))
+
+(defn define! [(e (mut CtEvaluator)) (frame env/FrameId)
+               (name (slice u8)) (value CtValue)] (-> env/CellId)
+  (env/define! [CtValue] (mut (field e environment)) frame name value))
+
+(defn bind-cell! [(e (mut CtEvaluator)) (frame env/FrameId)
+                  (name (slice u8)) (cell env/CellId)] (-> bool)
+  (env/bind-cell! [CtValue] (mut (field e environment)) frame name cell))
+
+(defn child-frame! [(e (mut CtEvaluator)) (parent env/FrameId)] (-> env/FrameId)
+  (env/child! [CtValue] (mut (field e environment)) parent))
+(defn import-frame! [(e (mut CtEvaluator)) (frame env/FrameId)
+                     (imported env/FrameId)] (-> bool)
+  (env/add-import! [CtValue] (mut (field e environment)) frame imported))
+(defn lookup-status [(e (ptr CtEvaluator)) (frame env/FrameId)
+                     (name (slice u8))] (-> env/CtLookup)
+  (env/lookup-status [CtValue] (field e environment) frame name))
+(defn lookup-value [(e (ptr CtEvaluator)) (cell env/CellId)] (-> CtValue)
+  (env/read-cell [CtValue] (field e environment) cell))
+
+(defn truthy? [(value CtValue)] (-> bool)
+  (match value
+    (ValueBool [value] value)
+    (ValueUnit [] false)
+    (_ true)))
+
+(defn syntax-simple-name [(node (ptr forms/CarpNode))] (-> (slice u8))
+  (match (forms/form-of node)
+    (forms/Symbol [segments]
+      (if (= (al/al-len [(slice u8)] (load segments)) 1)
+          (al/al-get [(slice u8)] (load segments) 0) ""))
+    (_ "")))
+
+(defn syntax-equal? [(left (ptr forms/CarpNode)) (right (ptr forms/CarpNode))]
+  (-> bool)
+  (match (forms/form-of left)
+    (forms/IntLit [a] (match (forms/form-of right) (forms/IntLit [b] (= a b)) (_ false)))
+    (forms/BoolLit [a] (match (forms/form-of right) (forms/BoolLit [b] (= a b)) (_ false)))
+    (forms/StringLit [a]
+      (match (forms/form-of right) (forms/StringLit [b] (str/str-eq a b)) (_ false)))
+    (forms/Symbol [_] (str/str-eq (syntax-simple-name left) (syntax-simple-name right)))
+    (_ (= (primitive/cast i64 left) (primitive/cast i64 right)))))
+
+(defn value-equal? [(left CtValue) (right CtValue)] (-> bool)
+  (match left
+    (ValueUnit [] (match right (ValueUnit [] true) (_ false)))
+    (ValueInt [a] (match right (ValueInt [b] (= a b)) (_ false)))
+    (ValueDouble [a] (match right
+                       (ValueDouble [b] (primitive/fcmp-eq a b))
+                       (_ false)))
+    (ValueBool [a] (match right (ValueBool [b] (= a b)) (_ false)))
+    (ValueChar [a] (match right
+                     (ValueChar [b] (= a b))
+                     (ValueString [b] (and (= (slice-len b) 1)
+                                           (= a (primitive/cast i64 (slice-get b 0)))))
+                     (_ false)))
+    (ValueString [a] (match right
+                       (ValueString [b] (str/str-eq a b))
+                       (ValueSyntax [b] (str/str-eq a (syntax-simple-name b)))
+                       (ValueChar [b] (and (= (slice-len a) 1)
+                                          (= b (primitive/cast i64 (slice-get a 0)))))
+                       (_ false)))
+    (ValueSyntax [a] (match right
+                       (ValueSyntax [b] (syntax-equal? a b))
+                       (ValueString [b] (str/str-eq (syntax-simple-name a) b))
+                       (_ false)))
+    (_ false)))
+
+(defn value-list-new [(e (mut CtEvaluator)) (array bool)]
+  (-> (ptr (al/ArrayList CtValue)))
+  (let [a (load (field e a))]
+    (alloc/box! a (al/ArrayList CtValue) (al/al-new [CtValue] a))))
+
+(defn comment-node? [(node (ptr forms/CarpNode))] (-> bool)
+  (match (forms/form-of node) (forms/Comment [_] true) (_ false)))
+
+(defn semantic-items [(e (mut CtEvaluator))
+                      (raw (ptr (al/ArrayList (ptr forms/CarpNode))))]
+  (-> (ptr (al/ArrayList (ptr forms/CarpNode))))
+  (let [a (load (field e a))
+        items (alloc/box! a (al/ArrayList (ptr forms/CarpNode))
+                          (al/al-new [(ptr forms/CarpNode)] a))
+        n (al/al-len [(ptr forms/CarpNode)] (load raw))
+        (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (let [node (al/al-get [(ptr forms/CarpNode)] (load raw) (load i))]
+                (if (not (comment-node? node))
+                    (al/al-push! [(ptr forms/CarpNode)] items node) 0)
+                (store! i (+ (load i) 1)))))
+    items))
+
+(defn expect-count [(node (ptr forms/CarpNode))
+                    (arguments (ptr (al/ArrayList CtValue))) (wanted i64)]
+  (-> CtEvalResult)
+  (if (= (al/al-len [CtValue] (load arguments)) wanted)
+      (EvalOk (ValueUnit))
+      (error-at node "compile-time call has wrong arity")))
+
+(defn normalize-number [(value CtValue)] (-> CtValue)
+  (match value
+    (ValueSyntax [node]
+      (match (forms/form-of node)
+        (forms/IntLit [value] (ValueInt value))
+        (forms/ByteLit [value] (ValueInt value))
+        (forms/LongLit [value] (ValueInt value))
+        (forms/FloatLit [value] (ValueDouble value))
+        (forms/DoubleLit [value] (ValueDouble value))
+        (_ value)))
+    (_ value)))
+
+(defn numeric-binary [(node (ptr forms/CarpNode)) (id i64)
+                      (arguments (ptr (al/ArrayList CtValue)))] (-> CtEvalResult)
+  (if (!= (al/al-len [CtValue] (load arguments)) 2)
+      (error-at node "numeric primitive expects two arguments")
+      (let [left (normalize-number (al/al-get [CtValue] (load arguments) 0))
+            right (normalize-number (al/al-get [CtValue] (load arguments) 1))]
+        (match left
+          (ValueInt [a]
+            (match right
+              (ValueInt [b]
+                (cond
+                  (= id BUILTIN-ADD) (EvalOk (ValueInt (+ a b)))
+                  (= id BUILTIN-SUB) (EvalOk (ValueInt (- a b)))
+                  (= id BUILTIN-MUL) (EvalOk (ValueInt (* a b)))
+                  (= id BUILTIN-DIV)
+                    (if (= b 0) (error-at node "division by zero")
+                        (EvalOk (ValueInt (/ a b))))
+                  (= id BUILTIN-LESS) (EvalOk (ValueBool (< a b)))
+                  (= id BUILTIN-GREATER) (EvalOk (ValueBool (> a b)))
+                  (= id BUILTIN-LESS-EQUAL) (EvalOk (ValueBool (<= a b)))
+                  (= id BUILTIN-GREATER-EQUAL) (EvalOk (ValueBool (>= a b)))
+                  :else (error-at node "unknown numeric primitive")))
+              (_ (error-at node "numeric operands must have the same type"))))
+          (ValueDouble [a]
+            (match right
+              (ValueDouble [b]
+                (cond
+                  (= id BUILTIN-ADD) (EvalOk (ValueDouble (+ a b)))
+                  (= id BUILTIN-SUB) (EvalOk (ValueDouble (- a b)))
+                  (= id BUILTIN-MUL) (EvalOk (ValueDouble (* a b)))
+                  (= id BUILTIN-DIV)
+                    (if (primitive/fcmp-eq b 0.0) (error-at node "division by zero")
+                        (EvalOk (ValueDouble (/ a b))))
+                  (= id BUILTIN-LESS) (EvalOk (ValueBool (< a b)))
+                  (= id BUILTIN-GREATER) (EvalOk (ValueBool (> a b)))
+                  (= id BUILTIN-LESS-EQUAL) (EvalOk (ValueBool (<= a b)))
+                  (= id BUILTIN-GREATER-EQUAL) (EvalOk (ValueBool (>= a b)))
+                  :else (error-at node "unknown numeric primitive")))
+              (_ (error-at node "numeric operands must have the same type"))))
+          (_ (error-at node "numeric primitive expects numbers"))))))
+
+(defn numeric-builtin? [(id i64)] (-> bool)
+  (or (= id BUILTIN-ADD)
+      (or (= id BUILTIN-SUB)
+          (or (= id BUILTIN-MUL)
+              (or (= id BUILTIN-DIV)
+                  (or (= id BUILTIN-LESS)
+                      (or (= id BUILTIN-GREATER)
+                          (or (= id BUILTIN-LESS-EQUAL)
+                              (= id BUILTIN-GREATER-EQUAL)))))))))
+
+(defn collection-values [(e (mut CtEvaluator)) (value CtValue)]
+  (-> (ptr (al/ArrayList CtValue)))
+  (match value
+    (ValueUnit [] (value-list-new (mut e) false))
+    (ValueList [values _] values)
+    (ValueSyntax [syntax]
+      (match (forms/form-of syntax)
+        (forms/ListForm [raw]
+          (let [nodes (semantic-items (mut e) raw)
+                values (value-list-new (mut e) false)
+                n (al/al-len [(ptr forms/CarpNode)] (load nodes))
+                (mut i) 0]
+            (loop (if (>= (load i) n) (break)
+                      (do (al/al-push! [CtValue] values
+                                       (ValueSyntax (al/al-get [(ptr forms/CarpNode)]
+                                                               (load nodes) (load i))))
+                          (store! i (+ (load i) 1)))))
+            values))
+        (forms/ArrayForm [raw]
+          (let [nodes (semantic-items (mut e) raw)
+                values (value-list-new (mut e) true)
+                n (al/al-len [(ptr forms/CarpNode)] (load nodes))
+                (mut i) 0]
+            (loop (if (>= (load i) n) (break)
+                      (do (al/al-push! [CtValue] values
+                                       (ValueSyntax (al/al-get [(ptr forms/CarpNode)]
+                                                               (load nodes) (load i))))
+                          (store! i (+ (load i) 1)))))
+            values))
+        (_ (primitive/cast (ptr (al/ArrayList CtValue)) 0))))
+    (_ (primitive/cast (ptr (al/ArrayList CtValue)) 0))))
+
+(defn dynamic-type-name [(value CtValue)] (-> (slice u8))
+  (match value
+    (ValueUnit [] "unit")
+    (ValueInt [_] "int")
+    (ValueDouble [_] "double")
+    (ValueBool [_] "bool")
+    (ValueChar [_] "char")
+    (ValueString [_] "string")
+    (ValueList [_ array] (if array "array" "list"))
+    (ValueClosure [_] "function")
+    (ValueBuiltin [_] "function")
+    (ValueSyntax [node]
+      (match (forms/form-of node)
+        (forms/IntLit [_] "int")
+        (forms/ByteLit [_] "byte")
+        (forms/LongLit [_] "long")
+        (forms/FloatLit [_] "float")
+        (forms/DoubleLit [_] "double")
+        (forms/BoolLit [_] "bool")
+        (forms/CharLit [_] "char")
+        (forms/StringLit [_] "string")
+        (forms/PatternLit [_] "pattern")
+        (forms/Symbol [_] "symbol")
+        (forms/ListForm [_] "list")
+        (forms/ArrayForm [_] "array")
+        (forms/StaticArrayForm [_] "static-array")
+        (forms/DictionaryForm [_] "dictionary")
+        (forms/Comment [_] "comment")))))
+
+(defn append-string-value! [(out (mut str/StrBuf)) (value CtValue)] (-> bool)
+  (match value
+    (ValueString [text] (do (str/sb-push-str! (mut out) text) true))
+    (ValueChar [code]
+      (if (<= code 127)
+          (do (str/sb-push-byte! (mut out) (primitive/cast u8 code)) true)
+          false))
+    (ValueSyntax [node]
+      (match (forms/form-of node)
+        (forms/StringLit [text] (do (str/sb-push-str! (mut out) text) true))
+        (forms/CharLit [code]
+          (if (<= code 127)
+              (do (str/sb-push-byte! (mut out) (primitive/cast u8 code)) true)
+              false))
+        (_ false)))
+    (_ false)))
+
+(defn value-symbol-segments [(value CtValue)]
+  (-> (ptr (al/ArrayList (slice u8))))
+  (match value
+    (ValueSyntax [node]
+      (match (forms/form-of node)
+        (forms/Symbol [segments] segments)
+        (_ (primitive/cast (ptr (al/ArrayList (slice u8))) 0))))
+    (_ (primitive/cast (ptr (al/ArrayList (slice u8))) 0))))
+
+(defn append-symbol-spelling! [(out (mut str/StrBuf))
+                               (segments (ptr (al/ArrayList (slice u8))))]
+  (-> i64)
+  (let [n (al/al-len [(slice u8)] (load segments)) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (if (> (load i) 0)
+                      (str/sb-push-byte! (mut out) (primitive/cast u8 46)) 0)
+                  (str/sb-push-str! (mut out)
+                    (al/al-get [(slice u8)] (load segments) (load i)))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn append-rendered-items! [(out (mut str/StrBuf))
+                              (items (ptr (al/ArrayList (ptr forms/CarpNode))))]
+  (-> bool)
+  (let [n (al/al-len [(ptr forms/CarpNode)] (load items))
+        (mut i) 0 (mut valid) true]
+    (loop (if (or (>= (load i) n) (not (load valid))) (break)
+              (do (if (> (load i) 0)
+                      (str/sb-push-byte! (mut out) (primitive/cast u8 32)) 0)
+                  (if (not (append-rendered-node! (mut out)
+                             (al/al-get [(ptr forms/CarpNode)]
+                                        (load items) (load i))))
+                      (store! valid false) 0)
+                  (store! i (+ (load i) 1)))))
+    (load valid)))
+
+(defn append-escaped! [(out (mut str/StrBuf)) (text (slice u8))] (-> i64)
+  (let [n (slice-len text) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (let [c (slice-get text (load i))]
+                (cond (= c (primitive/cast u8 34))
+                        (str/sb-push-str! (mut out) "\\\"")
+                      (= c (primitive/cast u8 92))
+                        (str/sb-push-str! (mut out) "\\\\")
+                      (= c (primitive/cast u8 10))
+                        (str/sb-push-str! (mut out) "\\n")
+                      :else (str/sb-push-byte! (mut out) c))
+                (store! i (+ (load i) 1)))))
+    0))
+
+(defn append-rendered-node! [(out (mut str/StrBuf))
+                             (node (ptr forms/CarpNode))] (-> bool)
+  (match (forms/form-of node)
+    (forms/IntLit [value] (do (str/sb-push-i64! (mut out) value) true))
+    (forms/ByteLit [value] (do (str/sb-push-i64! (mut out) value) true))
+    (forms/LongLit [value]
+      (do (str/sb-push-i64! (mut out) value) (str/sb-push-str! (mut out) "l") true))
+    (forms/FloatLit [_] false)
+    (forms/DoubleLit [_] false)
+    (forms/BoolLit [value]
+      (do (str/sb-push-str! (mut out) (if value "true" "false")) true))
+    (forms/CharLit [value]
+      (if (<= value 127)
+          (do (str/sb-push-byte! (mut out) (primitive/cast u8 92))
+              (str/sb-push-byte! (mut out) (primitive/cast u8 value)) true)
+          false))
+    (forms/StringLit [value]
+      (do (str/sb-push-byte! (mut out) (primitive/cast u8 34))
+          (append-escaped! (mut out) value)
+          (str/sb-push-byte! (mut out) (primitive/cast u8 34)) true))
+    (forms/PatternLit [value]
+      (do (str/sb-push-str! (mut out) "#\"")
+          (append-escaped! (mut out) value)
+          (str/sb-push-byte! (mut out) (primitive/cast u8 34)) true))
+    (forms/Symbol [segments]
+      (do (append-symbol-spelling! (mut out) segments) true))
+    (forms/ListForm [items]
+      (do (str/sb-push-byte! (mut out) (primitive/cast u8 40))
+          (let [valid (append-rendered-items! (mut out) items)]
+            (str/sb-push-byte! (mut out) (primitive/cast u8 41)) valid)))
+    (forms/ArrayForm [items]
+      (do (str/sb-push-byte! (mut out) (primitive/cast u8 91))
+          (let [valid (append-rendered-items! (mut out) items)]
+            (str/sb-push-byte! (mut out) (primitive/cast u8 93)) valid)))
+    (forms/StaticArrayForm [items]
+      (do (str/sb-push-str! (mut out) "$[")
+          (let [valid (append-rendered-items! (mut out) items)]
+            (str/sb-push-byte! (mut out) (primitive/cast u8 93)) valid)))
+    (forms/DictionaryForm [items]
+      (do (str/sb-push-byte! (mut out) (primitive/cast u8 123))
+          (let [valid (append-rendered-items! (mut out) items)]
+            (str/sb-push-byte! (mut out) (primitive/cast u8 125)) valid)))
+    (forms/Comment [value]
+      (do (str/sb-push-byte! (mut out) (primitive/cast u8 59))
+          (str/sb-push-str! (mut out) value) true))))
+
+(defn render-node [(a (dyn alloc/Allocator)) (node (ptr forms/CarpNode))]
+  (-> (slice u8))
+  (let [(mut out) (str/sb-new a)]
+    (if (append-rendered-node! (mut out) node)
+        (str/sb-finish! (mut out))
+        "<unrenderable Carp syntax>")))
+
+(defn append-str-value! [(out (mut str/StrBuf)) (value CtValue)] (-> bool)
+  (match value
+    (ValueUnit [] (do (str/sb-push-str! (mut out) "()") true))
+    (ValueInt [value] (do (str/sb-push-i64! (mut out) value) true))
+    (ValueDouble [_] false)
+    (ValueBool [value]
+      (do (str/sb-push-str! (mut out) (if value "true" "false")) true))
+    (ValueChar [value]
+      (if (<= value 127)
+          (do (str/sb-push-byte! (mut out) (primitive/cast u8 value)) true)
+          false))
+    (ValueString [value] (do (str/sb-push-str! (mut out) value) true))
+    (ValueSyntax [node]
+      (match (forms/form-of node)
+        (forms/StringLit [value] (do (str/sb-push-str! (mut out) value) true))
+        (_ (append-rendered-node! (mut out) node))))
+    (ValueList [values array]
+      (let [open (if array 91 40) close (if array 93 41)
+            n (al/al-len [CtValue] (load values))
+            (mut i) 0 (mut valid) true]
+        (str/sb-push-byte! (mut out) (primitive/cast u8 open))
+        (loop (if (or (>= (load i) n) (not (load valid))) (break)
+                  (do (if (> (load i) 0)
+                          (str/sb-push-byte! (mut out) (primitive/cast u8 32)) 0)
+                      (if (not (append-str-value! (mut out)
+                                 (al/al-get [CtValue] (load values) (load i))))
+                          (store! valid false) 0)
+                      (store! i (+ (load i) 1)))))
+        (str/sb-push-byte! (mut out) (primitive/cast u8 close))
+        (load valid)))
+    (_ false)))
+
+(defn string-value? [(value CtValue)] (-> bool)
+  (match value
+    (ValueString [_] true)
+    (ValueSyntax [node]
+      (match (forms/form-of node) (forms/StringLit [_] true) (_ false)))
+    (_ false)))
+
+(defn string-value-text [(value CtValue)] (-> (slice u8))
+  (match value
+    (ValueString [text] text)
+    (ValueSyntax [node]
+      (match (forms/form-of node) (forms/StringLit [text] text) (_ "")))
+    (_ "")))
+
+(defn char-value-code [(value CtValue)] (-> i64)
+  (match value
+    (ValueChar [code] code)
+    (ValueSyntax [node]
+      (match (forms/form-of node) (forms/CharLit [code] code) (_ -1)))
+    (_ -1)))
+
+(defn utf8-width [(first u8)] (-> i64)
+  (cond (< first (primitive/cast u8 128)) 1
+        (< first (primitive/cast u8 224)) 2
+        (< first (primitive/cast u8 240)) 3
+        :else 4))
+
+(defn utf8-count [(text (slice u8))] (-> i64)
+  (let [n (slice-len text) (mut offset) 0 (mut count) 0]
+    (loop (if (>= (load offset) n) (break)
+              (do (store! offset (+ (load offset)
+                                    (utf8-width (slice-get text (load offset)))))
+                  (store! count (+ (load count) 1)))))
+    (load count)))
+
+(defn utf8-byte-offset [(text (slice u8)) (character-index i64)] (-> i64)
+  (let [n (slice-len text) (mut offset) 0 (mut index) 0]
+    (loop (if (or (>= (load offset) n) (>= (load index) character-index)) (break)
+              (do (store! offset (+ (load offset)
+                                    (utf8-width (slice-get text (load offset)))))
+                  (store! index (+ (load index) 1)))))
+    (load offset)))
+
+(defn utf8-codepoint-at [(text (slice u8)) (character-index i64)] (-> i64)
+  (let [offset (utf8-byte-offset text character-index)
+        n (slice-len text)]
+    (if (or (< character-index 0) (>= offset n)) -1
+        (let [b0 (primitive/cast i64 (slice-get text offset))
+              width (utf8-width (slice-get text offset))]
+          (cond (= width 1) b0
+                (= width 2)
+                  (+ (* (- b0 192) 64)
+                     (- (primitive/cast i64 (slice-get text (+ offset 1))) 128))
+                (= width 3)
+                  (+ (* (- b0 224) 4096)
+                     (+ (* (- (primitive/cast i64 (slice-get text (+ offset 1))) 128) 64)
+                        (- (primitive/cast i64 (slice-get text (+ offset 2))) 128)))
+                :else
+                  (+ (* (- b0 240) 262144)
+                     (+ (* (- (primitive/cast i64 (slice-get text (+ offset 1))) 128)
+                           4096)
+                        (+ (* (- (primitive/cast i64 (slice-get text (+ offset 2))) 128)
+                              64)
+                           (- (primitive/cast i64 (slice-get text (+ offset 3))) 128)))))))))
+
+(defn apply-builtin [(e (mut CtEvaluator)) (frame env/FrameId)
+                     (node (ptr forms/CarpNode)) (id i64)
+                     (arguments (ptr (al/ArrayList CtValue)))] (-> CtEvalResult)
+  (cond
+    (numeric-builtin? id)
+      (numeric-binary node id arguments)
+    (= id BUILTIN-EQUAL)
+      (if (!= (al/al-len [CtValue] (load arguments)) 2)
+          (error-at node "= expects two arguments")
+          (EvalOk (ValueBool
+            (value-equal? (al/al-get [CtValue] (load arguments) 0)
+                          (al/al-get [CtValue] (load arguments) 1)))))
+    (or (= id BUILTIN-INC) (or (= id BUILTIN-DEC) (= id BUILTIN-NEG)))
+      (if (!= (al/al-len [CtValue] (load arguments)) 1)
+          (error-at node "numeric unary primitive expects one argument")
+          (match (normalize-number (al/al-get [CtValue] (load arguments) 0))
+            (ValueInt [value]
+              (EvalOk (ValueInt (cond (= id BUILTIN-INC) (+ value 1)
+                                      (= id BUILTIN-DEC) (- value 1)
+                                      :else (- 0 value)))))
+            (ValueDouble [value]
+              (EvalOk (ValueDouble (cond (= id BUILTIN-INC) (+ value 1.0)
+                                         (= id BUILTIN-DEC) (- value 1.0)
+                                         :else (- 0.0 value)))))
+            (_ (error-at node "numeric unary primitive expects a number"))))
+    (= id BUILTIN-NOT)
+      (if (!= (al/al-len [CtValue] (load arguments)) 1)
+          (error-at node "not expects one argument")
+          (EvalOk (ValueBool (not (truthy? (al/al-get [CtValue]
+                                            (load arguments) 0))))))
+    (or (= id BUILTIN-LIST) (= id BUILTIN-ARRAY))
+      (let [values (value-list-new (mut e) (= id BUILTIN-ARRAY))
+            n (al/al-len [CtValue] (load arguments))
+            (mut i) 0]
+        (loop (if (>= (load i) n) (break)
+                  (do (al/al-push! [CtValue] values
+                                   (al/al-get [CtValue] (load arguments) (load i)))
+                      (store! i (+ (load i) 1)))))
+        (EvalOk (ValueList values (= id BUILTIN-ARRAY))))
+    (= id BUILTIN-PARSE)
+      (if (!= (al/al-len [CtValue] (load arguments)) 1)
+          (error-at node "parse expects one string")
+          (match (al/al-get [CtValue] (load arguments) 0)
+            (ValueString [source]
+              (let [a (load (field e a))
+                    lowered (forms/lower a "" (reader/read a source))]
+                (if (forms/lower-failed? lowered)
+                    (error-at node "parse received invalid Carp source")
+                    (if (= (forms/module-count (.module lowered)) 1)
+                        (EvalOk (ValueSyntax
+                          (forms/clone-node a (forms/module-at (.module lowered) 0))))
+                        (error-at node "parse expects exactly one form")))))
+            (_ (error-at node "parse expects one string"))))
+    (= id BUILTIN-ROUND)
+      (if (!= (al/al-len [CtValue] (load arguments)) 1)
+          (error-at node "round expects one number")
+          (match (al/al-get [CtValue] (load arguments) 0)
+            (ValueInt [value] (EvalOk (ValueInt value)))
+            (ValueDouble [value]
+              ;; Carp's round is half-away-from-zero for the values used by
+              ;; compile-time Core functions.
+              (EvalOk (ValueInt
+                (primitive/cast i64 (if (< value 0.0) (- value 0.5) (+ value 0.5))))))
+            (_ (error-at node "round expects one number"))))
+    (or (= id BUILTIN-STRING-TO-LIST) (= id BUILTIN-STRING-TO-ARRAY))
+      (if (!= (al/al-len [CtValue] (load arguments)) 1)
+          (error-at node "string conversion expects one argument")
+          (match (al/al-get [CtValue] (load arguments) 0)
+            (ValueString [value]
+              (let [values (value-list-new (mut e) (= id BUILTIN-STRING-TO-ARRAY))
+                    n (slice-len value)
+                    (mut i) 0]
+                (loop (if (>= (load i) n) (break)
+                          (let [first (primitive/cast i64 (slice-get value (load i)))
+                                width (cond (< first 128) 1
+                                            (< first 224) 2
+                                            (< first 240) 3
+                                            :else 4)
+                                end (if (> (+ (load i) width) n) n
+                                        (+ (load i) width))]
+                            (al/al-push! [CtValue] values
+                              (ValueString (subslice value (load i) end)))
+                            (store! i end))))
+                (EvalOk (ValueList values (= id BUILTIN-STRING-TO-ARRAY)))))
+            (_ (error-at node "string conversion expects a string"))))
+    (= id BUILTIN-STRING-HEAD)
+      (if (!= (al/al-len [CtValue] (load arguments)) 1)
+          (error-at node "String.head expects one argument")
+          (match (al/al-get [CtValue] (load arguments) 0)
+            (ValueString [value]
+              (if (= (slice-len value) 0)
+                  (error-at node "String.head expects a non-empty string")
+                  (EvalOk (ValueChar
+                    (primitive/cast i64 (slice-get value 0))))))
+            (_ (error-at node "String.head expects a string"))))
+    (= id BUILTIN-LENGTH)
+      (if (!= (al/al-len [CtValue] (load arguments)) 1)
+          (error-at node "length expects one collection")
+          (let [value (al/al-get [CtValue] (load arguments) 0)
+                values (collection-values (mut e) value)]
+            (if (!= (primitive/cast i64 values) 0)
+                (EvalOk (ValueInt (al/al-len [CtValue] (load values))))
+                (if (string-value? value)
+                    (EvalOk (ValueInt (utf8-count (string-value-text value))))
+                    (error-at node "length expects a collection")))))
+    (or (= id BUILTIN-CAR)
+        (or (= id BUILTIN-CDR)
+            (or (= id BUILTIN-CADR)
+                (or (= id BUILTIN-CADDR)
+                    (or (= id BUILTIN-CADDDR) (= id BUILTIN-CDDR))))))
+      (if (!= (al/al-len [CtValue] (load arguments)) 1)
+          (error-at node "list accessor expects one collection")
+          (let [values (collection-values (mut e)
+                         (al/al-get [CtValue] (load arguments) 0))]
+            (if (= (primitive/cast i64 values) 0)
+                (error-at node "list accessor expects a collection")
+                (let [n (al/al-len [CtValue] (load values))]
+                  (cond
+                    (= id BUILTIN-CAR)
+                      (if (= n 0) (EvalOk (ValueUnit))
+                          (EvalOk (al/al-get [CtValue] (load values) 0)))
+                    (= id BUILTIN-CADR)
+                      (if (< n 2) (EvalOk (ValueUnit))
+                          (EvalOk (al/al-get [CtValue] (load values) 1)))
+                    (= id BUILTIN-CADDR)
+                      (if (< n 3) (EvalOk (ValueUnit))
+                          (EvalOk (al/al-get [CtValue] (load values) 2)))
+                    (= id BUILTIN-CADDDR)
+                      (if (< n 4) (EvalOk (ValueUnit))
+                          (EvalOk (al/al-get [CtValue] (load values) 3)))
+                    :else
+                      (let [tail (value-list-new (mut e) false)
+                            (mut i) (if (= id BUILTIN-CDDR) 2 1)]
+                        (loop (if (>= (load i) n) (break)
+                                  (do (al/al-push! [CtValue] tail
+                                                   (al/al-get [CtValue]
+                                                              (load values) (load i)))
+                                      (store! i (+ (load i) 1)))))
+                        (EvalOk (ValueList tail false))))))))
+    (or (= id BUILTIN-LAST) (= id BUILTIN-ALL-BUT-LAST))
+      (if (!= (al/al-len [CtValue] (load arguments)) 1)
+          (error-at node "list boundary operation expects one collection")
+          (let [values (collection-values (mut e)
+                         (al/al-get [CtValue] (load arguments) 0))]
+            (if (= (primitive/cast i64 values) 0)
+                (error-at node "list boundary operation expects a collection")
+                (let [n (al/al-len [CtValue] (load values))]
+                  (if (= id BUILTIN-LAST)
+                      (if (= n 0) (EvalOk (ValueUnit))
+                          (EvalOk (al/al-get [CtValue] (load values) (- n 1))))
+                      (let [prefix (value-list-new (mut e) false)
+                            (mut i) 0]
+                        (loop (if (>= (load i) (if (= n 0) 0 (- n 1))) (break)
+                                  (do (al/al-push! [CtValue] prefix
+                                                   (al/al-get [CtValue]
+                                                              (load values) (load i)))
+                                      (store! i (+ (load i) 1)))))
+                        (EvalOk (ValueList prefix false))))))))
+    (= id BUILTIN-CONS-LAST)
+      (if (!= (al/al-len [CtValue] (load arguments)) 2)
+          (error-at node "cons-last expects a value and collection")
+          (let [values (collection-values (mut e)
+                         (al/al-get [CtValue] (load arguments) 1))]
+            (if (= (primitive/cast i64 values) 0)
+                (error-at node "cons-last expects a collection")
+                (let [result (value-list-new (mut e) false)
+                      n (al/al-len [CtValue] (load values))
+                      (mut i) 0]
+                  (loop (if (>= (load i) n) (break)
+                            (do (al/al-push! [CtValue] result
+                                             (al/al-get [CtValue]
+                                                        (load values) (load i)))
+                                (store! i (+ (load i) 1)))))
+                  (al/al-push! [CtValue] result
+                               (al/al-get [CtValue] (load arguments) 0))
+                  (EvalOk (ValueList result false))))))
+    (= id BUILTIN-CONS)
+      (if (!= (al/al-len [CtValue] (load arguments)) 2)
+          (error-at node "cons expects a value and collection")
+          (let [values (collection-values (mut e)
+                         (al/al-get [CtValue] (load arguments) 1))]
+            (if (= (primitive/cast i64 values) 0)
+                (error-at node "cons expects a collection")
+                (let [result (value-list-new (mut e) false)
+                      n (al/al-len [CtValue] (load values))
+                      (mut i) 0]
+                  (al/al-push! [CtValue] result
+                               (al/al-get [CtValue] (load arguments) 0))
+                  (loop (if (>= (load i) n) (break)
+                            (do (al/al-push! [CtValue] result
+                                             (al/al-get [CtValue]
+                                                        (load values) (load i)))
+                                (store! i (+ (load i) 1)))))
+                  (EvalOk (ValueList result false))))))
+    (= id BUILTIN-APPEND)
+      (if (!= (al/al-len [CtValue] (load arguments)) 2)
+          (error-at node "append expects two collections")
+          (let [left (collection-values (mut e)
+                       (al/al-get [CtValue] (load arguments) 0))
+                right (collection-values (mut e)
+                        (al/al-get [CtValue] (load arguments) 1))]
+            (if (or (= (primitive/cast i64 left) 0)
+                    (= (primitive/cast i64 right) 0))
+                (error-at node "append expects collections")
+                (let [result (value-list-new (mut e) true)
+                      left-n (al/al-len [CtValue] (load left))
+                      right-n (al/al-len [CtValue] (load right))
+                      (mut i) 0]
+                  (loop (if (>= (load i) left-n) (break)
+                            (do (al/al-push! [CtValue] result
+                                             (al/al-get [CtValue] (load left) (load i)))
+                                (store! i (+ (load i) 1)))))
+                  (store! i 0)
+                  (loop (if (>= (load i) right-n) (break)
+                            (do (al/al-push! [CtValue] result
+                                             (al/al-get [CtValue] (load right) (load i)))
+                                (store! i (+ (load i) 1)))))
+                  (EvalOk (ValueList result true))))))
+    (= id BUILTIN-DYNAMIC-TYPE)
+      (if (!= (al/al-len [CtValue] (load arguments)) 1)
+          (error-at node "dynamic-type expects one value")
+          (EvalOk (ValueString
+            (dynamic-type-name (al/al-get [CtValue] (load arguments) 0)))))
+    (= id BUILTIN-STRING-CONCAT)
+      (if (!= (al/al-len [CtValue] (load arguments)) 1)
+          (error-at node "Dynamic.String.concat expects one array")
+          (let [values (collection-values (mut e)
+                         (al/al-get [CtValue] (load arguments) 0))]
+            (if (= (primitive/cast i64 values) 0)
+                (error-at node "Dynamic.String.concat expects an array")
+                (let [(mut out) (str/sb-new (load (field e a)))
+                      n (al/al-len [CtValue] (load values))
+                      (mut i) 0 (mut valid) true]
+                  (loop (if (or (>= (load i) n) (not (load valid))) (break)
+                            (do (if (not (append-string-value! (mut out)
+                                           (al/al-get [CtValue]
+                                                      (load values) (load i))))
+                                    (store! valid false) 0)
+                                (store! i (+ (load i) 1)))))
+                  (if (load valid)
+                      (EvalOk (ValueString (str/sb-finish! (mut out))))
+                      (error-at node "Dynamic.String.concat expects strings"))))))
+    (= id BUILTIN-HOST-ARCH)
+      (if (!= (al/al-len [CtValue] (load arguments)) 0)
+          (error-at node "host-arch expects no arguments")
+          (EvalOk (ValueString (load (field e host-arch)))))
+    (= id BUILTIN-HOST-OS)
+      (if (!= (al/al-len [CtValue] (load arguments)) 0)
+          (error-at node "host-os expects no arguments")
+          (EvalOk (ValueString (load (field e host-os)))))
+    (= id BUILTIN-PROJECT-GET-CONFIG)
+      (if (!= (al/al-len [CtValue] (load arguments)) 1)
+          (error-at node "Project.get-config expects one string")
+          (match (al/al-get [CtValue] (load arguments) 0)
+            (ValueString [key]
+              (if (str/str-eq key "target")
+                  (EvalOk (ValueString (load (field e project-target))))
+                  (if (str/str-eq key "load-stack")
+                      (let [values (value-list-new (mut e) false)
+                            n (al/al-len [(slice u8)] (load (field e load-stack)))
+                            (mut i) n]
+                        (loop (if (= (load i) 0) (break)
+                                  (do (store! i (- (load i) 1))
+                                      (al/al-push! [CtValue] values
+                                        (ValueString
+                                          (al/al-get [(slice u8)]
+                                            (load (field e load-stack)) (load i)))))))
+                        (EvalOk (ValueList values false)))
+                      (EvalOk (ValueUnit)))))
+            (_ (error-at node "Project.get-config expects one string"))))
+    (= id BUILTIN-SYMBOL-PREFIX)
+      (if (!= (al/al-len [CtValue] (load arguments)) 2)
+          (error-at node "Symbol.prefix expects two symbols")
+          (let [left (value-symbol-segments
+                       (al/al-get [CtValue] (load arguments) 0))
+                right (value-symbol-segments
+                        (al/al-get [CtValue] (load arguments) 1))]
+            (if (or (= (primitive/cast i64 left) 0)
+                    (= (primitive/cast i64 right) 0))
+                (error-at node "Symbol.prefix expects symbols")
+                (let [a (load (field e a))
+                      segments (alloc/box! a (al/ArrayList (slice u8))
+                                           (al/al-new [(slice u8)] a))
+                      left-n (al/al-len [(slice u8)] (load left))
+                      right-n (al/al-len [(slice u8)] (load right))
+                      (mut i) 0]
+                  (loop (if (>= (load i) left-n) (break)
+                            (do (al/al-push! [(slice u8)] segments
+                                  (al/al-get [(slice u8)] (load left) (load i)))
+                                (store! i (+ (load i) 1)))))
+                  (store! i 0)
+                  (loop (if (>= (load i) right-n) (break)
+                            (do (al/al-push! [(slice u8)] segments
+                                  (al/al-get [(slice u8)] (load right) (load i)))
+                                (store! i (+ (load i) 1)))))
+                  (EvalOk (ValueSyntax
+                    (forms/node-new-at a (forms/span-of node)
+                                       (forms/Symbol segments))))))))
+    (= id BUILTIN-SYMBOL-CONCAT)
+      (if (!= (al/al-len [CtValue] (load arguments)) 1)
+          (error-at node "Symbol.concat expects one collection")
+          (let [values (collection-values (mut e)
+                         (al/al-get [CtValue] (load arguments) 0))]
+            (if (= (primitive/cast i64 values) 0)
+                (error-at node "Symbol.concat expects symbols")
+                (let [a (load (field e a))
+                      (mut out) (str/sb-new a)
+                      n (al/al-len [CtValue] (load values))
+                      (mut i) 0 (mut valid) true]
+                  (loop (if (or (>= (load i) n) (not (load valid))) (break)
+                            (let [segments (value-symbol-segments
+                                             (al/al-get [CtValue]
+                                                        (load values) (load i)))]
+                              (if (= (primitive/cast i64 segments) 0)
+                                  (store! valid false)
+                                  (append-symbol-spelling! (mut out) segments))
+                              (store! i (+ (load i) 1)))))
+                  (if (not (load valid))
+                      (error-at node "Symbol.concat expects symbols")
+                      (let [segments (alloc/box! a (al/ArrayList (slice u8))
+                                             (al/al-new [(slice u8)] a))]
+                        (al/al-push! [(slice u8)] segments
+                                     (str/sb-finish! (mut out)))
+                        (EvalOk (ValueSyntax
+                          (forms/node-new-at a (forms/span-of node)
+                                             (forms/Symbol segments))))))))))
+    (= id BUILTIN-STR)
+      (let [(mut out) (str/sb-new (load (field e a)))
+            n (al/al-len [CtValue] (load arguments))
+            (mut i) 0 (mut valid) true]
+        (loop (if (or (>= (load i) n) (not (load valid))) (break)
+                  (do (if (not (append-str-value! (mut out)
+                                 (al/al-get [CtValue] (load arguments) (load i))))
+                          (store! valid false) 0)
+                      (store! i (+ (load i) 1)))))
+        (if (load valid)
+            (EvalOk (ValueString (str/sb-finish! (mut out))))
+            (error-at node "str cannot render this compile-time value")))
+    (= id BUILTIN-SYMBOL-FROM)
+      (if (!= (al/al-len [CtValue] (load arguments)) 1)
+          (error-at node "Symbol.from expects one argument")
+          (let [a (load (field e a))
+                value (al/al-get [CtValue] (load arguments) 0)
+                (mut out) (str/sb-new a)
+                (mut valid) true]
+            (match value
+              (ValueInt [integer] (str/sb-push-i64! (mut out) integer))
+              (ValueString [text] (str/sb-push-str! (mut out) text))
+              (ValueSyntax [syntax]
+                (match (forms/form-of syntax)
+                  (forms/IntLit [integer] (str/sb-push-i64! (mut out) integer))
+                  (forms/ByteLit [integer] (str/sb-push-i64! (mut out) integer))
+                  (forms/LongLit [integer] (str/sb-push-i64! (mut out) integer))
+                  (forms/StringLit [text] (str/sb-push-str! (mut out) text))
+                  (_ (store! valid false))))
+              (_ (store! valid false)))
+            (if (not (load valid))
+                (error-at node "Symbol.from expects Int or String syntax")
+                (let [segments (alloc/box! a (al/ArrayList (slice u8))
+                                       (al/al-new [(slice u8)] a))]
+                  (al/al-push! [(slice u8)] segments (str/sb-finish! (mut out)))
+                  (EvalOk (ValueSyntax
+                    (forms/node-new-at a (forms/span-of node)
+                                       (forms/Symbol segments))))))))
+    (= id BUILTIN-STRING-INDEX-OF)
+      (if (!= (al/al-len [CtValue] (load arguments)) 2)
+          (error-at node "String.index-of expects a string and character")
+          (let [source-value (al/al-get [CtValue] (load arguments) 0)
+                needle-value (al/al-get [CtValue] (load arguments) 1)
+                needle (char-value-code needle-value)]
+            (if (or (not (string-value? source-value)) (< needle 0))
+                (error-at node "String.index-of expects a string and character")
+                (let [source (string-value-text source-value)
+                      count (utf8-count source)
+                      (mut i) 0 (mut found) -1]
+                  (loop (if (or (>= (load i) count) (!= (load found) -1)) (break)
+                            (do (if (= (utf8-codepoint-at source (load i)) needle)
+                                    (store! found (load i)) 0)
+                                (store! i (+ (load i) 1)))))
+                  (EvalOk (ValueInt (load found)))))))
+    (= id BUILTIN-STRING-CHAR-AT)
+      (if (!= (al/al-len [CtValue] (load arguments)) 2)
+          (error-at node "String.char-at expects a string and index")
+          (let [source-value (al/al-get [CtValue] (load arguments) 0)
+                index-value (normalize-number
+                              (al/al-get [CtValue] (load arguments) 1))]
+            (if (not (string-value? source-value))
+                (error-at node "String.char-at expects a string")
+                (match index-value
+                  (ValueInt [index]
+                    (let [code (utf8-codepoint-at (string-value-text source-value) index)]
+                      (if (< code 0) (error-at node "String.char-at index out of bounds")
+                          (EvalOk (ValueChar code)))))
+                  (_ (error-at node "String.char-at expects an integer index"))))))
+    (= id BUILTIN-STRING-SLICE)
+      (if (!= (al/al-len [CtValue] (load arguments)) 3)
+          (error-at node "String.slice expects a string, start, and end")
+          (let [source-value (al/al-get [CtValue] (load arguments) 0)
+                start-value (normalize-number
+                              (al/al-get [CtValue] (load arguments) 1))
+                end-value (normalize-number
+                            (al/al-get [CtValue] (load arguments) 2))]
+            (if (not (string-value? source-value))
+                (error-at node "String.slice expects a string")
+                (match start-value
+                  (ValueInt [start]
+                    (match end-value
+                      (ValueInt [end]
+                        (let [source (string-value-text source-value)
+                              count (utf8-count source)]
+                          (if (or (< start 0) (or (< end start) (> end count)))
+                              (error-at node "String.slice indices out of bounds")
+                              (EvalOk (ValueString
+                                (subslice source (utf8-byte-offset source start)
+                                                 (utf8-byte-offset source end)))))))
+                      (_ (error-at node "String.slice expects integer indices"))))
+                  (_ (error-at node "String.slice expects integer indices"))))))
+    :else (error-at node "unknown compile-time builtin")))
+
+(defn parse-parameters [(e (mut CtEvaluator)) (node (ptr forms/CarpNode))]
+  (-> (ptr CtClosure))
+  ;; Body and frame are filled by the caller. A null return denotes malformed
+  ;; parameter syntax; the caller attaches the source-specific error.
+  (match (forms/form-of node)
+    (forms/ArrayForm [items]
+      (let [items (semantic-items (mut e) items)
+            a (load (field e a))
+            parameters (alloc/box! a (al/ArrayList (slice u8))
+                                   (al/al-new [(slice u8)] a))
+            body (alloc/box! a (al/ArrayList (ptr forms/CarpNode))
+                             (al/al-new [(ptr forms/CarpNode)] a))
+            n (al/al-len [(ptr forms/CarpNode)] (load items))
+            (mut i) 0
+            (mut rest) ""
+            (mut valid) true]
+        (loop (if (or (>= (load i) n) (not (load valid)))
+                  (break)
+                  (let [item (al/al-get [(ptr forms/CarpNode)] (load items) (load i))
+                        name (simple-name item)]
+                    (if (= (slice-len name) 0)
+                        (store! valid false)
+                        (if (str/str-eq name ":rest")
+                            (if (= (+ (load i) 1) (- n 1))
+                                (do (store! i (+ (load i) 1))
+                                    (store! rest (simple-name
+                                      (al/al-get [(ptr forms/CarpNode)]
+                                                 (load items) (load i)))))
+                                (store! valid false))
+                            (al/al-push! [(slice u8)] parameters name)))
+                    (store! i (+ (load i) 1)))))
+        (if (load valid)
+            (alloc/box! a CtClosure
+              (CtClosure :parameters parameters :rest-name (load rest)
+                         :body body :frame (env/FrameId :index -1)))
+            (primitive/cast (ptr CtClosure) 0))))
+    (_ (primitive/cast (ptr CtClosure) 0))))
+
+(defn eval-sequence [(e (mut CtEvaluator)) (frame env/FrameId)
+                     (items (ptr (al/ArrayList (ptr forms/CarpNode)))) (start i64)]
+  (-> CtEvalResult)
+  (let [n (al/al-len [(ptr forms/CarpNode)] (load items))
+        (mut i) start
+        (mut result) (EvalOk (ValueUnit))
+        (mut failed) false]
+    (loop (if (or (>= (load i) n) (load failed))
+              (break)
+              (do (store! result
+                          (eval-in (mut e) frame
+                                   (al/al-get [(ptr forms/CarpNode)]
+                                              (load items) (load i))))
+                  (if (eval-failed? (load result)) (store! failed true) 0)
+                  (store! i (+ (load i) 1)))))
+    (load result)))
+
+(defn eval-arguments [(e (mut CtEvaluator)) (frame env/FrameId)
+                      (items (ptr (al/ArrayList (ptr forms/CarpNode))))]
+  (-> CtEvalResult)
+  (let [values (value-list-new (mut e) false)
+        n (al/al-len [(ptr forms/CarpNode)] (load items))
+        (mut i) 1
+        (mut result) (EvalOk (ValueList values false))]
+    (loop (if (or (>= (load i) n) (eval-failed? (load result)))
+              (break)
+              (let [argument (eval-in (mut e) frame
+                                      (al/al-get [(ptr forms/CarpNode)]
+                                                 (load items) (load i)))]
+                (if (eval-failed? argument)
+                    (store! result argument)
+                    (al/al-push! [CtValue] values (result-value argument)))
+                (store! i (+ (load i) 1)))))
+    (load result)))
+
+(defn apply-closure [(e (mut CtEvaluator)) (node (ptr forms/CarpNode))
+                     (closure (ptr CtClosure))
+                     (arguments (ptr (al/ArrayList CtValue)))] (-> CtEvalResult)
+  (let [parameters (load (field closure parameters))
+        fixed (al/al-len [(slice u8)] (load parameters))
+        count (al/al-len [CtValue] (load arguments))
+        rest-name (load (field closure rest-name))]
+    (if (or (< count fixed)
+            (and (= (slice-len rest-name) 0) (!= count fixed)))
+        (error-at node "compile-time closure has wrong arity")
+        (let [call-frame (env/child! [CtValue] (mut (field e environment))
+                                     (load (field closure frame)))
+              (mut i) 0]
+          (loop (if (>= (load i) fixed) (break)
+                    (do (define! (mut e) call-frame
+                                 (al/al-get [(slice u8)] (load parameters) (load i))
+                                 (al/al-get [CtValue] (load arguments) (load i)))
+                        (store! i (+ (load i) 1)))))
+          (if (> (slice-len rest-name) 0)
+              (let [rest (value-list-new (mut e) false)]
+                (store! i fixed)
+                (loop (if (>= (load i) count) (break)
+                          (do (al/al-push! [CtValue] rest
+                                           (al/al-get [CtValue]
+                                                      (load arguments) (load i)))
+                              (store! i (+ (load i) 1)))))
+                (define! (mut e) call-frame rest-name (ValueList rest false))
+                0) 0)
+          (eval-sequence (mut e) call-frame (load (field closure body)) 0)))))
+
+(defn value-syntax-node [(e (mut CtEvaluator)) (span forms/SurfaceSpan)
+                         (value CtValue)] (-> (ptr forms/CarpNode))
+  (let [a (load (field e a))]
+    (match value
+      (ValueUnit []
+        (let [items (alloc/box! a (al/ArrayList (ptr forms/CarpNode))
+                                (al/al-new [(ptr forms/CarpNode)] a))]
+          (forms/node-new-at a span (forms/ListForm items))))
+      (ValueInt [value] (forms/node-new-at a span (forms/IntLit value)))
+      (ValueDouble [value] (forms/node-new-at a span (forms/DoubleLit value)))
+      (ValueBool [value] (forms/node-new-at a span (forms/BoolLit value)))
+      (ValueChar [value] (forms/node-new-at a span (forms/CharLit value)))
+      (ValueString [value] (forms/node-new-at a span (forms/StringLit value)))
+      (ValueSyntax [syntax]
+        (let [copy (forms/clone-node a syntax)] (forms/reanchor! copy span) copy))
+      (ValueList [values array]
+        (let [items (alloc/box! a (al/ArrayList (ptr forms/CarpNode))
+                                (al/al-new [(ptr forms/CarpNode)] a))
+              n (al/al-len [CtValue] (load values))
+              (mut i) 0 (mut valid) true]
+          (loop (if (or (>= (load i) n) (not (load valid))) (break)
+                    (let [item (value-syntax-node (mut e) span
+                                 (al/al-get [CtValue] (load values) (load i)))]
+                      (if (= (primitive/cast i64 item) 0) (store! valid false)
+                          (al/al-push! [(ptr forms/CarpNode)] items item))
+                      (store! i (+ (load i) 1)))))
+          (if (load valid)
+              (forms/node-new-at a span
+                (if array (forms/ArrayForm items) (forms/ListForm items)))
+              (primitive/cast (ptr forms/CarpNode) 0))))
+      (_ (primitive/cast (ptr forms/CarpNode) 0)))))
+
+(defn append-spliced-value! [(e (mut CtEvaluator))
+                             (node (ptr forms/CarpNode))
+                             (output (ptr (al/ArrayList (ptr forms/CarpNode))))
+                             (value CtValue)] (-> CtEvalResult)
+  (let [values (collection-values (mut e) value)]
+    (if (= (primitive/cast i64 values) 0)
+        (error-at node "unquote-splicing expects a collection")
+        (let [count (al/al-len [CtValue] (load values))
+              (mut i) 0 (mut result) (EvalOk (ValueUnit))]
+          (loop (if (or (>= (load i) count) (eval-failed? (load result))) (break)
+                    (let [syntax (value-syntax-node (mut e) (forms/span-of node)
+                                   (al/al-get [CtValue] (load values) (load i)))]
+                      (if (= (primitive/cast i64 syntax) 0)
+                          (store! result (error-at node "spliced value is not syntax"))
+                          (al/al-push! [(ptr forms/CarpNode)] output syntax))
+                      (store! i (+ (load i) 1)))))
+          (load result)))))
+
+(defn append-quasiquoted! [(e (mut CtEvaluator)) (frame env/FrameId)
+                           (node (ptr forms/CarpNode))
+                           (output (ptr (al/ArrayList (ptr forms/CarpNode))))
+                           (depth i64)] (-> CtEvalResult)
+  (let [quoted (quasiquote-node (mut e) frame node depth)]
+    (if (eval-failed? quoted) quoted
+        (match (result-value quoted)
+          (ValueSyntax [syntax]
+            (do (al/al-push! [(ptr forms/CarpNode)] output syntax)
+                (EvalOk (ValueUnit))))
+          (_ (error-at node "invalid quasiquote result"))))))
+
+(defn quasiquote-collection [(e (mut CtEvaluator)) (frame env/FrameId)
+                             (node (ptr forms/CarpNode))
+                             (raw (ptr (al/ArrayList (ptr forms/CarpNode))))
+                             (kind i64) (depth i64)] (-> CtEvalResult)
+  (let [a (load (field e a))
+        output (alloc/box! a (al/ArrayList (ptr forms/CarpNode))
+                           (al/al-new [(ptr forms/CarpNode)] a))
+        n (al/al-len [(ptr forms/CarpNode)] (load raw))
+        (mut i) 0 (mut result) (EvalOk (ValueUnit))]
+    (loop (if (or (>= (load i) n) (eval-failed? (load result))) (break)
+              (let [item (al/al-get [(ptr forms/CarpNode)] (load raw) (load i))]
+                (match (forms/form-of item)
+                  (forms/ListForm [inner-raw]
+                    (let [inner (semantic-items (mut e) inner-raw)
+                          inner-n (al/al-len [(ptr forms/CarpNode)] (load inner))]
+                      (if (and (= kind 1)
+                               (and (= depth 1) (> inner-n 0))
+                               (named? (al/al-get [(ptr forms/CarpNode)]
+                                                  (load inner) 0)
+                                       "unquote-splicing"))
+                          (if (!= inner-n 2)
+                              (store! result
+                                (error-at item "unquote-splicing expects one argument"))
+                              (let [spliced (eval-in (mut e) frame
+                                              (al/al-get [(ptr forms/CarpNode)]
+                                                         (load inner) 1))]
+                                (if (eval-failed? spliced)
+                                    (store! result spliced)
+                                    (store! result
+                                      (append-spliced-value! (mut e) item output
+                                                             (result-value spliced))))))
+                          (store! result
+                            (append-quasiquoted! (mut e) frame item output depth)))))
+                  (_ (store! result
+                       (append-quasiquoted! (mut e) frame item output depth))))
+                (store! i (+ (load i) 1)))))
+    (if (eval-failed? (load result)) (load result)
+        (EvalOk (ValueSyntax
+          (forms/node-new-at a (forms/span-of node)
+            (cond (= kind 1) (forms/ListForm output)
+                  (= kind 2) (forms/ArrayForm output)
+                  (= kind 3) (forms/StaticArrayForm output)
+                  :else (forms/DictionaryForm output))))))))
+
+(defn quasiquote-node [(e (mut CtEvaluator)) (frame env/FrameId)
+                       (node (ptr forms/CarpNode)) (depth i64)] (-> CtEvalResult)
+  (match (forms/form-of node)
+    (forms/ListForm [raw]
+      (let [items (semantic-items (mut e) raw)
+            n (al/al-len [(ptr forms/CarpNode)] (load items))]
+        (if (= n 0) (quasiquote-collection (mut e) frame node raw 1 depth)
+            (let [head (al/al-get [(ptr forms/CarpNode)] (load items) 0)]
+              (cond
+                (named? head "unquote")
+                  (if (!= n 2) (error-at node "unquote expects one argument")
+                      (if (= depth 1)
+                          (let [value (eval-in (mut e) frame
+                                        (al/al-get [(ptr forms/CarpNode)]
+                                                   (load items) 1))]
+                            (if (eval-failed? value) value
+                                (let [syntax (value-syntax-node (mut e)
+                                               (forms/span-of node)
+                                               (result-value value))]
+                                  (if (= (primitive/cast i64 syntax) 0)
+                                      (error-at node "unquoted value is not syntax")
+                                      (EvalOk (ValueSyntax syntax))))))
+                          (quasiquote-collection (mut e) frame node raw 1 (- depth 1))))
+                (named? head "unquote-splicing")
+                  (if (= depth 1)
+                      (error-at node "unquote-splicing is only valid in a collection")
+                      (quasiquote-collection (mut e) frame node raw 1 (- depth 1)))
+                (named? head "quasiquote")
+                  (quasiquote-collection (mut e) frame node raw 1 (+ depth 1))
+                :else (quasiquote-collection (mut e) frame node raw 1 depth))))))
+    (forms/ArrayForm [raw] (quasiquote-collection (mut e) frame node raw 2 depth))
+    (forms/StaticArrayForm [raw] (quasiquote-collection (mut e) frame node raw 3 depth))
+    (forms/DictionaryForm [raw] (quasiquote-collection (mut e) frame node raw 4 depth))
+    (_ (EvalOk (ValueSyntax (forms/clone-node (load (field e a)) node))))))
+
+(defn eval-case [(e (mut CtEvaluator)) (frame env/FrameId)
+                 (node (ptr forms/CarpNode))
+                 (items (ptr (al/ArrayList (ptr forms/CarpNode))))] (-> CtEvalResult)
+  (let [n (al/al-len [(ptr forms/CarpNode)] (load items))]
+    (if (< n 3) (error-at node "case expects a value and clauses")
+        (let [subject (eval-in (mut e) frame
+                              (al/al-get [(ptr forms/CarpNode)] (load items) 1))]
+          (if (eval-failed? subject) subject
+              (let [(mut i) 2
+                    (mut result) (EvalOk (ValueUnit))
+                    (mut matched) false]
+                (loop (if (or (>= (load i) n) (load matched)) (break)
+                          (if (= (+ (load i) 1) n)
+                              (do (store! result
+                                    (eval-in (mut e) frame
+                                      (al/al-get [(ptr forms/CarpNode)]
+                                                 (load items) (load i))))
+                                  (store! matched true))
+                              (let [candidate (eval-in (mut e) frame
+                                                (al/al-get [(ptr forms/CarpNode)]
+                                                           (load items) (load i)))]
+                                (if (eval-failed? candidate)
+                                    (do (store! result candidate)
+                                        (store! matched true))
+                                    (if (value-equal? (result-value subject)
+                                                      (result-value candidate))
+                                        (do (store! result
+                                              (eval-in (mut e) frame
+                                                (al/al-get [(ptr forms/CarpNode)]
+                                                           (load items)
+                                                           (+ (load i) 1))))
+                                            (store! matched true))
+                                        (store! i (+ (load i) 2))))))))
+                (load result)))))))
+
+(defn eval-list [(e (mut CtEvaluator)) (frame env/FrameId)
+                 (node (ptr forms/CarpNode))
+                 (raw-items (ptr (al/ArrayList (ptr forms/CarpNode))))] (-> CtEvalResult)
+  (let [items (semantic-items (mut e) raw-items)
+        n (al/al-len [(ptr forms/CarpNode)] (load items))]
+    (if (= n 0)
+        (EvalOk (ValueUnit))
+        (let [head (al/al-get [(ptr forms/CarpNode)] (load items) 0)]
+          (cond
+            (named? head "quote")
+              (if (= n 2)
+                  (EvalOk (ValueSyntax
+                    (forms/clone-node (load (field e a))
+                                      (al/al-get [(ptr forms/CarpNode)] (load items) 1))))
+                  (error-at node "quote expects one argument"))
+            (named? head "quasiquote")
+              (if (= n 2)
+                  (quasiquote-node (mut e) frame
+                                   (al/al-get [(ptr forms/CarpNode)] (load items) 1) 1)
+                  (error-at node "quasiquote expects one argument"))
+            (named? head "if")
+              (if (!= n 4) (error-at node "if expects three arguments")
+                  (let [condition (eval-in (mut e) frame
+                                          (al/al-get [(ptr forms/CarpNode)]
+                                                     (load items) 1))]
+                    (if (eval-failed? condition) condition
+                        (eval-in (mut e) frame
+                          (al/al-get [(ptr forms/CarpNode)] (load items)
+                                     (if (truthy? (result-value condition)) 2 3))))))
+            (named? head "case")
+              (eval-case (mut e) frame node items)
+            (named? head "do") (eval-sequence (mut e) frame items 1)
+            (named? head "and")
+              (let [(mut i) 1
+                    (mut result) (EvalOk (ValueBool true))]
+                (loop (if (or (>= (load i) n) (eval-failed? (load result))
+                              (not (truthy? (result-value (load result)))))
+                          (break)
+                          (do (store! result
+                                     (eval-in (mut e) frame
+                                       (al/al-get [(ptr forms/CarpNode)]
+                                                  (load items) (load i))))
+                              (store! i (+ (load i) 1)))))
+                (load result))
+            (named? head "or")
+              (let [(mut i) 1
+                    (mut result) (EvalOk (ValueBool false))]
+                (loop (if (or (>= (load i) n) (eval-failed? (load result))
+                              (truthy? (result-value (load result))))
+                          (break)
+                          (do (store! result
+                                     (eval-in (mut e) frame
+                                       (al/al-get [(ptr forms/CarpNode)]
+                                                  (load items) (load i))))
+                              (store! i (+ (load i) 1)))))
+                (load result))
+            (or (named? head "let") (named? head "let-do"))
+              (if (< n 3) (error-at node "let expects bindings and a body")
+                  (match (forms/form-of
+                           (al/al-get [(ptr forms/CarpNode)] (load items) 1))
+                    (forms/ArrayForm [bindings]
+                      (let [bindings (semantic-items (mut e) bindings)
+                            binding-count (al/al-len [(ptr forms/CarpNode)]
+                                                     (load bindings))]
+                        (if (!= (% binding-count 2) 0)
+                            (error-at node "let binding array must contain pairs")
+                            (let [child (env/child! [CtValue]
+                                          (mut (field e environment)) frame)
+                                  (mut i) 0
+                                  (mut result) (EvalOk (ValueUnit))]
+                              (loop (if (or (>= (load i) binding-count)
+                                            (eval-failed? (load result)))
+                                        (break)
+                                        (let [name-node (al/al-get [(ptr forms/CarpNode)]
+                                                                  (load bindings) (load i))
+                                              name (simple-name name-node)]
+                                          (if (= (slice-len name) 0)
+                                              (store! result
+                                                      (error-at name-node
+                                                        "let binding name must be a symbol"))
+                                              (let [value (eval-in (mut e) child
+                                                            (al/al-get [(ptr forms/CarpNode)]
+                                                              (load bindings) (+ (load i) 1)))]
+                                                (store! result value)
+                                                (if (not (eval-failed? value))
+                                                    (do (define! (mut e) child name
+                                                                 (result-value value))
+                                                        0) 0)))
+                                          (store! i (+ (load i) 2)))))
+                              (if (eval-failed? (load result)) (load result)
+                                  (eval-sequence (mut e) child items 2))))))
+                    (_ (error-at node "let expects a binding array"))))
+            (named? head "for")
+              (if (!= n 3) (error-at node "for expects a range and body")
+                  (match (forms/form-of
+                           (al/al-get [(ptr forms/CarpNode)] (load items) 1))
+                    (forms/ArrayForm [range]
+                      (let [range (semantic-items (mut e) range)]
+                      (if (!= (al/al-len [(ptr forms/CarpNode)] (load range)) 3)
+                          (error-at node "for range must be [name start end]")
+                          (let [name-node (al/al-get [(ptr forms/CarpNode)]
+                                                    (load range) 0)
+                                name (simple-name name-node)
+                                start-result (eval-in (mut e) frame
+                                               (al/al-get [(ptr forms/CarpNode)]
+                                                          (load range) 1))
+                                end-result (eval-in (mut e) frame
+                                             (al/al-get [(ptr forms/CarpNode)]
+                                                        (load range) 2))]
+                            (if (or (eval-failed? start-result)
+                                    (eval-failed? end-result))
+                                (if (eval-failed? start-result) start-result end-result)
+                                (match (result-value start-result)
+                                  (ValueInt [start]
+                                    (match (result-value end-result)
+                                      (ValueInt [end]
+                                        (let [child (env/child! [CtValue]
+                                                      (mut (field e environment)) frame)
+                                              cell (define! (mut e) child name
+                                                            (ValueInt start))
+                                              (mut i) start
+                                              (mut result) (EvalOk (ValueUnit))]
+                                          (loop (if (or (>= (load i) end)
+                                                        (eval-failed? (load result)))
+                                                    (break)
+                                                    (do
+                                                      (env/write-cell! [CtValue]
+                                                        (mut (field e environment)) cell
+                                                        (ValueInt (load i)))
+                                                      (store! result
+                                                        (eval-in (mut e) child
+                                                          (al/al-get [(ptr forms/CarpNode)]
+                                                            (load items) 2)))
+                                                      (store! i (+ (load i) 1)))))
+                                          (load result)))
+                                      (_ (error-at node "for end must be an integer"))))
+                                  (_ (error-at node "for start must be an integer"))))))))
+                    (_ (error-at node "for expects a range array"))))
+            (named? head "fn")
+              (if (< n 3) (error-at node "fn expects parameters and a body")
+                  (let [closure (parse-parameters (mut e)
+                                  (al/al-get [(ptr forms/CarpNode)] (load items) 1))]
+                    (if (= (primitive/cast i64 closure) 0)
+                        (error-at node "invalid function parameters")
+                        (do
+                          (store! (field closure frame) frame)
+                          (let [(mut i) 2]
+                            (loop (if (>= (load i) n) (break)
+                                      (do (al/al-push! [(ptr forms/CarpNode)]
+                                            (load (field closure body))
+                                            (al/al-get [(ptr forms/CarpNode)]
+                                                       (load items) (load i)))
+                                          (store! i (+ (load i) 1))))))
+                          (EvalOk (ValueClosure closure))))))
+            (named? head "set!")
+              (if (!= n 3) (error-at node "set! expects a name and value")
+                  (let [name-node (al/al-get [(ptr forms/CarpNode)] (load items) 1)
+                        name (symbol-key (mut e) name-node)
+                        value (eval-in (mut e) frame
+                                       (al/al-get [(ptr forms/CarpNode)]
+                                                  (load items) 2))]
+                    (if (eval-failed? value) value
+                        (if (env/set! [CtValue] (mut (field e environment)) frame name
+                                      (result-value value))
+                            value
+                            (error-at name-node "set! name is not bound")))))
+            (named? head "while")
+              (if (!= n 3) (error-at node "while expects condition and body")
+                  (let [(mut result) (EvalOk (ValueUnit))
+                        (mut done) false]
+                    (loop (if (or (load done) (eval-failed? (load result)))
+                              (break)
+                              (let [condition (eval-in (mut e) frame
+                                                (al/al-get [(ptr forms/CarpNode)]
+                                                           (load items) 1))]
+                                (if (eval-failed? condition)
+                                    (store! result condition)
+                                    (if (truthy? (result-value condition))
+                                        (store! result
+                                          (eval-in (mut e) frame
+                                            (al/al-get [(ptr forms/CarpNode)]
+                                                       (load items) 2)))
+                                        (store! done true))))))
+                    (load result)))
+            (named? head "eval")
+              (if (!= n 2) (error-at node "eval expects one argument")
+                  (let [value (eval-in (mut e) frame
+                                      (al/al-get [(ptr forms/CarpNode)]
+                                                 (load items) 1))]
+                    (if (eval-failed? value) value
+                        (match (result-value value)
+                          (ValueSyntax [syntax] (eval-in (mut e) frame syntax))
+                          (_ (error-at node "eval expects syntax"))))))
+            :else
+              (let [callee (eval-in (mut e) frame head)]
+                (if (eval-failed? callee) callee
+                    (let [arguments-result (eval-arguments (mut e) frame items)]
+                      (if (eval-failed? arguments-result) arguments-result
+                          (match (result-value arguments-result)
+                            (ValueList [arguments _]
+                              (match (result-value callee)
+                                (ValueBuiltin [id]
+                                  (apply-builtin (mut e) frame node id arguments))
+                                (ValueClosure [closure]
+                                  (apply-closure (mut e) node closure arguments))
+                                (_ (error-at head "attempted to call a non-function"))))
+                            (_ (error-at node "internal argument evaluation error"))))))))))))
+
+(defn eval-collection [(e (mut CtEvaluator)) (frame env/FrameId)
+                       (raw (ptr (al/ArrayList (ptr forms/CarpNode))))
+                       (array bool)] (-> CtEvalResult)
+  (let [items (semantic-items (mut e) raw)
+        values (value-list-new (mut e) array)
+        n (al/al-len [(ptr forms/CarpNode)] (load items))
+        (mut i) 0
+        (mut result) (EvalOk (ValueList values array))]
+    (loop (if (or (>= (load i) n) (eval-failed? (load result))) (break)
+              (let [value (eval-in (mut e) frame
+                            (al/al-get [(ptr forms/CarpNode)] (load items) (load i)))]
+                (if (eval-failed? value) (store! result value)
+                    (al/al-push! [CtValue] values (result-value value)))
+                (store! i (+ (load i) 1)))))
+    (load result)))
+
+(defn eval-in [(e (mut CtEvaluator)) (frame env/FrameId)
+               (node (ptr forms/CarpNode))] (-> CtEvalResult)
+  (if (<= (load (field e fuel)) 0)
+      (error-at node "compile-time evaluation fuel exhausted")
+      (do
+        (store! (field e fuel) (- (load (field e fuel)) 1))
+        (match (forms/form-of node)
+          (forms/IntLit [value] (EvalOk (ValueInt value)))
+          (forms/ByteLit [value] (EvalOk (ValueInt value)))
+          (forms/LongLit [value] (EvalOk (ValueInt value)))
+          (forms/FloatLit [value] (EvalOk (ValueDouble value)))
+          (forms/DoubleLit [value] (EvalOk (ValueDouble value)))
+          (forms/BoolLit [value] (EvalOk (ValueBool value)))
+          (forms/CharLit [value] (EvalOk (ValueChar value)))
+          (forms/StringLit [value] (EvalOk (ValueString value)))
+          (forms/PatternLit [value] (EvalOk (ValueString value)))
+          (forms/Comment [_] (EvalOk (ValueUnit)))
+          (forms/Symbol [_]
+            (let [name (symbol-key (mut e) node)]
+              (if (= (slice-len name) 0)
+                  (error-at node "empty compile-time name")
+                  (let [cell (env/lookup-cell [CtValue]
+                               (mut (field e environment)) frame name)]
+                    (if (= cell -1)
+                        (error-at node "unbound compile-time name")
+                        (EvalOk (env/read-cell [CtValue]
+                                  (mut (field e environment))
+                                  (env/CellId :index cell))))))))
+          (forms/ListForm [items] (eval-list (mut e) frame node items))
+          (forms/ArrayForm [items] (eval-collection (mut e) frame items true))
+          (forms/StaticArrayForm [items] (eval-collection (mut e) frame items true))
+          (forms/DictionaryForm [items] (eval-collection (mut e) frame items true))))))
+
+(defn eval [(e (mut CtEvaluator)) (node (ptr forms/CarpNode))] (-> CtEvalResult)
+  (eval-in (mut e) (load (field e root)) node))
+
+(defn apply-value [(e (mut CtEvaluator)) (frame env/FrameId)
+                   (call (ptr forms/CarpNode)) (callee CtValue)
+                   (arguments (ptr (al/ArrayList CtValue)))] (-> CtEvalResult)
+  (match callee
+    (ValueBuiltin [id] (apply-builtin (mut e) frame call id arguments))
+    (ValueClosure [closure] (apply-closure (mut e) call closure arguments))
+    (_ (error-at call "attempted to call a non-function"))))
