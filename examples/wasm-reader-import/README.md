@@ -1,23 +1,26 @@
 # WASM reader import proof of concept
 
-This project maps `.wat` files to `experiments.wasm.reader` in `Coil.toml`.
-`main.coil` imports `checksum.wat` through the normal Coil module system and
-calls its typed `checksum` export. The WebAssembly function computes a rolling
-hash of the ASCII bytes for `COIL`, using four typed parameters and a mutable
-WASM local.
+This project compiles a real `no_std` Rust library to core WebAssembly, maps its
+`.wasm` extension to `experiments.wasm.reader`, and imports the binary through
+Coil's normal module system. The exported Rust function loops over four packed
+ASCII bytes, classifies uppercase letters, vowels, and digits, and returns the
+three counters in one `u32`.
 
-Run it from this directory:
+Build the Rust binary and run Coil from this directory:
 
 ```sh
+cd rust
+RUSTFLAGS="-C target-cpu=mvp" cargo build --release --target wasm32-unknown-unknown
+cd ..
 coil run
 ```
 
 It prints:
 
 ```text
-WASM checksum for COIL: 2074255
+Rust/WASM analysis of COIL: 262656 (4 uppercase, 2 vowels, 0 digits)
 ```
 
-An exit status of zero also verifies the result.
-The same setup works for binary modules by changing the reader key to `.wasm`
-and pointing the module entry at a `.wasm` file.
+An exit status of zero also verifies the encoded result (`0x040200`). No WASI
+runtime, JavaScript glue, Python implementation, or native Rust library is used
+at runtime: Coil reads and compiles the generated `.wasm` file.
