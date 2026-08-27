@@ -1,0 +1,548 @@
+(module experiments.ohm.recipe-reader)
+
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "coil.primitive" :use [alloc-static fnptr-of cast])
+(import "coil.slice" :use [slice-len slice-get])
+(import "coil.str" :as str)
+(import "coil.json" :as json)
+(import "experiments.ohm.reader" :as ohm-reader)
+(import "experiments.ohm.unicode" :as unicode)
+
+(defstruct JsonString
+  [(valid bool)
+   (value (slice u8))
+   (end i64)])
+
+(defn recipe-byte [(source (slice u8)) (at i64)] (-> i64)
+  (if (or (< at 0) (>= at (slice-len source)))
+      -1
+      (primitive/cast i64 (slice-get source at))))
+
+(defn recipe-hex [(value i64)] (-> i64)
+  (cond (and (>= value 48) (<= value 57)) (- value 48)
+        (and (>= value 65) (<= value 70)) (+ (- value 65) 10)
+        (and (>= value 97) (<= value 102)) (+ (- value 97) 10)
+        :else -1))
+
+(defn recipe-unicode-escape [(source (slice u8)) (at i64)] (-> i64)
+  (let [(mut value) 0 (mut valid) true]
+    (for [index 0 4]
+      (let [digit (recipe-hex (recipe-byte source (+ at index)))]
+        (if (< digit 0)
+            (set! valid false)
+            (set! value (+ (* (load value) 16) digit)))))
+    (if (load valid) (load value) -1)))
+
+(defn recipe-push-scalar! [(builder (mut str/StrBuf))
+                           (value i64)] (-> i64)
+  (cond (< value 128)
+          (str/sb-push-byte! (mut builder) (primitive/cast u8 value))
+        (< value 2048)
+          (do
+            (str/sb-push-byte! (mut builder)
+                               (primitive/cast u8 (+ 192 (/ value 64))))
+            (str/sb-push-byte! (mut builder)
+                               (primitive/cast u8 (+ 128 (% value 64)))))
+        (< value 65536)
+          (do
+            (str/sb-push-byte! (mut builder)
+                               (primitive/cast u8 (+ 224 (/ value 4096))))
+            (str/sb-push-byte! (mut builder)
+                               (primitive/cast u8 (+ 128 (% (/ value 64) 64))))
+            (str/sb-push-byte! (mut builder)
+                               (primitive/cast u8 (+ 128 (% value 64)))))
+        :else
+          (do
+            (str/sb-push-byte! (mut builder)
+                               (primitive/cast u8 (+ 240 (/ value 262144))))
+            (str/sb-push-byte! (mut builder)
+                               (primitive/cast u8 (+ 128 (% (/ value 4096) 64))))
+            (str/sb-push-byte! (mut builder)
+                               (primitive/cast u8 (+ 128 (% (/ value 64) 64))))
+            (str/sb-push-byte! (mut builder)
+                               (primitive/cast u8 (+ 128 (% value 64))))))
+  value)
+
+(defn recipe-read-json-string [(source (slice u8)) (start i64)] (-> JsonString)
+  (let [(mut parsed) (primitive/zeroed JsonString)
+        (mut builder) (str/sb-new (malloc-allocator))
+        (mut at) (+ start 1)
+        (mut valid) (= (recipe-byte source start) 34)
+        (mut done) false]
+    (loop (if (or (not (load valid))
+                  (or (load done) (>= (load at) (slice-len source))))
+              (break)
+              (let [value (recipe-byte source (load at))]
+                (cond (= value 34)
+                        (do
+                          (set! at (+ (load at) 1))
+                          (set! done true))
+                      (= value 92)
+                        (let [escaped (recipe-byte source (+ (load at) 1))]
+                          (cond (= escaped 34) (str/sb-push-byte! (mut builder) 34)
+                                (= escaped 92) (str/sb-push-byte! (mut builder) 92)
+                                (= escaped 47) (str/sb-push-byte! (mut builder) 47)
+                                (= escaped 98) (str/sb-push-byte! (mut builder) 8)
+                                (= escaped 102) (str/sb-push-byte! (mut builder) 12)
+                                (= escaped 110) (str/sb-push-byte! (mut builder) 10)
+                                (= escaped 114) (str/sb-push-byte! (mut builder) 13)
+                                (= escaped 116) (str/sb-push-byte! (mut builder) 9)
+                                (= escaped 117)
+                                  (let [first (recipe-unicode-escape source (+ (load at) 2))]
+                                    (if (< first 0)
+                                        (set! valid false)
+                                        (if (and (>= first 55296) (<= first 56319))
+                                            (if (and (= (recipe-byte source (+ (load at) 6)) 92)
+                                                     (= (recipe-byte source (+ (load at) 7)) 117))
+                                                (let [second
+                                                        (recipe-unicode-escape source
+                                                                               (+ (load at) 8))]
+                                                  (if (and (>= second 56320) (<= second 57343))
+                                                      (do
+                                                        (recipe-push-scalar!
+                                                          (mut builder)
+                                                          (+ 65536
+                                                             (+ (* (- first 55296) 1024)
+                                                                (- second 56320))))
+                                                        (set! at (+ (load at) 6)))
+                                                      (set! valid false)))
+                                                (set! valid false))
+                                            (recipe-push-scalar! (mut builder) first))))
+                                :else (set! valid false))
+                          (set! at (+ (load at) 2)))
+                      (< value 32) (set! valid false)
+                      :else
+                        (do
+                          (str/sb-push-byte! (mut builder) (slice-get source (load at)))
+                          (set! at (+ (load at) 1)))))))
+    (set! (.valid parsed) (and (load valid) (load done)))
+    (set! (.value parsed) (str/sb-finish! (mut builder)))
+    (set! (.end parsed) (load at))
+    (load parsed)))
+
+(defn recipe-skip-space [(source (slice u8)) (start i64)] (-> i64)
+  (let [(mut at) start]
+    (loop (let [value (recipe-byte source (load at))]
+            (if (or (= value 32) (or (= value 9) (or (= value 10) (= value 13))))
+                (set! at (+ (load at) 1))
+                (break))))
+    (load at)))
+
+(defn recipe-source-key? [(source (slice u8))
+                          (after-key i64)
+                          (key (slice u8))] (-> bool)
+  (let [colon (recipe-skip-space source after-key)]
+    (and (str/str-eq key "source") (= (recipe-byte source colon) 58))))
+
+(defn recipe-extract-sources [(source (slice u8))]
+                              (-> (al/ArrayList (slice u8)))
+  (let [(mut sources) (al/al-new [(slice u8)] (malloc-allocator))
+        (mut at) 0]
+    (loop (if (>= (load at) (slice-len source))
+              (break)
+              (if (= (recipe-byte source (load at)) 34)
+                  (let [token (recipe-read-json-string source (load at))]
+                    (if (not (.valid token))
+                        (primitive/error "Invalid JSON string in Ohm recipe")
+                        0)
+                    (if (recipe-source-key? source (.end token) (.value token))
+                        (let [colon (recipe-skip-space source (.end token))
+                              value-start (recipe-skip-space source (+ colon 1))
+                              value (recipe-read-json-string source value-start)]
+                          (if (not (.valid value))
+                              (primitive/error "Ohm recipe source metadata must be a string")
+                              (push! (mut sources) (.value value)))
+                          (set! at (.end value)))
+                        (set! at (.end token))))
+                  (set! at (+ (load at) 1)))))
+    (load sources)))
+
+(defn recipe-json-string [(document json/Doc) (index i64)] (-> (slice u8))
+  (let [token (json/token document index)]
+    (if (not (json/is-string? token))
+        (primitive/error "Ohm recipe expected a JSON string")
+        0)
+    (let [parsed
+            (recipe-read-json-string (.source document) (- (.start token) 1))]
+      (if (not (.valid parsed))
+          (primitive/error "Invalid escaped string in Ohm recipe")
+          (.value parsed)))))
+
+(defn recipe-number [(document json/Doc) (index i64)] (-> i64)
+  (let [token (json/token document index)
+        text (json/number-text document token)
+        (mut value) 0]
+    (if (not (json/is-number? token))
+        (primitive/error "Ohm recipe expected an integer")
+        0)
+    (for [at 0 (slice-len text)]
+      (let [digit (- (primitive/cast i64 (slice-get text at)) 48)]
+        (if (or (< digit 0) (> digit 9))
+            (primitive/error "Ohm recipe expected a non-negative integer")
+            (set! value (+ (* (load value) 10) digit)))))
+    (load value)))
+
+(defn recipe-array-child [(document json/Doc)
+                          (array i64)
+                          (index i64)] (-> i64)
+  (let [token (json/token document array)]
+    (if (or (not (json/is-array? token)) (>= index (json/child-count token)))
+        (primitive/error "Malformed Ohm recipe array")
+        (json/array-nth document array index))))
+
+(defn recipe-array-count [(document json/Doc) (array i64)] (-> i64)
+  (let [token (json/token document array)]
+    (if (not (json/is-array? token))
+        (primitive/error "Malformed Ohm recipe: expected array")
+        (json/child-count token))))
+
+(defn recipe-tag [(document json/Doc) (array i64)] (-> (slice u8))
+  (recipe-json-string document (recipe-array-child document array 0)))
+
+(defn recipe-push-ohm-string! [(builder (mut str/StrBuf))
+                               (value (slice u8))] (-> i64)
+  (str/sb-push-byte! (mut builder) 34)
+  (for [index 0 (slice-len value)]
+    (let [byte (primitive/cast i64 (slice-get value index))]
+      (cond (= byte 34) (str/sb-push-str! (mut builder) "\\\"")
+            (= byte 92) (str/sb-push-str! (mut builder) "\\\\")
+            (= byte 10) (str/sb-push-str! (mut builder) "\\n")
+            (= byte 13) (str/sb-push-str! (mut builder) "\\r")
+            (= byte 9) (str/sb-push-str! (mut builder) "\\t")
+            (= byte 8) (str/sb-push-str! (mut builder) "\\b")
+            :else (str/sb-push-byte! (mut builder) (slice-get value index)))))
+  (str/sb-push-byte! (mut builder) 34)
+  0)
+
+(defn recipe-emit-unicode-property! [(builder (mut str/StrBuf))
+                                     (property (slice u8))] (-> i64)
+  (if (= (slice-len (unicode/unicode-property-ranges property)) 0)
+      (let [(mut message) (str/sb-new (malloc-allocator))]
+        (str/sb-push-str! (mut message) "Invalid Unicode category or property name: \"")
+        (str/sb-push-str! (mut message) property)
+        (str/sb-push-str! (mut message) "\"")
+        (primitive/error (str/sb-finish! (mut message))))
+      0)
+  (str/sb-push-str! (mut builder) "__ohm_unicode_")
+  (str/sb-push-str! (mut builder) property)
+  0)
+
+(defn recipe-emit-expression! [(builder (mut str/StrBuf))
+                               (document json/Doc)
+                               (expression i64)
+                               (formals i64)] (-> i64)
+  (let [tag (recipe-tag document expression)
+        count (recipe-array-count document expression)]
+    (cond (str/str-eq tag "terminal")
+            (recipe-push-ohm-string!
+              (mut builder)
+              (recipe-json-string document (recipe-array-child document expression 2)))
+          (str/str-eq tag "range")
+            (do
+              (recipe-push-ohm-string!
+                (mut builder)
+                (recipe-json-string document (recipe-array-child document expression 2)))
+              (str/sb-push-str! (mut builder) "..")
+              (recipe-push-ohm-string!
+                (mut builder)
+                (recipe-json-string document (recipe-array-child document expression 3))))
+          (str/str-eq tag "param")
+            (let [formal-index
+                    (recipe-number document (recipe-array-child document expression 2))]
+              (str/sb-push-str!
+                (mut builder)
+                (recipe-json-string document
+                                    (recipe-array-child document formals formal-index))))
+          (or (str/str-eq tag "alt") (str/str-eq tag "seq"))
+            (do
+              (str/sb-push-str! (mut builder) "(")
+              (for [index 2 count]
+                (if (> index 2)
+                    (str/sb-push-str! (mut builder)
+                                      (if (str/str-eq tag "alt") " | " " "))
+                    0)
+                (recipe-emit-expression! (mut builder)
+                                         document
+                                         (recipe-array-child document expression index)
+                                         formals))
+              (str/sb-push-str! (mut builder) ")"))
+          (or (str/str-eq tag "star")
+              (or (str/str-eq tag "plus") (str/str-eq tag "opt")))
+            (do
+              (str/sb-push-str! (mut builder) "(")
+              (recipe-emit-expression! (mut builder)
+                                       document
+                                       (recipe-array-child document expression 2)
+                                       formals)
+              (str/sb-push-str! (mut builder) ")")
+              (str/sb-push-str! (mut builder)
+                                (cond (str/str-eq tag "star") "*"
+                                      (str/str-eq tag "plus") "+"
+                                      :else "?")))
+          (or (str/str-eq tag "not")
+              (or (str/str-eq tag "lookahead") (str/str-eq tag "lex")))
+            (do
+              (str/sb-push-str! (mut builder)
+                                (cond (str/str-eq tag "not") "~"
+                                      (str/str-eq tag "lookahead") "&"
+                                      :else "#"))
+              (str/sb-push-str! (mut builder) "(")
+              (recipe-emit-expression! (mut builder)
+                                       document
+                                       (recipe-array-child document expression 2)
+                                       formals)
+              (str/sb-push-str! (mut builder) ")"))
+          (str/str-eq tag "app")
+            (do
+              (str/sb-push-str!
+                (mut builder)
+                (recipe-json-string document (recipe-array-child document expression 2)))
+              (let [arguments (recipe-array-child document expression 3)
+                    argument-count (recipe-array-count document arguments)]
+                (if (> argument-count 0)
+                    (do
+                      (str/sb-push-str! (mut builder) "<")
+                      (for [index 0 argument-count]
+                        (if (> index 0) (str/sb-push-str! (mut builder) ", ") 0)
+                        (recipe-emit-expression! (mut builder)
+                                                 document
+                                                 (recipe-array-child document arguments index)
+                                                 formals))
+                      (str/sb-push-str! (mut builder) ">"))
+                    0)))
+          (str/str-eq tag "splice")
+            (let [before (recipe-array-child document expression 2)
+                  after (recipe-array-child document expression 3)
+                  before-count (recipe-array-count document before)
+                  after-count (recipe-array-count document after)]
+              (str/sb-push-str! (mut builder) "(")
+              (for [index 0 before-count]
+                (if (> index 0) (str/sb-push-str! (mut builder) " | ") 0)
+                (recipe-emit-expression! (mut builder)
+                                         document
+                                         (recipe-array-child document before index)
+                                         formals))
+              (if (> before-count 0) (str/sb-push-str! (mut builder) " | ") 0)
+              (str/sb-push-str! (mut builder) "...")
+              (for [index 0 after-count]
+                (str/sb-push-str! (mut builder) " | ")
+                (recipe-emit-expression! (mut builder)
+                                         document
+                                         (recipe-array-child document after index)
+                                         formals))
+              (str/sb-push-str! (mut builder) ")"))
+          (or (str/str-eq tag "any") (str/str-eq tag "end"))
+            (str/sb-push-str! (mut builder) tag)
+          (str/str-eq tag "unicodeChar")
+            (let [category
+                    (recipe-json-string document
+                                        (recipe-array-child document expression 2))]
+              (recipe-emit-unicode-property! (mut builder) category))
+          :else
+            (let [(mut message) (str/sb-new (malloc-allocator))]
+              (str/sb-push-str! (mut message) "Unsupported Ohm recipe expression: ")
+              (str/sb-push-str! (mut message) tag)
+              (primitive/error (str/sb-finish! (mut message)))))
+    0))
+
+(defn recipe-emit-formals! [(builder (mut str/StrBuf))
+                            (document json/Doc)
+                            (formals i64)] (-> i64)
+  (let [count (recipe-array-count document formals)]
+    (if (> count 0)
+        (do
+          (str/sb-push-str! (mut builder) "<")
+          (for [index 0 count]
+            (if (> index 0) (str/sb-push-str! (mut builder) ", ") 0)
+            (str/sb-push-str! (mut builder)
+                              (recipe-json-string document
+                                                  (recipe-array-child document
+                                                                      formals
+                                                                      index))))
+          (str/sb-push-str! (mut builder) ">"))
+        0)))
+
+(defn recipe-emit-rule! [(builder (mut str/StrBuf))
+                         (document json/Doc)
+                         (name (slice u8))
+                         (rule i64)] (-> i64)
+  (let [action (recipe-json-string document (recipe-array-child document rule 0))
+        description-token (recipe-array-child document rule 2)
+        formals (recipe-array-child document rule 3)
+        body (recipe-array-child document rule 4)]
+    (str/sb-push-str! (mut builder) "  ")
+    (str/sb-push-str! (mut builder) name)
+    (recipe-emit-formals! (mut builder) document formals)
+    (if (not (json/is-null? (json/token document description-token)))
+        (do
+          (str/sb-push-str! (mut builder) " (")
+          (str/sb-push-str! (mut builder) (recipe-json-string document description-token))
+          (str/sb-push-str! (mut builder) ")"))
+        0)
+    (str/sb-push-str! (mut builder)
+                      (cond (str/str-eq action "extend") " += "
+                            (str/str-eq action "override") " := "
+                            :else " = "))
+    (recipe-emit-expression! (mut builder) document body formals)
+    (str/sb-push-str! (mut builder) "\n")
+    0))
+
+(defn recipe-object-key-string [(document json/Doc)
+                                (object i64)
+                                (index i64)] (-> (slice u8))
+  (recipe-json-string document (json/object-key document object index)))
+
+(defn recipe-emit-grammar! [(builder (mut str/StrBuf))
+                            (document json/Doc)
+                            (grammar i64)] (-> (slice u8))
+  (if (not (str/str-eq (recipe-tag document grammar) "grammar"))
+      (primitive/error "Ohm recipe root must be a grammar")
+      0)
+  (let [name (recipe-json-string document (recipe-array-child document grammar 2))
+        super (recipe-array-child document grammar 3)
+        default-token (recipe-array-child document grammar 4)
+        rules (recipe-array-child document grammar 5)
+        (mut super-name) ""]
+    (if (not (json/is-null? (json/token document super)))
+        (do
+          (set! super-name (recipe-emit-grammar! (mut builder) document super))
+          (str/sb-push-str! (mut builder) "\n"))
+        0)
+    (str/sb-push-str! (mut builder) name)
+    (if (> (slice-len (load super-name)) 0)
+        (do
+          (str/sb-push-str! (mut builder) " <: ")
+          (str/sb-push-str! (mut builder) (load super-name)))
+        0)
+    (str/sb-push-str! (mut builder) " {\n")
+    (let [rule-token (json/token document rules)
+          default-name
+            (if (json/is-null? (json/token document default-token))
+                ""
+                (recipe-json-string document default-token))]
+      (if (not (json/is-object? rule-token))
+          (primitive/error "Ohm grammar recipe rules must be an object")
+          0)
+      (if (> (slice-len default-name) 0)
+          (for [index 0 (json/child-count rule-token)]
+            (let [rule-name (recipe-object-key-string document rules index)]
+              (if (str/str-eq rule-name default-name)
+                  (recipe-emit-rule! (mut builder)
+                                     document
+                                     rule-name
+                                     (json/object-value document rules index))
+                  0)))
+          0)
+      (for [index 0 (json/child-count rule-token)]
+        (let [rule-name (recipe-object-key-string document rules index)]
+          (if (and (> (slice-len default-name) 0) (str/str-eq rule-name default-name))
+              0
+              (recipe-emit-rule! (mut builder)
+                                 document
+                                 rule-name
+                                 (json/object-value document rules index))))))
+    (str/sb-push-str! (mut builder) "}")
+    name))
+
+(defn recipe-source-from-structure [(source (slice u8))] (-> (slice u8))
+  (match (json/parse (malloc-allocator) source)
+    (Ok [document]
+      (let [(mut builder) (str/sb-new (malloc-allocator))
+            metadata (recipe-array-child document 0 1)
+            accept (json/object-get document metadata "fixtureAccept")
+            reject (json/object-get document metadata "fixtureReject")
+            accept-from (json/object-get document metadata "fixtureAcceptFrom")]
+        (if (>= accept 0)
+            (do
+              (str/sb-push-str! (mut builder) "// @accept ")
+              (str/sb-push-str! (mut builder) (recipe-json-string document accept))
+              (str/sb-push-str! (mut builder) "\n"))
+            0)
+        (if (>= reject 0)
+            (do
+              (str/sb-push-str! (mut builder) "// @reject ")
+              (str/sb-push-str! (mut builder) (recipe-json-string document reject))
+              (str/sb-push-str! (mut builder) "\n"))
+            0)
+        (if (>= accept-from 0)
+            (do
+              (str/sb-push-str! (mut builder) "// @accept-from ")
+              (str/sb-push-str! (mut builder) (recipe-json-string document accept-from))
+              (str/sb-push-str! (mut builder) "\n"))
+            0)
+        (recipe-emit-grammar! (mut builder) document 0)
+        (str/sb-finish! (mut builder))))
+    (Err [error]
+      (let [(mut message) (str/sb-new (malloc-allocator))]
+        (str/sb-push-str! (mut message) "Invalid Ohm recipe JSON at byte ")
+        (str/sb-push-i64! (mut message) (json/error-offset error))
+        (primitive/error (str/sb-finish! (mut message)))))))
+
+(defn recipe-valid-json? [(source (slice u8))] (-> bool)
+  (match (json/parse (malloc-allocator) source)
+    (Ok [document] true)
+    (Err [error] false)))
+
+(defn recipe-add-roundtrip-api [(context Code)
+                                (generated Code)
+                                (recipe (slice u8))] (-> Code)
+  (let [(mut output) (primitive/code-list-new)
+        name (primitive/datum->syntax context (primitive/code-symbol "to-recipe"))
+        main-name (primitive/datum->syntax context (primitive/code-symbol "main"))
+        inner-main-name
+          (primitive/datum->syntax context (primitive/code-symbol "__ohm_recipe_main"))]
+    (for form
+      (iter generated)
+      (if (and (primitive/code-list? form)
+               (and (> (len form) 1)
+                    (and (primitive/code-sym? (get form 0))
+                         (and (str/str-eq (primitive/code-sym (get form 0)) "defn")
+                              (and (primitive/code-sym? (get form 1))
+                                   (str/str-eq (primitive/code-sym (get form 1))
+                                               "main"))))))
+          (let [(mut renamed) (primitive/code-list-new)]
+            (for [index 0 (len form)]
+              (push! (mut renamed) (if (= index 1) inner-main-name (get form index))))
+            (push! (mut output) (primitive/code-list-done (load renamed))))
+          (if (and (primitive/code-list? form)
+                   (and (> (len form) 1)
+                        (and (primitive/code-sym? (get form 0))
+                             (and (str/str-eq (primitive/code-sym (get form 0)) "defn")
+                                  (and (primitive/code-sym? (get form 1))
+                                       (str/str-eq (primitive/code-sym (get form 1))
+                                                   "to-recipe"))))))
+              0
+              (push! (mut output) form))))
+    (push! (mut output)
+           `(defn ~name [] (-> (slice u8)) ~recipe))
+    (push! (mut output)
+           `(defn ~main-name [] (-> i64)
+              (if (= (~name) ~recipe) (~inner-main-name) 97)))
+    (primitive/code-list-done (load output))))
+
+(defn read-ohm-recipe-source [(context Code) (source (slice u8))] (-> Code)
+  (let [sources (recipe-extract-sources source)]
+    (if (not (recipe-valid-json? source))
+        (primitive/error "Invalid JSON passed to Ohm makeRecipe")
+        0)
+    (if (= (len sources) 0)
+        (recipe-add-roundtrip-api
+          context
+          (ohm-reader/read-ohm-impl context (recipe-source-from-structure source) true false)
+          source)
+        (let [(mut grammar-source) (str/sb-new (malloc-allocator))]
+          ;; Recipes nest from child to parent; Ohm source namespaces declare from
+          ;; parent to child.
+          (for [reverse-index 0 (len sources)]
+            (let [index (- (- (len sources) reverse-index) 1)]
+              (if (> reverse-index 0) (str/sb-push-str! (mut grammar-source) "\n") 0)
+              (str/sb-push-str! (mut grammar-source) (get sources index))))
+          (recipe-add-roundtrip-api
+            context
+            (ohm-reader/read-ohm-impl context (str/sb-finish! (mut grammar-source)) true false)
+            source)))))
+
+(defn read-ohm-recipe [(context Code)] (-> Code)
+  (read-ohm-recipe-source context (primitive/code-str (get context 2))))

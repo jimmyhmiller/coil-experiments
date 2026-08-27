@@ -1,0 +1,760 @@
+(module experiments.ohm.namespace-reader)
+
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use [slice-get slice-len subslice])
+(import "coil.str" :as str)
+(import "coil.fs" :as fs)
+(import "experiments.ohm.reader" :as ohm-reader)
+
+(defstruct NamespaceGrammar
+  [(name (slice u8))
+   (super-name (slice u8))
+   (super-start i64)
+   (super-end i64)
+   (start i64)
+   (end i64)
+   (source (slice u8))])
+
+(defstruct NamespaceCase
+  [(grammar (slice u8))
+   (rule (slice u8))
+   (input (slice u8))
+   (expected bool)])
+
+(defn namespace-byte [(source (slice u8)) (at i64)] (-> i64)
+  (if (or (< at 0) (>= at (slice-len source)))
+      -1
+      (primitive/cast i64 (slice-get source at))))
+
+(defn namespace-space? [(byte i64)] (-> bool)
+  (or (= byte 32) (or (= byte 9) (or (= byte 10) (= byte 13)))))
+
+(defn namespace-ident-byte? [(byte i64)] (-> bool)
+  (or (= byte 95)
+      (or (and (>= byte 48) (<= byte 57))
+          (or (and (>= byte 65) (<= byte 90))
+              (or (and (>= byte 97) (<= byte 122)) (>= byte 128))))))
+
+(defn namespace-line-end [(source (slice u8)) (start i64)] (-> i64)
+  (let [(mut at) start]
+    (loop (if (or (>= (load at) (slice-len source))
+                  (or (= (namespace-byte source (load at)) 10)
+                      (= (namespace-byte source (load at)) 13)))
+              (break)
+              (set! at (+ (load at) 1))))
+    (load at)))
+
+(defn namespace-skip-space-comments [(source (slice u8)) (start i64)] (-> i64)
+  (let [(mut at) start
+        (mut moving) true]
+    (loop (if (not (load moving))
+              (break)
+              (do
+                (set! moving false)
+                (loop (if (namespace-space? (namespace-byte source (load at)))
+                          (do (set! at (+ (load at) 1)) (set! moving true))
+                          (break)))
+                (if (and (= (namespace-byte source (load at)) 47)
+                         (= (namespace-byte source (+ (load at) 1)) 47))
+                    (do
+                      (set! at (namespace-line-end source (load at)))
+                      (set! moving true))
+                    (if (and (= (namespace-byte source (load at)) 47)
+                             (= (namespace-byte source (+ (load at) 1)) 42))
+                        (do
+                          (set! at (+ (load at) 2))
+                          (loop (if (or (>= (load at) (slice-len source))
+                                        (and (= (namespace-byte source (load at)) 42)
+                                             (= (namespace-byte source (+ (load at) 1)) 47)))
+                                    (break)
+                                    (set! at (+ (load at) 1))))
+                          (if (< (load at) (slice-len source))
+                              (set! at (+ (load at) 2))
+                              0)
+                          (set! moving true))
+                        0)))))
+    (load at)))
+
+(defn namespace-ident-end [(source (slice u8)) (start i64)] (-> i64)
+  (let [(mut at) start]
+    (loop (if (namespace-ident-byte? (namespace-byte source (load at)))
+              (set! at (+ (load at) 1))
+              (break)))
+    (load at)))
+
+(defn namespace-trim-line-end [(source (slice u8)) (start i64)] (-> i64)
+  (let [(mut end) (slice-len source)]
+    (loop (if (and (> (load end) start)
+                   (let [byte (namespace-byte source (- (load end) 1))]
+                     (or (= byte 32) (or (= byte 9) (= byte 13)))))
+              (set! end (- (load end) 1))
+              (break)))
+    (load end)))
+
+(defn namespace-append-imports! [(source (slice u8))
+                                 (builder (mut str/StrBuf))
+                                 (depth i64)] (-> i64)
+  (if (> depth 32) (primitive/error "Circular or excessively deep namespace import") 0)
+  (let [(mut at) 0
+        prefix "// @namespace-import "]
+    (loop (if (>= (load at) (slice-len source))
+              (break)
+              (let [end (namespace-line-end source (load at))
+                    line (subslice source (load at) end)]
+                (if (ohm-reader/slice-at? line 0 prefix)
+                    (let [path-start (slice-len prefix)
+                          path-end (namespace-trim-line-end line path-start)
+                          path (subslice line path-start path-end)]
+                      (if (= (slice-len path) 0)
+                          (primitive/error "Namespace import path must not be empty")
+                          0)
+                      (match (fs/read-file (malloc-allocator) path)
+                        (Ok [imported]
+                          (do
+                            (namespace-append-imports! imported
+                                                       (mut builder)
+                                                       (+ depth 1))
+                            (str/sb-push-str! (mut builder) "\n")))
+                        (Err [error]
+                          (let [(mut message) (str/sb-new (malloc-allocator))]
+                            (str/sb-push-str! (mut message) "Cannot read namespace import '")
+                            (str/sb-push-str! (mut message) path)
+                            (str/sb-push-str! (mut message) "'")
+                            (primitive/error (str/sb-finish! (mut message)))))))
+                    0)
+                (set! at (if (< end (slice-len source)) (+ end 1) end)))))
+    (str/sb-push-str! (mut builder) source)
+    0))
+
+(defn namespace-grammar-end [(source (slice u8)) (open i64)] (-> i64)
+  (let [(mut at) (+ open 1)
+        (mut depth) 1
+        (mut quote) -1]
+    (loop (if (or (<= (load depth) 0) (>= (load at) (slice-len source)))
+              (break)
+              (let [byte (namespace-byte source (load at))]
+                (if (>= (load quote) 0)
+                    (if (= byte 92)
+                        (set! at (+ (load at) 2))
+                        (do
+                          (if (= byte (load quote)) (set! quote -1) 0)
+                          (set! at (+ (load at) 1))))
+                    (cond (or (= byte 34) (= byte 39))
+                            (do (set! quote byte) (set! at (+ (load at) 1)))
+                          (and (= byte 47)
+                               (= (namespace-byte source (+ (load at) 1)) 47))
+                            (set! at (namespace-line-end source (load at)))
+                          (and (= byte 47)
+                               (= (namespace-byte source (+ (load at) 1)) 42))
+                            (do
+                              (set! at (+ (load at) 2))
+                              (loop (if (or (>= (load at) (slice-len source))
+                                            (and (= (namespace-byte source (load at)) 42)
+                                                 (= (namespace-byte source (+ (load at) 1)) 47)))
+                                        (break)
+                                        (set! at (+ (load at) 1))))
+                              (set! at (+ (load at) 2)))
+                          (= byte 123)
+                            (do
+                              (set! depth (+ (load depth) 1))
+                              (set! at (+ (load at) 1)))
+                          (= byte 125)
+                            (do
+                              (set! depth (- (load depth) 1))
+                              (set! at (+ (load at) 1)))
+                          :else (set! at (+ (load at) 1)))))))
+    (if (= (load depth) 0) (load at) -1)))
+
+(defn namespace-find-grammar [(grammars (ptr (al/ArrayList NamespaceGrammar)))
+                              (name (slice u8))] (-> i64)
+  (let [(mut found) -1]
+    (for [index 0 (len (load grammars))]
+      (let [grammar (get (load grammars) index)]
+        (if (str/str-eq (.name grammar) name) (set! found index) 0)))
+    (load found)))
+
+(defn namespace-error [(prefix (slice u8)) (name (slice u8))] (-> i64)
+  (let [(mut message) (str/sb-new (malloc-allocator))]
+    (str/sb-push-str! (mut message) prefix)
+    (str/sb-push-str! (mut message) name)
+    (primitive/error (str/sb-finish! (mut message)))))
+
+(defn namespace-duplicate-error [(name (slice u8))] (-> i64)
+  (let [(mut message) (str/sb-new (malloc-allocator))]
+    (str/sb-push-str! (mut message) "Grammar ")
+    (str/sb-push-str! (mut message) name)
+    (str/sb-push-str! (mut message) " is already declared in this namespace")
+    (primitive/error (str/sb-finish! (mut message)))))
+
+(defn namespace-undeclared-error [(source (slice u8))
+                                  (name (slice u8))
+                                  (start i64)
+                                  (end i64)] (-> i64)
+  (let [(mut message) (str/sb-new (malloc-allocator))]
+    (str/sb-push-str! (mut message) "Grammar ")
+    (str/sb-push-str! (mut message) name)
+    (str/sb-push-str! (mut message)
+                      " is not declared in namespace '[object Object]'")
+    (ohm-reader/source-error-for source start end (str/sb-finish! (mut message)))))
+
+(defn namespace-scan-grammars [(source (slice u8))]
+                              (-> (al/ArrayList NamespaceGrammar))
+  (let [(mut grammars) (al/al-new [NamespaceGrammar] (malloc-allocator))
+        (mut at) 0]
+    (loop
+      (set! at (namespace-skip-space-comments source (load at)))
+      (if (>= (load at) (slice-len source))
+          (break)
+          (let [start (load at)
+                name-end (namespace-ident-end source start)]
+            (if (= name-end start) (namespace-error "Expected grammar name at " "source") 0)
+            (let [name (subslice source start name-end)
+                  _
+                    (if (>= (namespace-find-grammar (mut grammars) name) 0)
+                        (namespace-duplicate-error name)
+                        0)
+                  (mut cursor) (namespace-skip-space-comments source name-end)
+                  (mut super-name) "BuiltInRules"
+                  (mut super-start) -1
+                  (mut super-end) -1]
+              (if (and (= (namespace-byte source (load cursor)) 60)
+                       (= (namespace-byte source (+ (load cursor) 1)) 58))
+                  (do
+                    (set! cursor (namespace-skip-space-comments source (+ (load cursor) 2)))
+                    (let [parsed-super-end (namespace-ident-end source (load cursor))]
+                      (set! super-start (load cursor))
+                      (set! super-end parsed-super-end)
+                      (set! super-name (subslice source (load cursor) parsed-super-end))
+                      (set! cursor (namespace-skip-space-comments source parsed-super-end))))
+                  0)
+              (if (!= (namespace-byte source (load cursor)) 123)
+                  (namespace-error "Expected '{' after grammar " name)
+                  0)
+              (let [end (namespace-grammar-end source (load cursor))
+                    (mut grammar) (primitive/zeroed NamespaceGrammar)]
+                (if (< end 0) (namespace-error "Unterminated grammar " name) 0)
+                (set! (.name grammar) name)
+                (set! (.super-name grammar) (load super-name))
+                (set! (.super-start grammar) (load super-start))
+                (set! (.super-end grammar) (load super-end))
+                (set! (.start grammar) start)
+                (set! (.end grammar) end)
+                (set! (.source grammar) (subslice source start end))
+                (push! (mut grammars) (load grammar))
+                (set! at end))))))
+    (load grammars)))
+
+(defn namespace-chain-source! [(grammars (ptr (al/ArrayList NamespaceGrammar)))
+                               (namespace-source (slice u8))
+                               (index i64)
+                               (builder (mut str/StrBuf))
+                               (depth i64)] (-> i64)
+  (if (> depth (len (load grammars)))
+      (primitive/error "Circular grammar inheritance")
+      0)
+  (let [grammar (get (load grammars) index)
+        super-name (.super-name grammar)]
+    (if (or (str/str-eq super-name "BuiltInRules")
+            (or (str/str-eq super-name "ProtoBuiltInRules")
+                (str/str-eq super-name "IndentationSensitive")))
+        0
+        (let [super-index (namespace-find-grammar grammars super-name)]
+          (if (< super-index 0)
+              (namespace-undeclared-error namespace-source
+                                          super-name
+                                          (.super-start grammar)
+                                          (.super-end grammar))
+              (do
+                (namespace-chain-source! grammars
+                                         namespace-source
+                                         super-index
+                                         (mut builder)
+                                         (+ depth 1))
+                (str/sb-push-str! (mut builder) "\n")))))
+    (str/sb-push-str! (mut builder) (.source grammar))
+    0))
+
+(defn namespace-definition-form? [(form Code)] (-> bool)
+  (and (primitive/code-list? form)
+       (and (> (len form) 1)
+            (and (primitive/code-sym? (get form 0))
+                 (let [head (primitive/code-sym (get form 0))]
+                   (or (str/str-eq head "defn")
+                       (or (str/str-eq head "defstruct")
+                           (or (str/str-eq head "deftrait")
+                               (str/str-eq head "const")))))))))
+
+(defn namespace-rewrite-code [(node Code) (old-names Code) (new-names Code)]
+                             (-> Code)
+  (if (primitive/code-sym? node)
+      (let [(mut answer) node]
+        (for [index 0 (len old-names)]
+          (if (primitive/free-identifier=? node (get old-names index))
+              (set! answer (get new-names index))
+              0))
+        (load answer))
+      (if (primitive/code-list? node)
+          (let [rewritten (primitive/code-list-new)]
+            (for child (iter node)
+              (primitive/code-list-push!
+                rewritten
+                (namespace-rewrite-code child old-names new-names)))
+            (primitive/code-list-done rewritten))
+          node)))
+
+(defn namespace-prefixed-name [(context Code)
+                               (grammar-index i64)
+                               (name (slice u8))] (-> Code)
+  (let [(mut builder) (str/sb-new (malloc-allocator))]
+    (str/sb-push-str! (mut builder) "__ohm_namespace_")
+    (str/sb-push-i64! (mut builder) grammar-index)
+    (str/sb-push-str! (mut builder) "_")
+    (str/sb-push-str! (mut builder) name)
+    (primitive/datum->syntax
+      context
+      (primitive/code-symbol (str/sb-finish! (mut builder))))))
+
+(defn namespace-form-head? [(form Code) (wanted (slice u8))] (-> bool)
+  (and (primitive/code-list? form)
+       (and (> (len form) 0)
+            (and (primitive/code-sym? (get form 0))
+                 (str/str-eq (primitive/code-sym (get form 0)) wanted)))))
+
+(defn namespace-read-cases [(source (slice u8))]
+                           (-> (al/ArrayList NamespaceCase))
+  (let [(mut cases) (al/al-new [NamespaceCase] (malloc-allocator))
+        (mut at) 0]
+    (loop (if (>= (load at) (slice-len source))
+              (break)
+              (let [end (namespace-line-end source (load at))
+                    line (subslice source (load at) end)
+                    positive-prefix "// @namespace-accept "
+                    negative-prefix "// @namespace-reject "
+                    positive-from-prefix "// @namespace-accept-from "
+                    negative-from-prefix "// @namespace-reject-from "
+                    positive (ohm-reader/slice-at? line 0 positive-prefix)
+                    negative (ohm-reader/slice-at? line 0 negative-prefix)
+                    positive-from (ohm-reader/slice-at? line 0 positive-from-prefix)
+                    negative-from (ohm-reader/slice-at? line 0 negative-from-prefix)]
+                (if (or positive
+                        (or negative (or positive-from negative-from)))
+                    (let [prefix-length
+                            (cond positive (slice-len positive-prefix)
+                                  negative (slice-len negative-prefix)
+                                  positive-from (slice-len positive-from-prefix)
+                                  :else (slice-len negative-from-prefix))
+                          grammar-end (namespace-ident-end line prefix-length)
+                          rule-start (+ grammar-end 1)
+                          rule-end
+                            (if (or positive-from negative-from)
+                                (namespace-ident-end line rule-start)
+                                rule-start)
+                          input-start
+                            (if (or positive-from negative-from)
+                                (+ rule-end 1)
+                                rule-start)
+                          (mut case) (primitive/zeroed NamespaceCase)]
+                      (set! (.grammar case) (subslice line prefix-length grammar-end))
+                      (set! (.rule case)
+                            (if (or positive-from negative-from)
+                                (subslice line rule-start rule-end)
+                                ""))
+                      (set! (.input case) (subslice line input-start (slice-len line)))
+                      (set! (.expected case) (or positive positive-from))
+                      (push! (mut cases) (load case)))
+                    0)
+                (set! at (if (< end (slice-len source)) (+ end 1) end)))))
+    (load cases)))
+
+(defn read-ohm-namespace-impl [(context Code) (local-source (slice u8))] (-> Code)
+  (let [(mut combined-source) (str/sb-new (malloc-allocator))
+        _ (namespace-append-imports! local-source (mut combined-source) 0)
+        source (str/sb-finish! (mut combined-source))
+        (mut grammars) (namespace-scan-grammars source)
+        cases (namespace-read-cases source)
+        (mut output) (primitive/code-list-new)
+        parse-dispatch-name
+          (primitive/datum->syntax context (primitive/code-symbol "namespace-parse"))
+        parse-from-dispatch-name
+          (primitive/datum->syntax context (primitive/code-symbol "namespace-parse-from"))
+        match-dispatch-name
+          (primitive/datum->syntax context (primitive/code-symbol "namespace-match"))
+        match-from-dispatch-name
+          (primitive/datum->syntax context (primitive/code-symbol "namespace-match-from"))
+        grammar-dispatch-name
+          (primitive/datum->syntax context (primitive/code-symbol "namespace-grammar"))
+        grammar-object-dispatch-name
+          (primitive/datum->syntax context
+                                   (primitive/code-symbol "namespace-grammar-object"))
+        count-dispatch-name
+          (primitive/datum->syntax context (primitive/code-symbol "namespace-count"))
+        name-dispatch-name
+          (primitive/datum->syntax context (primitive/code-symbol "namespace-name"))
+        main-name (primitive/datum->syntax context (primitive/code-symbol "main"))]
+    (push! (mut output) (primitive/code-symbol "do"))
+    (push! (mut output) `(module ohm.namespace.generated))
+    (push! (mut output) `(import "coil.primitive" :as primitive))
+    (push! (mut output) `(import "coil.primitive" :use [alloc-static fnptr-of cast]))
+    (push! (mut output) `(import "coil.alloc" :as alloc))
+    (push! (mut output) `(import "coil.arraylist" :as al))
+    (push! (mut output) `(import "coil.slice" :use [slice-get slice-len]))
+    (push! (mut output) `(import "coil.str" :as str))
+    (push! (mut output) `(import "experiments.ohm.runtime" :use []))
+    (push! (mut output) `(import "experiments.ohm.pexprs" :use []))
+    (let [parse-names (primitive/code-list-new)
+          parse-from-names (primitive/code-list-new)
+          match-names (primitive/code-list-new)
+          match-from-names (primitive/code-list-new)
+          grammar-names (primitive/code-list-new)
+          grammar-object-names (primitive/code-list-new)
+          (mut grammar-object-aliases) (al/al-new [Code] (malloc-allocator))]
+      (for [grammar-index 0 (len grammars)]
+        (let [(mut chain) (str/sb-new (malloc-allocator))
+              _ (namespace-chain-source!
+                  (mut grammars) source grammar-index (mut chain) 0)
+              grammar-context (primitive/fresh-identifier "namespace-grammar-context")
+              generated
+                (ohm-reader/read-ohm-impl
+                  grammar-context
+                  (str/sb-finish! (mut chain))
+                  true
+                  false)
+              old-names-builder (primitive/code-list-new)
+              new-names-builder (primitive/code-list-new)]
+          (for form (iter generated)
+            (if (namespace-definition-form? form)
+                (let [old-name (get form 1)
+                      new-name
+                        (namespace-prefixed-name
+                          old-name grammar-index (primitive/code-sym old-name))]
+                  (primitive/code-list-push! old-names-builder old-name)
+                  (primitive/code-list-push! new-names-builder new-name)
+                  0)
+                0))
+          (let [old-names (primitive/code-list-done old-names-builder)
+                new-names (primitive/code-list-done new-names-builder)]
+            (for form (iter generated)
+              (if (or (and (primitive/code-sym? form)
+                           (str/str-eq (primitive/code-sym form) "do"))
+                      (or (namespace-form-head? form "module")
+                          (namespace-form-head? form "import")))
+                  0
+                  (push! (mut output) form)))
+            (let [parse-old (primitive/datum->syntax context (primitive/code-symbol "parse"))
+                  parse-from-old
+                    (primitive/datum->syntax context (primitive/code-symbol "parse-from"))
+                  match-old
+                    (primitive/datum->syntax context (primitive/code-symbol "parse-tree"))
+                  match-from-old
+                    (primitive/datum->syntax context (primitive/code-symbol "parse-tree-from"))
+                  grammar-old
+                    (primitive/datum->syntax context (primitive/code-symbol "grammar"))
+                  grammar-object-old
+                    (primitive/datum->syntax context (primitive/code-symbol "grammar-object"))
+                  (mut parse-target) parse-old
+                  (mut parse-from-target) parse-from-old
+                  (mut match-target) match-old
+                  (mut match-from-target) match-from-old
+                  (mut grammar-target) grammar-old
+                  (mut grammar-object-target) grammar-object-old
+                  (mut parse-new) parse-old
+                  (mut parse-from-new) parse-from-old
+                  (mut grammar-new) grammar-old]
+              (for [index 0 (len old-names)]
+                (let [defined-name (primitive/code-sym (get old-names index))]
+                  (if (str/str-eq defined-name "parse")
+                      (do
+                        (set! parse-new (get new-names index))
+                        (set! parse-target (get old-names index))) 0)
+                  (if (str/str-eq defined-name "parse-from")
+                      (do
+                        (set! parse-from-new (get new-names index))
+                        (set! parse-from-target (get old-names index))) 0)
+                  (if (str/str-eq defined-name "parse-tree")
+                      (set! match-target (get old-names index)) 0)
+                  (if (str/str-eq defined-name "parse-tree-from")
+                      (set! match-from-target (get old-names index)) 0)
+                  (if (str/str-eq defined-name "grammar")
+                      (do
+                        (set! grammar-new (get new-names index))
+                        (set! grammar-target (get old-names index))) 0)
+                  (if (str/str-eq defined-name "grammar-object")
+                      (set! grammar-object-target (get old-names index))
+                      0)))
+              (let [parse-alias
+                      (namespace-prefixed-name context grammar-index "dispatch_parse")
+                    parse-from-alias
+                      (namespace-prefixed-name context grammar-index "dispatch_parse_from")
+                    match-alias
+                      (namespace-prefixed-name context grammar-index "dispatch_match")
+                    match-from-alias
+                      (namespace-prefixed-name context grammar-index "dispatch_match_from")
+                    grammar-alias
+                      (namespace-prefixed-name context grammar-index "dispatch_grammar")
+                    grammar-object-alias
+                      (namespace-prefixed-name context grammar-index "dispatch_grammar_object")
+                    alias-input (primitive/fresh-identifier "alias-input")
+                    alias-rule (primitive/fresh-identifier "alias-rule")
+                    grammar-object-value (primitive/fresh-identifier "namespace-grammar-object-value")
+                    remap-forms-builder (primitive/code-list-new)]
+                (for [source-index 0 (len grammars)]
+                  (let [source-grammar (get grammars source-index)]
+                    (primitive/code-list-push!
+                      remap-forms-builder
+                      `(experiments.ohm.runtime.remap-ohm-grammar-pexpr-source!
+                         (mut ~grammar-object-value)
+                         ~(.source source-grammar)
+                         ~source
+                         ~(ohm-reader/recipe-utf16-index
+                            source 0 (.start source-grammar))))))
+                (push! (mut output)
+                       `(defn ~parse-alias [(~alias-input (slice u8))] (-> bool)
+                          (~(load parse-target) ~alias-input)))
+                (push! (mut output)
+                       `(defn ~parse-from-alias
+                          [(~alias-input (slice u8)) (~alias-rule (slice u8))]
+                          (-> bool)
+                          (~(load parse-from-target) ~alias-input ~alias-rule)))
+                (push! (mut output)
+                       `(defn ~match-alias [(~alias-input (slice u8))]
+                          (-> experiments.ohm.runtime.MatchResult)
+                          (~(load match-target) ~alias-input)))
+                (push! (mut output)
+                       `(defn ~match-from-alias
+                          [(~alias-input (slice u8)) (~alias-rule (slice u8))]
+                          (-> experiments.ohm.runtime.MatchResult)
+                          (~(load match-from-target) ~alias-input ~alias-rule)))
+                (push! (mut output)
+                       `(defn ~grammar-alias []
+                          (-> experiments.ohm.runtime.OhmGrammarDescriptor)
+                          (~(load grammar-target))))
+                (push! (mut output)
+                       `(defn ~grammar-object-alias []
+                          (-> experiments.ohm.runtime.OhmGrammar)
+                          ~(let [current-grammar (get grammars grammar-index)
+                                 super-index
+                                   (namespace-find-grammar
+                                     grammars
+                                     (.super-name current-grammar))
+                                 remap-forms
+                                   (primitive/code-list-done remap-forms-builder)]
+                             `(let [(mut ~grammar-object-value)
+                                      (~(load grammar-object-target))]
+                                ~(if (>= super-index 0)
+                                     `(experiments.ohm.runtime.set-ohm-grammar-supergrammar-factory!
+                                        (mut ~grammar-object-value)
+                                        (fnptr-of ~(get grammar-object-aliases super-index)))
+                                     `0)
+                                (do ~@remap-forms)
+                                (load ~grammar-object-value)))))
+                (primitive/code-list-push! parse-names parse-alias)
+                (primitive/code-list-push! parse-from-names parse-from-alias)
+                (primitive/code-list-push! match-names match-alias)
+                (primitive/code-list-push! match-from-names match-from-alias)
+                (primitive/code-list-push! grammar-names grammar-alias)
+                (primitive/code-list-push! grammar-object-names grammar-object-alias)
+                (push! (mut grammar-object-aliases) grammar-object-alias))))))
+      (let [finished-parse-names (primitive/code-list-done parse-names)
+            finished-parse-from-names (primitive/code-list-done parse-from-names)
+            finished-match-names (primitive/code-list-done match-names)
+            finished-match-from-names (primitive/code-list-done match-from-names)
+            finished-grammar-names (primitive/code-list-done grammar-names)
+            finished-grammar-object-names
+              (primitive/code-list-done grammar-object-names)
+            input-name (primitive/fresh-identifier "namespace-input")
+            requested-name (primitive/fresh-identifier "namespace-name")
+            rule-name (primitive/fresh-identifier "namespace-rule")
+            (mut parse-body) `false
+            (mut parse-from-body) `false
+            (mut match-body)
+              (if (> (len grammars) 0)
+                  `(do
+                     (experiments.ohm.runtime.unknown-grammar ~requested-name)
+                     (~(get finished-match-names 0) ~input-name))
+                  `(do
+                     (experiments.ohm.runtime.unknown-grammar ~requested-name)
+                     (primitive/zeroed experiments.ohm.runtime.MatchResult)))
+            (mut match-from-body)
+              (if (> (len grammars) 0)
+                  `(do
+                     (experiments.ohm.runtime.unknown-grammar ~requested-name)
+                     (~(get finished-match-from-names 0) ~input-name ~rule-name))
+                  `(do
+                     (experiments.ohm.runtime.unknown-grammar ~requested-name)
+                     (primitive/zeroed experiments.ohm.runtime.MatchResult)))
+            (mut grammar-body)
+              `(experiments.ohm.runtime.new-ohm-grammar-descriptor "" "" "" "")
+            primitive-zeroed-name
+              (primitive/datum->syntax context (primitive/code-symbol "primitive/zeroed"))
+            (mut grammar-object-body)
+              `(~primitive-zeroed-name experiments.ohm.runtime.OhmGrammar)
+            (mut name-body) `""]
+        (for [reverse-index 0 (len grammars)]
+          (let [index (- (- (len grammars) reverse-index) 1)
+                grammar (get grammars index)]
+            (set! parse-body
+                  `(if (coil.str.str-eq ~requested-name ~(.name grammar))
+                       (~(get finished-parse-names index) ~input-name)
+                       ~(load parse-body)))
+            (set! parse-from-body
+                  `(if (coil.str.str-eq ~requested-name ~(.name grammar))
+                       (~(get finished-parse-from-names index) ~input-name ~rule-name)
+                       ~(load parse-from-body)))
+            (set! match-body
+                  `(if (coil.str.str-eq ~requested-name ~(.name grammar))
+                       (~(get finished-match-names index) ~input-name)
+                       ~(load match-body)))
+            (set! match-from-body
+                  `(if (coil.str.str-eq ~requested-name ~(.name grammar))
+                       (~(get finished-match-from-names index) ~input-name ~rule-name)
+                       ~(load match-from-body)))
+            (set! grammar-body
+                  `(if (coil.str.str-eq ~requested-name ~(.name grammar))
+                       (~(get finished-grammar-names index))
+                       ~(load grammar-body)))
+            (set! grammar-object-body
+                  `(if (coil.str.str-eq ~requested-name ~(.name grammar))
+                       (~(get finished-grammar-object-names index))
+                       ~(load grammar-object-body)))
+            (set! name-body
+                  `(if (= ~rule-name ~index) ~(.name grammar) ~(load name-body)))))
+        (push! (mut output)
+               `(defn ~parse-dispatch-name
+                  [(~requested-name (slice u8)) (~input-name (slice u8))]
+                  (-> bool)
+                  ~(load parse-body)))
+        (push! (mut output)
+               `(defn ~parse-from-dispatch-name
+                  [(~requested-name (slice u8))
+                   (~input-name (slice u8))
+                   (~rule-name (slice u8))]
+                  (-> bool)
+                  ~(load parse-from-body)))
+        (push! (mut output)
+               `(defn ~match-dispatch-name
+                  [(~requested-name (slice u8)) (~input-name (slice u8))]
+                  (-> experiments.ohm.runtime.MatchResult)
+                  ~(load match-body)))
+        (push! (mut output)
+               `(defn ~match-from-dispatch-name
+                  [(~requested-name (slice u8))
+                   (~input-name (slice u8))
+                   (~rule-name (slice u8))]
+                  (-> experiments.ohm.runtime.MatchResult)
+                  ~(load match-from-body)))
+        (push! (mut output)
+               `(defn ~grammar-dispatch-name [(~requested-name (slice u8))]
+                  (-> experiments.ohm.runtime.OhmGrammarDescriptor)
+                  ~(load grammar-body)))
+        (push! (mut output)
+               `(defn ~grammar-object-dispatch-name [(~requested-name (slice u8))]
+                  (-> experiments.ohm.runtime.OhmGrammar)
+                  ~(load grammar-object-body)))
+        (push! (mut output)
+               `(defn ~count-dispatch-name [] (-> i64) ~(len grammars)))
+        (push! (mut output)
+               `(defn ~name-dispatch-name [(~rule-name i64)] (-> (slice u8))
+                  ~(load name-body)))
+        (let [(mut test-body) `0]
+          (for [reverse-index 0 (len cases)]
+            (let [index (- (- (len cases) reverse-index) 1)
+                  case (get cases index)]
+              (set! test-body
+                    `(if (= ~(if (> (slice-len (.rule case)) 0)
+                                  `(~parse-from-dispatch-name
+                                     ~(.grammar case) ~(.input case) ~(.rule case))
+                                  `(~parse-dispatch-name ~(.grammar case) ~(.input case)))
+                            ~(.expected case))
+                         ~(load test-body)
+                         ~(+ index 1)))))
+          (for [reverse-index 0 (len grammars)]
+            (let [index (- (- (len grammars) reverse-index) 1)
+                  grammar (get grammars index)
+                  descriptor (primitive/fresh-identifier "namespace-descriptor")
+                  object (primitive/fresh-identifier "namespace-grammar-object")
+                  super-object (primitive/fresh-identifier "namespace-supergrammar-object")
+                  rest (load test-body)
+                  super-index (namespace-find-grammar grammars (.super-name grammar))
+                  (mut descriptor-mismatch) `199]
+              (for [candidate-reverse 0 (len grammars)]
+                (let [candidate-index (- (- (len grammars) candidate-reverse) 1)
+                      candidate (get grammars candidate-index)]
+                  (set! descriptor-mismatch
+                        `(if (coil.str.str-eq
+                               (experiments.ohm.runtime.grammar-descriptor-name
+                                 (mut ~descriptor))
+                               ~(.name candidate))
+                             ~(+ 120 candidate-index)
+                             ~(load descriptor-mismatch)))))
+              (set! test-body
+                    `(let [(mut ~descriptor) (~grammar-dispatch-name ~(.name grammar))
+                           (mut ~object) (~grammar-object-dispatch-name ~(.name grammar))
+                           (mut ~super-object)
+                             (experiments.ohm.runtime.ohm-grammar-supergrammar
+                               (mut ~object))
+                           object-valid
+                             (and (coil.str.str-eq
+                                    (experiments.ohm.runtime.ohm-grammar-name
+                                      (mut ~object))
+                                    ~(.name grammar))
+                                  ~(if (>= super-index 0)
+                                       `(and
+                                          (experiments.ohm.runtime.ohm-grammar-has-supergrammar?
+                                            (mut ~object))
+                                          (coil.str.str-eq
+                                            (experiments.ohm.runtime.ohm-grammar-name
+                                              (mut ~super-object))
+                                            ~(.super-name grammar)))
+                                       `(and
+                                          (experiments.ohm.runtime.ohm-grammar-has-supergrammar?
+                                            (mut ~object))
+                                          (coil.str.str-eq
+                                            (experiments.ohm.runtime.ohm-grammar-name
+                                              (mut ~super-object))
+                                            ~(.super-name grammar)))))
+                           status
+                             (if (not (coil.str.str-eq
+                                        (experiments.ohm.runtime.grammar-descriptor-name
+                                          (mut ~descriptor))
+                                        ~(.name grammar)))
+                                 ~(load descriptor-mismatch)
+                                 (if (not object-valid)
+                                     ~(+ 140 index)
+                                     (if (not (coil.str.str-eq (~name-dispatch-name ~index)
+                                                               ~(.name grammar)))
+                                         ~(+ 100 index)
+                                         ~rest)))]
+                       (experiments.ohm.runtime.free-ohm-grammar!
+                         (mut ~super-object))
+                       (experiments.ohm.runtime.free-ohm-grammar! (mut ~object))
+                       status))))
+          (push! (mut output)
+                 `(defn ~main-name [] (-> i64)
+                    ~(if (ohm-reader/source-contains? source
+                                                      "// @namespace-expect-empty")
+                         `(if (= (~count-dispatch-name) 0) 0 1)
+                         (if (ohm-reader/source-contains? source
+                                                      "// @namespace-expect-unknown-match ")
+                         (let [(mut marker-start) 0]
+                           (loop (if (or (>= (load marker-start) (slice-len source))
+                                         (ohm-reader/slice-at?
+                                           source
+                                           (load marker-start)
+                                           "// @namespace-expect-unknown-match "))
+                                     (break)
+                                     (set! marker-start (+ (load marker-start) 1))))
+                           (let [name-start (+ (load marker-start) 35)
+                                 name-end (namespace-line-end source name-start)]
+                             `(let [(mut impossible-match)
+                                      (~match-dispatch-name
+                                        ~(subslice source name-start name-end)
+                                        "")]
+                                (experiments.ohm.runtime.free-match! (mut impossible-match))
+                                0)))
+                         (load test-body))))))))
+    (primitive/code-list-done (load output))))
+
+(defn read-ohm-namespace [(context Code)] (-> Code)
+  (read-ohm-namespace-impl context (primitive/code-str (get context 2))))
