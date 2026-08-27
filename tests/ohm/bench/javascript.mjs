@@ -12,7 +12,7 @@ const cases = [
   ['arithmetic-small', 'Arithmetic', '12+34+56+78+90', 20000],
   ['arithmetic-large', 'Arithmetic', '1+2+3+4+5+6+7+8+9+10+11+12+13+14+15+16+17+18+19+20+21+22+23+24+25+26+27+28+29+30+31+32+33+34+35+36+37+38+39+40', 3000],
   ['csv', 'Csv', 'alpha,beta,gamma,delta\none,two,three,four\nfive,six,seven,eight\nnine,ten,eleven,twelve\nred,green,blue,orange\n', 5000],
-  ['json', 'Json', '{"name":"coil","items":[1,2,3,4,5,6,7,8],"active":true,"nested":{"x":12.5,"y":null},"tags":["parser","ohm","benchmark"]}', 200],
+  ['json', 'Json', '{"name":"coil","items":[1,2,3,4,5,6,7,8],"active":true,"nested":{"x":12.5,"y":null},"tags":["parser","ohm","benchmark"]}', 5000],
 ];
 
 function benchJs(rule, input, iterations) {
