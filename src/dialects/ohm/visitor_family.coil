@@ -1,0 +1,521 @@
+(module experiments.ohm.visitor-family)
+
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use [slice-len slice-get subslice])
+(import "coil.str" :as str)
+(import "experiments.ohm.runtime" :as ohm)
+
+;; A shape property contributes one action argument. Scalar properties wrap one
+;; child; `[]` properties wrap a list of children, matching VisitorFamily's
+;; Adapter and Array<Adapter> arguments respectively.
+(defstruct VisitorProperty [(name (slice u8)) (array bool)])
+(defstruct VisitorShape
+  [(tag (slice u8))
+   (custom bool)
+   (property-start i64)
+   (property-count i64)])
+
+(defstruct VisitorArgument
+  [(array bool)
+   (child-start i64)
+   (child-count i64)])
+
+(defstruct VisitorValidation
+  [(valid bool)
+   (error-kind i64)
+   (action-index i64)
+   (expected-arity i64)
+   (actual-arity i64)
+   (operation-index i64)])
+
+(defstruct VisitorEvaluationError
+  [(kind i64)
+   (tag (slice u8))
+   (operation (slice u8))])
+
+;; Tree storage is intentionally abstract. A family can visit any Coil data
+;; structure whose provider can return a tag and resolve configured property
+;; descriptors. Custom shapes correspond to upstream function-valued shapes.
+(deftrait OhmVisitorTree [Self]
+  (visitor-tag [(self (ptr Self)) (node i64)] (-> (slice u8)))
+  (visitor-property-child-count [(self (ptr Self))
+                                 (node i64)
+                                 (property (slice u8))] (-> i64))
+  (visitor-property-child [(self (ptr Self))
+                           (node i64)
+                           (property (slice u8))
+                           (index i64)] (-> i64))
+  (visitor-custom-argument-count [(self (ptr Self)) (node i64)] (-> i64))
+  (visitor-custom-argument-child-count [(self (ptr Self))
+                                        (node i64)
+                                        (argument i64)] (-> i64))
+  (visitor-custom-argument-child [(self (ptr Self))
+                                  (node i64)
+                                  (argument i64)
+                                  (index i64)] (-> i64)))
+
+;; The action dictionary mirrors the object passed to addOperation. Action
+;; implementations invoke `visitor-evaluate-argument!` when they want the
+;; equivalent of `child.visit(...)`; evaluation is deliberately lazy.
+(deftrait OhmVisitorActions [Self]
+  (visitor-action-count [(self (ptr Self))] (-> i64))
+  (visitor-action-name [(self (ptr Self)) (index i64)] (-> (slice u8)))
+  (visitor-action-arity [(self (ptr Self)) (index i64)] (-> i64))
+  (apply-visitor-action [(self (ptr Self))
+                         (evaluation (mut VisitorEvaluation))
+                         (node i64)
+                         (action-index i64)
+                         (arguments (slice VisitorArgument))]
+                        (-> i64)))
+
+(defstruct VisitorOperation
+  [(name (slice u8))
+   (signature (slice u8))
+   (formal-count i64)
+   (actions (dyn OhmVisitorActions))])
+
+(defstruct OhmVisitorFamily
+  [(shapes (al/ArrayList VisitorShape))
+   (properties (al/ArrayList VisitorProperty))
+   (operations (al/ArrayList VisitorOperation))
+   (allocator (dyn alloc/Allocator))])
+
+(defstruct VisitorEvaluation
+  [(family (ptr OhmVisitorFamily))
+   (tree (dyn OhmVisitorTree))
+   (actions (dyn OhmVisitorActions))
+   (operation i64)
+   (operation-arguments (slice i64))
+   (argument-children (al/ArrayList i64))
+   (error VisitorEvaluationError)
+   (failed bool)])
+
+(defstruct VisitorAdapter
+  [(family (ptr OhmVisitorFamily))
+   (tree (dyn OhmVisitorTree))
+   (node i64)])
+
+(defn new-visitor-family [(a (dyn alloc/Allocator))] (-> OhmVisitorFamily)
+  (let [(mut family) (primitive/zeroed OhmVisitorFamily)]
+    (set! (.shapes family) (al/al-new [VisitorShape] a))
+    (set! (.properties family) (al/al-new [VisitorProperty] a))
+    (set! (.operations family) (al/al-new [VisitorOperation] a))
+    (set! (.allocator family) a)
+    (load family)))
+
+(defn visitor-shape-index [(family (ptr OhmVisitorFamily))
+                           (tag (slice u8))] (-> i64)
+  (let [(mut found) -1]
+    (for [index 0 (len (.shapes family))]
+      (let [shape (get (.shapes family) index)]
+        (if (str/str-eq (.tag shape) tag) (set! found index) 0)))
+    (load found)))
+
+(defn visitor-operation-index [(family (ptr OhmVisitorFamily))
+                               (name (slice u8))] (-> i64)
+  (let [(mut found) -1]
+    (for [index 0 (len (.operations family))]
+      (let [operation (get (.operations family) index)]
+        (if (str/str-eq (.name operation) name) (set! found index) 0)))
+    (load found)))
+
+(defn visitor-family-add-shape! [(family (mut OhmVisitorFamily))
+                                 (tag (slice u8))
+                                 (custom bool)] (-> i64)
+  (if (>= (visitor-shape-index family tag) 0)
+      -1
+      (let [(mut shape) (primitive/zeroed VisitorShape)
+            index (len (.shapes family))]
+        (set! (.tag shape) tag)
+        (set! (.custom shape) custom)
+        (set! (.property-start shape) (len (.properties family)))
+        (set! (.property-count shape) 0)
+        (push! (mut (.shapes family)) (load shape))
+        index)))
+
+(defn visitor-family-add-fixed-shape! [(family (mut OhmVisitorFamily))
+                                       (tag (slice u8))] (-> i64)
+  (visitor-family-add-shape! (mut family) tag false))
+
+(defn visitor-family-add-custom-shape! [(family (mut OhmVisitorFamily))
+                                        (tag (slice u8))] (-> i64)
+  (visitor-family-add-shape! (mut family) tag true))
+
+(defn visitor-family-add-property! [(family (mut OhmVisitorFamily))
+                                    (shape-index i64)
+                                    (name (slice u8))
+                                    (array bool)] (-> i64)
+  (let [shape (get (.shapes family) shape-index)
+        expected (+ (.property-start shape) (.property-count shape))]
+    (if (or (.custom shape)
+            (or (!= shape-index (- (len (.shapes family)) 1))
+                (!= expected (len (.properties family)))))
+        -1
+        (let [(mut property) (primitive/zeroed VisitorProperty)
+              (mut updated) (primitive/zeroed VisitorShape)]
+          (set! (.name property) name)
+          (set! (.array property) array)
+          (set! (.tag updated) (.tag shape))
+          (set! (.custom updated) (.custom shape))
+          (set! (.property-start updated) (.property-start shape))
+          (set! (.property-count updated) (+ (.property-count shape) 1))
+          (push! (mut (.properties family)) (load property))
+          (set! (mut (.shapes family)) shape-index (load updated))
+          (- (.property-count updated) 1)))))
+
+(defn visitor-family-shape-count [(family (ptr OhmVisitorFamily))] (-> i64)
+  (len (.shapes family)))
+(defn visitor-family-operation-count [(family (ptr OhmVisitorFamily))] (-> i64)
+  (len (.operations family)))
+(defn visitor-family-operation-name [(family (ptr OhmVisitorFamily))
+                                     (index i64)] (-> (slice u8))
+  (let [operation (get (.operations family) index)] (.name operation)))
+(defn visitor-family-operation-formal-count [(family (ptr OhmVisitorFamily))
+                                             (index i64)] (-> i64)
+  (let [operation (get (.operations family) index)] (.formal-count operation)))
+
+(defn visitor-action-index [(actions (dyn OhmVisitorActions))
+                            (name (slice u8))] (-> i64)
+  (let [(mut found) -1]
+    (for [index 0 (visitor-action-count actions)]
+      (if (str/str-eq (visitor-action-name actions index) name)
+          (set! found index)
+          0))
+    (load found)))
+
+(defn visitor-validation-ok [(operation i64)] (-> VisitorValidation)
+  (let [(mut validation) (primitive/zeroed VisitorValidation)]
+    (set! (.valid validation) true)
+    (set! (.error-kind validation) 0)
+    (set! (.action-index validation) -1)
+    (set! (.expected-arity validation) -1)
+    (set! (.actual-arity validation) -1)
+    (set! (.operation-index validation) operation)
+    (load validation)))
+
+(defn visitor-validation-error [(kind i64)
+                                (action i64)
+                                (expected i64)
+                                (actual i64)] (-> VisitorValidation)
+  (let [(mut validation) (visitor-validation-ok -1)]
+    (set! (.valid validation) false)
+    (set! (.error-kind validation) kind)
+    (set! (.action-index validation) action)
+    (set! (.expected-arity validation) expected)
+    (set! (.actual-arity validation) actual)
+    (load validation)))
+
+;; Error kinds: 1 invalid signature, 2 unrecognized action, 3 wrong arity.
+(defn visitor-family-add-operation! [(family (mut OhmVisitorFamily))
+                                     (signature (slice u8))
+                                     (actions (dyn OhmVisitorActions))] (-> VisitorValidation)
+  (let [parsed (ohm/parse-semantic-signature signature false)]
+    (if (not (ohm/semantic-signature-valid? parsed))
+        (visitor-validation-error 1 -1 -1 -1)
+        (let [(mut validation) (visitor-validation-ok -1)]
+          (for [action-index 0 (visitor-action-count actions)]
+            (if (.valid validation)
+                (let [name (visitor-action-name actions action-index)
+                      shape-index (visitor-shape-index family name)]
+                  (if (< shape-index 0)
+                      (set! validation (visitor-validation-error 2 action-index -1 -1))
+                      (let [shape (get (.shapes family) shape-index)]
+                        (if (and (not (.custom shape))
+                                 (!= (visitor-action-arity actions action-index)
+                                     (.property-count shape)))
+                            (set! validation
+                                  (visitor-validation-error
+                                    3
+                                    action-index
+                                    (.property-count shape)
+                                    (visitor-action-arity actions action-index)))
+                            0))))
+                0))
+          (if (not (.valid validation))
+              (load validation)
+              (let [(mut operation) (primitive/zeroed VisitorOperation)
+                    existing
+                      (visitor-operation-index family (ohm/semantic-signature-name parsed))]
+                (set! (.name operation) (ohm/semantic-signature-name parsed))
+                (set! (.signature operation) signature)
+                (set! (.formal-count operation)
+                      (ohm/semantic-signature-formal-count parsed))
+                (set! (.actions operation) actions)
+                (if (>= existing 0)
+                    (set! (mut (.operations family)) existing (load operation))
+                    (push! (mut (.operations family)) (load operation)))
+                (visitor-validation-ok
+                  (if (>= existing 0) existing (- (len (.operations family)) 1)))))))))
+
+(defn visitor-validation-valid? [(validation VisitorValidation)] (-> bool) (.valid validation))
+(defn visitor-validation-error-kind [(validation VisitorValidation)] (-> i64) (.error-kind validation))
+(defn visitor-validation-action-index [(validation VisitorValidation)] (-> i64) (.action-index validation))
+(defn visitor-validation-expected-arity [(validation VisitorValidation)] (-> i64) (.expected-arity validation))
+(defn visitor-validation-actual-arity [(validation VisitorValidation)] (-> i64) (.actual-arity validation))
+(defn visitor-validation-operation-index [(validation VisitorValidation)] (-> i64) (.operation-index validation))
+
+(defn visitor-validation-message! [(validation VisitorValidation)
+                                   (actions (dyn OhmVisitorActions))
+                                   (signature (slice u8))
+                                   (a (dyn alloc/Allocator))] (-> (slice u8))
+  (let [(mut message) (str/sb-new a)]
+    (cond (= (.error-kind validation) 1)
+            (do
+              (str/sb-push-str! (mut message) "Invalid operation signature: ")
+              (str/sb-push-str! (mut message) signature))
+          (= (.error-kind validation) 2)
+            (do
+              (str/sb-push-str! (mut message) "Unrecognized action name '")
+              (str/sb-push-str! (mut message)
+                                (visitor-action-name actions (.action-index validation)))
+              (str/sb-push-str! (mut message) "'"))
+          (= (.error-kind validation) 3)
+            (do
+              (str/sb-push-str! (mut message) "Action '")
+              (str/sb-push-str! (mut message)
+                                (visitor-action-name actions (.action-index validation)))
+              (str/sb-push-str! (mut message) "' has the wrong arity: expected ")
+              (str/sb-push-i64! (mut message) (.expected-arity validation))
+              (str/sb-push-str! (mut message) ", got ")
+              (str/sb-push-i64! (mut message) (.actual-arity validation)))
+          :else (str/sb-push-str! (mut message) ""))
+    (str/sb-finish! (mut message))))
+
+(defn visitor-new-evaluation [(family (ptr OhmVisitorFamily))
+                              (tree (dyn OhmVisitorTree))
+                              (operation i64)
+                              (arguments (slice i64))] (-> VisitorEvaluation)
+  (let [definition (get (.operations family) operation)
+        (mut evaluation) (primitive/zeroed VisitorEvaluation)
+        (mut error) (primitive/zeroed VisitorEvaluationError)]
+    (set! (.kind error) 0)
+    (set! (.tag error) "")
+    (set! (.operation error) (.name definition))
+    (set! (.family evaluation) family)
+    (set! (.tree evaluation) tree)
+    (set! (.actions evaluation) (.actions definition))
+    (set! (.operation evaluation) operation)
+    (set! (.operation-arguments evaluation) arguments)
+    (set! (.argument-children evaluation) (al/al-new [i64] (.allocator family)))
+    (set! (.error evaluation) (load error))
+    (set! (.failed evaluation) false)
+    (load evaluation)))
+
+(defn visitor-fail! [(evaluation (mut VisitorEvaluation))
+                     (kind i64)
+                     (tag (slice u8))] (-> i64)
+  (let [(mut error) (.error evaluation)]
+    (set! (.kind error) kind)
+    (set! (.tag error) tag)
+    (set! (.error evaluation) (load error))
+    (set! (.failed evaluation) true)
+    0))
+
+(defn visitor-evaluate-node! [(evaluation (mut VisitorEvaluation))
+                              (node i64)] (-> i64)
+  (if (.failed evaluation)
+      0
+      (let [family (.family evaluation)
+            tree (.tree evaluation)
+            actions (.actions evaluation)
+            tag (visitor-tag tree node)
+            shape-index (visitor-shape-index family tag)]
+        (if (< shape-index 0)
+            (visitor-fail! (mut evaluation) 1 tag)
+            (let [action-index (visitor-action-index actions tag)]
+              (if (< action-index 0)
+                  (visitor-fail! (mut evaluation) 2 tag)
+                  (let [shape (get (.shapes family) shape-index)
+                        children-start (len (.argument-children evaluation))
+                        (mut arguments) (al/al-new [VisitorArgument] (.allocator family))]
+                    (if (.custom shape)
+                        (for [argument-index 0 (visitor-custom-argument-count tree node)]
+                          (let [(mut argument) (primitive/zeroed VisitorArgument)
+                                count
+                                  (visitor-custom-argument-child-count tree
+                                                                       node
+                                                                       argument-index)]
+                            (set! (.array argument) (> count 1))
+                            (set! (.child-start argument) (len (.argument-children evaluation)))
+                            (set! (.child-count argument) count)
+                            (for [child-index 0 count]
+                              (push! (mut (.argument-children evaluation))
+                                     (visitor-custom-argument-child tree
+                                                                    node
+                                                                    argument-index
+                                                                    child-index)))
+                            (push! (mut arguments) (load argument))))
+                        (for [property-index 0 (.property-count shape)]
+                          (let [property
+                                  (get (.properties family)
+                                       (+ (.property-start shape) property-index))
+                                (mut argument) (primitive/zeroed VisitorArgument)
+                                count
+                                  (visitor-property-child-count tree node (.name property))]
+                            (set! (.array argument) (.array property))
+                            (set! (.child-start argument) (len (.argument-children evaluation)))
+                            (set! (.child-count argument) count)
+                            (for [child-index 0 count]
+                              (push! (mut (.argument-children evaluation))
+                                     (visitor-property-child tree
+                                                             node
+                                                             (.name property)
+                                                             child-index)))
+                            (push! (mut arguments) (load argument)))))
+                    (let [answer
+                            (apply-visitor-action actions
+                                                  (mut evaluation)
+                                                  node
+                                                  action-index
+                                                  (al/al-slice [VisitorArgument]
+                                                               (load arguments)))]
+                      (al/al-free! (mut arguments))
+                      (loop (if (<= (len (.argument-children evaluation)) children-start)
+                                (break)
+                                (pop! (mut (.argument-children evaluation)))))
+                      answer))))))))
+
+(defn visitor-evaluate-argument! [(evaluation (mut VisitorEvaluation))
+                                  (argument VisitorArgument)
+                                  (index i64)] (-> i64)
+  (if (or (< index 0) (>= index (.child-count argument)))
+      (visitor-fail! (mut evaluation) 3 "")
+      (visitor-evaluate-node! (mut evaluation)
+                              (get (.argument-children evaluation)
+                                   (+ (.child-start argument) index)))))
+
+(defn visitor-argument-array? [(argument VisitorArgument)] (-> bool) (.array argument))
+(defn visitor-argument-child-count [(argument VisitorArgument)] (-> i64) (.child-count argument))
+(defn visitor-operation-argument-count [(evaluation (ptr VisitorEvaluation))] (-> i64)
+  (slice-len (.operation-arguments evaluation)))
+(defn visitor-operation-argument [(evaluation (ptr VisitorEvaluation))
+                                  (index i64)] (-> i64)
+  (slice-get (.operation-arguments evaluation) index))
+
+(defn visitor-space-byte? [(value i64)] (-> bool)
+  (or (= value 32) (or (= value 9) (or (= value 10) (= value 13)))))
+
+(defn visitor-operation-argument-by-name [(evaluation (ptr VisitorEvaluation))
+                                          (name (slice u8))] (-> i64)
+  (let [family (.family evaluation)
+        operation (get (.operations family) (.operation evaluation))
+        signature (.signature operation)
+        (mut at) 0
+        (mut argument-index) 0
+        (mut answer) 0
+        (mut found) false]
+    (loop (if (or (>= (load at) (slice-len signature))
+                  (= (primitive/cast i64 (slice-get signature (load at))) 40))
+              (break)
+              (set! at (+ (load at) 1))))
+    (if (< (load at) (slice-len signature)) (set! at (+ (load at) 1)) 0)
+    (loop (if (or (load found) (>= (load at) (slice-len signature)))
+              (break)
+              (do
+                (loop (if (and (< (load at) (slice-len signature))
+                               (visitor-space-byte?
+                                 (primitive/cast i64 (slice-get signature (load at)))))
+                          (set! at (+ (load at) 1))
+                          (break)))
+                (let [start (load at)]
+                  (loop (if (or (>= (load at) (slice-len signature))
+                                (let [value
+                                        (primitive/cast i64
+                                                          (slice-get signature (load at)))]
+                                  (or (= value 44) (= value 41))))
+                            (break)
+                            (set! at (+ (load at) 1))))
+                  (let [(mut end) (load at)]
+                    (loop (if (and (> (load end) start)
+                                   (visitor-space-byte?
+                                     (primitive/cast i64
+                                                       (slice-get signature (- (load end) 1)))))
+                              (set! end (- (load end) 1))
+                              (break)))
+                    (if (str/str-eq (subslice signature start (load end)) name)
+                        (do
+                          (if (< (load argument-index)
+                                 (slice-len (.operation-arguments evaluation)))
+                              (set! answer
+                                    (slice-get (.operation-arguments evaluation)
+                                               (load argument-index)))
+                              0)
+                          (set! found true))
+                        0))
+                  (if (and (< (load at) (slice-len signature))
+                           (= (primitive/cast i64 (slice-get signature (load at))) 44))
+                      (do
+                        (set! at (+ (load at) 1))
+                        (set! argument-index (+ (load argument-index) 1)))
+                      (set! at (slice-len signature)))))))
+    (load answer)))
+(defn visitor-evaluation-failed? [(evaluation (ptr VisitorEvaluation))] (-> bool)
+  (.failed evaluation))
+(defn visitor-evaluation-error-kind [(evaluation (ptr VisitorEvaluation))] (-> i64)
+  (.kind (.error evaluation)))
+(defn visitor-evaluation-error-tag [(evaluation (ptr VisitorEvaluation))] (-> (slice u8))
+  (.tag (.error evaluation)))
+
+(defn visitor-evaluation-error-message! [(evaluation (ptr VisitorEvaluation))]
+                                         (-> (slice u8))
+  (let [family (.family evaluation)
+        (mut message) (str/sb-new (.allocator family))]
+    (cond (= (.kind (.error evaluation)) 1)
+            (do
+              (str/sb-push-str! (mut message) "getTag returned unrecognized tag '")
+              (str/sb-push-str! (mut message) (.tag (.error evaluation)))
+              (str/sb-push-str! (mut message) "'"))
+          (= (.kind (.error evaluation)) 2)
+            (do
+              (str/sb-push-str! (mut message) "No action for '")
+              (str/sb-push-str! (mut message) (.tag (.error evaluation)))
+              (str/sb-push-str! (mut message) "' in operation '")
+              (str/sb-push-str! (mut message) (.operation (.error evaluation)))
+              (str/sb-push-str! (mut message) "'"))
+          (= (.kind (.error evaluation)) 3)
+            (str/sb-push-str! (mut message) "Visitor argument index out of range")
+          :else (str/sb-push-str! (mut message) ""))
+    (str/sb-finish! (mut message))))
+
+(defn visitor-evaluate [(family (ptr OhmVisitorFamily))
+                        (tree (dyn OhmVisitorTree))
+                        (operation-name (slice u8))
+                        (root i64)
+                        (arguments (slice i64))] (-> i64)
+  (let [operation (visitor-operation-index family operation-name)]
+    (if (< operation 0)
+        0
+        (let [(mut evaluation) (visitor-new-evaluation family tree operation arguments)
+              value (visitor-evaluate-node! (mut evaluation) root)]
+          (al/al-free! (mut (.argument-children evaluation)))
+          value))))
+
+(defn visitor-family-wrap [(family (ptr OhmVisitorFamily))
+                           (tree (dyn OhmVisitorTree))
+                           (node i64)] (-> VisitorAdapter)
+  (let [(mut adapter) (primitive/zeroed VisitorAdapter)]
+    (set! (.family adapter) family)
+    (set! (.tree adapter) tree)
+    (set! (.node adapter) node)
+    (load adapter)))
+
+(defn visitor-adapter-apply [(adapter (ptr VisitorAdapter))
+                             (operation (slice u8))
+                             (arguments (slice i64))] (-> i64)
+  (visitor-evaluate (.family adapter)
+                    (.tree adapter)
+                    operation
+                    (.node adapter)
+                    arguments))
+
+(defn free-visitor-evaluation! [(evaluation (mut VisitorEvaluation))] (-> i64)
+  (al/al-free! (mut (.argument-children evaluation)))
+  0)
+
+(defn free-visitor-family! [(family (mut OhmVisitorFamily))] (-> i64)
+  (al/al-free! (mut (.shapes family)))
+  (al/al-free! (mut (.properties family)))
+  (al/al-free! (mut (.operations family)))
+  0)

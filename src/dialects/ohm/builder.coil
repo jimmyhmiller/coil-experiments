@@ -1,0 +1,330 @@
+(module experiments.ohm.builder)
+
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use [slice-get slice-len])
+(import "coil.str" :as str)
+(import "experiments.ohm.namespace-reader" :as namespace-reader)
+(import "experiments.ohm.reader" :as reader)
+
+(defn builder-error [(message (slice u8))] (-> i64)
+  (primitive/error message))
+
+(defn builder-head? [(form Code) (wanted (slice u8))] (-> bool)
+  (and (> (len form) 0)
+       (let [head (get form 0)]
+         (and (primitive/code-sym? head)
+              (str/str-eq (primitive/code-sym head) wanted)))))
+
+(defn builder-name [(form Code)] (-> (slice u8))
+  (if (primitive/code-string? form)
+      (primitive/code-str form)
+      (if (primitive/code-sym? form)
+          (primitive/code-sym form)
+          (do (builder-error "Ohm builder expected a name or string") ""))))
+
+(defn builder-push-quoted! [(output (mut str/StrBuf))
+                            (value (slice u8))] (-> i64)
+  (str/sb-push-byte! (mut output) 34)
+  (for [index 0 (slice-len value)]
+    (let [byte (primitive/cast i64 (slice-get value index))]
+      (cond (= byte 34) (str/sb-push-str! (mut output) "\\\"")
+            (= byte 92) (str/sb-push-str! (mut output) "\\\\")
+            (= byte 10) (str/sb-push-str! (mut output) "\\n")
+            (= byte 13) (str/sb-push-str! (mut output) "\\r")
+            (= byte 9) (str/sb-push-str! (mut output) "\\t")
+            :else (str/sb-push-byte! (mut output) (slice-get value index)))))
+  (str/sb-push-byte! (mut output) 34)
+  0)
+
+(defn builder-expression! [(output (mut str/StrBuf))
+                           (expression Code)
+                           (formals Code)] (-> i64)
+  (if (or (primitive/code-sym? expression) (primitive/code-string? expression))
+      (str/sb-push-str! (mut output) (builder-name expression))
+      (if (= (len expression) 0)
+          (do (str/sb-push-str! (mut output) "()") 0)
+          (let [head (builder-name (get expression 0))]
+            (cond (str/str-eq head "terminal")
+                    (if (= (len expression) 2)
+                        (builder-push-quoted! (mut output)
+                                              (builder-name (get expression 1)))
+                        (builder-error "terminal expects one string"))
+                  (str/str-eq head "range")
+                    (if (= (len expression) 3)
+                        (do
+                          (builder-push-quoted! (mut output)
+                                                (builder-name (get expression 1)))
+                          (str/sb-push-str! (mut output) "..")
+                          (builder-push-quoted! (mut output)
+                                                (builder-name (get expression 2))))
+                        (builder-error "range expects two strings"))
+                  (or (str/str-eq head "alt") (str/str-eq head "seq"))
+                    (do
+                      (str/sb-push-str! (mut output) "(")
+                      (for [index 1 (len expression)]
+                        (do
+                          (if (> index 1)
+                              (str/sb-push-str! (mut output)
+                                                (if (str/str-eq head "alt") " | " " "))
+                              0)
+                          (builder-expression! (mut output) (get expression index) formals)))
+                      (str/sb-push-str! (mut output) ")"))
+                  (or (str/str-eq head "star")
+                      (or (str/str-eq head "plus") (str/str-eq head "opt")))
+                    (if (= (len expression) 2)
+                        (do
+                          (str/sb-push-str! (mut output) "(")
+                          (builder-expression! (mut output) (get expression 1) formals)
+                          (str/sb-push-str! (mut output) ")")
+                          (str/sb-push-str! (mut output)
+                                            (if (str/str-eq head "star") "*"
+                                                (if (str/str-eq head "plus") "+" "?"))))
+                        (builder-error "iteration expects one expression"))
+                  (or (str/str-eq head "not") (str/str-eq head "lookahead"))
+                    (if (= (len expression) 2)
+                        (do
+                          (str/sb-push-str! (mut output)
+                                            (if (str/str-eq head "not") "~(" "&("))
+                          (builder-expression! (mut output) (get expression 1) formals)
+                          (str/sb-push-str! (mut output) ")"))
+                        (builder-error "predicate expects one expression"))
+                  (str/str-eq head "lex")
+                    (if (= (len expression) 2)
+                        (do
+                          (str/sb-push-str! (mut output) "#(")
+                          (builder-expression! (mut output) (get expression 1) formals)
+                          (str/sb-push-str! (mut output) ")"))
+                        (builder-error "lex expects one expression"))
+                  (str/str-eq head "app")
+                    (if (>= (len expression) 2)
+                        (do
+                          (str/sb-push-str! (mut output) (builder-name (get expression 1)))
+                          (if (> (len expression) 2)
+                              (do
+                                (str/sb-push-str! (mut output) "<")
+                                (for [index 2 (len expression)]
+                                  (do
+                                    (if (> index 2) (str/sb-push-str! (mut output) ",") 0)
+                                    (builder-expression! (mut output)
+                                                         (get expression index)
+                                                         formals)))
+                                (str/sb-push-str! (mut output) ">"))
+                              0))
+                        (builder-error "app expects a rule name"))
+                  (str/str-eq head "param")
+                    (if (= (len expression) 2)
+                        (let [parameter (get expression 1)]
+                          (if (primitive/code-int? parameter)
+                              (let [index (primitive/code-int parameter)]
+                                (if (or (< index 0) (>= index (len formals)))
+                                    (builder-error "param index is outside the rule's formals")
+                                    (str/sb-push-str! (mut output)
+                                                      (builder-name (get formals index)))))
+                              (str/sb-push-str! (mut output)
+                                                (builder-name parameter))))
+                        (builder-error "param expects one formal name"))
+                  (str/str-eq head "splice")
+                    (if (= (len expression) 3)
+                        (do
+                          (str/sb-push-str! (mut output) "(")
+                          (let [(mut emitted) 0
+                                before (get expression 1)
+                                after (get expression 2)]
+                            (for item (iter before)
+                              (do
+                                (if (> (load emitted) 0)
+                                    (str/sb-push-str! (mut output) " | ") 0)
+                                (builder-expression! (mut output) item formals)
+                                (set! emitted (+ (load emitted) 1))))
+                            (if (> (load emitted) 0)
+                                (str/sb-push-str! (mut output) " | ") 0)
+                            (str/sb-push-str! (mut output) "...")
+                            (set! emitted (+ (load emitted) 1))
+                            (for item (iter after)
+                              (do
+                                (str/sb-push-str! (mut output) " | ")
+                                (builder-expression! (mut output) item formals))))
+                          (str/sb-push-str! (mut output) ")"))
+                        (builder-error "splice expects before and after collections"))
+                  (str/str-eq head "unicodeChar")
+                    (if (= (len expression) 2)
+                        (do
+                          (str/sb-push-str! (mut output) "__ohm_unicode_")
+                          (str/sb-push-str! (mut output) (builder-name (get expression 1))))
+                        (builder-error "unicodeChar expects a category or property"))
+                  (str/str-eq head "caseInsensitive")
+                    (if (= (len expression) 2)
+                        (do
+                          (str/sb-push-str! (mut output) "caseInsensitive<")
+                          (builder-expression! (mut output) (get expression 1) formals)
+                          (str/sb-push-str! (mut output) ">"))
+                        (builder-error "caseInsensitive expects one terminal"))
+                  (or (str/str-eq head "any") (str/str-eq head "end"))
+                    (str/sb-push-str! (mut output) head)
+                  :else (builder-error "Unknown Ohm Builder expression constructor"))))))
+
+(defn builder-formals! [(output (mut str/StrBuf)) (formals Code)] (-> i64)
+  (if (> (len formals) 0)
+      (do
+        (str/sb-push-str! (mut output) "<")
+        (for [index 0 (len formals)]
+          (do
+            (if (> index 0) (str/sb-push-str! (mut output) ",") 0)
+            (str/sb-push-str! (mut output) (builder-name (get formals index)))))
+        (str/sb-push-str! (mut output) ">"))
+      0))
+
+(defn builder-rule! [(output (mut str/StrBuf)) (rule Code)] (-> i64)
+  (if (< (len rule) 4) (builder-error "Ohm rule requires operation, name, formals, and body") 0)
+  (let [operation (builder-name (get rule 0))
+        name (builder-name (get rule 1))
+        formals (get rule 2)
+        body-index (if (= (len rule) 5) 4 3)]
+    (str/sb-push-str! (mut output) "  ")
+    (str/sb-push-str! (mut output) name)
+    (builder-formals! (mut output) formals)
+    (if (= (len rule) 5)
+        (do
+          (str/sb-push-str! (mut output) " (")
+          (str/sb-push-str! (mut output) (builder-name (get rule 3)))
+          (str/sb-push-str! (mut output) ")"))
+        0)
+    (str/sb-push-str! (mut output)
+                      (cond (str/str-eq operation "define") " = "
+                            (str/str-eq operation "override") " := "
+                            (str/str-eq operation "extend") " += "
+                            :else (do (builder-error "Unknown GrammarDecl rule operation") " = ")))
+    (builder-expression! (mut output) (get rule body-index) formals)
+    (str/sb-push-str! (mut output) "\n")
+    0))
+
+(defn builder-grammar! [(output (mut str/StrBuf)) (grammar Code)] (-> i64)
+  (if (or (< (len grammar) 2) (not (builder-head? grammar "grammar")))
+      (builder-error "Expected (grammar Name ...)")
+      0)
+  (str/sb-push-str! (mut output) (builder-name (get grammar 1)))
+  (let [(mut rule-start) 2]
+    (if (and (> (len grammar) 2) (builder-head? (get grammar 2) "super"))
+        (do
+          (if (!= (len (get grammar 2)) 2)
+              (builder-error "super expects one grammar name")
+              0)
+          (str/sb-push-str! (mut output) " <: ")
+          (str/sb-push-str! (mut output) (builder-name (get (get grammar 2) 1)))
+          (set! rule-start 3))
+        0)
+    (str/sb-push-str! (mut output) " {\n")
+    (for [index (load rule-start) (len grammar)]
+      (let [form (get grammar index)]
+        ;; The private marker lets the reader preserve GrammarDecl's explicit
+        ;; default even when this grammar inherits a different one.
+        (if (builder-head? form "withDefaultStartRule")
+            (if (= (len form) 2)
+                (do
+                  (str/sb-push-str! (mut output) "  // @ohm-builder-default ")
+                  (str/sb-push-str! (mut output) (builder-name (get form 1)))
+                  (str/sb-push-str! (mut output) "\n"))
+                (builder-error "withDefaultStartRule expects one rule name"))
+            (builder-rule! (mut output) form))))
+    (str/sb-push-str! (mut output) "}\n")
+    0))
+
+(defn build-ohm-grammar [(declaration Code)] (-> Code)
+  (let [(mut source) (str/sb-new (malloc-allocator))]
+    (reader/set-single-grammar-mode! false)
+    (reader/set-cst-differential-mode! false)
+    (reader/set-trace-differential-mode! false)
+    (if (builder-head? declaration "grammars")
+        (for [index 1 (len declaration)]
+          (builder-grammar! (mut source) (get declaration index)))
+        (builder-grammar! (mut source) declaration))
+    (let [namespace? (builder-head? declaration "grammars")
+          compiled (if namespace?
+                       (namespace-reader/read-ohm-namespace-impl
+                         declaration
+                         (str/sb-finish! (mut source)))
+                       (reader/read-ohm-impl
+                         declaration
+                         (str/sb-finish! (mut source))
+                         true
+                         false))
+          (mut output) (primitive/code-list-new)]
+      (push! (mut output) (primitive/code-symbol "do"))
+      (for form (iter compiled)
+        (if (or (and (primitive/code-sym? form)
+                     (str/str-eq (primitive/code-sym form) "do"))
+                (or (builder-head? form "module")
+                    (and (builder-head? form "defn")
+                         (> (len form) 1)
+                         (primitive/code-sym? (get form 1))
+                         (str/str-eq (primitive/code-sym (get form 1)) "main"))))
+            0
+            (push! (mut output) form)))
+      (if namespace?
+          (let [final-grammar (get declaration (- (len declaration) 1))
+                final-name (builder-name (get final-grammar 1))
+                parse-tree-name (primitive/datum->syntax declaration (primitive/code-symbol "parse-tree"))
+                parse-tree-from-name (primitive/datum->syntax declaration (primitive/code-symbol "parse-tree-from"))
+                parse-name (primitive/datum->syntax declaration (primitive/code-symbol "parse"))
+                parse-from-name (primitive/datum->syntax declaration (primitive/code-symbol "parse-from"))
+                grammar-object-name (primitive/datum->syntax declaration (primitive/code-symbol "grammar-object"))
+                semantics-for-to-ast-name
+                  (primitive/datum->syntax declaration
+                                           (primitive/code-symbol "semantics-for-to-ast"))
+                namespace-match-name (primitive/datum->syntax declaration (primitive/code-symbol "namespace-match"))
+                namespace-match-from-name (primitive/datum->syntax declaration (primitive/code-symbol "namespace-match-from"))
+                namespace-parse-name (primitive/datum->syntax declaration (primitive/code-symbol "namespace-parse"))
+                namespace-parse-from-name (primitive/datum->syntax declaration (primitive/code-symbol "namespace-parse-from"))
+                namespace-grammar-object-name (primitive/datum->syntax declaration (primitive/code-symbol "namespace-grammar-object"))]
+            (push! (mut output)
+                   `(defn ~parse-tree-name [(input (slice u8))]
+                      (-> experiments.ohm.runtime.MatchResult)
+                      (~namespace-match-name ~final-name input)))
+            (push! (mut output)
+                   `(defn ~parse-tree-from-name [(input (slice u8)) (rule (slice u8))]
+                      (-> experiments.ohm.runtime.MatchResult)
+                      (~namespace-match-from-name ~final-name input rule)))
+            (push! (mut output)
+                   `(defn ~parse-name [(input (slice u8))] (-> bool)
+                      (~namespace-parse-name ~final-name input)))
+            (push! (mut output)
+                   `(defn ~parse-from-name [(input (slice u8)) (rule (slice u8))] (-> bool)
+                      (~namespace-parse-from-name ~final-name input rule)))
+            (push! (mut output)
+                   `(defn ~grammar-object-name [] (-> experiments.ohm.runtime.OhmGrammar)
+                      (~namespace-grammar-object-name ~final-name)))
+            (push! (mut output)
+                   `(defn ~semantics-for-to-ast-name []
+                      (-> experiments.ohm.runtime.OhmToAstSemantics)
+                      (let [(mut public-grammar) (~grammar-object-name)
+                            (mut semantics)
+                              (experiments.ohm.runtime.ohm-grammar-semantics-for-to-ast
+                                (mut public-grammar))]
+                        (experiments.ohm.runtime.free-ohm-grammar! (mut public-grammar))
+                        (load semantics)))))
+          0)
+      (primitive/code-list-done (load output)))))
+
+;; Read ordinary Coil first, then expand Builder declarations while imports are
+;; still real read-phase forms. This is the `--use` entry point; unlike a normal
+;; macro expansion, its generated dependency imports participate in module load.
+(defn read-ohm-builder [(context Code)] (-> Code)
+  (let [source-text (primitive/code-str (get context 2))
+        parsed (primitive/code-read (get `(source ~source-text) 1) `(reader-config))
+        output (primitive/code-list-new)]
+    (primitive/code-list-push! output (primitive/code-symbol "do"))
+    (for form (iter parsed)
+      (if (builder-head? form "build-ohm-grammar")
+          (if (= (len form) 2)
+              (for generated (iter (build-ohm-grammar (get form 1)))
+                (if (and (primitive/code-sym? generated)
+                         (str/str-eq (primitive/code-sym generated) "do"))
+                    0
+                    (do (primitive/code-list-push! output generated) 0)))
+              (primitive/error "build-ohm-grammar expects one declaration"))
+          (if (and (primitive/code-sym? form)
+                   (str/str-eq (primitive/code-sym form) "do"))
+              0
+              (do (primitive/code-list-push! output form) 0))))
+    (primitive/code-list-done output)))

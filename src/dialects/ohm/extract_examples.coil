@@ -1,0 +1,340 @@
+(module experiments.ohm.extract-examples)
+
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use [slice-get slice-len subslice])
+(import "coil.str" :as str)
+
+(defstruct OhmExample
+  [(grammar (slice u8))
+   (rule (slice u8))
+   (example (slice u8))
+   (should-match bool)])
+
+(defstruct OhmExamples
+  [(items (al/ArrayList OhmExample))
+   (valid bool)
+   (allocator (dyn alloc/Allocator))])
+
+(defstruct ExampleJsonString
+  [(valid bool) (value (slice u8)) (end i64)])
+
+(defn example-byte [(source (slice u8)) (at i64)] (-> i64)
+  (if (or (< at 0) (>= at (slice-len source)))
+      -1
+      (primitive/cast i64 (slice-get source at))))
+
+(defn example-hex [(byte i64)] (-> i64)
+  (cond (and (>= byte 48) (<= byte 57)) (- byte 48)
+        (and (>= byte 65) (<= byte 70)) (+ (- byte 65) 10)
+        (and (>= byte 97) (<= byte 102)) (+ (- byte 97) 10)
+        :else -1))
+
+(defn example-unicode-escape [(source (slice u8)) (at i64)] (-> i64)
+  (let [(mut value) 0 (mut valid) true]
+    (for [index 0 4]
+      (let [digit (example-hex (example-byte source (+ at index)))]
+        (if (< digit 0)
+            (set! valid false)
+            (set! value (+ (* (load value) 16) digit)))))
+    (if (load valid) (load value) -1)))
+
+(defn example-push-scalar! [(builder (mut str/StrBuf)) (value i64)] (-> i64)
+  (cond (< value 128)
+          (str/sb-push-byte! (mut builder) (primitive/cast u8 value))
+        (< value 2048)
+          (do
+            (str/sb-push-byte! (mut builder)
+                               (primitive/cast u8 (+ 192 (/ value 64))))
+            (str/sb-push-byte! (mut builder)
+                               (primitive/cast u8 (+ 128 (% value 64)))))
+        (< value 65536)
+          (do
+            (str/sb-push-byte! (mut builder)
+                               (primitive/cast u8 (+ 224 (/ value 4096))))
+            (str/sb-push-byte! (mut builder)
+                               (primitive/cast u8 (+ 128 (% (/ value 64) 64))))
+            (str/sb-push-byte! (mut builder)
+                               (primitive/cast u8 (+ 128 (% value 64)))))
+        :else
+          (do
+            (str/sb-push-byte! (mut builder)
+                               (primitive/cast u8 (+ 240 (/ value 262144))))
+            (str/sb-push-byte! (mut builder)
+                               (primitive/cast u8 (+ 128 (% (/ value 4096) 64))))
+            (str/sb-push-byte! (mut builder)
+                               (primitive/cast u8 (+ 128 (% (/ value 64) 64))))
+            (str/sb-push-byte! (mut builder)
+                               (primitive/cast u8 (+ 128 (% value 64))))))
+  value)
+
+(defn example-read-json-string [(source (slice u8)) (start i64)]
+                               (-> ExampleJsonString)
+  (let [(mut parsed) (primitive/zeroed ExampleJsonString)
+        (mut builder) (str/sb-new (alloc/malloc-allocator))
+        (mut at) (+ start 1)
+        (mut valid) (= (example-byte source start) 34)
+        (mut done) false]
+    (loop (if (or (not (load valid))
+                  (or (load done) (>= (load at) (slice-len source))))
+              (break)
+              (let [byte (example-byte source (load at))]
+                (cond (= byte 34)
+                        (do (set! at (+ (load at) 1)) (set! done true))
+                      (= byte 92)
+                        (let [escaped (example-byte source (+ (load at) 1))]
+                          (cond (= escaped 34) (str/sb-push-byte! (mut builder) 34)
+                                (= escaped 92) (str/sb-push-byte! (mut builder) 92)
+                                (= escaped 47) (str/sb-push-byte! (mut builder) 47)
+                                (= escaped 98) (str/sb-push-byte! (mut builder) 8)
+                                (= escaped 102) (str/sb-push-byte! (mut builder) 12)
+                                (= escaped 110) (str/sb-push-byte! (mut builder) 10)
+                                (= escaped 114) (str/sb-push-byte! (mut builder) 13)
+                                (= escaped 116) (str/sb-push-byte! (mut builder) 9)
+                                (= escaped 117)
+                                  (let [first
+                                          (example-unicode-escape source (+ (load at) 2))]
+                                    (if (< first 0)
+                                        (set! valid false)
+                                        (if (and (>= first 55296) (<= first 56319))
+                                            (if (and (= (example-byte source (+ (load at) 6)) 92)
+                                                     (= (example-byte source (+ (load at) 7)) 117))
+                                                (let [second
+                                                        (example-unicode-escape
+                                                          source (+ (load at) 8))]
+                                                  (if (and (>= second 56320)
+                                                           (<= second 57343))
+                                                      (do
+                                                        (example-push-scalar!
+                                                          (mut builder)
+                                                          (+ 65536
+                                                             (+ (* (- first 55296) 1024)
+                                                                (- second 56320))))
+                                                        ;; The shared escape advance below consumes
+                                                        ;; the first `\u`; skip the remaining ten
+                                                        ;; bytes of the surrogate-pair escape here.
+                                                        (set! at (+ (load at) 10)))
+                                                      (set! valid false)))
+                                                (set! valid false))
+                                            (do
+                                              (example-push-scalar! (mut builder) first)
+                                              ;; Together with the shared two-byte
+                                              ;; advance, consume all six bytes.
+                                              (set! at (+ (load at) 4))))))
+                                :else (set! valid false))
+                          (set! at (+ (load at) 2)))
+                      (< byte 32) (set! valid false)
+                      :else
+                        (do
+                          (str/sb-push-byte! (mut builder)
+                                             (slice-get source (load at)))
+                          (set! at (+ (load at) 1)))))))
+    (set! (.valid parsed) (and (load valid) (load done)))
+    (set! (.value parsed) (str/sb-finish! (mut builder)))
+    (set! (.end parsed) (load at))
+    (load parsed)))
+
+(defn example-space? [(byte i64)] (-> bool)
+  (or (= byte 32) (= byte 9)))
+
+(defn example-skip-space [(source (slice u8)) (start i64) (end i64)] (-> i64)
+  (let [(mut at) start]
+    (loop (if (and (< (load at) end) (example-space? (example-byte source (load at))))
+              (set! at (+ (load at) 1))
+              (break)))
+    (load at)))
+
+(defn example-ident-byte? [(byte i64)] (-> bool)
+  (or (and (>= byte 48) (<= byte 57))
+      (or (and (>= byte 65) (<= byte 90))
+          (or (and (>= byte 97) (<= byte 122))
+              (or (= byte 95) (>= byte 128))))))
+
+(defn example-line-end [(source (slice u8)) (start i64)] (-> i64)
+  (let [(mut end) start]
+    (loop (if (or (>= (load end) (slice-len source))
+                  (or (= (example-byte source (load end)) 10)
+                      (= (example-byte source (load end)) 13)))
+              (break)
+              (set! end (+ (load end) 1))))
+    (load end)))
+
+(defn example-next-line [(source (slice u8)) (end i64)] (-> i64)
+  (let [(mut at) end]
+    (if (= (example-byte source (load at)) 13) (set! at (+ (load at) 1)) 0)
+    (if (= (example-byte source (load at)) 10) (set! at (+ (load at) 1)) 0)
+    (load at)))
+
+(defn example-find-byte [(source (slice u8))
+                         (start i64)
+                         (end i64)
+                         (wanted i64)] (-> i64)
+  (let [(mut at) start]
+    (loop (if (>= (load at) end)
+              (break)
+              (if (= (example-byte source (load at)) wanted)
+                  (break)
+                  (set! at (+ (load at) 1)))))
+    (if (< (load at) end) (load at) -1)))
+
+(defn example-grammar-name [(source (slice u8))
+                            (line-start i64)
+                            (open i64)] (-> (slice u8))
+  (let [(mut end) open]
+    (loop (if (and (> (load end) line-start)
+                   (example-space? (example-byte source (- (load end) 1))))
+              (set! end (- (load end) 1))
+              (break)))
+    (let [(mut start) (load end)]
+      (loop (if (and (> (load start) line-start)
+                     (example-ident-byte? (example-byte source (- (load start) 1))))
+                (set! start (- (load start) 1))
+                (break)))
+      (subslice source (load start) (load end)))))
+
+(defn example-rule-name [(source (slice u8))
+                         (start i64)
+                         (end i64)] (-> (slice u8))
+  (let [at (example-skip-space source start end)]
+    (if (or (>= at end) (not (example-ident-byte? (example-byte source at))))
+        ""
+        (let [(mut name-end) at]
+          (loop (if (and (< (load name-end) end)
+                         (example-ident-byte? (example-byte source (load name-end))))
+                    (set! name-end (+ (load name-end) 1))
+                    (break)))
+          (subslice source at (load name-end))))))
+
+(defn assign-pending-example-rules! [(examples (mut OhmExamples))
+                                     (pending (mut (al/ArrayList i64)))
+                                     (rule (slice u8))] (-> i64)
+  (for index
+    (iter (load pending))
+    (set! (.rule (al/al-elem [OhmExample] (mut (.items examples)) index)) rule))
+  (loop (if (= (len (load pending)) 0)
+            (break)
+            (pop! (mut pending))))
+  0)
+
+(defn extract-example-comment! [(examples (mut OhmExamples))
+                                (pending (mut (al/ArrayList i64)))
+                                (source (slice u8))
+                                (grammar (slice u8))
+                                (start i64)
+                                (end i64)
+                                (should-match bool)] (-> i64)
+  (let [(mut at) (example-skip-space source start end)]
+    (loop (if (or (>= (load at) end) (!= (example-byte source (load at)) 34))
+              (break)
+              (let [parsed (example-read-json-string source (load at))]
+                (if (not (.valid parsed))
+                    (do
+                      (set! (.valid examples) false)
+                      (break))
+                    (let [(mut item) (primitive/zeroed OhmExample)
+                          index (len (.items examples))]
+                      (set! (.grammar item) grammar)
+                      (set! (.rule item) "")
+                      (set! (.example item) (.value parsed))
+                      (set! (.should-match item) should-match)
+                      (push! (mut (.items examples)) (load item))
+                      (push! (mut pending) index)
+                      (set! at (example-skip-space source (.end parsed) end))
+                      (if (= (example-byte source (load at)) 44)
+                          (set! at (example-skip-space source (+ (load at) 1) end))
+                          (break)))))))
+    0))
+
+(defn extract-ohm-examples [(source (slice u8))
+                            (a (dyn alloc/Allocator))] (-> OhmExamples)
+  (let [(mut examples) (primitive/zeroed OhmExamples)
+        (mut pending) (al/al-new [i64] a)
+        (mut line-start) 0
+        (mut grammar) ""
+        (mut in-grammar) false]
+    (set! (.items examples) (al/al-new [OhmExample] a))
+    (set! (.valid examples) true)
+    (set! (.allocator examples) a)
+    (loop (if (>= (load line-start) (slice-len source))
+              (break)
+              (let [line-end (example-line-end source (load line-start))
+                    trimmed (example-skip-space source (load line-start) line-end)
+                    comment (example-find-byte source trimmed line-end 47)
+                    comment-start
+                      (if (and (>= comment 0)
+                               (= (example-byte source (+ comment 1)) 47))
+                          comment
+                          -1)
+                    code-end (if (>= comment-start 0) comment-start line-end)]
+                (if (not (load in-grammar))
+                    (let [open (example-find-byte source trimmed code-end 123)]
+                      (if (>= open 0)
+                          (do
+                            (set! grammar
+                                  (example-grammar-name source (load line-start) open))
+                            (set! in-grammar (> (slice-len (load grammar)) 0)))
+                          0))
+                    0)
+                (if (load in-grammar)
+                    (do
+                      (if (> (len (load pending)) 0)
+                          (let [rule (example-rule-name source trimmed code-end)]
+                            (if (> (slice-len rule) 0)
+                                (assign-pending-example-rules!
+                                  (mut examples) (mut pending) rule)
+                                0))
+                          0)
+                      (if (>= comment-start 0)
+                          (let [kind (example-byte source (+ comment-start 2))]
+                            (if (or (= kind 43) (= kind 45))
+                                (extract-example-comment!
+                                  (mut examples)
+                                  (mut pending)
+                                  source
+                                  (load grammar)
+                                  (+ comment-start 3)
+                                  line-end
+                                  (= kind 43))
+                                0))
+                          0)
+                      (if (= (example-byte source trimmed) 125)
+                          (do
+                            (assign-pending-example-rules!
+                              (mut examples) (mut pending) "")
+                            (set! in-grammar false)
+                            (set! grammar ""))
+                          0))
+                    0)
+                (set! line-start (example-next-line source line-end)))))
+    (if (> (len (load pending)) 0)
+        (assign-pending-example-rules! (mut examples) (mut pending) "")
+        0)
+    (al/al-free! (mut pending))
+    (load examples)))
+
+(defn ohm-example-count [(examples (ptr OhmExamples))] (-> i64)
+  (len (.items examples)))
+
+(defn ohm-example-grammar [(examples (ptr OhmExamples)) (index i64)]
+                          (-> (slice u8))
+  (let [item (get (.items examples) index)] (.grammar item)))
+
+(defn ohm-example-rule [(examples (ptr OhmExamples)) (index i64)]
+                       (-> (slice u8))
+  (let [item (get (.items examples) index)] (.rule item)))
+
+(defn ohm-example-text [(examples (ptr OhmExamples)) (index i64)]
+                       (-> (slice u8))
+  (let [item (get (.items examples) index)] (.example item)))
+
+(defn ohm-example-should-match? [(examples (ptr OhmExamples)) (index i64)]
+                                (-> bool)
+  (let [item (get (.items examples) index)] (.should-match item)))
+
+(defn ohm-examples-valid? [(examples (ptr OhmExamples))] (-> bool)
+  (.valid examples))
+
+(defn free-ohm-examples! [(examples (mut OhmExamples))] (-> i64)
+  (al/al-free! (mut (.items examples)))
+  0)

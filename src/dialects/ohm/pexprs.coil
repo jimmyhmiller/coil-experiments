@@ -1,0 +1,1581 @@
+(module experiments.ohm.pexprs)
+
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.json" :as json)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use [slice-get slice-len subslice])
+(import "coil.str" :as str)
+(import "experiments.ohm.extract-examples" :as extract)
+(import "experiments.ohm.runtime" :as ohm)
+
+(defn pexpr-parse-i64 [(text (slice u8))] (-> i64)
+  (let [(mut value) 0]
+    (for [index 0 (slice-len text)]
+      (set! value
+            (+ (* (load value) 10)
+               (- (primitive/cast i64 (slice-get text index)) 48))))
+    (load value)))
+
+(defn pexpr-decode-json-content! [(grammar (mut ohm/OhmPExprGrammar))
+                                  (encoded (slice u8))] (-> (slice u8))
+  (let [(mut builder) (str/sb-new (.allocator grammar))
+        (mut at) 0]
+    (loop (if (>= (load at) (slice-len encoded))
+              (break)
+              (let [byte (primitive/cast i64 (slice-get encoded (load at)))]
+                (if (!= byte 92)
+                    (do
+                      (str/sb-push-byte! (mut builder) (slice-get encoded (load at)))
+                      (set! at (+ (load at) 1)))
+                    (let [escaped
+                            (primitive/cast i64
+                              (slice-get encoded (+ (load at) 1)))]
+                      (cond (= escaped 34) (str/sb-push-byte! (mut builder) 34)
+                            (= escaped 92) (str/sb-push-byte! (mut builder) 92)
+                            (= escaped 47) (str/sb-push-byte! (mut builder) 47)
+                            (= escaped 98) (str/sb-push-byte! (mut builder) 8)
+                            (= escaped 102) (str/sb-push-byte! (mut builder) 12)
+                            (= escaped 110) (str/sb-push-byte! (mut builder) 10)
+                            (= escaped 114) (str/sb-push-byte! (mut builder) 13)
+                            (= escaped 116) (str/sb-push-byte! (mut builder) 9)
+                            (= escaped 117)
+                              (let [first
+                                      (extract/example-unicode-escape
+                                        encoded
+                                        (+ (load at) 2))]
+                                (if (and (>= first 55296)
+                                         (and (<= first 56319)
+                                              (= (primitive/cast i64
+                                                   (slice-get encoded (+ (load at) 6)))
+                                                 92)))
+                                    (let [second
+                                            (extract/example-unicode-escape
+                                              encoded
+                                              (+ (load at) 8))]
+                                      (extract/example-push-scalar!
+                                        (mut builder)
+                                        (+ 65536
+                                           (+ (* (- first 55296) 1024)
+                                              (- second 56320))))
+                                      (set! at (+ (load at) 6)))
+                                    (extract/example-push-scalar! (mut builder) first)))
+                            :else 0)
+                      (set! at (+ (load at) (if (= escaped 117) 6 2))))))))
+    (ohm/own-ohm-pexpr-string! (mut grammar) (str/sb-finish! (mut builder)))))
+
+(defn pexpr-json-string! [(grammar (mut ohm/OhmPExprGrammar))
+                          (doc json/Doc)
+                          (index i64)] (-> (slice u8))
+  (pexpr-decode-json-content!
+    (mut grammar)
+    (json/string-text doc (json/token doc index))))
+
+(defn pexpr-meta-bound [(doc json/Doc) (meta i64) (which i64)] (-> i64)
+  (let [interval (json/object-get doc meta "sourceInterval")]
+    (if (< interval 0)
+        -1
+        (let [number-index (json/array-nth doc interval which)]
+          (pexpr-parse-i64 (json/number-text doc (json/token doc number-index)))))))
+
+(defn pexpr-utf16-byte-index [(source (slice u8)) (wanted i64)] (-> i64)
+  (let [(mut byte-index) 0
+        (mut units) 0]
+    (loop (if (or (>= (load byte-index) (slice-len source))
+                  (>= (load units) wanted))
+              (break)
+              (let [first (primitive/cast i64 (slice-get source (load byte-index)))
+                    width (cond (< first 128) 1
+                                (< first 224) 2
+                                (< first 240) 3
+                                :else 4)]
+                (set! byte-index (+ (load byte-index) width))
+                (set! units (+ (load units) (if (= width 4) 2 1))))))
+    (load byte-index)))
+
+(defn pexpr-source-display! [(grammar (mut ohm/OhmPExprGrammar))
+                             (start i64)
+                             (end i64)
+                             (fallback (slice u8))] (-> (slice u8))
+  (if (or (< start 0) (< end start))
+      (let [(mut builder) (str/sb-new (.allocator grammar))]
+        (str/sb-push-str! (mut builder) fallback)
+        (ohm/own-ohm-pexpr-string! (mut grammar) (str/sb-finish! (mut builder))))
+      (let [source (.source grammar)
+            (mut left) (pexpr-utf16-byte-index source start)
+            (mut right) (pexpr-utf16-byte-index source end)]
+        (loop (if (and (< (load left) (load right))
+                       (let [byte (primitive/cast i64 (slice-get source (load left)))]
+                         (or (= byte 32)
+                             (or (= byte 9) (or (= byte 10) (= byte 13))))))
+                  (set! left (+ (load left) 1))
+                  (break)))
+        (loop (if (and (> (load right) (load left))
+                       (let [byte
+                               (primitive/cast i64
+                                 (slice-get source (- (load right) 1)))]
+                         (or (= byte 32)
+                             (or (= byte 9) (or (= byte 10) (= byte 13))))))
+                  (set! right (- (load right) 1))
+                  (break)))
+        (let [(mut builder) (str/sb-new (.allocator grammar))]
+          (str/sb-push-str! (mut builder) (subslice source (load left) (load right)))
+          (ohm/own-ohm-pexpr-string!
+            (mut grammar)
+            (str/sb-finish! (mut builder)))))))
+
+(defn pexpr-push-hex-nibble! [(builder (mut str/StrBuf)) (value i64)] (-> i64)
+  (str/sb-push-byte! (mut builder)
+                     (primitive/cast u8 (if (< value 10) (+ 48 value) (+ 87 value))))
+  0)
+
+(defn pexpr-push-quoted! [(builder (mut str/StrBuf)) (value (slice u8))] (-> i64)
+  (str/sb-push-byte! (mut builder) 34)
+  (for byte (iter value)
+    (let [number (primitive/cast i64 byte)]
+      (cond (= number 34) (str/sb-push-str! (mut builder) "\\\"")
+            (= number 92) (str/sb-push-str! (mut builder) "\\\\")
+            (= number 10) (str/sb-push-str! (mut builder) "\\n")
+            (= number 13) (str/sb-push-str! (mut builder) "\\r")
+            (= number 9) (str/sb-push-str! (mut builder) "\\t")
+            (= number 8) (str/sb-push-str! (mut builder) "\\b")
+            (= number 12) (str/sb-push-str! (mut builder) "\\f")
+            (< number 32)
+              (do
+                (str/sb-push-str! (mut builder) "\\u00")
+                (pexpr-push-hex-nibble! (mut builder) (/ number 16))
+                (pexpr-push-hex-nibble! (mut builder) (% number 16)))
+            :else (str/sb-push-byte! (mut builder) byte))))
+  (str/sb-push-byte! (mut builder) 34)
+  0)
+
+(defn pexpr-kind-for-tag [(tag (slice u8))] (-> i64)
+  (cond (str/str-eq tag "terminal") 1
+        (str/str-eq tag "range") 2
+        (str/str-eq tag "alt") 3
+        (str/str-eq tag "seq") 4
+        (str/str-eq tag "star") 5
+        (str/str-eq tag "plus") 6
+        (str/str-eq tag "opt") 7
+        (str/str-eq tag "not") 8
+        (str/str-eq tag "lookahead") 9
+        (str/str-eq tag "lex") 10
+        (str/str-eq tag "param") 11
+        (str/str-eq tag "app") 12
+        (str/str-eq tag "splice") 13
+        (str/str-eq tag "any") 14
+        (str/str-eq tag "end") 15
+        (str/str-eq tag "unicodeChar") 16
+        (str/str-eq tag "caseInsensitive") 17
+        (str/str-eq tag "extend") 18
+        :else 0))
+
+(defn pexpr-read-expression! [(grammar (mut ohm/OhmPExprGrammar))
+                              (doc json/Doc)
+                              (expression i64)] (-> i64)
+  (let [tag (pexpr-json-string! (mut grammar) doc (json/array-nth doc expression 0))
+        meta (json/array-nth doc expression 1)
+        start (pexpr-meta-bound doc meta 0)
+        end (pexpr-meta-bound doc meta 1)
+        kind (pexpr-kind-for-tag tag)
+        (mut children) (al/al-new [i64] (.allocator grammar))
+        (mut text) ""
+        (mut text2) ""]
+    (cond (or (str/str-eq tag "alt") (str/str-eq tag "seq"))
+            (for [index 2 (json/child-count (json/token doc expression))]
+              (push! (mut children)
+                     (pexpr-read-expression!
+                       (mut grammar)
+                       doc
+                       (json/array-nth doc expression index))))
+          (str/str-eq tag "app")
+            (do
+              (set! text
+                    (pexpr-json-string! (mut grammar) doc (json/array-nth doc expression 2)))
+              (let [arguments (json/array-nth doc expression 3)]
+                (for [index 0 (json/child-count (json/token doc arguments))]
+                  (push! (mut children)
+                         (pexpr-read-expression!
+                           (mut grammar)
+                           doc
+                           (json/array-nth doc arguments index))))))
+          (or (str/str-eq tag "star")
+              (or (str/str-eq tag "plus")
+                  (or (str/str-eq tag "opt")
+                      (or (str/str-eq tag "not")
+                          (or (str/str-eq tag "lookahead")
+                              (str/str-eq tag "lex"))))))
+            (push! (mut children)
+                   (pexpr-read-expression!
+                     (mut grammar)
+                     doc
+                     (json/array-nth doc expression 2)))
+          (str/str-eq tag "terminal")
+            (set! text
+                  (pexpr-json-string! (mut grammar) doc (json/array-nth doc expression 2)))
+          (str/str-eq tag "range")
+            (do
+              (set! text
+                    (pexpr-json-string! (mut grammar) doc (json/array-nth doc expression 2)))
+              (set! text2
+                    (pexpr-json-string! (mut grammar) doc (json/array-nth doc expression 3))))
+          (str/str-eq tag "param")
+            (let [(mut builder) (str/sb-new (.allocator grammar))]
+              (str/sb-push-str! (mut builder) "param")
+              (str/sb-push-str!
+                (mut builder)
+                (json/number-text
+                  doc
+                  (json/token doc (json/array-nth doc expression 2))))
+              (set! text
+                    (ohm/own-ohm-pexpr-string!
+                      (mut grammar)
+                      (str/sb-finish! (mut builder)))))
+          :else 0)
+    (let [(mut string-builder) (str/sb-new (.allocator grammar))]
+      (cond (str/str-eq tag "terminal")
+              (pexpr-push-quoted! (mut string-builder) (load text))
+            (str/str-eq tag "range")
+              (do
+                (pexpr-push-quoted! (mut string-builder) (load text))
+                (str/sb-push-str! (mut string-builder) "..")
+                (pexpr-push-quoted! (mut string-builder) (load text2)))
+            (str/str-eq tag "param")
+              (do
+                (str/sb-push-str! (mut string-builder) "$")
+                (str/sb-push-str!
+                  (mut string-builder)
+                  (json/number-text
+                    doc
+                    (json/token doc (json/array-nth doc expression 2)))))
+            (str/str-eq tag "app")
+              (do
+                (str/sb-push-str! (mut string-builder) (load text))
+                (if (> (len children) 0)
+                    (do
+                      (str/sb-push-str! (mut string-builder) "<")
+                      (for [index 0 (len children)]
+                        (do
+                          (if (> index 0) (str/sb-push-str! (mut string-builder) ",") 0)
+                          (str/sb-push-str!
+                            (mut string-builder)
+                            (ohm/ohm-pexpr-stored-string
+                              (mut grammar)
+                              (get children index)))))
+                      (str/sb-push-str! (mut string-builder) ">"))
+                    0))
+            (or (str/str-eq tag "alt") (str/str-eq tag "seq"))
+              (if (= (len children) 1)
+                  (str/sb-push-str!
+                    (mut string-builder)
+                    (ohm/ohm-pexpr-stored-string (mut grammar) (get children 0)))
+                  (do
+                    (str/sb-push-str! (mut string-builder) "(")
+                    (for [index 0 (len children)]
+                      (do
+                        (if (> index 0)
+                            (str/sb-push-str!
+                              (mut string-builder)
+                              (if (str/str-eq tag "alt") " | " " "))
+                            0)
+                        (str/sb-push-str!
+                          (mut string-builder)
+                          (ohm/ohm-pexpr-stored-string
+                            (mut grammar)
+                            (get children index)))))
+                    (str/sb-push-str! (mut string-builder) ")")))
+            (or (str/str-eq tag "star")
+                (or (str/str-eq tag "plus") (str/str-eq tag "opt")))
+              (do
+                (str/sb-push-str!
+                  (mut string-builder)
+                  (ohm/ohm-pexpr-stored-string (mut grammar) (get children 0)))
+                (str/sb-push-str!
+                  (mut string-builder)
+                  (if (str/str-eq tag "star") "*"
+                      (if (str/str-eq tag "plus") "+" "?"))))
+            (str/str-eq tag "not")
+              (do
+                (str/sb-push-str! (mut string-builder) "~")
+                (str/sb-push-str!
+                  (mut string-builder)
+                  (ohm/ohm-pexpr-stored-string (mut grammar) (get children 0))))
+            (str/str-eq tag "lookahead")
+              (do
+                (str/sb-push-str! (mut string-builder) "&")
+                (str/sb-push-str!
+                  (mut string-builder)
+                  (ohm/ohm-pexpr-stored-string (mut grammar) (get children 0))))
+            (str/str-eq tag "lex")
+              (do
+                (str/sb-push-str! (mut string-builder) "#(")
+                (str/sb-push-str!
+                  (mut string-builder)
+                  (ohm/ohm-pexpr-stored-string (mut grammar) (get children 0)))
+                (str/sb-push-str! (mut string-builder) ")"))
+            :else (str/sb-push-str! (mut string-builder) tag))
+      (let [string-value
+              (ohm/own-ohm-pexpr-string!
+                (mut grammar)
+                (str/sb-finish! (mut string-builder)))
+            display-value
+              (if (or (str/str-eq tag "alt") (str/str-eq tag "seq"))
+                  (pexpr-source-display! (mut grammar)
+                                         start
+                                         end
+                                         (if (str/str-eq tag "alt") "[Alt]" "[Seq]"))
+                  string-value)
+            node
+              (ohm/push-ohm-pexpr-node!
+                (mut grammar)
+                kind
+                (load text)
+                (load text2)
+                string-value
+                display-value
+                (.source grammar)
+                start
+                end)]
+        (for child (iter children)
+          (ohm/add-ohm-pexpr-child! (mut grammar) node child))
+        (al/al-free! (mut children))
+        node))))
+
+(defn pexpr-read-grammar-rules! [(grammar (mut ohm/OhmPExprGrammar))
+                                (doc json/Doc)
+                                (grammar-index i64)] (-> i64)
+  (let [supergrammar (json/array-nth doc grammar-index 3)]
+    (if (json/is-array? (json/token doc supergrammar))
+        (pexpr-read-grammar-rules! (mut grammar) doc supergrammar)
+        0))
+  (let [metadata (json/array-nth doc grammar-index 1)
+        grammar-source (json/object-get doc metadata "source")
+        _
+          (if (>= grammar-source 0)
+              (ohm/set-ohm-pexpr-source!
+                (mut grammar)
+                (pexpr-json-string! (mut grammar) doc grammar-source))
+              0)
+        rules (json/array-nth doc grammar-index 5)
+        count (json/child-count (json/token doc rules))]
+    (for [index 0 count]
+      (let [key (json/object-key doc rules index)
+            definition (json/object-value doc rules index)
+            name (pexpr-json-string! (mut grammar) doc key)
+            operation
+              (pexpr-json-string!
+                (mut grammar)
+                doc
+                (json/array-nth doc definition 0))
+            meta (json/array-nth doc definition 1)
+            description-token (json/array-nth doc definition 2)
+            has-description (not (json/is-null? (json/token doc description-token)))
+            description
+              (if has-description
+                  (pexpr-json-string! (mut grammar) doc description-token)
+                  "")
+            formal-tokens (json/array-nth doc definition 3)
+            (mut formals) (al/al-new [(slice u8)] (.allocator grammar))
+            _
+              (for [formal-index 0
+                    (json/child-count (json/token doc formal-tokens))]
+                (push! (mut formals)
+                       (pexpr-json-string!
+                         (mut grammar)
+                         doc
+                         (json/array-nth doc formal-tokens formal-index))))
+            body (json/array-nth doc definition 4)
+            root-node (pexpr-read-expression! (mut grammar) doc body)
+            existing (pexpr-find-rule (mut grammar) name)
+            start (pexpr-meta-bound doc meta 0)
+            end (pexpr-meta-bound doc meta 1)]
+        (let [rule-index
+                (if (>= existing 0)
+                    (let [effective-root
+                            (if (str/str-eq operation "extend")
+                                (let [extended
+                                        (pexpr-new-extend!
+                                          (mut grammar)
+                                          root-node
+                                          (ohm/ohm-pexpr-rule-body (mut grammar) existing))]
+                                  (ohm/set-ohm-pexpr-node-source!
+                                    (mut grammar)
+                                    extended
+                                    (.source grammar)
+                                    (ohm/ohm-pexpr-source-start (mut grammar) root-node)
+                                    (ohm/ohm-pexpr-source-end (mut grammar) root-node)
+                                    (ohm/ohm-pexpr-to-display-string (mut grammar) root-node))
+                                  extended)
+                                root-node)]
+                      (ohm/set-ohm-pexpr-rule!
+                        (mut grammar) existing name effective-root (.source grammar) start end)
+                      existing)
+                    (let [next (ohm/ohm-pexpr-rule-count grammar)]
+                      (ohm/add-ohm-pexpr-rule!
+                        (mut grammar) name root-node (.source grammar) start end)
+                      next))]
+          (ohm/set-ohm-pexpr-rule-metadata!
+            (mut grammar)
+            rule-index
+            (al/al-slice [(slice u8)] (load formals))
+            description
+            has-description
+            operation
+            false)
+          (al/al-free! (mut formals))))))
+  0)
+
+(defn ohm-pexprs-from-recipe [(recipe (slice u8))
+                              (source (slice u8))
+                              (a (dyn alloc/Allocator))]
+                             (-> ohm/OhmPExprGrammar)
+  (let [(mut grammar) (ohm/new-ohm-pexpr-grammar source a)]
+    (match (json/parse a recipe)
+      (Err [error]
+        (do
+          (ohm/invalidate-ohm-pexpr-grammar! (mut grammar))
+          (load grammar)))
+      (Ok [parsed-doc]
+        (let [(mut doc) parsed-doc
+              root 0
+              _ (pexpr-read-grammar-rules! (mut grammar) (load doc) root)]
+          (json/doc-free! (mut doc))
+          (load grammar))))))
+
+(defn pexpr-own-builder! [(grammar (mut ohm/OhmPExprGrammar))
+                          (builder (mut str/StrBuf))] (-> (slice u8))
+  (ohm/own-ohm-pexpr-string! (mut grammar) (str/sb-finish! (mut builder))))
+
+(defn pexpr-build-leaf! [(grammar (mut ohm/OhmPExprGrammar))
+                         (kind i64)
+                         (text (slice u8))
+                         (text2 (slice u8))
+                         (string-value (slice u8))
+                         (display-value (slice u8))] (-> i64)
+  (ohm/push-ohm-pexpr-node! (mut grammar)
+                            kind
+                            text
+                            text2
+                            string-value
+                            display-value
+                            ""
+                            -1
+                            -1))
+
+(defn pexpr-new-any! [(grammar (mut ohm/OhmPExprGrammar))] (-> i64)
+  (pexpr-build-leaf! (mut grammar) 14 "" "" "any" "any"))
+
+(defn pexpr-new-end! [(grammar (mut ohm/OhmPExprGrammar))] (-> i64)
+  (pexpr-build-leaf! (mut grammar) 15 "" "" "end" "end"))
+
+(defn pexpr-new-terminal! [(grammar (mut ohm/OhmPExprGrammar))
+                           (value (slice u8))] (-> i64)
+  (let [(mut builder) (str/sb-new (.allocator grammar))]
+    (pexpr-push-quoted! (mut builder) value)
+    (let [string-value (pexpr-own-builder! (mut grammar) (mut builder))]
+      (pexpr-build-leaf! (mut grammar) 1 value "" string-value string-value))))
+
+(defn pexpr-new-range! [(grammar (mut ohm/OhmPExprGrammar))
+                        (from (slice u8))
+                        (to (slice u8))] (-> i64)
+  (let [(mut builder) (str/sb-new (.allocator grammar))]
+    (pexpr-push-quoted! (mut builder) from)
+    (str/sb-push-str! (mut builder) "..")
+    (pexpr-push-quoted! (mut builder) to)
+    (let [string-value (pexpr-own-builder! (mut grammar) (mut builder))]
+      (pexpr-build-leaf! (mut grammar) 2 from to string-value string-value))))
+
+(defn pexpr-new-param! [(grammar (mut ohm/OhmPExprGrammar))
+                        (index i64)] (-> i64)
+  (let [(mut text-builder) (str/sb-new (.allocator grammar))
+        (mut string-builder) (str/sb-new (.allocator grammar))]
+    (str/sb-push-str! (mut text-builder) "param")
+    (str/sb-push-i64! (mut text-builder) index)
+    (str/sb-push-str! (mut string-builder) "$")
+    (str/sb-push-i64! (mut string-builder) index)
+    (let [text (pexpr-own-builder! (mut grammar) (mut text-builder))
+          string-value (pexpr-own-builder! (mut grammar) (mut string-builder))]
+      (pexpr-build-leaf! (mut grammar) 11 text "" string-value string-value))))
+
+(defn pexpr-new-collection! [(grammar (mut ohm/OhmPExprGrammar))
+                             (kind i64)
+                             (children (slice i64))] (-> i64)
+  (let [(mut builder) (str/sb-new (.allocator grammar))
+        count (slice-len children)
+        separator (if (or (= kind 3) (or (= kind 13) (= kind 18))) " | " " ")]
+    (if (!= count 1) (str/sb-push-str! (mut builder) "(") 0)
+    (for [index 0 count]
+      (if (> index 0) (str/sb-push-str! (mut builder) separator) 0)
+      (str/sb-push-str! (mut builder)
+                        (ohm/ohm-pexpr-stored-string grammar (slice-get children index))))
+    (if (!= count 1) (str/sb-push-str! (mut builder) ")") 0)
+    (let [string-value (pexpr-own-builder! (mut grammar) (mut builder))
+          display-value (cond (= kind 3) "[Alt]"
+                              (= kind 13) "[Splice]"
+                              (= kind 18) "[Extend]"
+                              :else "[Seq]")
+          node (pexpr-build-leaf! (mut grammar)
+                                  kind
+                                  ""
+                                  ""
+                                  string-value
+                                  display-value)]
+      (for child (iter children)
+        (ohm/add-ohm-pexpr-child! (mut grammar) node child))
+      node)))
+
+(defn pexpr-new-alt! [(grammar (mut ohm/OhmPExprGrammar))
+                      (children (slice i64))] (-> i64)
+  (pexpr-new-collection! (mut grammar) 3 children))
+
+(defn pexpr-new-seq! [(grammar (mut ohm/OhmPExprGrammar))
+                      (children (slice i64))] (-> i64)
+  (pexpr-new-collection! (mut grammar) 4 children))
+
+(defn pexpr-builder-collection! [(grammar (mut ohm/OhmPExprGrammar))
+                                 (kind i64)
+                                 (arguments (slice i64))] (-> i64)
+  (let [(mut flattened) (al/al-new [i64] (.allocator grammar))]
+    (for argument (iter arguments)
+      (if (= (ohm/ohm-pexpr-kind grammar argument) kind)
+          (for [index 0 (ohm/ohm-pexpr-child-count grammar argument)]
+            (push! (mut flattened) (ohm/ohm-pexpr-child grammar argument index)))
+          (push! (mut flattened) argument)))
+    (let [answer
+            (if (= (len (load flattened)) 1)
+                (get (load flattened) 0)
+                (pexpr-new-collection!
+                  (mut grammar)
+                  kind
+                  (al/al-slice [i64] (load flattened))))]
+      (al/al-free! (mut flattened))
+      answer)))
+
+;; These two entry points mirror Builder.alt/seq, including flattening nested
+;; nodes and returning the sole expression rather than introducing a wrapper.
+(defn pexpr-builder-alt! [(grammar (mut ohm/OhmPExprGrammar))
+                          (arguments (slice i64))] (-> i64)
+  (pexpr-builder-collection! (mut grammar) 3 arguments))
+
+(defn pexpr-builder-seq! [(grammar (mut ohm/OhmPExprGrammar))
+                          (arguments (slice i64))] (-> i64)
+  (pexpr-builder-collection! (mut grammar) 4 arguments))
+
+(defn pexpr-new-unary! [(grammar (mut ohm/OhmPExprGrammar))
+                        (kind i64)
+                        (child i64)] (-> i64)
+  (let [(mut builder) (str/sb-new (.allocator grammar))
+        child-string (ohm/ohm-pexpr-stored-string grammar child)]
+    (cond (= kind 5) (str/sb-push-str! (mut builder) child-string)
+          (= kind 6) (str/sb-push-str! (mut builder) child-string)
+          (= kind 7) (str/sb-push-str! (mut builder) child-string)
+          (= kind 8) (do (str/sb-push-str! (mut builder) "~")
+                         (str/sb-push-str! (mut builder) child-string))
+          (= kind 9) (do (str/sb-push-str! (mut builder) "&")
+                         (str/sb-push-str! (mut builder) child-string))
+          (= kind 10) (do (str/sb-push-str! (mut builder) "#(")
+                          (str/sb-push-str! (mut builder) child-string)
+                          (str/sb-push-str! (mut builder) ")"))
+          :else 0)
+    (cond (= kind 5) (str/sb-push-str! (mut builder) "*")
+          (= kind 6) (str/sb-push-str! (mut builder) "+")
+          (= kind 7) (str/sb-push-str! (mut builder) "?")
+          :else 0)
+    (let [string-value (pexpr-own-builder! (mut grammar) (mut builder))
+          node (pexpr-build-leaf! (mut grammar)
+                                  kind "" "" string-value string-value)]
+      (ohm/add-ohm-pexpr-child! (mut grammar) node child)
+      node)))
+
+(defn pexpr-new-star! [(grammar (mut ohm/OhmPExprGrammar))
+                       (child i64)] (-> i64)
+  (pexpr-new-unary! (mut grammar) 5 child))
+
+(defn pexpr-new-plus! [(grammar (mut ohm/OhmPExprGrammar))
+                       (child i64)] (-> i64)
+  (pexpr-new-unary! (mut grammar) 6 child))
+
+(defn pexpr-new-opt! [(grammar (mut ohm/OhmPExprGrammar))
+                      (child i64)] (-> i64)
+  (pexpr-new-unary! (mut grammar) 7 child))
+
+(defn pexpr-new-not! [(grammar (mut ohm/OhmPExprGrammar))
+                      (child i64)] (-> i64)
+  (pexpr-new-unary! (mut grammar) 8 child))
+
+(defn pexpr-new-lookahead! [(grammar (mut ohm/OhmPExprGrammar))
+                            (child i64)] (-> i64)
+  (pexpr-new-unary! (mut grammar) 9 child))
+
+(defn pexpr-new-lex! [(grammar (mut ohm/OhmPExprGrammar))
+                      (child i64)] (-> i64)
+  (pexpr-new-unary! (mut grammar) 10 child))
+
+(defn pexpr-new-extend! [(grammar (mut ohm/OhmPExprGrammar))
+                         (body i64)
+                         (inherited-body i64)] (-> i64)
+  (let [(mut children) (al/al-new [i64] (.allocator grammar))]
+    (push! (mut children) body)
+    (push! (mut children) inherited-body)
+    (let [node (pexpr-new-collection! (mut grammar) 18 (al/al-slice [i64] (load children)))]
+      (al/al-free! (mut children))
+      node)))
+
+(defn pexpr-new-splice! [(grammar (mut ohm/OhmPExprGrammar))
+                         (before (slice i64))
+                         (inherited-body i64)
+                         (after (slice i64))] (-> i64)
+  (let [(mut children) (al/al-new [i64] (.allocator grammar))]
+    (for child (iter before) (push! (mut children) child))
+    (push! (mut children) inherited-body)
+    (for child (iter after) (push! (mut children) child))
+    (let [node (pexpr-new-collection! (mut grammar)
+                                      13
+                                      (al/al-slice [i64] (load children)))]
+      (al/al-free! (mut children))
+      node)))
+
+(defn pexpr-new-apply! [(grammar (mut ohm/OhmPExprGrammar))
+                        (rule-name (slice u8))
+                        (arguments (slice i64))] (-> i64)
+  (let [(mut builder) (str/sb-new (.allocator grammar))]
+    (str/sb-push-str! (mut builder) rule-name)
+    (if (> (slice-len arguments) 0)
+        (do
+          (str/sb-push-str! (mut builder) "<")
+          (for [index 0 (slice-len arguments)]
+            (if (> index 0) (str/sb-push-str! (mut builder) ",") 0)
+            (str/sb-push-str! (mut builder)
+                              (ohm/ohm-pexpr-stored-string
+                                grammar
+                                (slice-get arguments index))))
+          (str/sb-push-str! (mut builder) ">"))
+        0)
+    (let [string-value (pexpr-own-builder! (mut grammar) (mut builder))
+          node (pexpr-build-leaf! (mut grammar)
+                                  12 rule-name "" string-value string-value)]
+      (for argument (iter arguments)
+        (ohm/add-ohm-pexpr-child! (mut grammar) node argument))
+      node)))
+
+(defn pexpr-new-unicode-char! [(grammar (mut ohm/OhmPExprGrammar))
+                               (property (slice u8))] (-> i64)
+  (let [(mut string-builder) (str/sb-new (.allocator grammar))
+        (mut display-builder) (str/sb-new (.allocator grammar))]
+    (str/sb-push-str! (mut string-builder) "\\p{")
+    (str/sb-push-str! (mut string-builder) property)
+    (str/sb-push-str! (mut string-builder) "}")
+    (str/sb-push-str! (mut display-builder) "Unicode [")
+    (str/sb-push-str! (mut display-builder) property)
+    (str/sb-push-str! (mut display-builder) "] character")
+    (pexpr-build-leaf! (mut grammar)
+                       16
+                       property
+                       ""
+                       (pexpr-own-builder! (mut grammar) (mut string-builder))
+                       (pexpr-own-builder! (mut grammar) (mut display-builder)))))
+
+(defn pexpr-new-case-insensitive-terminal!
+  [(grammar (mut ohm/OhmPExprGrammar)) (param i64)] (-> i64)
+  (let [(mut display-builder) (str/sb-new (.allocator grammar))]
+    (str/sb-push-str! (mut display-builder)
+                      (ohm/ohm-pexpr-to-display-string grammar param))
+    (str/sb-push-str! (mut display-builder) " (case-insensitive)")
+    (let [node (pexpr-build-leaf!
+                 (mut grammar)
+                 17
+                 ""
+                 ""
+                 ""
+                 (pexpr-own-builder! (mut grammar) (mut display-builder)))]
+      (ohm/add-ohm-pexpr-child! (mut grammar) node param)
+      node)))
+
+(defn pexpr-add-public-rule! [(grammar (mut ohm/OhmPExprGrammar))
+                              (name (slice u8))
+                              (body i64)
+                              (formals (slice (slice u8)))
+                              (description (slice u8))
+                              (has-description bool)
+                              (primitive bool)] (-> i64)
+  (let [index (ohm/ohm-pexpr-rule-count grammar)
+        _ (ohm/add-ohm-pexpr-rule! (mut grammar) name body "" -1 -1)]
+    (ohm/set-ohm-pexpr-rule-metadata!
+      (mut grammar)
+      index
+      formals
+      description
+      has-description
+      "define"
+      primitive)
+    index))
+
+;; These are the exact own-rule graphs constructed in Grammar.js before the
+;; bootstrapped BuiltInRules grammar is loaded. They are public grammar data,
+;; not aliases for a user grammar's effective parser table.
+(defn new-proto-built-in-pexprs [(a (dyn alloc/Allocator))]
+                                (-> ohm/OhmPExprGrammar)
+  (let [(mut grammar) (ohm/new-ohm-pexpr-grammar "" a)
+        (mut formals) (al/al-new [(slice u8)] a)]
+    (pexpr-add-public-rule! (mut grammar) "any" (pexpr-new-any! (mut grammar))
+                            (al/al-slice [(slice u8)] (load formals))
+                            "any character" true true)
+    (pexpr-add-public-rule! (mut grammar) "end" (pexpr-new-end! (mut grammar))
+                            (al/al-slice [(slice u8)] (load formals))
+                            "end of input" true true)
+    (push! (mut formals) "str")
+    (pexpr-add-public-rule!
+      (mut grammar)
+      "caseInsensitive"
+      (pexpr-new-case-insensitive-terminal!
+        (mut grammar)
+        (pexpr-new-param! (mut grammar) 0))
+      (al/al-slice [(slice u8)] (load formals)) "" false true)
+    (al/al-clear! (mut formals))
+    (pexpr-add-public-rule! (mut grammar) "lower"
+                            (pexpr-new-unicode-char! (mut grammar) "Ll")
+                            (al/al-slice [(slice u8)] (load formals))
+                            "a lowercase letter" true true)
+    (pexpr-add-public-rule! (mut grammar) "upper"
+                            (pexpr-new-unicode-char! (mut grammar) "Lu")
+                            (al/al-slice [(slice u8)] (load formals))
+                            "an uppercase letter" true true)
+    (pexpr-add-public-rule! (mut grammar) "unicodeLtmo"
+                            (pexpr-new-unicode-char! (mut grammar) "Ltmo")
+                            (al/al-slice [(slice u8)] (load formals))
+                            "a Unicode character in Lt, Lm, or Lo" true true)
+    (let [(mut arguments) (al/al-new [i64] a)
+          space-application (pexpr-new-apply!
+                              (mut grammar) "space"
+                              (al/al-slice [i64] (load arguments)))]
+      (pexpr-add-public-rule! (mut grammar) "spaces"
+                              (pexpr-new-star! (mut grammar) space-application)
+                              (al/al-slice [(slice u8)] (load formals))
+                              "" false false)
+      (al/al-free! (mut arguments)))
+    (pexpr-add-public-rule! (mut grammar) "space"
+                            (pexpr-new-range! (mut grammar) "\0" " ")
+                            (al/al-slice [(slice u8)] (load formals))
+                            "a space" true false)
+    (al/al-free! (mut formals))
+    (load grammar)))
+
+(defn new-built-in-pexprs-manual [(a (dyn alloc/Allocator))]
+                          (-> ohm/OhmPExprGrammar)
+  (let [(mut grammar) (ohm/new-ohm-pexpr-grammar "" a)
+        (mut formals) (al/al-new [(slice u8)] a)
+        (mut arguments) (al/al-new [i64] a)
+        (mut children) (al/al-new [i64] a)]
+    (let [letter (pexpr-new-apply! (mut grammar) "letter"
+                                    (al/al-slice [i64] (load arguments)))
+          digit (pexpr-new-apply! (mut grammar) "digit"
+                                   (al/al-slice [i64] (load arguments)))]
+      (push! (mut children) letter)
+      (push! (mut children) digit)
+      (pexpr-add-public-rule! (mut grammar) "alnum"
+                              (pexpr-new-alt! (mut grammar)
+                                (al/al-slice [i64] (load children)))
+                              (al/al-slice [(slice u8)] (load formals))
+                              "an alpha-numeric character" true false))
+    (al/al-clear! (mut children))
+    (let [lower (pexpr-new-apply! (mut grammar) "lower"
+                                   (al/al-slice [i64] (load arguments)))
+          upper (pexpr-new-apply! (mut grammar) "upper"
+                                   (al/al-slice [i64] (load arguments)))
+          other (pexpr-new-apply! (mut grammar) "unicodeLtmo"
+                                   (al/al-slice [i64] (load arguments)))]
+      (push! (mut children) lower)
+      (push! (mut children) upper)
+      (push! (mut children) other)
+      (pexpr-add-public-rule! (mut grammar) "letter"
+                              (pexpr-new-alt! (mut grammar)
+                                (al/al-slice [i64] (load children)))
+                              (al/al-slice [(slice u8)] (load formals))
+                              "a letter" true false))
+    (pexpr-add-public-rule! (mut grammar) "digit"
+                            (pexpr-new-range! (mut grammar) "0" "9")
+                            (al/al-slice [(slice u8)] (load formals))
+                            "a digit" true false)
+    (al/al-clear! (mut children))
+    (let [digit (pexpr-new-apply! (mut grammar) "digit"
+                                   (al/al-slice [i64] (load arguments)))
+          lower-hex (pexpr-new-range! (mut grammar) "a" "f")
+          upper-hex (pexpr-new-range! (mut grammar) "A" "F")]
+      (push! (mut children) digit)
+      (push! (mut children) lower-hex)
+      (push! (mut children) upper-hex)
+      (pexpr-add-public-rule! (mut grammar) "hexDigit"
+                              (pexpr-new-alt! (mut grammar)
+                                (al/al-slice [i64] (load children)))
+                              (al/al-slice [(slice u8)] (load formals))
+                              "a hexadecimal digit" true false))
+    (push! (mut formals) "elem")
+    (push! (mut formals) "sep")
+    (for [syntactic 0 2]
+      (let [nonempty-name (if (= syntactic 0) "NonemptyListOf" "nonemptyListOf")
+            empty-name (if (= syntactic 0) "EmptyListOf" "emptyListOf")
+            list-name (if (= syntactic 0) "ListOf" "listOf")
+            elem-param (pexpr-new-param! (mut grammar) 0)
+            sep-param (pexpr-new-param! (mut grammar) 1)]
+        (al/al-clear! (mut arguments))
+        (push! (mut arguments) elem-param)
+        (push! (mut arguments) sep-param)
+        (let [nonempty (pexpr-new-apply! (mut grammar) nonempty-name
+                                         (al/al-slice [i64] (load arguments)))
+              empty (pexpr-new-apply! (mut grammar) empty-name
+                                      (al/al-slice [i64] (load arguments)))]
+          (al/al-clear! (mut children))
+          (push! (mut children) nonempty)
+          (push! (mut children) empty)
+          (pexpr-add-public-rule! (mut grammar) list-name
+                                  (pexpr-new-alt! (mut grammar)
+                                    (al/al-slice [i64] (load children)))
+                                  (al/al-slice [(slice u8)] (load formals))
+                                  "" false false))
+        (let [elem (pexpr-new-param! (mut grammar) 0)
+              sep (pexpr-new-param! (mut grammar) 1)
+              next-elem (pexpr-new-param! (mut grammar) 0)]
+          (al/al-clear! (mut children))
+          (push! (mut children) sep)
+          (push! (mut children) next-elem)
+          (let [tail (pexpr-new-star! (mut grammar)
+                       (pexpr-new-seq! (mut grammar)
+                         (al/al-slice [i64] (load children))))]
+            (al/al-clear! (mut children))
+            (push! (mut children) elem)
+            (push! (mut children) tail)
+            (pexpr-add-public-rule! (mut grammar) nonempty-name
+                                    (pexpr-new-seq! (mut grammar)
+                                      (al/al-slice [i64] (load children)))
+                                    (al/al-slice [(slice u8)] (load formals))
+                                    "" false false)))
+        (al/al-clear! (mut children))
+        (pexpr-add-public-rule! (mut grammar) empty-name
+                                (pexpr-new-seq! (mut grammar)
+                                  (al/al-slice [i64] (load children)))
+                                (al/al-slice [(slice u8)] (load formals))
+                                "" false false)))
+    (al/al-clear! (mut formals))
+    (push! (mut formals) "app")
+    (pexpr-add-public-rule! (mut grammar) "applySyntactic"
+                            (pexpr-new-param! (mut grammar) 0)
+                            (al/al-slice [(slice u8)] (load formals))
+                            "" false false)
+    (al/al-free! (mut children))
+    (al/al-free! (mut arguments))
+    (al/al-free! (mut formals))
+    (load grammar)))
+
+(const BUILT_IN_RULES_RECIPE
+  "[\"grammar\",{\"source\":\"BuiltInRules {\\n\\n  alnum  (an alpha-numeric character)\\n    = letter\\n    | digit\\n\\n  letter  (a letter)\\n    = lower\\n    | upper\\n    | unicodeLtmo\\n\\n  digit  (a digit)\\n    = \\\"0\\\"..\\\"9\\\"\\n\\n  hexDigit  (a hexadecimal digit)\\n    = digit\\n    | \\\"a\\\"..\\\"f\\\"\\n    | \\\"A\\\"..\\\"F\\\"\\n\\n  ListOf<elem, sep>\\n    = NonemptyListOf<elem, sep>\\n    | EmptyListOf<elem, sep>\\n\\n  NonemptyListOf<elem, sep>\\n    = elem (sep elem)*\\n\\n  EmptyListOf<elem, sep>\\n    = /* nothing */\\n\\n  listOf<elem, sep>\\n    = nonemptyListOf<elem, sep>\\n    | emptyListOf<elem, sep>\\n\\n  nonemptyListOf<elem, sep>\\n    = elem (sep elem)*\\n\\n  emptyListOf<elem, sep>\\n    = /* nothing */\\n\\n  // Allows a syntactic rule application within a lexical context.\\n  applySyntactic<app> = app\\n}\"},\"BuiltInRules\",null,null,{\"alnum\":[\"define\",{\"sourceInterval\":[18,78]},\"an alpha-numeric character\",[],[\"alt\",{\"sourceInterval\":[60,78]},[\"app\",{\"sourceInterval\":[60,66]},\"letter\",[]],[\"app\",{\"sourceInterval\":[73,78]},\"digit\",[]]]],\"letter\":[\"define\",{\"sourceInterval\":[82,142]},\"a letter\",[],[\"alt\",{\"sourceInterval\":[107,142]},[\"app\",{\"sourceInterval\":[107,112]},\"lower\",[]],[\"app\",{\"sourceInterval\":[119,124]},\"upper\",[]],[\"app\",{\"sourceInterval\":[131,142]},\"unicodeLtmo\",[]]]],\"digit\":[\"define\",{\"sourceInterval\":[146,177]},\"a digit\",[],[\"range\",{\"sourceInterval\":[169,177]},\"0\",\"9\"]],\"hexDigit\":[\"define\",{\"sourceInterval\":[181,254]},\"a hexadecimal digit\",[],[\"alt\",{\"sourceInterval\":[219,254]},[\"app\",{\"sourceInterval\":[219,224]},\"digit\",[]],[\"range\",{\"sourceInterval\":[231,239]},\"a\",\"f\"],[\"range\",{\"sourceInterval\":[246,254]},\"A\",\"F\"]]],\"ListOf\":[\"define\",{\"sourceInterval\":[258,336]},null,[\"elem\",\"sep\"],[\"alt\",{\"sourceInterval\":[282,336]},[\"app\",{\"sourceInterval\":[282,307]},\"NonemptyListOf\",[[\"param\",{\"sourceInterval\":[297,301]},0],[\"param\",{\"sourceInterval\":[303,306]},1]]],[\"app\",{\"sourceInterval\":[314,336]},\"EmptyListOf\",[[\"param\",{\"sourceInterval\":[326,330]},0],[\"param\",{\"sourceInterval\":[332,335]},1]]]]],\"NonemptyListOf\":[\"define\",{\"sourceInterval\":[340,388]},null,[\"elem\",\"sep\"],[\"seq\",{\"sourceInterval\":[372,388]},[\"param\",{\"sourceInterval\":[372,376]},0],[\"star\",{\"sourceInterval\":[377,388]},[\"seq\",{\"sourceInterval\":[378,386]},[\"param\",{\"sourceInterval\":[378,381]},1],[\"param\",{\"sourceInterval\":[382,386]},0]]]]],\"EmptyListOf\":[\"define\",{\"sourceInterval\":[392,434]},null,[\"elem\",\"sep\"],[\"seq\",{\"sourceInterval\":[438,438]}]],\"listOf\":[\"define\",{\"sourceInterval\":[438,516]},null,[\"elem\",\"sep\"],[\"alt\",{\"sourceInterval\":[462,516]},[\"app\",{\"sourceInterval\":[462,487]},\"nonemptyListOf\",[[\"param\",{\"sourceInterval\":[477,481]},0],[\"param\",{\"sourceInterval\":[483,486]},1]]],[\"app\",{\"sourceInterval\":[494,516]},\"emptyListOf\",[[\"param\",{\"sourceInterval\":[506,510]},0],[\"param\",{\"sourceInterval\":[512,515]},1]]]]],\"nonemptyListOf\":[\"define\",{\"sourceInterval\":[520,568]},null,[\"elem\",\"sep\"],[\"seq\",{\"sourceInterval\":[552,568]},[\"param\",{\"sourceInterval\":[552,556]},0],[\"star\",{\"sourceInterval\":[557,568]},[\"seq\",{\"sourceInterval\":[558,566]},[\"param\",{\"sourceInterval\":[558,561]},1],[\"param\",{\"sourceInterval\":[562,566]},0]]]]],\"emptyListOf\":[\"define\",{\"sourceInterval\":[572,682]},null,[\"elem\",\"sep\"],[\"seq\",{\"sourceInterval\":[685,685]}]],\"applySyntactic\":[\"define\",{\"sourceInterval\":[685,710]},null,[\"app\"],[\"param\",{\"sourceInterval\":[707,710]},0]]}]")
+
+(defn new-built-in-pexprs [(a (dyn alloc/Allocator))]
+                          (-> ohm/OhmPExprGrammar)
+  (ohm-pexprs-from-recipe BUILT_IN_RULES_RECIPE "" a))
+
+(defn pexpr-new-indentation! [(grammar (mut ohm/OhmPExprGrammar))
+                              (indent bool)] (-> i64)
+  (pexpr-build-leaf! (mut grammar) 19 "" ""
+                     (if indent "indent" "dedent")
+                     (if indent "indent" "dedent")))
+
+(defn new-indentation-sensitive-pexprs [(a (dyn alloc/Allocator))]
+                                       (-> ohm/OhmPExprGrammar)
+  (let [(mut grammar) (ohm/new-ohm-pexpr-grammar "" a)
+        (mut formals) (al/al-new [(slice u8)] a)
+        (mut no-arguments) (al/al-new [i64] a)
+        (mut before) (al/al-new [i64] a)
+        (mut after) (al/al-new [i64] a)]
+    (pexpr-add-public-rule! (mut grammar) "indent"
+                            (pexpr-new-indentation! (mut grammar) true)
+                            (al/al-slice [(slice u8)] (load formals))
+                            "an indented block" true true)
+    (pexpr-add-public-rule! (mut grammar) "dedent"
+                            (pexpr-new-indentation! (mut grammar) false)
+                            (al/al-slice [(slice u8)] (load formals))
+                            "a dedent" true true)
+    (push! (mut before)
+           (pexpr-new-apply! (mut grammar) "indent"
+                             (al/al-slice [i64] (load no-arguments))))
+    (push! (mut before)
+           (pexpr-new-apply! (mut grammar) "dedent"
+                             (al/al-slice [i64] (load no-arguments))))
+    (let [splice (pexpr-new-splice! (mut grammar)
+                   (al/al-slice [i64] (load before))
+                   (pexpr-new-any! (mut grammar))
+                   (al/al-slice [i64] (load after)))
+          extended (pexpr-new-extend! (mut grammar) splice
+                                      (pexpr-new-any! (mut grammar)))]
+      (pexpr-add-public-rule! (mut grammar) "any" extended
+                              (al/al-slice [(slice u8)] (load formals))
+                              "any character" true false))
+    (al/al-free! (mut after))
+    (al/al-free! (mut before))
+    (al/al-free! (mut no-arguments))
+    (al/al-free! (mut formals))
+    (load grammar)))
+
+;; Mirrors PExpr.withSource: the assigned interval is trimmed first and the
+;; receiver itself is returned. Only Alt/Seq subclasses derive their display
+;; label from source; every other expression retains its normal display string.
+(defn pexpr-with-source! [(grammar (mut ohm/OhmPExprGrammar))
+                          (node i64)
+                          (interval ohm/OhmInterval)] (-> i64)
+  (if (not (ohm/ohm-interval-valid? interval))
+      node
+      (let [trimmed (ohm/ohm-interval-trimmed interval)
+            kind (ohm/ohm-pexpr-kind grammar node)
+            display
+              (if (or (= kind 3) (or (= kind 4) (or (= kind 13) (= kind 18))))
+                  (ohm/ohm-interval-contents trimmed)
+                  (ohm/ohm-pexpr-to-display-string grammar node))]
+        (ohm/set-ohm-pexpr-node-source!
+          (mut grammar)
+          node
+          (ohm/ohm-interval-source trimmed)
+          (ohm/ohm-interval-start trimmed)
+          (ohm/ohm-interval-end trimmed)
+          display))))
+
+(defn pexpr-find-rule [(grammar (ptr ohm/OhmPExprGrammar))
+                       (name (slice u8))] (-> i64)
+  (let [(mut found) -1]
+    (for [index 0 (ohm/ohm-pexpr-rule-count grammar)]
+      (if (str/str-eq (ohm/ohm-pexpr-rule-name grammar index) name)
+          (set! found index)
+          0))
+    (load found)))
+
+(defstruct OhmArgumentNames
+  [(items (al/ArrayList (slice u8)))
+   (owned (al/ArrayList (slice u8)))
+   (allocator (dyn alloc/Allocator))])
+
+(defn new-ohm-argument-names [(a (dyn alloc/Allocator))] (-> OhmArgumentNames)
+  (let [(mut names) (primitive/zeroed OhmArgumentNames)]
+    (set! (.items names) (al/al-new [(slice u8)] a))
+    (set! (.owned names) (al/al-new [(slice u8)] a))
+    (set! (.allocator names) a)
+    (load names)))
+
+(defn argument-names-push-builder! [(names (mut OhmArgumentNames))
+                                    (builder (mut str/StrBuf))] (-> i64)
+  (let [value (str/sb-finish! (mut builder))]
+    (push! (mut (.owned names)) value)
+    (push! (mut (.items names)) value)
+    (- (len (.items names)) 1)))
+
+(defn argument-names-push-copy! [(names (mut OhmArgumentNames))
+                                 (value (slice u8))] (-> i64)
+  (let [(mut builder) (str/sb-new (.allocator names))]
+    (str/sb-push-str! (mut builder) value)
+    (argument-names-push-builder! (mut names) (mut builder))))
+
+(defn argument-names-count [(names (ptr OhmArgumentNames))] (-> i64)
+  (len (.items names)))
+
+(defn argument-name [(names (ptr OhmArgumentNames)) (index i64)] (-> (slice u8))
+  (get (.items names) index))
+
+(defn free-ohm-argument-names! [(names (mut OhmArgumentNames))] (-> i64)
+  (for value (iter (.owned names))
+    (alloc/free [u8] (.allocator names) value))
+  (al/al-free! (mut (.items names)))
+  (al/al-free! (mut (.owned names)))
+  0)
+
+(defn pexpr-ascii-identifier-char? [(byte i64)] (-> bool)
+  (or (and (>= byte 48) (<= byte 57))
+      (or (and (>= byte 65) (<= byte 90))
+          (or (and (>= byte 97) (<= byte 122))
+              (or (= byte 95) (= byte 36))))))
+
+(defn pexpr-restricted-identifier? [(value (slice u8))] (-> bool)
+  (and (> (slice-len value) 0)
+       (let [first (primitive/cast i64 (slice-get value 0))
+             (mut valid)
+               (or (= first 95)
+                   (or (= first 36)
+                       (or (and (>= first 65) (<= first 90))
+                           (and (>= first 97) (<= first 122)))))]
+         (for [index 1 (slice-len value)]
+           (if (not (pexpr-ascii-identifier-char?
+                      (primitive/cast i64 (slice-get value index))))
+               (set! valid false)
+               0))
+         (load valid))))
+
+(defn pexpr-terminal-suffix? [(value (slice u8))] (-> bool)
+  (let [(mut valid) (> (slice-len value) 0)]
+    (for byte (iter value)
+      (let [number (primitive/cast i64 byte)]
+        (if (not (or (= number 95)
+                     (or (and (>= number 48) (<= number 57))
+                         (or (and (>= number 65) (<= number 90))
+                             (and (>= number 97) (<= number 122))))))
+            (set! valid false)
+            0)))
+    (load valid)))
+
+(defn pexpr-positional-name! [(names (mut OhmArgumentNames))
+                              (first-index i64)] (-> i64)
+  (let [(mut builder) (str/sb-new (.allocator names))]
+    (str/sb-push-str! (mut builder) "$")
+    (str/sb-push-i64! (mut builder) first-index)
+    (argument-names-push-builder! (mut names) (mut builder))))
+
+(defn pexpr-resolve-duplicate-names! [(names (mut OhmArgumentNames))] (-> i64)
+  (for [index 0 (len (.items names))]
+    (let [wanted (get (.items names) index)
+          (mut first) index
+          (mut count) 0]
+      (for [scan 0 (len (.items names))]
+        (if (str/str-eq (get (.items names) scan) wanted)
+            (do
+              (if (< scan (load first)) (set! first scan) 0)
+              (set! count (+ (load count) 1)))
+            0))
+      (if (and (= (load first) index) (> (load count) 1))
+          (let [(mut subscript) 1]
+            (for [scan 0 (len (.items names))]
+              (if (str/str-eq (get (.items names) scan) wanted)
+                  (let [(mut builder) (str/sb-new (.allocator names))]
+                    (str/sb-push-str! (mut builder) wanted)
+                    (str/sb-push-str! (mut builder) "_")
+                    (str/sb-push-i64! (mut builder) (load subscript))
+                    (let [replacement (str/sb-finish! (mut builder))]
+                      (push! (mut (.owned names)) replacement)
+                      (set! (mut (.items names)) scan replacement))
+                    (set! subscript (+ (load subscript) 1)))
+                  0)))
+          0)))
+  0)
+
+(defn pexpr-to-argument-names-inner
+  [(grammar (ptr ohm/OhmPExprGrammar))
+   (node i64)
+   (first-index i64)
+   (no-duplicate-check bool)
+   (a (dyn alloc/Allocator))] (-> OhmArgumentNames)
+  (let [(mut names) (new-ohm-argument-names a)
+        kind (ohm/ohm-pexpr-kind grammar node)
+        text (ohm/ohm-pexpr-text grammar node)]
+    (cond (or (= kind 0) (= kind 12))
+            (argument-names-push-copy! (mut names) text)
+          (= kind 1)
+            (if (pexpr-terminal-suffix? text)
+                (let [(mut builder) (str/sb-new a)]
+                  (str/sb-push-str! (mut builder) "_")
+                  (str/sb-push-str! (mut builder) text)
+                  (argument-names-push-builder! (mut names) (mut builder)))
+                (pexpr-positional-name! (mut names) first-index))
+          (= kind 2)
+            (let [(mut candidate) (str/sb-new a)]
+              (str/sb-push-str! (mut candidate) text)
+              (str/sb-push-str! (mut candidate) "_to_")
+              (str/sb-push-str! (mut candidate) (ohm/ohm-pexpr-text2 grammar node))
+              (let [plain (str/sb-finish! (mut candidate))]
+                (if (pexpr-restricted-identifier? plain)
+                    (argument-names-push-copy! (mut names) plain)
+                    (let [(mut prefixed-builder) (str/sb-new a)]
+                      (str/sb-push-str! (mut prefixed-builder) "_")
+                      (str/sb-push-str! (mut prefixed-builder) plain)
+                      (let [prefixed (str/sb-finish! (mut prefixed-builder))]
+                        (if (pexpr-restricted-identifier? prefixed)
+                            (argument-names-push-copy! (mut names) prefixed)
+                            (pexpr-positional-name! (mut names) first-index))
+                        (alloc/free [u8] a prefixed))))
+                (alloc/free [u8] a plain)))
+          (or (= kind 3) (or (= kind 13) (= kind 18)))
+            (if (> (ohm/ohm-pexpr-child-count grammar node) 0)
+                (let [(mut rows) (al/al-new [OhmArgumentNames] a)]
+                  (for [row 0 (ohm/ohm-pexpr-child-count grammar node)]
+                    (push! (mut rows)
+                           (pexpr-to-argument-names-inner
+                             grammar
+                             (ohm/ohm-pexpr-child grammar node row)
+                             first-index
+                             true
+                             a)))
+                  (let [columns (argument-names-count (al/al-elem [OhmArgumentNames]
+                                                                  (mut rows)
+                                                                  0))]
+                    (for [column 0 columns]
+                      (let [(mut builder) (str/sb-new a)
+                            (mut unique) (al/al-new [(slice u8)] a)]
+                        (for [row 0 (len rows)]
+                          (let [candidate
+                                  (argument-name
+                                    (al/al-elem [OhmArgumentNames] (mut rows) row)
+                                    column)
+                                (mut seen) false]
+                            (for existing (iter unique)
+                              (if (str/str-eq existing candidate) (set! seen true) 0))
+                            (if (not (load seen))
+                                (do
+                                  (if (> (len unique) 0)
+                                      (str/sb-push-str! (mut builder) "_or_")
+                                      0)
+                                  (str/sb-push-str! (mut builder) candidate)
+                                  (push! (mut unique) candidate))
+                                0)))
+                        (argument-names-push-builder! (mut names) (mut builder))
+                        (al/al-free! (mut unique)))))
+                  (for [row 0 (len rows)]
+                    (free-ohm-argument-names!
+                      (mut (al/al-elem [OhmArgumentNames] (mut rows) row))))
+                  (al/al-free! (mut rows)))
+                0)
+          (= kind 4)
+            (let [(mut next-index) first-index]
+              (for [child-index 0 (ohm/ohm-pexpr-child-count grammar node)]
+                (let [(mut child-names)
+                        (pexpr-to-argument-names-inner
+                          grammar
+                          (ohm/ohm-pexpr-child grammar node child-index)
+                          (load next-index)
+                          true
+                          a)]
+                  (for value (iter (.items child-names))
+                    (argument-names-push-copy! (mut names) value))
+                  (set! next-index (+ (load next-index) (len (.items child-names))))
+                  (free-ohm-argument-names! (mut child-names)))))
+          (or (= kind 5) (= kind 6))
+            (let [(mut child-names)
+                    (pexpr-to-argument-names-inner
+                      grammar
+                      (ohm/ohm-pexpr-child grammar node 0)
+                      first-index
+                      no-duplicate-check
+                      a)]
+              (for value (iter (.items child-names))
+                (let [(mut builder) (str/sb-new a)]
+                  (str/sb-push-str! (mut builder) value)
+                  (str/sb-push-str!
+                    (mut builder)
+                    (if (and (> (slice-len value) 0)
+                             (= (primitive/cast i64
+                                  (slice-get value (- (slice-len value) 1)))
+                                115))
+                        "es"
+                        "s"))
+                  (argument-names-push-builder! (mut names) (mut builder))))
+              (free-ohm-argument-names! (mut child-names)))
+          (= kind 7)
+            (let [(mut child-names)
+                    (pexpr-to-argument-names-inner
+                      grammar
+                      (ohm/ohm-pexpr-child grammar node 0)
+                      first-index
+                      no-duplicate-check
+                      a)]
+              (for value (iter (.items child-names))
+                (let [(mut builder) (str/sb-new a)
+                      first (primitive/cast i64 (slice-get value 0))]
+                  (str/sb-push-str! (mut builder) "opt")
+                  (str/sb-push-byte!
+                    (mut builder)
+                    (primitive/cast u8
+                      (if (and (>= first 97) (<= first 122)) (- first 32) first)))
+                  (if (> (slice-len value) 1)
+                      (str/sb-push-str!
+                        (mut builder)
+                        (subslice value 1 (slice-len value)))
+                      0)
+                  (argument-names-push-builder! (mut names) (mut builder))))
+              (free-ohm-argument-names! (mut child-names)))
+          (= kind 8) 0
+          (or (= kind 9) (= kind 10))
+            (let [(mut child-names)
+                    (pexpr-to-argument-names-inner
+                      grammar
+                      (ohm/ohm-pexpr-child grammar node 0)
+                      first-index
+                      no-duplicate-check
+                      a)]
+              (for value (iter (.items child-names))
+                (argument-names-push-copy! (mut names) value))
+              (free-ohm-argument-names! (mut child-names)))
+          (= kind 11) (argument-names-push-copy! (mut names) text)
+          :else 0)
+    (if (not no-duplicate-check)
+        (pexpr-resolve-duplicate-names! (mut names))
+        0)
+    (load names)))
+
+(defn pexpr-get-arity [(grammar (ptr ohm/OhmPExprGrammar))
+                       (node i64)] (-> i64)
+  (let [kind (ohm/ohm-pexpr-kind grammar node)]
+    (cond (or (= kind 1)
+              (or (= kind 2)
+                  (or (= kind 11)
+                      (or (= kind 12)
+                          (or (= kind 14)
+                              (or (= kind 15)
+                                  (or (= kind 16) (= kind 17)))))))) 1
+          (or (= kind 3) (or (= kind 13) (= kind 18)))
+            (if (= (ohm/ohm-pexpr-child-count grammar node) 0)
+                0
+                (pexpr-get-arity grammar (ohm/ohm-pexpr-child grammar node 0)))
+          (= kind 4)
+            (let [(mut arity) 0]
+              (for [index 0 (ohm/ohm-pexpr-child-count grammar node)]
+                (set! arity
+                      (+ (load arity)
+                         (pexpr-get-arity grammar
+                                          (ohm/ohm-pexpr-child grammar node index)))))
+              (load arity))
+          (or (= kind 5) (or (= kind 6) (= kind 7)))
+            (pexpr-get-arity grammar (ohm/ohm-pexpr-child grammar node 0))
+          (= kind 8) 0
+          (or (= kind 9) (= kind 10))
+            (pexpr-get-arity grammar (ohm/ohm-pexpr-child grammar node 0))
+          :else 1)))
+
+(defn pexpr-param-index [(text (slice u8))] (-> i64)
+  (if (and (>= (slice-len text) 6)
+           (str/str-eq (subslice text 0 5) "param"))
+      (pexpr-parse-i64 (subslice text 5 (slice-len text)))
+      -1))
+
+(defn pexpr-is-nullable-inner?
+  [(grammar (ptr ohm/OhmPExprGrammar))
+   (node i64)
+   (actual-app i64)
+   (active-rules (mut (al/ArrayList bool)))] (-> bool)
+  (let [kind (ohm/ohm-pexpr-kind grammar node)]
+    (cond (or (= kind 14)
+              (or (= kind 2)
+                  (or (= kind 6) (= kind 16)))) false
+          (= kind 15) true
+          (= kind 1) (= (slice-len (ohm/ohm-pexpr-text grammar node)) 0)
+          (= kind 11)
+            (let [index (pexpr-param-index (ohm/ohm-pexpr-text grammar node))]
+              (and (>= actual-app 0)
+                   (and (>= index 0)
+                        (and (< index (ohm/ohm-pexpr-child-count grammar actual-app))
+                             (pexpr-is-nullable-inner?
+                               grammar
+                               (ohm/ohm-pexpr-child grammar actual-app index)
+                               -1
+                               (mut active-rules))))))
+          (= kind 17)
+            (pexpr-is-nullable-inner?
+              grammar
+              (ohm/ohm-pexpr-child grammar node 0)
+              actual-app
+              (mut active-rules))
+          (or (= kind 3) (or (= kind 13) (= kind 18)))
+            (let [(mut nullable) (= (ohm/ohm-pexpr-child-count grammar node) 0)]
+              (for [index 0 (ohm/ohm-pexpr-child-count grammar node)]
+                (if (pexpr-is-nullable-inner?
+                      grammar
+                      (ohm/ohm-pexpr-child grammar node index)
+                      actual-app
+                      (mut active-rules))
+                    (set! nullable true)
+                    0))
+              (load nullable))
+          (= kind 4)
+            (let [(mut nullable) true]
+              (for [index 0 (ohm/ohm-pexpr-child-count grammar node)]
+                (if (not (pexpr-is-nullable-inner?
+                           grammar
+                           (ohm/ohm-pexpr-child grammar node index)
+                           actual-app
+                           (mut active-rules)))
+                    (set! nullable false)
+                    0))
+              (load nullable))
+          (or (= kind 5)
+              (or (= kind 7) (or (= kind 8) (= kind 9)))) true
+          (= kind 10)
+            (pexpr-is-nullable-inner? grammar
+                                      (ohm/ohm-pexpr-child grammar node 0)
+                                      actual-app
+                                      (mut active-rules))
+          (= kind 12)
+            (let [rule-index (pexpr-find-rule grammar (ohm/ohm-pexpr-text grammar node))]
+              (if (or (< rule-index 0) (get (load active-rules) rule-index))
+                  false
+                  (do
+                    (store! (al/al-elem [bool] active-rules rule-index) true)
+                    (let [answer
+                            (pexpr-is-nullable-inner?
+                              grammar
+                              (ohm/ohm-pexpr-rule-body grammar rule-index)
+                              node
+                              (mut active-rules))]
+                      (store! (al/al-elem [bool] active-rules rule-index) false)
+                      answer))))
+          :else false)))
+
+(defn pexpr-is-nullable? [(grammar (ptr ohm/OhmPExprGrammar))
+                          (node i64)] (-> bool)
+  (let [(mut active)
+          (al/al-new [bool] (alloc/malloc-allocator))]
+    (for [_ 0 (ohm/ohm-pexpr-rule-count grammar)]
+      (push! (mut active) false))
+    (let [answer (pexpr-is-nullable-inner? grammar node -1 (mut active))]
+      (al/al-free! (mut active))
+      answer)))
+
+(defn pexpr-to-argument-names [(grammar (ptr ohm/OhmPExprGrammar))
+                               (node i64)
+                               (first-index i64)
+                               (a (dyn alloc/Allocator))]
+                              (-> OhmArgumentNames)
+  (pexpr-to-argument-names-inner grammar node first-index false a))
+
+;; A deterministic public-API projection used by the pinned upstream
+;; differential. It deliberately serializes values obtainable from PExpr and
+;; RuleInfo rather than the internal recipe representation.
+(defn pexpr-push-public-node! [(builder (mut str/StrBuf))
+                               (grammar (ptr ohm/OhmPExprGrammar))
+                               (node i64)] (-> i64)
+  (let [kind (ohm/ohm-pexpr-kind grammar node)
+        (mut names) (pexpr-to-argument-names grammar node 1 (alloc/malloc-allocator))]
+    (str/sb-push-str! (mut builder) "[")
+    (str/sb-push-i64! (mut builder) kind)
+    (str/sb-push-str! (mut builder) ",")
+    (pexpr-push-quoted! (mut builder) (ohm/ohm-pexpr-text grammar node))
+    (str/sb-push-str! (mut builder) ",")
+    (pexpr-push-quoted! (mut builder) (ohm/ohm-pexpr-text2 grammar node))
+    (str/sb-push-str! (mut builder) ",")
+    (str/sb-push-i64! (mut builder) (ohm/ohm-pexpr-source-start grammar node))
+    (str/sb-push-str! (mut builder) ",")
+    (str/sb-push-i64! (mut builder) (ohm/ohm-pexpr-source-end grammar node))
+    (str/sb-push-str! (mut builder) ",")
+    (pexpr-push-quoted! (mut builder) (ohm/ohm-pexpr-stored-string grammar node))
+    (str/sb-push-str! (mut builder) ",")
+    (pexpr-push-quoted! (mut builder) (ohm/ohm-pexpr-to-display-string grammar node))
+    (str/sb-push-str! (mut builder) ",")
+    (str/sb-push-i64! (mut builder) (pexpr-get-arity grammar node))
+    (str/sb-push-str! (mut builder) ",")
+    (str/sb-push-str! (mut builder) (if (pexpr-is-nullable? grammar node) "true" "false"))
+    (str/sb-push-str! (mut builder) ",[")
+    (for [index 0 (argument-names-count (mut names))]
+      (do
+        (if (> index 0) (str/sb-push-str! (mut builder) ",") 0)
+        (pexpr-push-quoted! (mut builder) (argument-name (mut names) index))))
+    (str/sb-push-str! (mut builder) "],[")
+    (for [index 0 (ohm/ohm-pexpr-child-count grammar node)]
+      (do
+        (if (> index 0) (str/sb-push-str! (mut builder) ",") 0)
+        (pexpr-push-public-node!
+          (mut builder)
+          grammar
+          (ohm/ohm-pexpr-child grammar node index))))
+    (str/sb-push-str! (mut builder) "]]" )
+    (free-ohm-argument-names! (mut names))
+    0))
+
+(defn pexpr-public-signature! [(grammar (mut ohm/OhmPExprGrammar))]
+                              (-> (slice u8))
+  (let [(mut builder) (str/sb-new (alloc/malloc-allocator))]
+    (str/sb-push-str! (mut builder) "[")
+    (for [rule 0 (ohm/ohm-pexpr-rule-count (mut grammar))]
+      (do
+        (if (> rule 0) (str/sb-push-str! (mut builder) ",") 0)
+        (str/sb-push-str! (mut builder) "[")
+        (pexpr-push-quoted! (mut builder) (ohm/ohm-pexpr-rule-name (mut grammar) rule))
+        (str/sb-push-str! (mut builder) ",")
+        (str/sb-push-i64! (mut builder) (ohm/ohm-pexpr-rule-source-start (mut grammar) rule))
+        (str/sb-push-str! (mut builder) ",")
+        (str/sb-push-i64! (mut builder) (ohm/ohm-pexpr-rule-source-end (mut grammar) rule))
+        (str/sb-push-str! (mut builder) ",")
+        (pexpr-push-quoted! (mut builder) (ohm/ohm-pexpr-rule-description (mut grammar) rule))
+        (str/sb-push-str! (mut builder) ",[")
+        (for [formal 0 (ohm/ohm-pexpr-rule-formal-count (mut grammar) rule)]
+          (do
+            (if (> formal 0) (str/sb-push-str! (mut builder) ",") 0)
+            (pexpr-push-quoted!
+              (mut builder)
+              (ohm/ohm-pexpr-rule-formal (mut grammar) rule formal))))
+        (str/sb-push-str! (mut builder) "],")
+        (pexpr-push-public-node!
+          (mut builder)
+          (mut grammar)
+          (ohm/ohm-pexpr-rule-body (mut grammar) rule))
+        (str/sb-push-str! (mut builder) "]")))
+    (str/sb-push-str! (mut builder) "]")
+    (str/sb-finish! (mut builder))))
+
+(defn pexpr-argument-names-match? [(grammar (ptr ohm/OhmPExprGrammar))
+                                   (node i64)
+                                   (expected (slice u8))] (-> bool)
+  (let [(mut names)
+          (pexpr-to-argument-names grammar node 1 (alloc/malloc-allocator))
+        (mut builder) (str/sb-new (alloc/malloc-allocator))]
+    (for [index 0 (argument-names-count (mut names))]
+      (do
+        (if (> index 0) (str/sb-push-str! (mut builder) ",") 0)
+        (str/sb-push-str! (mut builder) (argument-name (mut names) index))))
+    (let [actual (str/sb-finish! (mut builder))
+          valid (str/str-eq actual expected)]
+      (alloc/free [u8] (alloc/malloc-allocator) actual)
+      (free-ohm-argument-names! (mut names))
+      valid)))
+
+(defn pexpr-upstream-argument-names-compatible?
+  [(grammar (ptr ohm/OhmPExprGrammar))] (-> bool)
+  (let [start (ohm/ohm-pexpr-rule-body grammar (pexpr-find-rule grammar "Start"))
+        foo (ohm/ohm-pexpr-rule-body grammar (pexpr-find-rule grammar "foo"))
+        more-alt (ohm/ohm-pexpr-rule-body grammar (pexpr-find-rule grammar "MoreAlt"))
+        bars (ohm/ohm-pexpr-rule-body grammar (pexpr-find-rule grammar "bars"))
+        more-seq (ohm/ohm-pexpr-rule-body grammar (pexpr-find-rule grammar "MoreSeq"))
+        plus (ohm/ohm-pexpr-rule-body grammar (pexpr-find-rule grammar "plus"))
+        more-opts (ohm/ohm-pexpr-rule-body grammar (pexpr-find-rule grammar "MoreOpts"))
+        ranges (ohm/ohm-pexpr-rule-body grammar (pexpr-find-rule grammar "ranges"))
+        pair (ohm/ohm-pexpr-rule-body grammar (pexpr-find-rule grammar "Pair"))
+        foo-many (ohm/ohm-pexpr-child grammar foo 1)
+        (mut valid) true]
+    (if (not (pexpr-argument-names-match? grammar start "foo_1s,barses,foo_2s"))
+        (set! valid false) 0)
+    (if (not (pexpr-argument-names-match?
+               grammar foo "_ab_or_letters_or_a_to_z"))
+        (set! valid false) 0)
+    (if (not (pexpr-argument-names-match?
+               grammar (ohm/ohm-pexpr-child grammar foo 0) "_ab"))
+        (set! valid false) 0)
+    (if (not (pexpr-argument-names-match? grammar more-alt "_a_or__c,_b_or__c"))
+        (set! valid false) 0)
+    (if (not (pexpr-argument-names-match? grammar foo-many "letters"))
+        (set! valid false) 0)
+    (if (not (pexpr-argument-names-match?
+               grammar (ohm/ohm-pexpr-child grammar foo-many 0) "letter"))
+        (set! valid false) 0)
+    (if (not (pexpr-argument-names-match?
+               grammar (ohm/ohm-pexpr-child grammar foo 2) "a_to_z"))
+        (set! valid false) 0)
+    (if (not (pexpr-argument-names-match?
+               grammar bars "letter_or_digit,_b,optFoo,$4"))
+        (set! valid false) 0)
+    (if (not (pexpr-argument-names-match?
+               grammar (ohm/ohm-pexpr-child grammar bars 2) "optFoo"))
+        (set! valid false) 0)
+    (if (not (pexpr-argument-names-match?
+               grammar (ohm/ohm-pexpr-child grammar bars 3) "$1"))
+        (set! valid false) 0)
+    (if (not (pexpr-argument-names-match?
+               grammar more-seq "foo_1,_a_1,foo_2,foo_3,_a_2,foo_4"))
+        (set! valid false) 0)
+    (if (not (pexpr-argument-names-match? grammar plus "foo,$2,bars"))
+        (set! valid false) 0)
+    (if (not (pexpr-argument-names-match? grammar more-opts "opt$1,optStart"))
+        (set! valid false) 0)
+    (if (not (pexpr-argument-names-match?
+               grammar (ohm/ohm-pexpr-child grammar ranges 0) "_1_to_9"))
+        (set! valid false) 0)
+    (if (not (pexpr-argument-names-match?
+               grammar (ohm/ohm-pexpr-child grammar ranges 1) "$1"))
+        (set! valid false) 0)
+    (if (not (pexpr-argument-names-match?
+               grammar pair "$1,param0_1,$3,param0_2,$5"))
+        (set! valid false) 0)
+    (load valid)))
+
+(defn pexpr-rule-source? [(grammar (ptr ohm/OhmPExprGrammar))
+                          (name (slice u8))
+                          (start i64)
+                          (end i64)] (-> bool)
+  (let [index (pexpr-find-rule grammar name)]
+    (and (>= index 0)
+         (and (= (ohm/ohm-pexpr-rule-source-start grammar index) start)
+              (= (ohm/ohm-pexpr-rule-source-end grammar index) end)))))
+
+(defn pexpr-node-source? [(grammar (ptr ohm/OhmPExprGrammar))
+                          (node i64)
+                          (start i64)
+                          (end i64)] (-> bool)
+  (and (= (ohm/ohm-pexpr-source-start grammar node) start)
+       (= (ohm/ohm-pexpr-source-end grammar node) end)))
+
+(defn pexpr-upstream-source-compatible?
+  [(grammar (ptr ohm/OhmPExprGrammar))] (-> bool)
+  (let [foo (pexpr-find-rule grammar "foo")
+        beep (pexpr-find-rule grammar "beep")
+        bar (pexpr-find-rule grammar "bar")
+        bar-baz (pexpr-find-rule grammar "bar_baz")
+        (mut valid)
+          (and (ohm/ohm-pexpr-grammar-valid? grammar)
+               (and (>= foo 0)
+                    (and (>= beep 0) (and (>= bar 0) (>= bar-baz 0)))))]
+    (if (load valid)
+        (let [foo-body (ohm/ohm-pexpr-rule-body grammar foo)
+              beep-body (ohm/ohm-pexpr-rule-body grammar beep)
+              bar-body (ohm/ohm-pexpr-rule-body grammar bar)
+              bar-baz-body (ohm/ohm-pexpr-rule-body grammar bar-baz)]
+          (if (not (pexpr-rule-source? grammar "foo" 6 15)) (set! valid false) 0)
+          (if (not (pexpr-rule-source? grammar "beep" 18 35)) (set! valid false) 0)
+          (if (not (pexpr-rule-source? grammar "bar" 38 74)) (set! valid false) 0)
+          (if (not (pexpr-rule-source? grammar "bar_baz" 59 74)) (set! valid false) 0)
+          (if (not (pexpr-node-source? grammar foo-body 12 15)) (set! valid false) 0)
+          (if (not (pexpr-node-source? grammar beep-body 25 35)) (set! valid false) 0)
+          (if (not (pexpr-node-source?
+                     grammar (ohm/ohm-pexpr-child grammar beep-body 0) 25 31))
+              (set! valid false) 0)
+          (if (not (pexpr-node-source?
+                     grammar (ohm/ohm-pexpr-child grammar beep-body 1) 32 35))
+              (set! valid false) 0)
+          (if (not (pexpr-node-source? grammar bar-body 44 74)) (set! valid false) 0)
+          (if (not (pexpr-node-source?
+                     grammar (ohm/ohm-pexpr-child grammar bar-body 0) 44 47))
+              (set! valid false) 0)
+          (if (not (pexpr-node-source?
+                     grammar (ohm/ohm-pexpr-child grammar bar-body 1) 50 56))
+              (set! valid false) 0)
+          (if (not (pexpr-node-source? grammar bar-baz-body 59 67))
+              (set! valid false) 0))
+        0)
+    (load valid)))
+
+(defn pexpr-upstream-definition-source-compatible?
+  [(grammar (ptr ohm/OhmPExprGrammar))] (-> bool)
+  (let [untouched (pexpr-find-rule grammar "untouched")]
+    (and (pexpr-rule-source? grammar "foo" 12 22)
+         (and (pexpr-rule-source? grammar "bar" 25 48)
+              (and (pexpr-rule-source? grammar "bar_baz" 38 48)
+                   (and (>= untouched 0)
+                        (str/str-eq
+                          (ohm/ohm-pexpr-rule-source grammar untouched)
+                          "G {\n  foo = bar\n  bar = \"a\" | \"b\" -- baz\n  untouched = \"u\"\n}")))))))
+
+(defn pexpr-upstream-display-compatible?
+  [(grammar (ptr ohm/OhmPExprGrammar))] (-> bool)
+  (let [rule (pexpr-find-rule grammar "start")]
+    (if (< rule 0)
+        false
+        (let [root (ohm/ohm-pexpr-rule-body grammar rule)
+              terminal (ohm/ohm-pexpr-child grammar root 0)
+              many (ohm/ohm-pexpr-child grammar root 1)
+              letter (ohm/ohm-pexpr-child grammar many 0)
+              range (ohm/ohm-pexpr-child grammar root 2)]
+          (and (str/str-eq
+                 (ohm/ohm-pexpr-to-display-string grammar root)
+                 "\"ab\" | letter* | \"a\"..\"z\"")
+               (and (str/str-eq
+                      (ohm/ohm-pexpr-to-display-string grammar terminal)
+                      "\"ab\"")
+                    (and (str/str-eq
+                           (ohm/ohm-pexpr-to-display-string grammar many)
+                           "letter*")
+                         (and (str/str-eq
+                                (ohm/ohm-pexpr-to-display-string grammar letter)
+                                "letter")
+                              (and (str/str-eq
+                                     (ohm/ohm-pexpr-to-display-string grammar range)
+                                     "\"a\"..\"z\"")
+                                   (str/str-eq
+                                     (ohm/ohm-pexpr-to-string grammar root)
+                                     "(\"ab\" | letter* | \"a\"..\"z\")"))))))))))
+
+(defn pexpr-upstream-string-compatible?
+  [(grammar (ptr ohm/OhmPExprGrammar))] (-> bool)
+  (let [rule (pexpr-find-rule grammar "start")]
+    (and (>= rule 0)
+         (str/str-eq
+           (ohm/ohm-pexpr-to-string
+             grammar
+             (ohm/ohm-pexpr-rule-body grammar rule))
+           "(&\"a\" ~(\"b\" | #(c)?) \"a\"..\"z\")"))))

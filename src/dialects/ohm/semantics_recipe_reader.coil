@@ -1,0 +1,291 @@
+(module experiments.ohm.semantics-recipe-reader)
+
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :as al)
+(import "coil.json" :as json)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use [slice-len slice-get subslice])
+(import "coil.str" :as str)
+(import "experiments.ohm.recipe-reader" :as recipe)
+
+(defn semantics-recipe-form-named? [(form Code) (name (slice u8))] (-> bool)
+  (and (primitive/code-list? form)
+       (and (> (len form) 1)
+            (and (primitive/code-sym? (get form 0))
+                 (and (str/str-eq (primitive/code-sym (get form 0)) "defn")
+                      (and (primitive/code-sym? (get form 1))
+                           (str/str-eq (primitive/code-sym (get form 1)) name)))))))
+
+(defn semantics-recipe-read-forms [(source (slice u8))] (-> Code)
+  (primitive/code-read (get `(source ~source) 1) `(reader-config)))
+
+(defn semantics-recipe-read-expression [(source (slice u8))] (-> Code)
+  (semantics-recipe-read-forms source))
+
+(defn semantics-recipe-preamble-present?
+  [(preambles (ptr (al/ArrayList (slice u8))))
+   (candidate (slice u8))] (-> bool)
+  (let [(mut present) false]
+    (for existing
+      (iter (load preambles))
+      (if (str/str-eq existing candidate) (set! present true) 0))
+    (load present)))
+
+(defn semantics-recipe-trim-trailing-space [(source (slice u8))] (-> (slice u8))
+  (let [(mut end) (slice-len source)]
+    (loop (if (= (load end) 0)
+              (break)
+              (let [byte (primitive/cast i64 (slice-get source (- (load end) 1)))]
+                (if (or (= byte 32) (or (= byte 9) (or (= byte 10) (= byte 13))))
+                    (set! end (- (load end) 1))
+                    (break)))))
+    (subslice source 0 (load end))))
+
+(defn read-ohm-semantics-recipe [(context Code)] (-> Code)
+  (let [source (primitive/code-str (get context 2))]
+    (match (json/parse (malloc-allocator) source)
+      (Err [error] (primitive/error "Invalid JSON passed to Ohm semantics recipe"))
+      (Ok [document]
+        (let [root 0
+              tag (recipe/recipe-json-string
+                    document
+                    (recipe/recipe-array-child document root 0))
+              version (recipe/recipe-number
+                        document
+                        (recipe/recipe-array-child document root 1))
+              semantics-name-text
+                (recipe/recipe-json-string
+                  document
+                  (recipe/recipe-array-child document root 2))
+              grammar-name-text
+                (recipe/recipe-json-string
+                  document
+                  (recipe/recipe-array-child document root 3))
+              grammar-recipe
+                (recipe/recipe-json-string
+                  document
+                  (recipe/recipe-array-child document root 4))
+              definitions (recipe/recipe-array-child document root 5)
+              definition-count (recipe/recipe-array-count document definitions)
+              root-count (recipe/recipe-array-count document root)
+              has-behavior-test (>= root-count 9)
+              behavior-input
+                (if has-behavior-test
+                    (recipe/recipe-json-string
+                      document
+                      (recipe/recipe-array-child document root 6))
+                    "")
+              behavior-action
+                (if has-behavior-test
+                    (recipe/recipe-json-string
+                      document
+                      (recipe/recipe-array-child document root 7))
+                    "")
+              behavior-expected
+                (if has-behavior-test
+                    (recipe/recipe-number
+                      document
+                      (recipe/recipe-array-child document root 8))
+                    0)
+              behavior-argument-list
+                (if (> root-count 9)
+                    (recipe/recipe-array-child document root 9)
+                    -1)
+              behavior-argument-count
+                (if (>= behavior-argument-list 0)
+                    (recipe/recipe-array-count document behavior-argument-list)
+                    0)]
+          (if (or (not (str/str-eq tag "coilSemantics")) (!= version 1))
+              (primitive/error "Unsupported Ohm semantics recipe")
+              0)
+          (let [generated
+                  (recipe/read-ohm-recipe-source context grammar-recipe)
+                make-name
+                  (primitive/datum->syntax context
+                                           (primitive/code-symbol "make-semantics"))
+                recipe-name
+                  (primitive/datum->syntax context
+                                           (primitive/code-symbol "semantics-to-recipe"))
+                main-name
+                  (primitive/datum->syntax context (primitive/code-symbol "main"))
+                grammar-token-name
+                  (primitive/datum->syntax context
+                                           (primitive/code-symbol "grammar-token"))
+                parse-tree-name
+                  (primitive/datum->syntax context
+                                           (primitive/code-symbol "parse-tree"))
+                semantics-value (primitive/fresh-identifier "semantics")
+                (mut output) (primitive/code-list-new)
+                (mut preambles)
+                  (al/al-new [(slice u8)] (malloc-allocator))
+                (mut construction) (primitive/code-list-new)
+                (mut validation) `true
+                behavior-result (primitive/fresh-identifier "behavior-match")
+                behavior-index (primitive/fresh-identifier "behavior-action-index")
+                behavior-evaluation (primitive/fresh-identifier "behavior-evaluation")
+                behavior-arguments (primitive/fresh-identifier "behavior-arguments")
+                behavior-value (primitive/fresh-identifier "behavior-value")
+                behavior-valid (primitive/fresh-identifier "behavior-valid")
+                (mut behavior-argument-setup) (primitive/code-list-new)]
+            (push! (mut behavior-argument-setup) (primitive/code-symbol "do"))
+            (for [argument-index 0 behavior-argument-count]
+              (push! (mut behavior-argument-setup)
+                     `(push! (mut ~behavior-arguments)
+                             ~(recipe/recipe-number
+                                document
+                                (recipe/recipe-array-child
+                                  document
+                                  behavior-argument-list
+                                  argument-index)))))
+            (for form
+              (iter generated)
+              (if (or (semantics-recipe-form-named? form "main")
+                      (semantics-recipe-form-named? form "to-recipe"))
+                  0
+                  (push! (mut output) form)))
+            (push! (mut construction) (primitive/code-symbol "do"))
+            (for [index 0 definition-count]
+              (let [definition (recipe/recipe-array-child document definitions index)
+                    kind
+                      (recipe/recipe-json-string
+                        document
+                        (recipe/recipe-array-child document definition 0))
+                    name
+                      (recipe/recipe-json-string
+                        document
+                        (recipe/recipe-array-child document definition 1))
+                    formal-count
+                      (recipe/recipe-number
+                        document
+                        (recipe/recipe-array-child document definition 2))
+                    inherited
+                      (!= (recipe/recipe-number
+                            document
+                            (recipe/recipe-array-child document definition 3))
+                          0)
+                    extended
+                      (!= (recipe/recipe-number
+                            document
+                            (recipe/recipe-array-child document definition 4))
+                          0)
+                    preamble
+                      (recipe/recipe-json-string
+                        document
+                        (recipe/recipe-array-child document definition 5))
+                    constructor-source
+                      (recipe/recipe-json-string
+                        document
+                        (recipe/recipe-array-child document definition 6))
+                    constructor
+                      (semantics-recipe-read-expression constructor-source)
+                    action-value (primitive/fresh-identifier "semantic-action")]
+                (if (and (> (len preamble) 0)
+                         (not (semantics-recipe-preamble-present?
+                                (mut preambles)
+                                preamble)))
+                    (do
+                      (push! (mut preambles) preamble)
+                      (push! (mut output) (semantics-recipe-read-forms preamble)))
+                    0)
+                (push! (mut construction)
+                       `(let [~action-value ~constructor]
+                          ~(if (str/str-eq kind "attribute")
+                               `(experiments.ohm.runtime.add-semantics-attribute!
+                                  (mut ~semantics-value)
+                                  ~name
+                                  ~action-value)
+                               `(experiments.ohm.runtime.add-semantics-operation!
+                                  (mut ~semantics-value)
+                                  ~name
+                                  ~action-value))
+                          (experiments.ohm.runtime.set-semantics-action-history!
+                            (mut ~semantics-value) ~name ~inherited ~extended)
+                          (experiments.ohm.runtime.set-semantics-action-recipe-source!
+                            (mut ~semantics-value)
+                            ~name
+                            ~preamble
+                            ~constructor-source)))
+                (set! validation
+                      `(and ~(load validation)
+                            (and (= (experiments.ohm.runtime.semantics-action-formal-count
+                                      (mut ~semantics-value) ~index)
+                                    ~formal-count)
+                                 (and (= (experiments.ohm.runtime.semantics-action-inherited?
+                                           (mut ~semantics-value) ~index)
+                                         ~inherited)
+                                      (= (experiments.ohm.runtime.semantics-action-extended?
+                                           (mut ~semantics-value) ~index)
+                                         ~extended)))))))
+            (push! (mut construction) `(load ~semantics-value))
+            (push! (mut output)
+                   `(defn ~make-name [] (-> experiments.ohm.runtime.OhmSemantics)
+                      (let [(mut ~semantics-value)
+                              (experiments.ohm.runtime.new-ohm-semantics
+                                ~grammar-name-text
+                                (~grammar-token-name)
+                                (coil.alloc.malloc-allocator))]
+                        (experiments.ohm.runtime.set-semantics-name!
+                          (mut ~semantics-value) ~semantics-name-text)
+                        (experiments.ohm.runtime.set-semantics-grammar-recipe!
+                          (mut ~semantics-value) ~grammar-recipe)
+                        ~(primitive/code-list-done (load construction)))))
+            (push! (mut output)
+                   `(defn ~recipe-name [] (-> (slice u8)) ~source))
+            (push! (mut output)
+                   `(defn ~main-name [] (-> i64)
+                      (let [(mut ~semantics-value) (~make-name)
+                            ~behavior-valid
+                              ~(if has-behavior-test
+                                   `(let [(mut ~behavior-result)
+                                            (~parse-tree-name ~behavior-input)
+                                          ~behavior-index
+                                            (experiments.ohm.runtime.semantic-definition-index
+                                              (mut ~semantics-value)
+                                              ~behavior-action)
+                                          (mut ~behavior-evaluation)
+                                            (experiments.ohm.runtime.new-registered-semantic-evaluation
+                                              (mut ~semantics-value)
+                                              ~behavior-index
+                                              (mut ~behavior-result))
+                                          (mut ~behavior-arguments)
+                                            (coil.arraylist.al-new [i64]
+                                              (coil.alloc.malloc-allocator))
+                                          ~behavior-value
+                                            (do
+                                              ~(primitive/code-list-done
+                                                 (load behavior-argument-setup))
+                                              (experiments.ohm.runtime.evaluate-semantic-root!
+                                                (mut ~behavior-evaluation)
+                                                (coil.arraylist.al-slice [i64]
+                                                  (load ~behavior-arguments))))
+                                          valid
+                                            (and (experiments.ohm.runtime.match-succeeded?
+                                                   (load ~behavior-result))
+                                                 (= ~behavior-value ~behavior-expected))]
+                                      (coil.arraylist.al-free! (mut ~behavior-arguments))
+                                      (experiments.ohm.runtime.free-registered-semantic-evaluation!
+                                        (mut ~semantics-value)
+                                        ~behavior-index
+                                        (mut ~behavior-evaluation))
+                                      (experiments.ohm.runtime.free-match!
+                                        (mut ~behavior-result))
+                                      valid)
+                                   `(coil.str.str-eq
+                                      (experiments.ohm.runtime.semantics-to-persistent-recipe!
+                                        (mut ~semantics-value))
+                                      ~(semantics-recipe-trim-trailing-space source)))
+                            valid
+                              (and ~behavior-valid
+                                   (and (coil.str.str-eq
+                                     (experiments.ohm.runtime.semantics-name
+                                       (mut ~semantics-value))
+                                     ~semantics-name-text)
+                                   (and (= (experiments.ohm.runtime.semantics-action-count
+                                             (mut ~semantics-value))
+                                           ~definition-count)
+                                        ~(load validation))))]
+                        (experiments.ohm.runtime.free-ohm-semantics!
+                          (mut ~semantics-value))
+                        (if valid 0 1))))
+            (al/al-free! (mut preambles))
+            (primitive/code-list-done (load output))))))))
