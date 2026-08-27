@@ -6,6 +6,7 @@
 (import "coil.slice" :use [slice-data slice-len slice-get subslice])
 (import "coil.str" :as str)
 (import "coil.io" :as io)
+(import "coil.debug" :as debug)
 (import "experiments.ohm.unicode" :as unicode)
 
 (const OHM-VERSION "17.2.1")
@@ -1908,6 +1909,32 @@
     (set! (.farthest snapshot) (.farthest state))
     (load snapshot)))
 
+(defn begin-failure-scope! [(state (mut ParseState))] (-> FailureSnapshot)
+  (let [(mut outer) (failure-snapshot state)]
+    (loop (if (= (len (.expectations state)) 0)
+              (break)
+              (pop! (mut (.expectations state)))))
+    (set! (.farthest state) -1)
+    (load outer)))
+
+(defn finish-failure-scope! [(state (mut ParseState))
+                             (outer (mut FailureSnapshot))
+                             (end i64)] (-> i64)
+  (let [(mut inner) (failure-snapshot state)]
+    (if (and (>= end 0) (= end (.farthest inner)))
+        (for [index 0 (len (.expectations inner))]
+          (set! (.fluffy (al/al-elem [Expectation]
+                                      (mut (.expectations inner))
+                                      index))
+                true))
+        0)
+    (restore-failures! (mut state) (mut outer))
+    (for expectation
+      (iter (.expectations inner))
+      (merge-recorded-expectation! (mut state) (.farthest inner) expectation))
+    (al/al-free! (mut (.expectations inner)))
+    end))
+
 (defn restore-failures! [(state (mut ParseState))
                          (snapshot (mut FailureSnapshot))] (-> i64)
   (loop (if (= (len (.expectations state)) 0)
@@ -3485,6 +3512,25 @@
                     (set! index (- (load index) 1))))))
     (load answer)))
 
+(defn memo-find-named [(state (ptr ParseState))
+                       (rule-id i64)
+                       (rule-name (slice u8))
+                       (start i64)] (-> i64)
+  (let [(mut index) (- (len (.memo state)) 1)
+        (mut answer) -1]
+    (loop (if (or (< (load index) 0) (>= (load answer) 0))
+              (break)
+              (let [entry (get (.memo state) (load index))]
+                (if (and (= (.rule-id entry) rule-id)
+                         (and (str/str-eq (.rule-name entry) rule-name)
+                              (and (= (.start entry) start)
+                                   (or (not (.tracing state))
+                                       (or (= (.generation entry) (.cache-generation state))
+                                           (> (.trace-snapshot-count entry) 0))))))
+                    (set! answer (load index))
+                    (set! index (- (load index) 1))))))
+    (load answer)))
+
 (defn memo-find-any [(state (ptr ParseState)) (rule-id i64) (start i64)] (-> i64)
   (let [(mut index) (- (len (.memo state)) 1)
         (mut answer) -1]
@@ -4039,12 +4085,19 @@
 
 (defn match-letter-cst! [(state (mut ParseState)) (source (slice u8)) (at i64)] (-> i64)
   (let [checkpoint (begin-rule! (mut state))
+        (mut failures) (failure-snapshot state)
         end (match-letter-category-node! (mut state) source at)]
     (if (< end 0)
         (do
+          ; `letter` is a named built-in rule. Its public expectation replaces
+          ; the lower/upper/unicode alternatives used to implement it, just as
+          ; generated named rules replace their implementation expectations.
+          (restore-failures! (mut state) (mut failures))
           (record-expectation! (mut state) at "a letter" 1)
           (fail-rule! (mut state) checkpoint at))
-        (succeed-rule! (mut state) "letter" at end))))
+        (do
+          (discard-failure-snapshot! (mut failures))
+          (succeed-rule! (mut state) "letter" at end)))))
 
 (defn match-space-cst! [(state (mut ParseState)) (source (slice u8)) (at i64)] (-> i64)
   (match-builtin-result! (mut state)
@@ -4292,6 +4345,8 @@
   (let [(mut message) (str/sb-new (.allocator state))
         total (len (.expectations state))
         (mut count) 0
+        (mut previous-text) ""
+        (mut previous-type) -1
         (mut previous-order) -1]
     (for expectation
       (iter (.expectations state))
@@ -4305,17 +4360,37 @@
                                 ", "))
           0)
       (let [(mut chosen) -1
-            (mut chosen-order) -1]
+            (mut chosen-order) -1
+            (mut chosen-type) -1
+            (mut chosen-text) ""]
         (for [candidate-index 0 total]
           (let [candidate (get (.expectations state) candidate-index)]
+            (let [after-previous
+                    (or (= index 0)
+                        (let [text-order (str/str-cmp (.text candidate) (load previous-text))]
+                          (or (> text-order 0)
+                              (and (= text-order 0)
+                                   (or (> (.type candidate) (load previous-type))
+                                       (and (= (.type candidate) (load previous-type))
+                                            (> (.order candidate) (load previous-order))))))))
+                  before-chosen
+                    (or (< (load chosen) 0)
+                        (let [text-order (str/str-cmp (.text candidate) (load chosen-text))]
+                          (or (< text-order 0)
+                              (and (= text-order 0)
+                                   (or (< (.type candidate) (load chosen-type))
+                                       (and (= (.type candidate) (load chosen-type))
+                                            (< (.order candidate) (load chosen-order))))))))]
             (if (and (not (.fluffy candidate))
-                     (> (.order candidate) (load previous-order))
-                     (or (< (load chosen) 0)
-                         (< (.order candidate) (load chosen-order))))
+                     (and after-previous before-chosen))
                 (do
                   (set! chosen candidate-index)
-                  (set! chosen-order (.order candidate)))
-                0)))
+                  (set! chosen-order (.order candidate))
+                  (set! chosen-type (.type candidate))
+                  (set! chosen-text (.text candidate)))
+                0))))
+        (set! previous-text (load chosen-text))
+        (set! previous-type (load chosen-type))
         (set! previous-order (load chosen-order))
         (let [expectation (get (.expectations state) (load chosen))]
           (if (= (.type expectation) 0) (str/sb-push-str! (mut message) "\"") 0)
@@ -6963,6 +7038,65 @@
           (set! answer index)
           0))
     (load answer)))
+
+(defn debug-write-indent [(writer (ptr io/Writer)) (depth i64)] (-> i64)
+  (for [_ 0 depth]
+    (io/print-str writer "  "))
+  0)
+
+(defn debug-write-match-node [(result MatchResult)
+                              (node i64)
+                              (writer (ptr io/Writer))
+                              (depth i64)] (-> i64)
+  (debug-write-indent writer depth)
+  (io/print-str writer "(CstNode :ctorName ")
+  (debug/debug-write (node-rule result node) writer)
+  (io/print-str writer " :startIdx ")
+  (debug/debug-write (node-start-utf16 result node) writer)
+  (io/print-str writer " :endIdx ")
+  (debug/debug-write (node-end-utf16 result node) writer)
+  (io/print-str writer " :sourceString ")
+  (debug/debug-write (node-source-string result node) writer)
+  (io/print-str writer " :terminal ")
+  (debug/debug-write (node-terminal? result node) writer)
+  (io/print-str writer " :iteration ")
+  (debug/debug-write (node-iteration? result node) writer)
+  (io/print-str writer " :optional ")
+  (debug/debug-write (node-optional? result node) writer)
+  (let [count (node-child-count result node)]
+    (if (= count 0)
+        (io/print-str writer ")")
+        (do
+          (io/print-str writer " :children (\n")
+          (for [index 0 count]
+            (do
+              (debug-write-match-node result
+                                      (node-child result node index)
+                                      writer
+                                      (+ depth 2))
+              (io/print-str writer "\n")))
+          (debug-write-indent writer (+ depth 1))
+          (io/print-str writer ")\n")
+          (debug-write-indent writer depth)
+          (io/print-str writer ")"))))
+  0)
+
+(impl debug/Debug MatchResult
+  (debug-write [(result MatchResult) (writer (ptr io/Writer))] (-> i64)
+    (io/print-str writer "(MatchResult :succeeded ")
+    (debug/debug-write (match-succeeded? result) writer)
+    (io/print-str writer " :grammar ")
+    (debug/debug-write (match-grammar-name result) writer)
+    (if (match-succeeded? result)
+        (do
+          (io/print-str writer " :root\n")
+          (debug-write-match-node result (match-root result) writer 1)
+          (io/print-str writer ")"))
+        (do
+          (io/print-str writer " :message ")
+          (debug/debug-write (match-message result) writer)
+          (io/print-str writer ")")))
+    0))
 
 (defn node-has-children? [(result MatchResult) (node i64)] (-> bool)
   (> (node-child-count result node) 0))
