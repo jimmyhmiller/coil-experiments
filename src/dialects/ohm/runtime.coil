@@ -31,7 +31,8 @@
 
 ;; type 0 is a quoted string terminal; type 1 is a human-readable description.
 (defstruct Expectation [(text (slice u8)) (type i64) (order i64) (fluffy bool)])
-(defstruct FailureSnapshot [(expectations (al/ArrayList Expectation)) (farthest i64)])
+(defstruct FailureSnapshot
+  [(expectations (al/ArrayList Expectation)) (farthest i64) (batch bool)])
 (defstruct LineColumn
   [(offset i64) (line i64) (column i64) (line-start i64) (line-end i64)])
 
@@ -1356,7 +1357,7 @@
     (note-examined! (mut state) examined)
     examined))
 
-(defn note-expression-examined! [(state (mut ParseState))
+(defn note-expression-examined! :inline (Always) [(state (mut ParseState))
                                  (source (slice u8))
                                  (start i64)
                                  (end i64)
@@ -1401,6 +1402,12 @@
     (set! (.next-node-id cache) 1)
     (load cache)))
 
+(defn mark-parse-cache-batch! [(cache (mut ParseCache))] (-> i64)
+  ;; `new-parse-state-from-cache!` increments before copying the generation.
+  ;; Generation zero therefore identifies a one-shot, non-incremental parse.
+  (set! (.generation cache) -1)
+  0)
+
 (defn new-parse-state-from-cache! [(cache (mut ParseCache))] (-> ParseState)
   (let [(mut state) (new-parse-state (.allocator cache))]
     (al/al-free! (mut (.memo state)))
@@ -1429,12 +1436,16 @@
     (if (= (load counter) 0) (store! counter 1) 0)
     counter))
 
-(defn next-node-id! [(state (mut ParseState))] (-> i64)
-  (let [counter (global-node-id-counter)
-        id (load counter)]
-    (store! counter (+ id 1))
-    (set! (.next-node-id state) (+ id 1))
-    id))
+(defn next-node-id! :inline (Always) [(state (mut ParseState))] (-> i64)
+  (if (parse-state-batch-direct? state)
+      (let [id (.next-node-id state)]
+        (set! (.next-node-id state) (+ id 1))
+        id)
+      (let [counter (global-node-id-counter)
+            id (load counter)]
+        (store! counter (+ id 1))
+        (set! (.next-node-id state) (+ id 1))
+        id)))
 
 (defn free-parse-cache! [(cache (mut ParseCache))] (-> i64)
   (al/al-free! (mut (.memo cache)))
@@ -1448,7 +1459,22 @@
   (set! (.tracing state) true)
   0)
 
-(defn trace-enter-kind-source! [(state (mut ParseState))
+(defn parse-state-batch-direct? :inline (Always) [(state (ptr ParseState))] (-> bool)
+  (and (not (.tracing state)) (= (.cache-generation state) 0)))
+
+(defn prepare-batch-state! [(state (mut ParseState))
+                            (source (slice u8))] (-> i64)
+  (if (parse-state-batch-direct? state)
+      (do
+        (al/al-reserve! [CstNode] (mut (.nodes state))
+                        (+ (* (slice-len source) 4) 32))
+        (al/al-reserve! [CstFrame] (mut (.frames state)) 64)
+        (al/al-reserve! [Expectation] (mut (.expectations state)) 16)
+        (al/al-reserve! [(slice u8)] (mut (.applications state)) 32)
+        0)
+      0))
+
+(defn trace-enter-kind-source! :inline (Always) [(state (mut ParseState))
                                 (display (slice u8))
                                 (start i64)
                                 (kind i64)
@@ -1555,7 +1581,7 @@
                 (set! event-index (+ (load event-index) 1)))))
     0))
 
-(defn trace-exit! [(state (mut ParseState)) (index i64) (end i64)] (-> i64)
+(defn trace-exit! :inline (Always) [(state (mut ParseState)) (index i64) (end i64)] (-> i64)
   (if (< index 0)
       end
       (do
@@ -1734,6 +1760,16 @@
 (defn trace-skip-spaces! [(state (mut ParseState))
                          (source (slice u8))
                          (at i64)] (-> i64)
+  (if (not (.tracing state))
+      (let [(mut end) at]
+        (loop (let [next
+                      (if (input-visible-at? state (load end))
+                          (match-space source (load end))
+                          -1)]
+                (if (< next 0)
+                    (break)
+                    (set! end next))))
+        (load end))
   (let [spaces-event (trace-enter! (mut state) "spaces" at)
         _ (trace-set-implicit-spaces! (mut state) spaces-event)
         _ (trace-set-memoized! (mut state) spaces-event)
@@ -1816,12 +1852,15 @@
       (trace-set-trace-only-binding! (mut state) star-event iteration-node)
       (trace-exit! (mut state) spaces-event (load end))
       (trace-set-trace-only-binding! (mut state) spaces-event spaces-node)
-      (load end))))
+      (load end)))))
 
 (defn record-expectation! [(state (mut ParseState))
                            (at i64)
                            (text (slice u8))
                            (type i64)] (-> i64)
+  (if (parse-state-batch-direct? state)
+      -1
+      (do
   (note-failure-examined! (mut state) at)
   (if (> at (.farthest state))
       (do
@@ -1852,11 +1891,14 @@
               (push! (mut (.expectations state)) (load expectation)))
             0))
       0)
-  -1)
+  -1)))
 
 (defn merge-recorded-expectation! [(state (mut ParseState))
                                    (at i64)
                                    (expectation Expectation)] (-> i64)
+  (if (parse-state-batch-direct? state)
+      -1
+      (do
   (note-failure-examined! (mut state) at)
   (if (> at (.farthest state))
       (do
@@ -1884,7 +1926,7 @@
             (push! (mut (.expectations state)) expectation)
             0))
       0)
-  -1)
+  -1)))
 
 (defn failure-order-mark [(state (ptr ParseState))] (-> i64)
   (.next-expectation-order state))
@@ -1900,13 +1942,17 @@
       0)
   0)
 
-(defn failure-snapshot [(state (ptr ParseState))] (-> FailureSnapshot)
+(defn failure-snapshot :inline (Always) [(state (ptr ParseState))] (-> FailureSnapshot)
   (let [(mut snapshot) (primitive/zeroed FailureSnapshot)]
-    (set! (.expectations snapshot) (al/al-new [Expectation] (.allocator state)))
-    (for expectation
-      (iter (.expectations state))
-      (push! (mut (.expectations snapshot)) expectation))
-    (set! (.farthest snapshot) (.farthest state))
+    (set! (.batch snapshot) (parse-state-batch-direct? state))
+    (if (not (.batch snapshot))
+        (do
+          (set! (.expectations snapshot) (al/al-new [Expectation] (.allocator state)))
+          (for expectation
+            (iter (.expectations state))
+            (push! (mut (.expectations snapshot)) expectation))
+          (set! (.farthest snapshot) (.farthest state)))
+        0)
     (load snapshot)))
 
 (defn begin-failure-scope! [(state (mut ParseState))] (-> FailureSnapshot)
@@ -1920,41 +1966,48 @@
 (defn finish-failure-scope! [(state (mut ParseState))
                              (outer (mut FailureSnapshot))
                              (end i64)] (-> i64)
-  (let [(mut inner) (failure-snapshot state)]
-    (if (and (>= end 0) (= end (.farthest inner)))
-        (for [index 0 (len (.expectations inner))]
-          (set! (.fluffy (al/al-elem [Expectation]
-                                      (mut (.expectations inner))
-                                      index))
-                true))
-        0)
-    (restore-failures! (mut state) (mut outer))
-    (for expectation
-      (iter (.expectations inner))
-      (merge-recorded-expectation! (mut state) (.farthest inner) expectation))
-    (al/al-free! (mut (.expectations inner)))
-    end))
+  (if (.batch outer)
+      end
+      (let [(mut inner) (failure-snapshot state)]
+        (if (and (>= end 0) (= end (.farthest inner)))
+            (for [index 0 (len (.expectations inner))]
+              (set! (.fluffy (al/al-elem [Expectation]
+                                          (mut (.expectations inner))
+                                          index))
+                    true))
+            0)
+        (restore-failures! (mut state) (mut outer))
+        (for expectation
+          (iter (.expectations inner))
+          (merge-recorded-expectation! (mut state) (.farthest inner) expectation))
+        (al/al-free! (mut (.expectations inner)))
+        end)))
 
-(defn restore-failures! [(state (mut ParseState))
+(defn restore-failures! :inline (Always) [(state (mut ParseState))
                          (snapshot (mut FailureSnapshot))] (-> i64)
-  (loop (if (= (len (.expectations state)) 0)
-            (break)
-            (pop! (mut (.expectations state)))))
-  (for expectation
-    (iter (.expectations snapshot))
-    (push! (mut (.expectations state)) expectation))
-  (set! (.farthest state) (.farthest snapshot))
-  (al/al-free! (mut (.expectations snapshot)))
+  (if (not (.batch snapshot))
+      (do
+        (loop (if (= (len (.expectations state)) 0)
+                  (break)
+                  (pop! (mut (.expectations state)))))
+        (for expectation
+          (iter (.expectations snapshot))
+          (push! (mut (.expectations state)) expectation))
+        (set! (.farthest state) (.farthest snapshot))
+        (al/al-free! (mut (.expectations snapshot))))
+      0)
   0)
 
-(defn discard-failure-snapshot! [(snapshot (mut FailureSnapshot))] (-> i64)
-  (al/al-free! (mut (.expectations snapshot)))
+(defn discard-failure-snapshot! :inline (Always) [(snapshot (mut FailureSnapshot))] (-> i64)
+  (if (not (.batch snapshot))
+      (al/al-free! (mut (.expectations snapshot)))
+      0)
   0)
 
-(defn current-frame [(state (ptr ParseState))] (-> (ptr CstFrame))
+(defn current-frame :inline (Always) [(state (ptr ParseState))] (-> (ptr CstFrame))
   (al/al-elem [CstFrame] (field state frames) (- (len (.frames state)) 1)))
 
-(defn begin-rule! [(state (mut ParseState))] (-> i64)
+(defn begin-rule! :inline (Always) [(state (mut ParseState))] (-> i64)
   (let [(mut frame) (primitive/zeroed CstFrame)]
     (set! (.first-child frame) -1)
     (set! (.last-child frame) -1)
@@ -1962,20 +2015,20 @@
     (push! (mut (.frames state)) (load frame))
     (len (.nodes state))))
 
-(defn rollback-nodes! [(state (mut ParseState)) (count i64)] (-> i64)
+(defn rollback-nodes! :inline (Always) [(state (mut ParseState)) (count i64)] (-> i64)
   (loop (if (<= (len (.nodes state)) count)
             (break)
             (pop! (mut (.nodes state)))))
   0)
 
-(defn fail-rule! [(state (mut ParseState)) (checkpoint i64) (at i64)] (-> i64)
+(defn fail-rule! :inline (Always) [(state (mut ParseState)) (checkpoint i64) (at i64)] (-> i64)
   (rollback-nodes! (mut state) checkpoint)
   (let [frame (current-frame state)]
     (restore-indentation-changes! (mut state) (.indentation-change-count frame)))
   (pop! (mut (.frames state)))
   -1)
 
-(defn attach-child! [(state (mut ParseState)) (child i64)] (-> i64)
+(defn attach-child! :inline (Always) [(state (mut ParseState)) (child i64)] (-> i64)
   (if (= (len (.frames state)) 0)
       (set! (.root state) child)
       (let [frame (current-frame state)]
@@ -1988,7 +2041,38 @@
         (set! (.last-child frame) child)))
   child)
 
-(defn succeed-rule! [(state (mut ParseState))
+;; Batch parsing has already reserved the node arena and does not need a frame
+;; merely to wrap one terminal in one named built-in node. Keep this operation
+;; together so the generated machine code performs two contiguous appends and
+;; one attachment to the enclosing frame.
+(defn record-terminal-rule-pair! :inline (Always) [(state (mut ParseState))
+                                                   (rule (slice u8))
+                                                   (start i64)
+                                                   (end i64)] (-> i64)
+  (let [terminal-index (len (.nodes state))
+        (mut terminal) (primitive/zeroed CstNode)
+        (mut rule-node) (primitive/zeroed CstNode)]
+    (set! (.id terminal) (next-node-id! (mut state)))
+    (set! (.rule terminal) "_terminal")
+    (set! (.start terminal) start)
+    (set! (.end terminal) end)
+    (set! (.first-child terminal) -1)
+    (set! (.last-child terminal) -1)
+    (set! (.next-sibling terminal) -1)
+    (push! (mut (.nodes state)) (load terminal))
+    (set! (.id rule-node) (next-node-id! (mut state)))
+    (set! (.rule rule-node) rule)
+    (set! (.start rule-node) start)
+    (set! (.end rule-node) end)
+    (set! (.first-child rule-node) terminal-index)
+    (set! (.last-child rule-node) terminal-index)
+    (set! (.next-sibling rule-node) -1)
+    (let [rule-index (len (.nodes state))]
+      (push! (mut (.nodes state)) (load rule-node))
+      (attach-child! (mut state) rule-index)
+      end)))
+
+(defn succeed-rule! :inline (Always) [(state (mut ParseState))
                      (rule (slice u8))
                      (start i64)
                      (end i64)] (-> i64)
@@ -2141,12 +2225,16 @@
       0)
   (alloc/abort))
 
-(defn push-application! [(state (mut ParseState)) (application (slice u8))] (-> i64)
-  (push! (mut (.applications state)) application)
+(defn push-application! :inline (Always) [(state (mut ParseState)) (application (slice u8))] (-> i64)
+  (if (parse-state-batch-direct? state)
+      0
+      (push! (mut (.applications state)) application))
   0)
 
-(defn pop-application! [(state (mut ParseState))] (-> i64)
-  (pop! (mut (.applications state)))
+(defn pop-application! :inline (Always) [(state (mut ParseState))] (-> i64)
+  (if (parse-state-batch-direct? state)
+      0
+      (do (pop! (mut (.applications state))) 0))
   0)
 
 (defn unknown-start-rule [(rule (slice u8))] (-> i64)
@@ -3892,7 +3980,7 @@
             (attach-child! (mut state) (+ destination-start (.root-offset entry)))
             (.best-end entry))))))
 
-(defn record-terminal! [(state (mut ParseState)) (start i64) (end i64)] (-> i64)
+(defn record-terminal! :inline (Always) [(state (mut ParseState)) (start i64) (end i64)] (-> i64)
   (let [(mut node) (primitive/zeroed CstNode)
         index (len (.nodes state))]
     (set! (.id node) (next-node-id! (mut state)))
@@ -3917,6 +4005,100 @@
   (if (< end 0)
       (record-expectation! (mut state) start expected type)
       (record-terminal! (mut state) start end)))
+
+(defn match-not-bytes-any-cst-fast! [(state (mut ParseState))
+                                     (source (slice u8))
+                                     (at i64)
+                                     (excluded-a i64)
+                                     (excluded-b i64)] (-> i64)
+  (let [byte (byte-at source at)]
+    (if (or (< byte 0) (or (= byte excluded-a) (= byte excluded-b)))
+        -1
+        (match-any-rule-cst! (mut state) source at))))
+
+(defn match-not-bytes-any-iteration-cst-fast! [(state (mut ParseState))
+                                               (source (slice u8))
+                                               (at i64)
+                                               (excluded-a i64)
+                                               (excluded-b i64)] (-> i64)
+  (let [checkpoint (begin-rule! (mut state))
+        (mut cursor) at
+        (mut first-root) -1
+        (mut last-root) -1
+        (mut node-id) (.next-node-id state)]
+    (loop (let [byte (byte-at source (load cursor))]
+            (if (or (< byte 0)
+                    (or (= byte excluded-a) (= byte excluded-b)))
+                (break)
+                (let [start (load cursor)
+                      next (if (< byte 128) (+ start 1) (match-any source start))]
+                  (if (< next 0)
+                      (break)
+                      (let [terminal-index (len (.nodes state))
+                            any-index (+ terminal-index 1)
+                            (mut nodes) (mut (field state nodes))
+                            terminal (primitive/index
+                                       (load (field nodes data))
+                                       terminal-index)
+                            any-node (primitive/index
+                                       (load (field nodes data))
+                                       any-index)]
+                        ;; `prepare-batch-state!` reserves four nodes per input
+                        ;; byte, while this loop emits exactly two. Write each
+                        ;; node once in its final arena slot instead of zeroing
+                        ;; stack temporaries and copying them into the list.
+                        (store! (field terminal id) (load node-id))
+                        (set! node-id (+ (load node-id) 1))
+                        (store! (field terminal rule) "_terminal")
+                        (store! (field terminal start) start)
+                        (store! (field terminal end) next)
+                        (store! (field terminal first-child) -1)
+                        (store! (field terminal last-child) -1)
+                        (store! (field terminal next-sibling) -1)
+                        (store! (field terminal optional) false)
+                        (store! (field any-node id) (load node-id))
+                        (set! node-id (+ (load node-id) 1))
+                        (store! (field any-node rule) "any")
+                        (store! (field any-node start) start)
+                        (store! (field any-node end) next)
+                        (store! (field any-node first-child) terminal-index)
+                        (store! (field any-node last-child) terminal-index)
+                        (store! (field any-node next-sibling) -1)
+                        (store! (field any-node optional) false)
+                        (store! (field nodes len) (+ terminal-index 2))
+                          (if (< (load first-root) 0)
+                              (set! first-root any-index)
+                              (set! (.next-sibling (al/al-elem [CstNode]
+                                                               (field state nodes)
+                                                               (load last-root)))
+                                    any-index))
+                          (set! last-root any-index)
+                          (set! cursor next)))))))
+    (let [frame (current-frame state)]
+      (set! (.first-child frame) (load first-root))
+      (set! (.last-child frame) (load last-root)))
+    (set! (.next-node-id state) (load node-id))
+    (succeed-rule! (mut state) "_iter" at (load cursor))))
+
+(defn match-digit-iteration-cst-fast! [(state (mut ParseState))
+                                       (source (slice u8))
+                                       (at i64)] (-> i64)
+  (let [checkpoint (begin-rule! (mut state))
+        (mut cursor) at
+        (mut count) 0]
+    (loop (let [end (match-digit source (load cursor))]
+            (if (< end 0)
+                (break)
+                (do
+                  (record-terminal-rule-pair! (mut state)
+                                              "digit"
+                                              (load cursor)
+                                              end)
+                  (set! cursor end)
+                  (set! count (+ (load count) 1))))))
+    (if (= (load count) 0)
+        (fail-rule! (mut state) checkpoint at)
+        (succeed-rule! (mut state) "_iter" at (load cursor)))))
 
 (defn trace-primitive-match! [(state (mut ParseState))
                               (display (slice u8))
@@ -3965,7 +4147,7 @@
           (record-terminal! (mut state) start end)
           (trace-exit! (mut state) event end)))))
 
-(defn match-literal-cst! [(state (mut ParseState))
+(defn match-literal-cst! :inline (Always) [(state (mut ParseState))
                           (source (slice u8))
                           (at i64)
                           (literal (slice u8))] (-> i64)
@@ -3989,7 +4171,7 @@
                         (literal-examined-end source at literal)))
     (matched-expected-terminal! (mut state) at end expected 1)))
 
-(defn match-range-cst! [(state (mut ParseState))
+(defn match-range-cst! :inline (Always) [(state (mut ParseState))
                         (source (slice u8))
                         (at i64)
                         (lo i64)
@@ -4117,13 +4299,17 @@
 
 (defn match-digit-cst! [(state (mut ParseState)) (source (slice u8)) (at i64)] (-> i64)
   (let [end (if (input-visible-at? state at) (match-digit source at) -1)]
-    (match-traced-builtin-result! (mut state)
-                                  "digit"
-                                  "a digit"
-                                  "\"0\"..\"9\""
-                                  at
-                                  end
-                                  (primitive-examined-end source at))))
+    (if (parse-state-batch-direct? state)
+        (if (< end 0)
+            -1
+            (record-terminal-rule-pair! (mut state) "digit" at end))
+        (match-traced-builtin-result! (mut state)
+                                      "digit"
+                                      "a digit"
+                                      "\"0\"..\"9\""
+                                      at
+                                      end
+                                      (primitive-examined-end source at)))))
 
 (defn match-digit-node! [(state (mut ParseState)) (source (slice u8)) (at i64)] (-> i64)
   (let [end (if (input-visible-at? state at) (match-digit source at) -1)]
@@ -4296,12 +4482,17 @@
         (do (record-expectation! (mut state) at "end of input" 1) -1)
         end)))
 
-(defn match-any-rule-cst! [(state (mut ParseState)) (source (slice u8)) (at i64)] (-> i64)
-  (let [checkpoint (begin-rule! (mut state))
-        end (match-any-cst! (mut state) source at)]
-    (if (< end 0)
-        (fail-rule! (mut state) checkpoint at)
-        (succeed-rule! (mut state) "any" at end))))
+(defn match-any-rule-cst! :inline (Always) [(state (mut ParseState)) (source (slice u8)) (at i64)] (-> i64)
+  (if (and (parse-state-batch-direct? state) (= (indentation-token-at state at) 0))
+      (let [end (match-any source at)]
+        (if (< end 0)
+            -1
+            (record-terminal-rule-pair! (mut state) "any" at end)))
+      (let [checkpoint (begin-rule! (mut state))
+            end (match-any-cst! (mut state) source at)]
+        (if (< end 0)
+            (fail-rule! (mut state) checkpoint at)
+            (succeed-rule! (mut state) "any" at end)))))
 
 (defn match-indentation-cst! [(state (mut ParseState))
                               (at i64)
@@ -5256,7 +5447,9 @@
       (str/sb-push-str! (mut message) expected)
       (own-result-text! (mut state) (str/sb-finish! (mut message))))))
 
-(defn finish-match [(state (mut ParseState)) (source (slice u8)) (end i64)] (-> MatchResult)
+(defn finish-match-detailed [(state (mut ParseState))
+                             (source (slice u8))
+                             (end i64)] (-> MatchResult)
   (let [expected-text (build-expected-text! (mut state))
         info (failure-line-column source (.farthest state))
         short-message (build-short-message! (mut state) info expected-text)
@@ -5324,6 +5517,56 @@
     (al/al-free! (mut (.indentation-changes state)))
     (load result)))
 
+(defn finish-match-batch-success [(state (mut ParseState))
+                                  (source (slice u8))
+                                  (end i64)] (-> MatchResult)
+  (let [(mut result) (primitive/zeroed MatchResult)]
+    (set! (.source result) source)
+    (set! (.nodes result) (.nodes state))
+    (set! (.trace-nodes result) (.trace-nodes state))
+    (set! (.trace-node-base result) (+ (len (.nodes state)) 1))
+    (set! (.owned-names result) (.owned-names state))
+    (set! (.failures result) (.expectations state))
+    (set! (.trace-events result) (.trace-events state))
+    (set! (.allocator result) (.allocator state))
+    (set! (.expected-text result) "")
+    (set! (.short-message result) "")
+    (set! (.message result) "")
+    (set! (.failure-line result) 0)
+    (set! (.failure-column result) 0)
+    (set! (.grammar-name result) (.grammar-name state))
+    (set! (.grammar-token result) (.grammar-token state))
+    (set! (.grammar-names result) (.grammar-names state))
+    (set! (.semantic-rules result) (.semantic-rules state))
+    (set! (.root result) (.root state))
+    (set! (.end result) end)
+    (set! (.succeeded result) true)
+    (set! (.failure-position result) -1)
+    (al/al-free! (mut (.frames state)))
+    (al/al-free! (mut (.memo state)))
+    (al/al-free! (mut (.memo-nodes state)))
+    (al/al-free! (mut (.memo-expectations state)))
+    (al/al-free! (mut (.memo-trace-events state)))
+    (al/al-free! (mut (.stable-identities state)))
+    (al/al-free! (mut (.applications state)))
+    (al/al-free! (mut (.start-arguments state)))
+    (al/al-free! (mut (.start-argument-frame-starts state)))
+    (al/al-free! (mut (.start-expressions state)))
+    (al/al-free! (mut (.start-expression-children state)))
+    (al/al-free! (mut (.trace-stack state)))
+    (al/al-free! (mut (.examined-stack state)))
+    (al/al-free! (mut (.failure-examined-stack state)))
+    (al/al-free! (mut (.indentation-tokens state)))
+    (al/al-free! (mut (.indentation-changes state)))
+    (load result)))
+
+(defn finish-match [(state (mut ParseState))
+                    (source (slice u8))
+                    (end i64)] (-> MatchResult)
+  (if (and (parse-state-batch-direct? state) (>= end 0))
+      (finish-match-batch-success (mut state) source end)
+      (finish-match-detailed (mut state) source end)))
+
 (defn memo-examined-end-for-rule-name [(state (ptr ParseState))
                                        (rule-name (slice u8))
                                        (start i64)] (-> i64)
@@ -5384,8 +5627,9 @@
   (al/al-free! (mut (.stable-identities cache)))
   (set! (.stable-identities cache)
         (al/al-new [StableNodeIdentity] (.allocator cache)))
-  (let [(mut paths) (al/al-new [i64] (.allocator state))
-        _ (compute-parse-state-node-paths! state (mut paths))]
+  (if (not (parse-state-batch-direct? state))
+      (let [(mut paths) (al/al-new [i64] (.allocator state))
+            _ (compute-parse-state-node-paths! state (mut paths))]
     (for [node-index 0 (len (.nodes state))]
       (let [path (get (load paths) node-index)]
         (if (>= path 0)
@@ -5439,7 +5683,8 @@
               (set! (.id identity) (.id candidate))
               (push! (mut (.stable-identities cache)) (load identity)))
             0))))
-    (al/al-free! (mut paths)))
+        (al/al-free! (mut paths)))
+      0)
   (set! (.memo cache) (.memo state))
   (set! (.memo-nodes cache) (.memo-nodes state))
   (set! (.memo-expectations cache) (.memo-expectations state))
