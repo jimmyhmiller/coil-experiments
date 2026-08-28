@@ -15,6 +15,7 @@ fi
 for case in tests/borrow-checker/borrow_then_move.coil \
             tests/borrow-checker/branch_move.coil \
             tests/borrow-checker/conflicting_borrow.coil \
+            tests/borrow-checker/direct_owner_field.coil \
             tests/borrow-checker/escape_aggregate.coil \
             tests/borrow-checker/escape_call.coil \
             tests/borrow-checker/escape_return.coil \

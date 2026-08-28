@@ -35,6 +35,9 @@ The safe policy also rejects raw allocation/free, aliasing primitives, inline
 LLVM, indirect calls, and unannotated foreign calls. Put the smallest audited
 operation—not an entire function—inside `unsafe-borrow` when interoperability
 requires one of those proof boundaries.
+`experiments.borrow-checker.runtime` is the implementation/unsafe module; normal
+programs import only `experiments.borrow-checker.borrow-checker`. Importing the
+runtime directly is equivalent to entering an unsafe implementation boundary.
 
 One current Coil compiler defect requires a conservative rule: bind-and-match
 of an owned `Option` or `Result` is rejected because upstream cleanup presently
