@@ -1,0 +1,404 @@
+(module openai-responses)
+
+(import "coil.primitive" :as primitive)
+
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.match" :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "harness-event" :use *)
+(import "harness-json" :use *)
+(import "harness-model" :use *)
+(import "harness-tool" :use *)
+(import "harness-http" :use *)
+(import "harness-sse" :use *)
+(import "harness-system" :use *)
+(import "provider-common" :use *)
+
+(defn openai-latest-user-input [(allocator (dyn Allocator))
+                                (request (ptr ModelRequest))] (-> Json)
+  (let [messages (load (field request messages))
+        (mut i) (al-len [Message] (load messages))
+        (mut content) ""]
+    (loop (if (<= (load i) 0)
+              (break)
+              (do
+                (set! i (- (load i) 1))
+                (let [message (al-get [Message] (load messages) (load i))]
+                  (match (.role message)
+                    (UserRole [] (do (set! content (.content message)) (break)))
+                    (SystemRole [] 0)
+                    (AssistantRole [] 0))))))
+    (let [(mut item) (json-object allocator)
+          (mut input) (json-array allocator)]
+      (json-put-string! (mut item) "role" "user")
+      (json-put-string! (mut item) "content" (load content))
+      (json-array-push! (mut input) (load item))
+      (load input))))
+
+(defstruct OpenAIResponsesContext
+  [(endpoint (slice u8))
+   (credential ApiCredential)
+   (transport (dyn StreamingHttpTransport))])
+
+(defn openai-context-default [(allocator (dyn Allocator))] (-> OpenAIResponsesContext)
+  (let [context (primitive/alloc-stack OpenAIResponsesContext)]
+    (set! (.endpoint context) "https://api.openai.com/v1/responses")
+    (set! (.primary-env (.credential context)) c"OPENAI_API_KEY")
+    (set! (.fallback-env (.credential context)) c"OPENAI_KEY")
+    (store! (field context transport)
+            (box! allocator CurlStreamingHttpTransport (zeroed CurlStreamingHttpTransport)))
+    (load context)))
+
+(defn openai-tool-results [(allocator (dyn Allocator)) (results (ptr (ArrayList ToolResult)))] (-> Json)
+  (let [(mut input) (json-array allocator)
+        (mut i) 0
+        n (al-len [ToolResult] (load results))]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [result (al-get [ToolResult] (load results) (load i))
+                    (mut item) (json-object allocator)
+                    output
+                      (match (.status result)
+                        (ToolSucceeded [] (json-stringify allocator (.output result)))
+                        (ToolErrored [] (.error result))
+                        (ToolDenied [] (.error result))
+                        (ToolUnknown [] (.error result)))]
+                (json-put-string! (mut item) "type" "function_call_output")
+                (json-put-string! (mut item) "call_id" (.call-id result))
+                (json-put-string! (mut item) "output" output)
+                (json-array-push! (mut input) (load item))
+                (set! i (+ (load i) 1)))))
+    (load input)))
+
+;; Translate the common model request into the current Responses API shape.
+(defn openai-request-json-with-output-limit [(allocator (dyn Allocator))
+                                             (request (ptr ModelRequest))
+                                             (include-output-limit bool)] (-> Json)
+  (let [(mut body) (json-object allocator)
+        continuation (field request continuation)]
+    (json-put-string! (mut body) "model" (.model request))
+    (when (> (slice-len [u8] (load (field request instructions))) 0)
+      (json-put-string! (mut body) "instructions" (load (field request instructions)))
+      0)
+    (if (.present continuation)
+        (do
+          (json-put-string! (mut body)
+                            "previous_response_id"
+                            (.previous-response-id continuation))
+          (let [(mut input)
+                  (if (= (load (field continuation tool-results))
+                         (cast (ptr (ArrayList ToolResult)) 0))
+                      (openai-latest-user-input allocator request)
+                      (openai-tool-results allocator
+                                           (load (field continuation tool-results))))]
+            ;; Anything a person said since the last turn rides along with it.
+            (push-interjection! allocator (mut input) continuation)
+            (json-object-put! (mut body) "input" (load input))))
+        (json-object-put! (mut body)
+                          "input"
+                          (messages-wire allocator (load (field request messages)))))
+    (when (> (al-len [ToolDefinition]
+                     (load (field (load (field request tools)) definitions)))
+             0)
+      (json-object-put! (mut body)
+                        "tools"
+                        (tool-registry-wire allocator
+                                            (load (field request tools))
+                                            TOOL_LAYOUT_RESPONSES))
+      (json-object-put! (mut body)
+                        "tool_choice"
+                        (tool-choice-responses allocator
+                                               (load (field request tool-choice))))
+      (json-put-bool! (mut body)
+                      "parallel_tool_calls"
+                      (load (field request parallel-tool-calls)))
+      0)
+    (let [(mut reasoning) (json-object allocator)]
+      (json-put-string! (mut reasoning)
+                        "effort"
+                        (.reasoning request))
+      (json-object-put! (mut body) "reasoning" (load reasoning)))
+    (when (and include-output-limit
+               (> (load (field request max-output-tokens)) 0))
+      (json-object-put! (mut body)
+                        "max_output_tokens"
+                        (json-integer allocator
+                                      (load (field request max-output-tokens))))
+      0)
+    (json-put-bool! (mut body) "store" true)
+    (json-put-bool! (mut body) "stream" true)
+    (load body)))
+
+(defn openai-request-json [(allocator (dyn Allocator)) (request (ptr ModelRequest))] (-> Json)
+  (openai-request-json-with-output-limit allocator request true))
+
+(defn openai-usage [(root Json)] (-> ModelUsage)
+  (let [usage (primitive/alloc-stack ModelUsage)
+        wire (json-get root "usage")]
+    (set! (.input-tokens usage) (json-number-i64 (json-get wire "input_tokens")))
+    (set! (.output-tokens usage) (json-number-i64 (json-get wire "output_tokens")))
+    (set! (.reasoning-tokens usage)
+          (json-number-i64 (json-get (json-get wire "output_tokens_details") "reasoning_tokens")))
+    (set! (.cached-input-tokens usage)
+          (json-number-i64 (json-get (json-get wire "input_tokens_details") "cached_tokens")))
+    (set! (.cache-write-tokens usage)
+          (json-number-i64 (json-get (json-get wire "input_tokens_details") "cache_write_tokens")))
+    (load usage)))
+
+(defn openai-parse-response [(allocator (dyn Allocator)) (root Json)] (-> ModelResponse)
+  (let [(mut response) (response-empty allocator)
+        (mut text) (sb-new allocator)
+        output (json-get root "output")
+        (mut i) 0
+        count (json-array-length output)]
+    (set! (.provider response) "openai-responses")
+    (set! (.response-id response) (match (json-string-at root "id") (Some [id] id) (None [] "")))
+    (set! (.model response) (match (json-string-at root "model") (Some [model] model) (None [] "")))
+    (loop (if (>= (load i) count)
+              (break)
+              (let [item (json-array-get output (load i))
+                    kind
+                      (match (json-string-at item "type")
+                        (Some [value] value)
+                        (None [] ""))]
+                (cond (= kind "function_call")
+                        (let [id
+                                (match (json-string-at item "call_id")
+                                  (Some [value] value)
+                                  (None [] ""))
+                              name
+                                (match (json-string-at item "name")
+                                  (Some [value] value)
+                                  (None [] ""))
+                              arguments
+                                (match (json-string-at item "arguments")
+                                  (Some [value] value)
+                                  (None [] "{}"))]
+                          (al-push! [ToolCall]
+                                    (mut (field response tool-calls))
+                                    (parsed-tool-call allocator id name arguments)))
+                      (= kind "message")
+                        (let [content (json-get item "content")
+                              (mut j) 0
+                              content-count (json-array-length content)]
+                          (loop (if (>= (load j) content-count)
+                                    (break)
+                                    (let [part (json-array-get content (load j))]
+                                      (match (json-string-at part "text")
+                                        (Some [value] (sb-push-str! (mut text) value))
+                                        (None [] 0))
+                                      (store! j (+ (load j) 1))))))
+                      :else 0)
+                (set! i (+ (load i) 1)))))
+    (set! (.output-text response) (sb-finish! (mut text)))
+    (set! (.usage response) (openai-usage root))
+    (set! (.raw-output response) root)
+    (load response)))
+
+(defn openai-event [(emitter (ptr EventEmitter))
+                    (request (ptr ModelRequest))
+                    (kind EventKind)
+                    (payload Json)] (-> i64)
+  (emit-event emitter
+              (now-ms)
+              kind
+              (.run-id request)
+              (.operation-id request)
+              ""
+              "openai-responses"
+              (.model request)
+              payload))
+
+(defstruct OpenAIStreamState
+  [(allocator (dyn Allocator))
+   (request (ptr ModelRequest))
+   (emitter (ptr EventEmitter))
+   (completed bool)
+   (failed bool)
+   (response Json)])
+
+(impl SseEventSink OpenAIStreamState
+  (consume-sse-event [(self (ptr OpenAIStreamState))
+                      (event-name (slice u8))
+                      (data (slice u8))]
+                     (-> bool)
+                     (if (model-request-cancelled? (load (field self request)))
+                         false
+                         (if (str-eq data "[DONE]")
+                             true
+                             (let [parsed (json-parse (load (field self allocator)) data)]
+                               (if (not (.ok parsed))
+                                   (do (set! (.failed self) true) false)
+                                   (let [wire (.value parsed)
+                                         kind
+                                           (if (> (slice-len [u8] event-name) 0)
+                                               event-name
+                                               (match (json-string-at wire "type")
+                                                 (Some [value] value)
+                                                 (None [] "")))]
+                                     (cond (str-eq kind "response.output_text.delta")
+                                             (match (json-string-at wire "delta")
+                                               (Some [delta]
+                                                     (do
+                                                       (openai-event (load (field self emitter))
+                                                                     (load (field self request))
+                                                                     (ModelResponseDelta)
+                                                                     (JsonString delta))
+                                                       true))
+                                               (None [] true))
+                                           (str-eq kind "response.completed")
+                                             (let [owned
+                                                     (concat-or-empty (load (field self allocator))
+                                                                      ""
+                                                                      data)
+                                                   retained
+                                                     (json-parse (load (field self allocator))
+                                                                 owned)]
+                                               (if (load (field retained ok))
+                                                   (do
+                                                     (store! (field self response)
+                                                             (json-get (load (field retained value))
+                                                                       "response"))
+                                                     (store! (field self completed) true)
+                                                     true)
+                                                   (do
+                                                     (store! (field self failed) true)
+                                                     false)))
+                                           (str-eq kind "response.failed") (do (store! (field self failed) true) false)
+                                           :else true))))))))
+
+(defn openai-execute-stream [(context (ptr OpenAIResponsesContext))
+                             (request (ptr ModelRequest))
+                             (emitter (ptr EventEmitter))
+                             (allocator (dyn Allocator))] (-> ModelResult)
+  (let [key (api-key allocator (.credential context))]
+    (if (= (slice-len [u8] key) 0)
+        (model-failure "openai-responses" 0 "OPENAI_API_KEY or OPENAI_KEY is not set")
+        (let [headers
+                (box! allocator
+                     (ArrayList (slice u8))
+                     (al-new [(slice u8)] allocator))
+              authorization (concat-or-empty allocator "Authorization: Bearer " key)
+              state (primitive/alloc-stack OpenAIStreamState)
+              decoder (primitive/alloc-stack SseDecoder)
+              http-request (primitive/alloc-stack HttpRequest)]
+          (al-push! [(slice u8)] headers "Content-Type: application/json")
+          (al-push! [(slice u8)] headers "Accept: text/event-stream")
+          (al-push! [(slice u8)] headers authorization)
+          (set! (.allocator state) allocator)
+          (set! (.request state) request)
+          (set! (.emitter state) emitter)
+          (set! (.completed state) false)
+          (set! (.failed state) false)
+          (set! (.response state) (JsonNull))
+          (set! decoder (sse-decoder-new allocator state 1048576))
+          (set! (.url http-request) (.endpoint context))
+          (set! (.headers http-request) headers)
+          (set! (.body http-request) (json-stringify allocator (openai-request-json allocator request)))
+          (set! (.timeout-ms http-request) (model-request-remaining-ms request))
+          (set! (.cancellation http-request) (load (field request cancellation)))
+          (set! (.context (.chunks http-request)) (cast (ptr i8) decoder))
+          (set! (.consume (.chunks http-request)) (fnptr-of sse-http-chunk))
+          (openai-event emitter request (ModelRequestStarted) (JsonNull))
+          (let [http
+                  (streaming-http-send (.transport context)
+                                       allocator
+                                       http-request)
+                status (.status-code http)]
+            (sse-decoder-free! decoder)
+            (if (or (!= (.transport-code http) 0)
+                    (< status 200)
+                    (>= status 300)
+                    (.failed state)
+                    (not (.completed state)))
+                (let [message
+                        (if (.failed state)
+                            "OpenAI stream failed"
+                            (if (or (< status 200) (>= status 300))
+                                "OpenAI streaming request returned an error"
+                                (.error http)))]
+                  (openai-event emitter request (ModelRequestFailed) (JsonString message))
+                  (model-failure "openai-responses" status message))
+                (let [(mut response) (openai-parse-response allocator (.response state))]
+                  (openai-event emitter
+                                request
+                                (ModelRequestCompleted)
+                                (model-completion-payload allocator request (mut response)))
+                  (ModelOk (load response)))))))))
+
+(defn openai-execute [(context (ptr OpenAIResponsesContext))
+                      (request (ptr ModelRequest))
+                      (emitter (ptr EventEmitter))
+                      (allocator (dyn Allocator))] (-> ModelResult)
+  (let [key (api-key allocator (.credential context))]
+    (if (= (slice-len [u8] key) 0)
+        (model-failure "openai-responses" 0 "OPENAI_API_KEY or OPENAI_KEY is not set")
+        (let [headers
+                (box! allocator
+                     (ArrayList (slice u8))
+                     (al-new [(slice u8)] allocator))
+              authorization (concat-or-empty allocator "Authorization: Bearer " key)]
+          (al-push! [(slice u8)] headers "Content-Type: application/json")
+          (al-push! [(slice u8)] headers authorization)
+          (let [wire (openai-request-json allocator request)
+                body (json-stringify allocator wire)
+                http-request (primitive/alloc-stack HttpRequest)]
+            (set! (.url http-request) (.endpoint context))
+            (set! (.headers http-request) headers)
+            (set! (.body http-request) body)
+            (set! (.timeout-ms http-request) (model-request-remaining-ms request))
+            (set! (.cancellation http-request) (load (field request cancellation)))
+            (set! (.context (.chunks http-request)) (cast (ptr i8) 0))
+            (set! (.consume (.chunks http-request)) (fnptr-of discard-http-chunk))
+            (openai-event emitter request (ModelRequestStarted) (JsonNull))
+            (let [http (http-post allocator http-request)]
+              (if (!= (.transport-code http) 0)
+                  (do
+                    (openai-event emitter
+                                  request
+                                  (ModelRequestFailed)
+                                  (JsonString (.error http)))
+                    (model-failure "openai-responses" 0 (.error http)))
+                  (let [parsed (json-parse allocator (.body http))]
+                    (if (not (.ok parsed))
+                        (do
+                          (openai-event emitter
+                                        request
+                                        (ModelRequestFailed)
+                                        (JsonString "OpenAI returned invalid JSON"))
+                          (model-failure "openai-responses"
+                                         (.status-code http)
+                                         "OpenAI returned invalid JSON"))
+                        (let [root (.value parsed)
+                              status (.status-code http)]
+                          (if (or (< status 200) (>= status 300))
+                              (let [message (json-error-message root (.body http))]
+                                (openai-event emitter
+                                              request
+                                              (ModelRequestFailed)
+                                              (JsonString message))
+                                (model-failure "openai-responses" status message))
+                              (let [(mut response) (openai-parse-response allocator root)]
+                                (openai-event emitter
+                                              request
+                                              (ModelRequestCompleted)
+                                              (model-completion-payload allocator request (mut response)))
+                                (ModelOk (load response))))))))))))))
+
+(impl ModelProvider OpenAIResponsesContext
+  (provider-name [(self (ptr OpenAIResponsesContext))]
+                 (-> (slice u8))
+                 "openai-responses")
+  (provider-capabilities [(self (ptr OpenAIResponsesContext))]
+                         (-> ProviderCapabilities)
+                         (provider-capabilities-for "openai-responses"))
+
+  (execute-model [(self (ptr OpenAIResponsesContext))
+                  (request (ptr ModelRequest))
+                  (emitter (ptr EventEmitter))
+                  (allocator (dyn Allocator))]
+                 (-> ModelResult)
+                 (openai-execute-stream self request emitter allocator)))

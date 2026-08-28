@@ -1,0 +1,316 @@
+(module experiments.markdown-agent.main)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.cancellation" :as cancellation)
+(import "coil.fs" :as fs)
+(import "coil.io" :use [println])
+(import "coil.match" :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+(import "coil.subprocess" :as subprocess)
+(import "coil.time" :as time)
+
+(extern rename :cc c [(ptr i8) (ptr i8)] (-> i32))
+(extern unlink :cc c [(ptr i8)] (-> i32))
+
+(const MAX-ATTEMPTS 5)
+(const OUTPUT-LIMIT 65536)
+(const AGENT-TIMEOUT-MS 600000)
+(const CHECK-TIMEOUT-MS 30000)
+
+(defstruct CommandResult
+  [(started bool)
+   (exit-code i64)
+   (stdout (slice u8))
+   (stderr (slice u8))])
+
+(defn arg-at [(argv (ptr (ptr i8))) (i i64)] (-> (slice u8))
+  (str/cstr->str (load (primitive/index argv i))))
+
+(defn append! [(out (mut str/StrBuf)) (value (slice u8))] (-> i64)
+  (str/sb-push-str! (mut out) value))
+
+(defn candidate-path [(a (dyn Allocator)) (target (slice u8))] (-> (slice u8))
+  (let [(mut out) (str/sb-new a)]
+    (append! (mut out) target)
+    (append! (mut out) ".candidate")
+    (str/sb-finish! (mut out))))
+
+(defn request-path [(a (dyn Allocator)) (candidate (slice u8))] (-> (slice u8))
+  (let [(mut out) (str/sb-new a)]
+    (append! (mut out) candidate)
+    (append! (mut out) ".request.md")
+    (str/sb-finish! (mut out))))
+
+(defn command-deadline [(timeout-ms i64)] (-> (Option time/Instant))
+  (match (time/duration-millis timeout-ms)
+    (Err [_] (None [time/Instant]))
+    (Ok [duration]
+      (match (time/deadline-after duration)
+        (Err [_] (None [time/Instant]))
+        (Ok [deadline] (Some deadline))))))
+
+(defn run-command [(a (dyn Allocator))
+                   (program (slice u8))
+                   (args (slice (slice u8)))
+                   (timeout-ms i64)] (-> CommandResult)
+  (let [out (primitive/alloc-stack subprocess/RunResult)
+        options (subprocess/run-options program
+                                        args
+                                        "."
+                                        OUTPUT-LIMIT
+                                        OUTPUT-LIMIT
+                                        (command-deadline timeout-ms)
+                                        (primitive/cast (ptr cancellation/Cancellation) 0)
+                                        (primitive/zeroed time/Duration))]
+    (match (subprocess/run a out options)
+      (Err [_] (CommandResult :started false :exit-code -1 :stdout "" :stderr ""))
+      (Ok [completed]
+        (let [code (match (.status completed)
+                     (subprocess/Exited [status] status)
+                     (subprocess/Signaled [signal] (+ 128 signal)))
+              result (CommandResult :started true
+                                    :exit-code code
+                                    :stdout (.stdout completed)
+                                    :stderr (.stderr completed))]
+          ;; Keep the captured buffers alive: they are allocated by `a`.  Only the
+          ;; small RunResult wrapper itself is caller-owned.
+          result)))))
+
+(defn generation-prompt [(a (dyn Allocator))
+                         (markdown-path (slice u8))
+                         (markdown (slice u8))
+                         (candidate (slice u8))
+                         (module-name (slice u8))
+                         (diagnostics (slice u8))] (-> (slice u8))
+  (let [(mut out) (str/sb-new a)]
+    (append! (mut out) "Generate a complete Coil module from the Markdown specification below. Work in the current repository. Read AGENTS.md and Coil.toml, inspect relevant Coil source for APIs and conventions, and do not use Python for production functionality. Write only the implementation artifact to `")
+    (append! (mut out) candidate)
+    (append! (mut out) "`. It must declare exactly `(module ")
+    (append! (mut out) module-name)
+    (append! (mut out) ")`. Do not write the final target; the build materializer promotes a verified candidate atomically. Use the available tools to inspect and edit the repository.\n\nSpecification path: ")
+    (append! (mut out) markdown-path)
+    (append! (mut out) "\n\n--- specification ---\n")
+    (append! (mut out) markdown)
+    (append! (mut out) "\n--- end specification ---\n")
+    (when (> (slice-len diagnostics) 0)
+      (append! (mut out) "\nThe previous candidate failed the authoritative Coil check. Correct every relevant error:\n\n")
+      (append! (mut out) diagnostics)
+      0)
+    (str/sb-finish! (mut out))))
+
+(defn check-source [(a (dyn Allocator))
+                    (coil (slice u8))
+                    (source (slice u8))] (-> CommandResult)
+  (let [args (primitive/alloc-stack (array (slice u8) 2))]
+    (store! (primitive/index args 0) "check")
+    (store! (primitive/index args 1) source)
+    (run-command a coil (slice-new [(slice u8)] (primitive/index args 0) 2) CHECK-TIMEOUT-MS)))
+
+(defn run-source [(a (dyn Allocator))
+                  (coil (slice u8))
+                  (source (slice u8))] (-> CommandResult)
+  (let [args (primitive/alloc-stack (array (slice u8) 2))]
+    (store! (primitive/index args 0) "run")
+    (store! (primitive/index args 1) source)
+    (run-command a coil (slice-new [(slice u8)] (primitive/index args 0) 2) CHECK-TIMEOUT-MS)))
+
+(defn run-agent [(a (dyn Allocator))
+                 (agent (slice u8))
+                 (model (slice u8))
+                 (request-path (slice u8))] (-> CommandResult)
+  (let [args (primitive/alloc-stack (array (slice u8) 2))]
+    (store! (primitive/index args 0) model)
+    (store! (primitive/index args 1) request-path)
+    (run-command a agent
+                 (slice-new [(slice u8)] (primitive/index args 0) 2)
+                 AGENT-TIMEOUT-MS)))
+
+(defn combined-diagnostics [(a (dyn Allocator)) (result CommandResult)] (-> (slice u8))
+  (let [(mut out) (str/sb-new a)]
+    (append! (mut out) (.stdout result))
+    (when (and (> (slice-len (.stdout result)) 0)
+               (> (slice-len (.stderr result)) 0))
+      (append! (mut out) "\n")
+      0)
+    (append! (mut out) (.stderr result))
+    (str/sb-finish! (mut out))))
+
+(defn missing-candidate-diagnostics [(a (dyn Allocator))
+                                     (result CommandResult)] (-> (slice u8))
+  (let [(mut out) (str/sb-new a)
+        agent-output (combined-diagnostics a result)]
+    (append! (mut out) "The agent completed without writing the required candidate file.")
+    (when (> (slice-len agent-output) 0)
+      (append! (mut out) " Its final output was:\n\n")
+      (append! (mut out) agent-output)
+      0)
+    (str/sb-finish! (mut out))))
+
+(defn whitespace? [(byte u8)] (-> bool)
+  (or (= byte (primitive/cast u8 32))
+      (or (= byte (primitive/cast u8 9))
+          (or (= byte (primitive/cast u8 10)) (= byte (primitive/cast u8 13))))))
+
+;; Generated modules have a deliberately stricter contract than general Coil
+;; sources: the first form must be their module declaration. This prevents an
+;; agent from accidentally producing a valid module under the wrong identity.
+(defn generated-module-name [(source (slice u8))] (-> (slice u8))
+  (let [n (slice-len source)
+        (mut at) 0
+        (mut start) -1]
+    (loop (if (or (>= (load at) n) (not (whitespace? (slice-get source (load at)))))
+              (break)
+              (store! at (+ (load at) 1))))
+    (if (or (> (+ (load at) 8) n)
+            (not (= (subslice source (load at) (+ (load at) 8)) "(module ")))
+        ""
+        (do
+          (store! at (+ (load at) 8))
+          (store! start (load at))
+          (loop (if (or (>= (load at) n)
+                        (= (slice-get source (load at)) (primitive/cast u8 41))
+                        (whitespace? (slice-get source (load at))))
+                    (break)
+                    (store! at (+ (load at) 1))))
+          (if (and (> (load at) (load start))
+                   (< (load at) n)
+                   (= (slice-get source (load at)) (primitive/cast u8 41)))
+              (subslice source (load start) (load at))
+              "")))))
+
+(defn materialize [(a (dyn Allocator))
+                   (markdown-path (slice u8))
+                   (target (slice u8))
+                   (module-name (slice u8))
+                   (consumer (slice u8))
+                   (agent (slice u8))
+                   (coil (slice u8))
+                   (model (slice u8))] (-> i64)
+  ;; A sibling Coil file is authoritative. This first version deliberately never
+  ;; overwrites one; generated-artifact ownership/invalidation will be added only
+  ;; with an explicit metadata contract.
+  (match (fs/read-file a target)
+    (Ok [_] (do (println "markdown-agent: using existing {s}" target) 0))
+    (Err [_]
+      (match (fs/read-file a markdown-path)
+        (Err [_] (do (println "markdown-agent: cannot read {s}" markdown-path) 66))
+        (Ok [markdown]
+          (let [candidate (candidate-path a target)
+                request-path (request-path a candidate)
+                (mut diagnostics) ""
+                (mut attempt) 0
+                (mut done) false
+                (mut status) 1]
+            (loop (if (or (load done) (>= (load attempt) MAX-ATTEMPTS))
+                      (break)
+                      (do
+                        (store! attempt (+ (load attempt) 1))
+                        (println "markdown-agent: generation attempt {d}/{d}" (load attempt) MAX-ATTEMPTS)
+                        ;; Every attempt must produce new evidence. Never accept a
+                        ;; candidate left behind by an earlier agent invocation.
+                        (unlink (str/str->cstr a candidate))
+                        (let [prompt (generation-prompt a markdown-path markdown candidate module-name (load diagnostics))
+                              request-written (fs/write-file a request-path prompt)]
+                          (if (match request-written (Ok [_] false) (Err [_] true))
+                              (do
+                                (println "markdown-agent: cannot write agent request {s}" request-path)
+                                (store! status 74)
+                                (store! done true))
+                              (let [agent-result (run-agent a agent model request-path)
+                                    _request-cleanup (unlink (str/str->cstr a request-path))]
+                                (if (not (.started agent-result))
+                              (do
+                                (println "markdown-agent: could not start agent runner {s}" agent)
+                                (store! status 69)
+                                (store! done true))
+                              (match (fs/read-file a candidate)
+                                (Err [_]
+                                  (store! diagnostics (missing-candidate-diagnostics a agent-result)))
+                                (Ok [candidate-source]
+                                  (if (not (= (generated-module-name candidate-source) module-name))
+                                      (store! diagnostics "The candidate's first form must be the exact required module declaration.")
+                                      (let [checked (check-source a coil candidate)]
+                                        (cond (not (.started checked))
+                                            (do
+                                              (println "markdown-agent: could not start Coil compiler {s}" coil)
+                                              (store! status 69)
+                                              (store! done true))
+                                          (= (.exit-code checked) 0)
+                                            (if (= (rename (str/str->cstr a candidate)
+                                                           (str/str->cstr a target)) 0)
+                                                (if (= consumer "-")
+                                                    (do
+                                                      (println "markdown-agent: typechecked and installed {s} (no contract)" target)
+                                                      (store! status 0)
+                                                      (store! done true))
+                                                    (let [consumer-check (check-source a coil consumer)]
+                                                  (cond (not (.started consumer-check))
+                                                          (do
+                                                            (rename (str/str->cstr a target)
+                                                                    (str/str->cstr a candidate))
+                                                            (println "markdown-agent: could not start Coil compiler {s}" coil)
+                                                            (store! status 69)
+                                                            (store! done true))
+                                                        (= (.exit-code consumer-check) 0)
+                                                          (let [consumer-run (run-source a coil consumer)]
+                                                            (if (and (.started consumer-run)
+                                                                     (= (.exit-code consumer-run) 0))
+                                                                (do
+                                                                  (println "markdown-agent: verified and installed {s}" target)
+                                                                  (store! status 0)
+                                                                  (store! done true))
+                                                                (do
+                                                                  (rename (str/str->cstr a target)
+                                                                          (str/str->cstr a candidate))
+                                                                  (store! diagnostics
+                                                                          (if (.started consumer-run)
+                                                                              (combined-diagnostics a consumer-run)
+                                                                              "The consumer contract could not start or timed out."))
+                                                                  (when (= (slice-len (load diagnostics)) 0)
+                                                                    (store! diagnostics
+                                                                            "The consumer contract failed or timed out without diagnostics. Inspect its runtime behavior and termination.")
+                                                                    0)
+                                                                  (println "markdown-agent: candidate failed runtime consumer contract")
+                                                                  0)))
+                                                        :else
+                                                          (do
+                                                            ;; The source root must not contain a failed artifact
+                                                            ;; between attempts. Move it back; do not copy or delete it.
+                                                            (rename (str/str->cstr a target)
+                                                                    (str/str->cstr a candidate))
+                                                            (store! diagnostics
+                                                                    (combined-diagnostics a consumer-check))
+                                                            (println "markdown-agent: candidate failed consumer graph check")
+                                                            0))))
+                                                (do
+                                                  (println "markdown-agent: verified candidate but atomic rename failed")
+                                                  (store! status 74)
+                                                  (store! done true)))
+                                          :else
+                                            (do
+                                              (store! diagnostics (combined-diagnostics a checked))
+                                              (println "markdown-agent: candidate failed Coil check")
+                                              0)))))))))))))
+            (unless (load done)
+              (println "markdown-agent: exhausted {d} attempts; last diagnostics:\n{s}"
+                       MAX-ATTEMPTS
+                       (load diagnostics))
+              0)
+            (load status)))))))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (if (or (< (primitive/cast i64 argc) 7) (> (primitive/cast i64 argc) 8))
+      (do
+        (println "usage: markdown-agent MARKDOWN TARGET.coil MODULE CONTRACT.coil|- AGENT COIL [MODEL]")
+        64)
+      (materialize (malloc-allocator)
+                   (arg-at argv 1)
+                   (arg-at argv 2)
+                   (arg-at argv 3)
+                   (arg-at argv 4)
+                   (arg-at argv 5)
+                   (arg-at argv 6)
+                   (if (= (primitive/cast i64 argc) 8) (arg-at argv 7) "gpt-5.6-luna"))))

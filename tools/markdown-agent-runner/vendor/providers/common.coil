@@ -1,0 +1,283 @@
+(module provider-common)
+
+(import "coil.primitive" :as primitive)
+
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.match" :use *)
+(import "coil.os" :as os)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "harness-json" :use *)
+(import "harness-model" :use *)
+(import "harness-system" :use *)
+(import "harness-tool" :use *)
+
+(const TOOL_LAYOUT_RESPONSES 0)
+(const TOOL_LAYOUT_CHAT 1)
+(const TOOL_LAYOUT_ANTHROPIC 2)
+
+(defn model-request-remaining-ms [(request (ptr ModelRequest))] (-> i64)
+  (deadline-remaining-ms (.deadline-monotonic-ms request)
+                         (.timeout-ms request)))
+
+(defstruct ApiCredential
+  [(primary-env (ptr i8))
+   (fallback-env (ptr i8))])
+
+;; Return an allocator-owned credential value, trying the primary name first.
+(defn api-key [(allocator (dyn Allocator)) (credential ApiCredential)] (-> (slice u8))
+  (match (os/env-get allocator (cstr->str (load (field credential primary-env))))
+    (Ok [primary]
+        (match primary
+          (Some [value] (os/owned-string-slice value))
+          (None []
+                (match (os/env-get allocator (cstr->str (load (field credential fallback-env))))
+                  (Ok [fallback]
+                      (match fallback
+                        (Some [value] (os/owned-string-slice value))
+                        (None [] "")))
+                  (Err [failure] "")))))
+    (Err [failure] "")))
+
+(defn json-put-string! [(object (mut Json)) (key (slice u8)) (value (slice u8))] (-> bool)
+  (json-object-put! (mut object) key (JsonString value)))
+
+(defn json-put-bool! [(object (mut Json)) (key (slice u8)) (value bool)] (-> bool)
+  (json-object-put! (mut object) key (JsonBool value)))
+
+(defn concat-or-empty [(allocator (dyn Allocator)) (left (slice u8)) (right (slice u8))] (-> (slice u8))
+  (match (str-concat allocator left right)
+    (Some [value] value)
+    (None [] "")))
+
+(defn tool-spec-wire [(allocator (dyn Allocator)) (spec ToolSpec) (layout i64)] (-> Json)
+  (let [(mut function) (json-object allocator)]
+    (json-put-string! (mut function) "name" (.name spec))
+    (json-put-string! (mut function) "description" (.description spec))
+    (json-object-put! (mut function)
+                      (if (= layout TOOL_LAYOUT_ANTHROPIC)
+                          "input_schema"
+                          "parameters")
+                      (.input-schema spec))
+    (when (!= layout TOOL_LAYOUT_ANTHROPIC)
+      (json-put-bool! (mut function) "strict" (load (field spec strict)))
+      0)
+    (if (= layout TOOL_LAYOUT_CHAT)
+        (let [(mut wrapper) (json-object allocator)]
+          (json-put-string! (mut wrapper) "type" "function")
+          (json-object-put! (mut wrapper) "function" (load function))
+          (load wrapper))
+        (do
+          (when (= layout TOOL_LAYOUT_RESPONSES)
+            (json-put-string! (mut function) "type" "function")
+            0)
+          (load function)))))
+
+(defn tool-registry-wire [(allocator (dyn Allocator)) (registry (ptr ToolRegistry)) (layout i64)] (-> Json)
+  (let [(mut tools) (json-array allocator)
+        definitions (field registry definitions)
+        (mut i) 0
+        n (al-len [ToolDefinition] (load definitions))]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [definition (al-get [ToolDefinition] (load definitions) (load i))]
+                (json-array-push! (mut tools)
+                                  (tool-spec-wire allocator
+                                                  (.spec definition)
+                                                  layout))
+                (set! i (+ (load i) 1)))))
+    (load tools)))
+
+(defn messages-wire [(allocator (dyn Allocator)) (messages (ptr (ArrayList Message)))] (-> Json)
+  (let [(mut result) (json-array allocator)
+        (mut i) 0
+        n (al-len [Message] (load messages))]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [message (al-get [Message] (load messages) (load i))
+                    (mut object) (json-object allocator)]
+                (json-put-string! (mut object)
+                                  "role"
+                                  (message-role-name (.role message)))
+                (json-put-string! (mut object)
+                                  "content"
+                                  (.content message))
+                (json-array-push! (mut result) (load object))
+                (set! i (+ (load i) 1)))))
+    (load result)))
+
+;; What a person said, as one more input item.
+;;
+;; A wire that continues by response id sends only what is new each turn, so an
+;; interjection has to travel with the tool results rather than in a replayed
+;; transcript -- otherwise the run keeps going as though nobody spoke, which is
+;; exactly how it looked before this existed.
+(defn continuation-interjection [(continuation (ptr ModelContinuation))] (-> (slice u8))
+  (let [turns (load (field continuation turns))]
+    (if (= (cast i64 turns) 0)
+        ""
+        (let [n (al-len [ContinuationTurn] (load turns))]
+          (if (= n 0)
+              ""
+              (let [turn (al-elem [ContinuationTurn] turns (- n 1))]
+                (load (field turn user-text))))))))
+
+(defn user-input-item [(allocator (dyn Allocator)) (text (slice u8))] (-> Json)
+  (let [(mut object) (json-object allocator)]
+    (json-put-string! (mut object) "role" "user")
+    (json-put-string! (mut object) "content" text)
+    (load object)))
+
+(defn push-interjection! [(allocator (dyn Allocator))
+                          (input (mut Json))
+                          (continuation (ptr ModelContinuation))] (-> i64)
+  (let [text (continuation-interjection continuation)]
+    (when (> (slice-len [u8] text) 0)
+      (json-array-push! (mut input) (user-input-item allocator text))
+      0)
+    0))
+
+(defn tool-choice-responses [(allocator (dyn Allocator)) (choice ModelToolChoice)] (-> Json)
+  (match choice
+    (ToolsAuto [] (JsonString "auto"))
+    (ToolsNone [] (JsonString "none"))
+    (ToolsRequired [] (JsonString "required"))
+    (ToolForced [name]
+                (let [(mut value) (json-object allocator)]
+                  (json-put-string! (mut value) "type" "function")
+                  (json-put-string! (mut value) "name" name)
+                  (load value)))))
+
+(defn tool-choice-chat [(allocator (dyn Allocator)) (choice ModelToolChoice)] (-> Json)
+  (match choice
+    (ToolsAuto [] (JsonString "auto"))
+    (ToolsNone [] (JsonString "none"))
+    (ToolsRequired [] (JsonString "required"))
+    (ToolForced [name]
+                (let [(mut function) (json-object allocator)
+                      (mut value) (json-object allocator)]
+                  (json-put-string! (mut function) "name" name)
+                  (json-put-string! (mut value) "type" "function")
+                  (json-object-put! (mut value) "function" (load function))
+                  (load value)))))
+
+(defn tool-choice-anthropic [(allocator (dyn Allocator)) (choice ModelToolChoice)] (-> Json)
+  (let [(mut value) (json-object allocator)]
+    (match choice
+      (ToolsAuto [] (json-put-string! (mut value) "type" "auto"))
+      (ToolsNone [] (json-put-string! (mut value) "type" "none"))
+      (ToolsRequired [] (json-put-string! (mut value) "type" "any"))
+      (ToolForced [name]
+                  (do
+                    (json-put-string! (mut value) "type" "tool")
+                    (json-put-string! (mut value) "name" name))))
+    (load value)))
+
+
+(defn usage-empty [] (-> ModelUsage)
+  (zeroed ModelUsage))
+
+(defn response-empty [(allocator (dyn Allocator))] (-> ModelResponse)
+  (let [response (primitive/alloc-stack ModelResponse)]
+    (set! (.provider response) "")
+    (set! (.model response) "")
+    (set! (.response-id response) "")
+    (set! (.provider-session-id response) "")
+    (set! (.output-text response) "")
+    (set! (.tool-calls response) (al-new [ToolCall] allocator))
+    (set! (.usage response) (usage-empty))
+    (set! (.raw-output response) (JsonNull))
+    (load response)))
+
+(defn model-completion-payload [(allocator (dyn Allocator))
+                                (request (ptr ModelRequest))
+                                (response (ptr ModelResponse))] (-> Json)
+  (let [(mut usage) (json-object allocator)
+        (mut payload) (json-object allocator)]
+    (json-put-string! (mut payload) "response_id" (.response-id response))
+    (json-put-string! (mut payload)
+                      "provider_session_id"
+                      (.provider-session-id response))
+    (json-put-string! (mut payload) "cache_key" (.cache-key request))
+    (json-object-put! (mut usage)
+                      "input_tokens"
+                      (json-integer allocator (.input-tokens (.usage response))))
+    (json-object-put! (mut usage)
+                      "output_tokens"
+                      (json-integer allocator (.output-tokens (.usage response))))
+    (json-object-put! (mut usage)
+                      "reasoning_tokens"
+                      (json-integer allocator (.reasoning-tokens (.usage response))))
+    (json-object-put! (mut usage)
+                      "cached_input_tokens"
+                      (json-integer allocator
+                                    (.cached-input-tokens (.usage response))))
+    (json-object-put! (mut usage)
+                      "cache_write_tokens"
+                      (json-integer allocator
+                                    (.cache-write-tokens (.usage response))))
+    (json-object-put! (mut payload) "usage" (load usage))
+    (load payload)))
+
+(defn model-failure [(provider (slice u8))
+                     (status i64)
+                     (message (slice u8))] (-> ModelResult)
+  (let [failure (primitive/alloc-stack ModelFailure)]
+    (store! (field failure kind)
+            (cond (= status 0) (TransportFailure)
+                  (or (= status 401) (= status 403)) (AuthenticationFailure)
+                  (= status 429) (RateLimitFailure)
+                  :else (ProviderFailure)))
+    (set! (.provider failure) provider)
+    (set! (.status-code failure) status)
+    (set! (.message failure) message)
+    (set! (.retryable failure)
+          (or (= status 0)
+              (or (= status 408)
+                  (or (= status 429) (>= status 500)))))
+    (ModelErr (load failure))))
+
+(defn json-error-message [(root Json) (fallback (slice u8))] (-> (slice u8))
+  (match (json-string-at (json-get root "error") "message")
+    (Some [message] message)
+    (None [] fallback)))
+
+(defn parsed-tool-call [(allocator (dyn Allocator))
+                        (id (slice u8))
+                        (name (slice u8))
+                        (raw-arguments (slice u8))] (-> ToolCall)
+  (let [call (primitive/alloc-stack ToolCall)
+        parsed (json-parse allocator raw-arguments)]
+    (set! (.id call) id)
+    (set! (.name call) name)
+    (set! (.raw-arguments call) raw-arguments)
+    (set! (.arguments call)
+          (if (.ok parsed)
+              (.value parsed)
+              (JsonNull)))
+    (load call)))
+
+;; `int->str` is a comptime primitive, so a runtime status code is formatted by
+;; hand. Lives here because every provider needs it to describe a failure.
+(defn model-decimal [(allocator (dyn Allocator)) (value i64)] (-> (slice u8))
+  (if (<= value 0)
+      "0"
+      (let [(mut buffer) (sb-new allocator)
+            (mut digits) (al-new [i64] allocator)
+            (mut remaining) value]
+        (loop (if (<= (load remaining) 0)
+                  (break)
+                  (do
+                    (al-push! [i64] (mut digits) (% (load remaining) 10))
+                    (set! remaining (/ (load remaining) 10)))))
+        (let [n (al-len [i64] (load digits))
+              (mut i) 0]
+          (loop (if (>= (load i) n)
+                    (break)
+                    (do
+                      (sb-push-byte! (mut buffer)
+                                     (cast u8 (+ 48 (al-get [i64] (load digits) (- (- n 1) (load i))))))
+                      (set! i (+ (load i) 1))))))
+        (sb-finish! (mut buffer)))))

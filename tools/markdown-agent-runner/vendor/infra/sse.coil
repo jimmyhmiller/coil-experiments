@@ -1,0 +1,176 @@
+(module harness-sse)
+
+(import "coil.primitive" :as primitive)
+
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.match" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+
+;; Delivery is synchronous: returning false applies backpressure by aborting the
+;; decoder and, once connected to HTTP, the libcurl write callback.
+(deftrait SseEventSink [Self]
+  (consume-sse-event [(self (ptr Self))
+                      (event-name (slice u8))
+                      (data (slice u8))]
+                     (-> bool)))
+
+(defstruct SseBoundary [(found bool) (block-end i64) (consumed i64)])
+
+(defstruct SseDecoder
+  [(allocator (dyn Allocator))
+   (buffer (ArrayList u8))
+   (sink (dyn SseEventSink))
+   (max-buffer-bytes i64)
+   (failed bool)])
+
+(defn sse-decoder-new [(allocator (dyn Allocator))
+                       (sink (dyn SseEventSink))
+                       (max-buffer-bytes i64)] (-> SseDecoder)
+  (let [decoder (primitive/alloc-stack SseDecoder)]
+    (set! (.allocator decoder) allocator)
+    (set! (.buffer decoder) (al-new [u8] allocator))
+    (set! (.sink decoder) sink)
+    (set! (.max-buffer-bytes decoder) (if (> max-buffer-bytes 0) max-buffer-bytes 1048576))
+    (set! (.failed decoder) false)
+    (load decoder)))
+
+(defn sse-boundary [(bytes (slice u8))] (-> SseBoundary)
+  (let [result (primitive/alloc-stack SseBoundary)
+        n (slice-len [u8] bytes)
+        (mut i) 0
+        (mut last-was-newline) false
+        (mut last-newline-index) -1]
+    (set! (.found result) false)
+    (loop (if (>= (load i) n)
+              (break)
+              (let [byte (cast i64 (slice-get [u8] bytes (load i)))]
+                (if (= byte 10)
+                    (if (load last-was-newline)
+                        (do
+                          (set! (.found result) true)
+                          (set! (.block-end result)
+                                (if (and (> (load last-newline-index) 0)
+                                         (= (cast i64
+                                                  (slice-get [u8]
+                                                             bytes
+                                                             (- (load last-newline-index) 1)))
+                                            13))
+                                    (- (load last-newline-index) 1)
+                                    (load last-newline-index)))
+                          (set! (.consumed result) (+ (load i) 1))
+                          (break))
+                        (do
+                          (set! last-was-newline true)
+                          (set! last-newline-index (load i))
+                          (set! i (+ (load i) 1))))
+                    (do
+                      (when (!= byte 13) (store! last-was-newline false) 0)
+                      (set! i (+ (load i) 1)))))))
+    (load result)))
+
+(defn sse-field-value [(line (slice u8)) (prefix-len i64)] (-> (slice u8))
+  (let [n (slice-len [u8] line)
+        start
+          (if (and (< prefix-len n)
+                   (= (cast i64 (slice-get [u8] line prefix-len)) 32))
+              (+ prefix-len 1)
+              prefix-len)]
+    (subslice [u8] line start n)))
+
+(defn sse-dispatch-block [(decoder (ptr SseDecoder)) (frame (slice u8))] (-> bool)
+  (let [(mut data) (sb-new (load (field decoder allocator)))
+        (mut event-name) ""
+        (mut data-lines) 0
+        n (slice-len [u8] frame)
+        (mut start) 0]
+    (loop (if (> (load start) n)
+              (break)
+              (let [(mut end) (load start)]
+                (loop (if (or (>= (load end) n)
+                              (= (cast i64 (slice-get [u8] frame (load end))) 10))
+                          (break)
+                          (set! end (+ (load end) 1))))
+                (let [trimmed-end
+                        (if (and (> (load end) (load start))
+                                 (= (cast i64 (slice-get [u8] frame (- (load end) 1))) 13))
+                            (- (load end) 1)
+                            (load end))
+                      line (subslice [u8] frame (load start) trimmed-end)]
+                  (cond (starts-with line "data:")
+                          (do
+                            (when (> (load data-lines) 0) (sb-push-str! (mut data) "\n") 0)
+                            (sb-push-str! (mut data) (sse-field-value line 5))
+                            (store! data-lines (+ (load data-lines) 1)))
+                        (starts-with line "event:") (store! event-name (sse-field-value line 6))
+                        :else 0))
+                (if (>= (load end) n)
+                    (break)
+                    (set! start (+ (load end) 1))))))
+    (let [accepted
+            (if (> (load data-lines) 0)
+                (consume-sse-event (.sink decoder)
+                                   (load event-name)
+                                   (sb-str (load data)))
+                true)]
+      (sb-free! (mut data))
+      accepted)))
+
+(defn sse-drop-prefix! [(buffer (mut (ArrayList u8))) (count i64)] (-> i64)
+  (let [n (al-len [u8] (load buffer))
+        remaining (- n count)
+        (mut i) 0]
+    (loop (if (>= (load i) remaining)
+              (break)
+              (do
+                (al-set! [u8]
+                         (mut buffer)
+                         (load i)
+                         (al-get [u8] (load buffer) (+ count (load i))))
+                (set! i (+ (load i) 1)))))
+    (set! (.len buffer) remaining)
+    remaining))
+
+(defn sse-decoder-drain! [(decoder (ptr SseDecoder))] (-> bool)
+  (let [boundary (sse-boundary (al-slice [u8] (.buffer decoder)))]
+    (if (not (.found boundary))
+        true
+        (let [accepted
+                (sse-dispatch-block decoder
+                                    (subslice [u8]
+                                              (al-slice [u8] (.buffer decoder))
+                                              0
+                                              (.block-end boundary)))]
+          (sse-drop-prefix! (mut (.buffer decoder))
+                            (.consumed boundary))
+          (if accepted
+              (sse-decoder-drain! decoder)
+              (do (set! (.failed decoder) true) false))))))
+
+;; Accept an arbitrary transport chunk. Frames may span chunks or share one chunk.
+;; False is sticky and means either bounded-buffer overflow or downstream rejection.
+(defn sse-decoder-feed! [(decoder (ptr SseDecoder)) (chunk (slice u8))] (-> bool)
+  (if (.failed decoder)
+      false
+      (do
+        (al-extend! [u8]
+                    (mut (.buffer decoder))
+                    (slice-data [u8] chunk)
+                    (slice-len [u8] chunk))
+        (if (> (al-len [u8] (.buffer decoder))
+               (.max-buffer-bytes decoder))
+            (do (set! (.failed decoder) true) false)
+            (sse-decoder-drain! decoder)))))
+
+(defn sse-http-chunk [(data (ptr u8)) (length usize) (context (ptr i8))] (-> usize)
+  (if (sse-decoder-feed! (cast (ptr SseDecoder) context)
+                         (slice-new [u8] data (cast i64 length)))
+      length
+      (cast usize 0)))
+
+(defn sse-decoder-failed? [(decoder (ptr SseDecoder))] (-> bool)
+  (.failed decoder))
+
+(defn sse-decoder-free! [(decoder (ptr SseDecoder))] (-> i64)
+  (al-free! [u8] (mut (.buffer decoder))))

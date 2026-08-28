@@ -1,0 +1,200 @@
+(module harness-tool)
+
+(import "coil.primitive" :as primitive)
+
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.atomic" :use *)
+(import "coil.cancellation" :as native-cancellation)
+(import "coil.match" :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "harness-json" :use *)
+(import "harness-json-schema" :use *)
+
+;; Effect classification is descriptive metadata for presentation and retry policy.
+;; It is deliberately independent of provider tool formats. The harness does not
+;; gate execution on it; an out-of-tree policy plugin is free to.
+(defsum ToolEffect
+  (ReadOnly [])
+  (Reversible [])
+  (Destructive []))
+
+(defn tool-effect-name [(effect ToolEffect)] (-> (slice u8))
+  (match effect
+    (ReadOnly [] "read_only")
+    (Reversible [] "reversible")
+    (Destructive [] "destructive")))
+
+(defstruct CancellationToken
+  [(native native-cancellation/Cancellation)
+   (initialized bool)])
+
+(defn cancellation-token-new [(allocator (dyn Allocator))] (-> (ptr CancellationToken))
+  (let [token (box! allocator CancellationToken (zeroed CancellationToken))]
+    (match (native-cancellation/cancellation-init (field token native))
+      (Ok [opened] (set! (.initialized token) true))
+      (Err [failure] (set! (.initialized token) false)))
+    token))
+
+(defn cancellation-request! [(token (ptr CancellationToken))] (-> i64)
+  (if (= token (cast (ptr CancellationToken) 0))
+      0
+      (if (.initialized token)
+          (native-cancellation/cancellation-request! (field token native))
+          0)))
+
+(defn cancellation-requested? [(token (ptr CancellationToken))] (-> bool)
+  (and (!= token (cast (ptr CancellationToken) 0))
+       (and (.initialized token)
+            (native-cancellation/cancellation-requested? (field token native)))))
+
+(defn cancellation-token-close! [(token (ptr CancellationToken))] (-> i64)
+  (if (or (= token (cast (ptr CancellationToken) 0))
+          (not (.initialized token)))
+      0
+      (do
+        (set! (.initialized token) false)
+        (native-cancellation/cancellation-close! (field token native)))))
+
+(defstruct ToolExecutionContext
+  [(run-id (slice u8))
+   (cancellation (ptr CancellationToken))
+   (run-deadline-monotonic-ms i64)
+   (tool-deadline-monotonic-ms i64)])
+
+(defstruct ToolSpec
+  [(name (slice u8))
+   (description (slice u8))
+   (input-schema Json)
+   (strict bool)
+   (effect ToolEffect)
+   (idempotent bool)
+   (timeout-ms i64)])
+
+(defstruct ToolCall
+  [(id (slice u8))
+   (name (slice u8))
+   (arguments Json)
+   (raw-arguments (slice u8))])
+
+(defsum ToolStatus
+  (ToolSucceeded [])
+  (ToolErrored [])
+  (ToolDenied [])
+  (ToolUnknown []))
+
+(defn tool-status-name [(status ToolStatus)] (-> (slice u8))
+  (match status
+    (ToolSucceeded [] "succeeded")
+    (ToolErrored [] "errored")
+    (ToolDenied [] "denied")
+    (ToolUnknown [] "unknown")))
+
+(defstruct ToolResult
+  [(call-id (slice u8))
+   (status ToolStatus)
+   (output Json)
+   (error (slice u8))
+   (started-at-ms i64)
+   (finished-at-ms i64)])
+
+(deftrait ToolImplementation [Self]
+  (execute-tool [(self (ptr Self))
+                 (call (ptr ToolCall))
+                 (context (ptr ToolExecutionContext))
+                 (allocator (dyn Allocator))]
+                (-> ToolResult)))
+
+;; A registered tool combines serializable metadata with an erased implementation.
+;; Implementations return data; registration is the only gate on execution.
+(defstruct ToolDefinition
+  [(spec ToolSpec)
+   (implementation (dyn ToolImplementation))])
+
+(defstruct ToolRegistry
+  [(definitions (ArrayList ToolDefinition))])
+
+(defn tool-registry-new [(allocator (dyn Allocator))] (-> ToolRegistry)
+  (let [registry (primitive/alloc-stack ToolRegistry)]
+    (set! (.definitions registry) (al-new [ToolDefinition] allocator))
+    (load registry)))
+
+;; Register a tool. Names must be unique; false means an existing name was left
+;; unchanged.
+(defn tool-register! [(registry (mut ToolRegistry)) (definition ToolDefinition)] (-> bool)
+  (let [name (.name (.spec definition))
+        (mut i) 0
+        n (al-len [ToolDefinition] (.definitions registry))
+        (mut unique) true]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [existing (al-get [ToolDefinition] (.definitions registry) (load i))]
+                (if (= (.name (.spec existing)) name)
+                    (do (set! unique false) (break))
+                    (set! i (+ (load i) 1))))))
+    (if (and (load unique) (tool-spec-valid? (.spec definition)))
+        (do (al-push! [ToolDefinition] (mut (.definitions registry)) definition) true)
+        false)))
+
+(defn tool-find [(registry ToolRegistry) (name (slice u8))] (-> (Option ToolDefinition))
+  (let [definitions (field registry definitions)
+        (mut i) 0
+        n (al-len [ToolDefinition] (load definitions))
+        (mut found) false
+        (mut result) (zeroed ToolDefinition)]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [definition (al-get [ToolDefinition] (load definitions) (load i))]
+                (if (= (.name (.spec definition)) name)
+                    (do (set! result definition) (set! found true) (break))
+                    (set! i (+ (load i) 1))))))
+    (if (load found) (Some (load result)) (None [ToolDefinition]))))
+
+(defn tool-result-empty [(call-id (slice u8)) (status ToolStatus)] (-> ToolResult)
+  (let [result (primitive/alloc-stack ToolResult)]
+    (set! (.call-id result) call-id)
+    (set! (.status result) status)
+    (set! (.output result) (JsonNull))
+    (set! (.error result) "")
+    (set! (.started-at-ms result) 0)
+    (set! (.finished-at-ms result) 0)
+    (load result)))
+
+;; Promotion helpers make arena crossings explicit. A copied tagged Json value is
+;; still a borrow; these functions recursively own every retained field in `target`.
+(defn tool-call-clone-into [(target (dyn Allocator))
+                            (source ToolCall)] (-> ToolCall)
+  (let [result (primitive/alloc-stack ToolCall)]
+    (set! (.id result) (json-copy-string target (.id source)))
+    (set! (.name result) (json-copy-string target (.name source)))
+    (set! (.arguments result) (json-clone target (.arguments source)))
+    (set! (.raw-arguments result) (json-copy-string target (.raw-arguments source)))
+    (load result)))
+
+(defn tool-result-clone-into [(target (dyn Allocator))
+                              (source ToolResult)] (-> ToolResult)
+  (let [result (primitive/alloc-stack ToolResult)]
+    (set! (.call-id result) (json-copy-string target (.call-id source)))
+    (set! (.status result) (.status source))
+    (set! (.output result) (json-clone target (.output source)))
+    (set! (.error result) (json-copy-string target (.error source)))
+    (set! (.started-at-ms result) (.started-at-ms source))
+    (set! (.finished-at-ms result) (.finished-at-ms source))
+    (load result)))
+
+;; Validate the cross-provider subset required by strict function tools. Provider
+;; adapters may impose additional restrictions and report them separately.
+(defn tool-spec-valid? [(spec ToolSpec)] (-> bool)
+  (let [name (.name spec)]
+    (and (> (slice-len [u8] name) 0)
+         (and (<= (slice-len [u8] name) 64)
+              (match (.input-schema spec)
+                     (JsonObject [keys values]
+                                 (match (json-string-at (.input-schema spec) "type")
+                                        (Some [kind] (= kind "object"))
+                                        (_ false)))
+                     (_ false))
+              (or (not (.strict spec))
+                  (json-schema-strict-compatible? (.input-schema spec)))))))

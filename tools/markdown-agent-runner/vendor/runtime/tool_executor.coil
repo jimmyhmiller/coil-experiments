@@ -1,0 +1,325 @@
+(module harness-tool-executor)
+
+(import "coil.primitive" :as primitive)
+
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.match" :use *)
+(import "coil.region" :as region)
+(import "coil.slice" :use *)
+(import "coil.thread" :use *)
+(import "harness-event" :use *)
+(import "harness-json" :use *)
+(import "harness-json-schema" :use *)
+(import "harness-tool" :use *)
+(import "harness-system" :use *)
+(import "experiments.safety.runtime" :use [bounds-check])
+(import "experiments.safety.unsafe" :use [unchecked-index])
+
+(defstruct ToolExecutionRequest
+  [(run-id (slice u8))
+   (parent-operation-id (slice u8))
+   (provider (slice u8))
+   (model (slice u8))
+   (registry (ptr ToolRegistry))
+   (calls (ptr (ArrayList ToolCall)))
+   (emitter (ptr EventEmitter))
+   (cancellation (ptr CancellationToken))
+   (run-deadline-monotonic-ms i64)
+   (max-parallel i64)])
+
+(defstruct ToolExecutionBatch [(results (ArrayList ToolResult))])
+
+(defstruct ToolJob
+  [(run-allocator (dyn Allocator))
+   (run-id (slice u8))
+   (parent-operation-id (slice u8))
+   (provider (slice u8))
+   (model (slice u8))
+   (call ToolCall)
+   (definition ToolDefinition)
+   (context ToolExecutionContext)
+   (results-data (ptr ToolResult))
+   (results-count i64)
+   (result-index i64)
+   (emitter (ptr EventEmitter))])
+
+(defn tool-context-stop-reason [(context (ptr ToolExecutionContext))] (-> (slice u8))
+  (if (cancellation-requested? (load (field context cancellation)))
+      "tool execution cancelled"
+      (let [deadline (.tool-deadline-monotonic-ms context)]
+        (if (and (> deadline 0) (= (deadline-remaining-ms deadline 0) 0))
+            "tool deadline exceeded"
+            ""))))
+
+(defstruct ActiveThread [(thread Thread) (spawned bool)])
+
+(defn tool-job-result-slot [(job (ptr ToolJob))] (-> (ptr ToolResult))
+  (unchecked-index [ToolResult]
+                   (load (field job results-data))
+                   (bounds-check (.result-index job) (.results-count job))))
+
+;; macOS gives pthread workers a 512 KiB default stack. That is not enough for
+;; the subprocess capture path used by the bash tool: execute-bash ->
+;; subprocess/run crossed the guard page in a real TUI run and surfaced as the
+;; misleading shell message `bus error`. Tool implementations are an extension
+;; boundary, so give every tool worker an explicit, portable stack contract.
+(const TOOL_WORKER_STACK_SIZE 8388608)
+(const TOOL_WORKER_GUARD_SIZE 65536)
+
+(defn tool-event [(emitter (ptr EventEmitter))
+                  (kind EventKind)
+                  (run-id (slice u8))
+                  (parent-operation-id (slice u8))
+                  (provider (slice u8))
+                  (model (slice u8))
+                  (call ToolCall)
+                  (payload Json)] (-> i64)
+  (emit-event emitter
+              (now-ms)
+              kind
+              run-id
+              (.id call)
+              parent-operation-id
+              provider
+              model
+              payload))
+
+;; The proposal is the authoritative immutable description of a tool call. Later
+;; lifecycle events reference the same operation ID and do not need to duplicate or
+;; reconstruct these facts.
+(defn tool-proposal-payload [(allocator (dyn Allocator))
+                             (call (ref ToolCall))] (-> Json)
+  (let [(mut payload) (json-object allocator)]
+    (json-object-put! (mut payload) "name" (JsonString (.name call)))
+    (json-object-put! (mut payload) "arguments" (.arguments call))
+    (load payload)))
+
+(defn tool-job-run [(opaque (ptr i8))] (-> (ptr i8))
+  (let [job (cast (ptr ToolJob) opaque)
+        call-region (primitive/alloc-stack region/Region)
+        call (field job call)
+        definition (field job definition)
+        result-slot (tool-job-result-slot job)
+        started (now-ms)]
+    (region/region-init call-region (load (field job run-allocator)))
+    (tool-event (load (field job emitter))
+                (ToolCallStarted)
+                (.run-id job)
+                (.parent-operation-id job)
+                (.provider job)
+                (.model job)
+                (load call)
+                (JsonString (.name call)))
+    (let [stop-before (tool-context-stop-reason (field job context))
+          (mut executed)
+            (if (> (slice-len [u8] stop-before) 0)
+                (let [(mut stopped) (tool-result-empty (.id call) (ToolErrored))]
+                  (set! (.error stopped) stop-before)
+                  (load stopped))
+                (execute-tool (.implementation definition)
+                              call
+                              (field job context)
+                              (region/region-allocator call-region)))
+          finished (now-ms)]
+      (let [stop-after (tool-context-stop-reason (field job context))]
+        (when (> (slice-len [u8] stop-after) 0)
+          (store! (field executed status) (ToolErrored))
+          (store! (field executed error) stop-after)
+          0))
+      (set! (.call-id executed) (.id call))
+      (set! (.started-at-ms executed) started)
+      (set! (.finished-at-ms executed) finished)
+      (let [promoted
+              (tool-result-clone-into (load (field job run-allocator))
+                                      (load executed))]
+        (region/region-close! call-region)
+        (set! result-slot promoted)
+        (match (.status promoted)
+          (ToolSucceeded []
+                         (tool-event (load (field job emitter))
+                                     (ToolCallCompleted)
+                                     (.run-id job)
+                                     (.parent-operation-id job)
+                                     (.provider job)
+                                     (.model job)
+                                     (load call)
+                                     (.output promoted)))
+          (ToolErrored []
+                       (tool-event (load (field job emitter))
+                                   (ToolCallFailed)
+                                   (.run-id job)
+                                   (.parent-operation-id job)
+                                   (.provider job)
+                                   (.model job)
+                                   (load call)
+                                   (JsonString (.error promoted))))
+          (ToolDenied [] 0)
+          (ToolUnknown [] 0))))
+    (cast (ptr i8) 0)))
+
+(defn denied-result [(call ToolCall) (reason (slice u8))] (-> ToolResult)
+  (let [(mut result) (tool-result-empty (.id call) (ToolDenied))]
+    (set! (.error result) reason)
+    (set! (.finished-at-ms result) (now-ms))
+    (load result)))
+
+(defn unknown-result [(call ToolCall)] (-> ToolResult)
+  (let [(mut result) (tool-result-empty (.id call) (ToolUnknown))]
+    (set! (.error result) "unknown tool")
+    (set! (.finished-at-ms result) (now-ms))
+    (load result)))
+
+;; Execute all schema-valid calls, using at most `max-parallel` worker threads. Results
+;; retain input order even though completion events reflect actual completion order.
+;; Each handler receives a thread-confined child region. Only the deeply promoted
+;; ToolResult survives in the synchronized run allocator after the worker joins.
+(defn execute-tools-parallel [(allocator (dyn Allocator)) (request (ptr ToolExecutionRequest))] (-> ToolExecutionBatch)
+  (let [(mut results) (al-new [ToolResult] allocator)
+        (mut jobs) (al-new [ToolJob] allocator)
+        calls (load (field request calls))
+        count (al-len [ToolCall] (load calls))
+        (mut i) 0]
+    (al-reserve! [ToolResult] (mut results) count)
+    (al-reserve! [ToolJob] (mut jobs) count)
+    (loop (if (>= (load i) count)
+              (break)
+              (let [call (al-get [ToolCall] (load calls) (load i))]
+                (al-push! [ToolResult]
+                          (mut results)
+                          (tool-result-empty (.id call) (ToolErrored)))
+                (tool-event (load (field request emitter))
+                            (ToolCallProposed)
+                            (.run-id request)
+                            (.parent-operation-id request)
+                            (.provider request)
+                            (.model request)
+                            call
+                            (tool-proposal-payload allocator call))
+                (match (tool-find (load (load (field request registry)))
+                                  (.name call))
+                  (None []
+                        (do
+                          (al-set! [ToolResult] (mut results) (load i) (unknown-result call))
+                          (tool-event (load (field request emitter))
+                                      (ToolCallFailed)
+                                      (.run-id request)
+                                      (.parent-operation-id request)
+                                      (.provider request)
+                                      (.model request)
+                                      call
+                                      (JsonString "unknown tool"))))
+                  (Some [definition]
+                        (let [selected definition
+                              validation
+                                (json-schema-validate allocator
+                                                      (.input-schema (.spec selected))
+                                                      (.arguments call))]
+                          (if (not (.ok validation))
+                              (do
+                                (al-set! [ToolResult]
+                                         (mut results)
+                                         (load i)
+                                         (denied-result call
+                                                        "tool arguments do not satisfy input schema"))
+                                (tool-event (load (field request emitter))
+                                            (ToolCallRejected)
+                                            (.run-id request)
+                                            (.parent-operation-id request)
+                                            (.provider request)
+                                            (.model request)
+                                            call
+                                            (JsonString "tool arguments do not satisfy input schema")))
+                              (let [job (primitive/alloc-stack ToolJob)]
+                                (set! (.run-allocator job) allocator)
+                                (set! (.run-id job) (.run-id request))
+                                (set! (.parent-operation-id job) (.parent-operation-id request))
+                                (set! (.provider job) (.provider request))
+                                (set! (.model job) (.model request))
+                                (set! (.call job) call)
+                                (set! (.definition job) selected)
+                                (set! (.run-id (.context job)) (.run-id request))
+                                (set! (.cancellation (.context job)) (load (field request cancellation)))
+                                (set! (.run-deadline-monotonic-ms (.context job))
+                                      (.run-deadline-monotonic-ms request))
+                                (let [tool-timeout
+                                        (.timeout-ms (.spec selected))
+                                      tool-deadline (deadline-from-timeout tool-timeout)
+                                      run-deadline
+                                        (.run-deadline-monotonic-ms request)]
+                                  (set! (.tool-deadline-monotonic-ms (.context job))
+                                        (if (and (> run-deadline 0)
+                                                 (or (= tool-deadline 0)
+                                                     (< run-deadline tool-deadline)))
+                                            run-deadline
+                                            tool-deadline)))
+                                (set! (.results-data job) (load (field results data)))
+                                (set! (.results-count job) (al-len [ToolResult] (load results)))
+                                (set! (.result-index job) (load i))
+                                (set! (.emitter job) (load (field request emitter)))
+                                (al-push! [ToolJob] (mut jobs) (load job)))))))
+                (set! i (+ (load i) 1)))))
+
+    (let [job-count (al-len [ToolJob] (load jobs))
+          limit
+            (if (> (.max-parallel request) 0)
+                (.max-parallel request)
+                1)
+          (mut start) 0]
+      (loop (if (>= (load start) job-count)
+                (break)
+                (let [remaining (- job-count (load start))
+                      batch-size (if (< remaining limit) remaining limit)
+                      (mut active) (al-new [ActiveThread] allocator)
+                      (mut j) 0]
+                  (al-reserve! [ActiveThread] (mut active) batch-size)
+                  (loop (if (>= (load j) batch-size)
+                            (break)
+                            (do
+                              (al-push! [ActiveThread] (mut active) (zeroed ActiveThread))
+                              (set! j (+ (load j) 1)))))
+                  (set! j 0)
+                  (loop (if (>= (load j) batch-size)
+                            (break)
+                            (let [active-slot (al-elem [ActiveThread] (mut active) (load j))
+                                  job-slot (al-elem [ToolJob]
+                                                    (mut jobs)
+                                                    (+ (load start) (load j)))
+                                  spawn-code
+                                    (thread-spawn-configured (field active-slot thread)
+                                                             (fnptr-of tool-job-run)
+                                                             (cast (ptr i8) job-slot)
+                                                             (thread-config TOOL_WORKER_STACK_SIZE
+                                                                            TOOL_WORKER_GUARD_SIZE))]
+                              (if (= spawn-code 0)
+                                  (set! (.spawned active-slot) true)
+                                  (let [call (field job-slot call)
+                                        result-slot (tool-job-result-slot job-slot)
+                                        (mut failed)
+                                          (tool-result-empty (.id call)
+                                                             (ToolErrored))]
+                                    (set! (.error failed) "could not spawn tool worker")
+                                    (set! (.finished-at-ms failed) (now-ms))
+                                    (set! result-slot (load failed))
+                                    (tool-event (load (field job-slot emitter))
+                                                (ToolCallFailed)
+                                                (.run-id job-slot)
+                                                (.parent-operation-id job-slot)
+                                                (.provider job-slot)
+                                                (.model job-slot)
+                                                (load call)
+                                                (JsonString "could not spawn tool worker"))))
+                              (set! j (+ (load j) 1)))))
+                  (set! j 0)
+                  (loop (if (>= (load j) batch-size)
+                            (break)
+                            (let [active-slot (al-elem [ActiveThread] (mut active) (load j))]
+                              (when (load (field active-slot spawned))
+                                (thread-join (field active-slot thread))
+                                0)
+                              (set! j (+ (load j) 1)))))
+                  (al-free! [ActiveThread] (mut active))
+                  (set! start (+ (load start) batch-size))))))
+    (let [batch (primitive/alloc-stack ToolExecutionBatch)]
+      (set! (.results batch) (load results))
+      (load batch))))

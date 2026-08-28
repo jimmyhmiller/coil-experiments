@@ -1,0 +1,250 @@
+(module harness-event)
+
+(import "coil.primitive" :as primitive)
+
+(import "coil.alloc" :as alloc :use [unwrap-ptr create])
+(import "coil.atomic" :use *)
+(import "harness-json" :use *)
+
+;; Stable semantic lifecycle categories. Additions are expected; existing meanings
+;; must not be repurposed because persisted event streams and UIs depend on them.
+(defsum EventKind
+  (RunCreated [])
+  (RunStarted [])
+  (RunCancellationRequested [])
+  (RunCompleted [])
+  (RunFailed [])
+  (RunCancelled [])
+  (AgentCreated [])
+  (AgentDelegated [])
+  (AgentMessageReceived [])
+  ;; A person said something into a run that was already going.
+  (OperatorMessageDelivered [])
+  (WorkflowNodeCreated [])
+  (WorkflowNodeReady [])
+  (WorkflowNodeSkipped [])
+  (FactoryRunCreated [])
+  (FactoryWorkspacePrepared [])
+  (FactoryCommandStarted [])
+  (FactoryCommandCompleted [])
+  (FactoryCommandFailed [])
+  (FactoryStageStarted [])
+  (FactoryStageAccepted [])
+  ;; A worker said it was not done; the coordinator sent it back in.
+  (FactoryStageContinued [])
+  (FactoryRunCompleted [])
+  (FactoryRunFailed [])
+  (SupervisorAssessmentRecorded [])
+  (SupervisorInterventionRequested [])
+  (SupervisorInterventionApplied [])
+  (SupervisorInterventionRejected [])
+  (WorkerRegistered [])
+  (WorkerAssignmentClaimed [])
+  (WorkerLeaseRenewed [])
+  (WorkerProgress [])
+  (WorkerAssignmentCompleted [])
+  (WorkerAssignmentRecoveryRequired [])
+  (ModelRequestStarted [])
+  (ModelResponseDelta [])
+  (ModelRequestCompleted [])
+  (ModelRequestFailed [])
+  (ModelRequestRetryScheduled [])
+  (ToolCallProposed [])
+  (ToolCallRejected [])
+  (ToolCallStarted [])
+  (ToolCallCompleted [])
+  (ToolCallFailed [])
+  (CodexNotification []))
+
+;; A structured observation. Payload is provider-neutral JSON; adapters may include
+;; provider-specific data under a namespaced member without changing this envelope.
+(defstruct Event
+  [(version i64)
+   (sequence i64)
+   (timestamp-ms i64)
+   (kind EventKind)
+   (run-id (slice u8))
+   (agent-id (slice u8))
+   (operation-id (slice u8))
+   (parent-operation-id (slice u8))
+   (provider (slice u8))
+   (model (slice u8))
+   (payload Json)])
+
+;; Event sinks are synchronous capabilities. Implementations must copy data they
+;; retain and be safe for concurrent calls from the parallel tool executor.
+(deftrait EventSink [Self]
+  (publish-event [(self (ptr Self)) (event (ptr Event))] (-> i64)))
+
+(defstruct NoopEventSink [(reserved u8)])
+
+(impl EventSink NoopEventSink
+  (publish-event [(self (ptr NoopEventSink)) (event (ptr Event))] (-> i64) 0))
+
+;; An emitter owns global ordering for one run. `next-sequence` is atomic because
+;; model and tool workers may publish concurrently.
+(defstruct EventEmitter
+  [(sink (ptr (dyn EventSink)))
+   (next-sequence (ptr i64))
+   (publish-lock i64)])
+
+;; Create an emitter over caller-owned sequence storage. The sequence cell must
+;; outlive every worker that uses the emitter.
+(defn event-emitter-new [(allocator (dyn alloc/Allocator))
+                         (sink (dyn EventSink))
+                         (next-sequence (ptr i64))] (-> EventEmitter)
+  (let [emitter (primitive/alloc-stack EventEmitter)]
+    (store! (field emitter sink) (alloc/box! allocator (dyn EventSink) sink))
+    (set! (.next-sequence emitter) next-sequence)
+    (set! (.publish-lock emitter) 0)
+    (load emitter)))
+
+;; Initialize long-lived emitters in their final storage. This avoids copying a
+;; dynamic trait object through a returned aggregate at an ownership boundary.
+(defn event-emitter-init! [(emitter (ptr EventEmitter))
+                           (allocator (dyn alloc/Allocator))
+                           (sink (dyn EventSink))
+                           (next-sequence (ptr i64))] (-> i64)
+  (store! (field emitter sink) (alloc/box! allocator (dyn EventSink) sink))
+  (set! (.next-sequence emitter) next-sequence)
+  (set! (.publish-lock emitter) 0)
+  0)
+
+(defn event-emitter-lock! [(emitter (ptr EventEmitter))] (-> i64)
+  (loop (if (= (atomic-cas (field emitter publish-lock) 0 1) 0)
+            (break)
+            0))
+  0)
+
+(defn event-emitter-unlock! [(emitter (ptr EventEmitter))] (-> i64)
+  (atomic-store (field emitter publish-lock) 0))
+
+;; Publish one event and return its assigned sequence number.
+(defn emit-event-for-agent [(emitter (ptr EventEmitter))
+                            (timestamp-ms i64)
+                            (kind EventKind)
+                            (run-id (slice u8))
+                            (agent-id (slice u8))
+                            (operation-id (slice u8))
+                            (parent-operation-id (slice u8))
+                            (provider (slice u8))
+                            (model (slice u8))
+                            (payload Json)] (-> i64)
+  (event-emitter-lock! emitter)
+  (let [sequence (atomic-add (load (field emitter next-sequence)) 1)
+        event (primitive/alloc-stack Event)
+        sink (load (field emitter sink))]
+    (set! (.version event) 1)
+    (set! (.sequence event) sequence)
+    (set! (.timestamp-ms event) timestamp-ms)
+    (set! (.kind event) kind)
+    (set! (.run-id event) run-id)
+    (set! (.agent-id event) agent-id)
+    (set! (.operation-id event) operation-id)
+    (set! (.parent-operation-id event) parent-operation-id)
+    (set! (.provider event) provider)
+    (set! (.model event) model)
+    (set! (.payload event) payload)
+    (let [publish-code (publish-event (load sink) event)]
+      (event-emitter-unlock! emitter)
+      (if (= publish-code 0) sequence -1))))
+
+;; Existing run-scoped events belong to the run's root agent. Delegated agents use
+;; their child run ID, so old call sites gain stable identity without an ambient value.
+(defn emit-event [(emitter (ptr EventEmitter))
+                  (timestamp-ms i64)
+                  (kind EventKind)
+                  (run-id (slice u8))
+                  (operation-id (slice u8))
+                  (parent-operation-id (slice u8))
+                  (provider (slice u8))
+                  (model (slice u8))
+                  (payload Json)] (-> i64)
+  (emit-event-for-agent emitter
+                        timestamp-ms
+                        kind
+                        run-id
+                        run-id
+                        operation-id
+                        parent-operation-id
+                        provider
+                        model
+                        payload))
+
+;; Stable wire name for an event category.
+(defn event-kind-name [(kind EventKind)] (-> (slice u8))
+  (match kind
+    (RunCreated [] "run.created")
+    (RunStarted [] "run.started")
+    (RunCancellationRequested [] "run.cancellation_requested")
+    (RunCompleted [] "run.completed")
+    (RunFailed [] "run.failed")
+    (RunCancelled [] "run.cancelled")
+    (AgentCreated [] "agent.created")
+    (AgentDelegated [] "agent.delegated")
+    (AgentMessageReceived [] "agent.message.received")
+    (OperatorMessageDelivered [] "operator.message.delivered")
+    (WorkflowNodeCreated [] "workflow.node.created")
+    (WorkflowNodeReady [] "workflow.node.ready")
+    (WorkflowNodeSkipped [] "workflow.node.skipped")
+    (FactoryRunCreated [] "factory.run.created")
+    (FactoryWorkspacePrepared [] "factory.workspace.prepared")
+    (FactoryCommandStarted [] "factory.command.started")
+    (FactoryCommandCompleted [] "factory.command.completed")
+    (FactoryCommandFailed [] "factory.command.failed")
+    (FactoryStageStarted [] "factory.stage.started")
+    (FactoryStageAccepted [] "factory.stage.accepted")
+    (FactoryStageContinued [] "factory.stage.continued")
+    (FactoryRunCompleted [] "factory.run.completed")
+    (FactoryRunFailed [] "factory.run.failed")
+    (SupervisorAssessmentRecorded [] "supervisor.assessment.recorded")
+    (SupervisorInterventionRequested [] "supervisor.intervention.requested")
+    (SupervisorInterventionApplied [] "supervisor.intervention.applied")
+    (SupervisorInterventionRejected [] "supervisor.intervention.rejected")
+    (WorkerRegistered [] "worker.registered")
+    (WorkerAssignmentClaimed [] "worker.assignment.claimed")
+    (WorkerLeaseRenewed [] "worker.lease.renewed")
+    (WorkerProgress [] "worker.progress")
+    (WorkerAssignmentCompleted [] "worker.assignment.completed")
+    (WorkerAssignmentRecoveryRequired [] "worker.assignment.recovery_required")
+    (ModelRequestStarted [] "model.request.started")
+    (ModelResponseDelta [] "model.response.delta")
+    (ModelRequestCompleted [] "model.request.completed")
+    (ModelRequestFailed [] "model.request.failed")
+    (ModelRequestRetryScheduled [] "model.request.retry_scheduled")
+    (ToolCallProposed [] "tool.call.proposed")
+    (ToolCallRejected [] "tool.call.rejected")
+    (ToolCallStarted [] "tool.call.started")
+    (ToolCallCompleted [] "tool.call.completed")
+    (ToolCallFailed [] "tool.call.failed")
+    (CodexNotification [] "codex.notification")))
+
+;; Canonical versioned wire envelope shared by CLI, journals, and remote transports.
+(defn event-to-json [(allocator (dyn alloc/Allocator)) (event (ptr Event))] (-> Json)
+  (let [(mut record) (json-object allocator)]
+    (json-object-put! (mut record)
+                      "version"
+                      (json-integer allocator (.version event)))
+    (json-object-put! (mut record)
+                      "sequence"
+                      (json-integer allocator (.sequence event)))
+    (json-object-put! (mut record)
+                      "timestamp_ms"
+                      (json-integer allocator (.timestamp-ms event)))
+    (json-object-put! (mut record)
+                      "event"
+                      (JsonString (event-kind-name (.kind event))))
+    (json-object-put! (mut record) "run_id" (JsonString (.run-id event)))
+    (json-object-put! (mut record) "agent_id" (JsonString (.agent-id event)))
+    (json-object-put! (mut record)
+                      "operation_id"
+                      (JsonString (.operation-id event)))
+    (json-object-put! (mut record)
+                      "parent_operation_id"
+                      (JsonString (.parent-operation-id event)))
+    (json-object-put! (mut record)
+                      "provider"
+                      (JsonString (.provider event)))
+    (json-object-put! (mut record) "model" (JsonString (.model event)))
+    (json-object-put! (mut record) "payload" (.payload event))
+    (load record)))

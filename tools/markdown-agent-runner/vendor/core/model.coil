@@ -1,0 +1,210 @@
+(module harness-model)
+
+(import "coil.primitive" :as primitive)
+
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.str" :use *)
+(import "harness-json" :use *)
+(import "harness-tool" :use *)
+(import "harness-event" :use *)
+
+(defsum MessageRole
+  (SystemRole [])
+  (UserRole [])
+  (AssistantRole []))
+
+(defstruct Message
+  [(role MessageRole)
+   (content (slice u8))])
+
+(defsum ModelToolChoice
+  (ToolsAuto [])
+  (ToolsNone [])
+  (ToolsRequired [])
+  (ToolForced [(name (slice u8))]))
+
+;; Provider-neutral continuation data. `previous-output` is deliberately opaque to
+;; the runtime: an adapter can preserve reasoning/signature items without projecting
+;; them into a lossy common message format.
+;; One completed turn: what the model said, and the results of the tools it
+;; called. A wire with no server-side history has to resend every one of these.
+(defstruct ContinuationTurn
+  [(output Json)
+   (results (ptr (ArrayList ToolResult)))
+   ;; What a person said at this point in the conversation, or "". A run that is
+   ;; being watched can be spoken to, and what was said belongs in the transcript
+   ;; where the model reads it -- in order, at the moment it arrived.
+   (user-text (slice u8))])
+
+(defstruct ModelContinuation
+  [(present bool)
+   (previous-response-id (slice u8))
+   ;; Provider-owned conversation/session handle (for example a Codex thread id).
+   ;; This is deliberately separate from a response id: the two have different
+   ;; continuation semantics and conflating them silently destroys cache reuse.
+   (provider-session-id (slice u8))
+   (previous-output Json)
+   (tool-results (ptr (ArrayList ToolResult)))
+   ;; Every completed turn, oldest first, including the latest. A provider that
+   ;; continues by response id ignores this; one that must resend the
+   ;; conversation reads it instead of `previous-output`.
+   ;;
+   ;; Without it a model sees only its own last turn and re-derives everything
+   ;; before that, which looks from the outside like an agent reading the same
+   ;; file over and over and never getting anywhere.
+   (turns (ptr (ArrayList ContinuationTurn)))])
+
+(defstruct ModelRequest
+  [(run-id (slice u8))
+   (operation-id (slice u8))
+   (model (slice u8))
+   (instructions (slice u8))
+   (cache-key (slice u8))
+   (prompt-cache-key (slice u8))
+   (messages (ptr (ArrayList Message)))
+   (tools (ptr ToolRegistry))
+   (tool-choice ModelToolChoice)
+   (parallel-tool-calls bool)
+   ;; Opaque provider-facing value. Catalogues may suggest values, but the
+   ;; runtime never constrains them.
+   (reasoning (slice u8))
+   (max-output-tokens i64)
+   (timeout-ms i64)
+   (deadline-monotonic-ms i64)
+   (cancellation (ptr CancellationToken))
+   (run-lifecycle (ptr i64))
+   ;; Where to look for messages from a person while this run is going, or "".
+   ;; See `harness-run-inbox`.
+   (inbox (slice u8))
+   (continuation ModelContinuation)])
+
+(defn model-request-cancelled? [(request (ptr ModelRequest))] (-> bool)
+  (cancellation-requested? (load (field request cancellation))))
+
+(defstruct ModelUsage
+  [(input-tokens i64)
+   (output-tokens i64)
+   (reasoning-tokens i64)
+   (cached-input-tokens i64)
+   (cache-write-tokens i64)])
+
+(defstruct ModelResponse
+  [(provider (slice u8))
+   (model (slice u8))
+   (response-id (slice u8))
+   (provider-session-id (slice u8))
+   (output-text (slice u8))
+   (tool-calls (ArrayList ToolCall))
+   (usage ModelUsage)
+   (raw-output Json)])
+
+(defsum ModelFailureKind
+  (ConfigurationFailure [])
+  (TransportFailure [])
+  (AuthenticationFailure [])
+  (RateLimitFailure [])
+  (ProviderFailure [])
+  (ProtocolFailure [])
+  (TimeoutFailure [])
+  (CancelledFailure []))
+
+(defstruct ModelFailure
+  [(kind ModelFailureKind)
+   (provider (slice u8))
+   (status-code i64)
+   (message (slice u8))
+   (retryable bool)])
+
+(defsum ModelResult
+  (ModelOk [(response ModelResponse)])
+  (ModelErr [(failure ModelFailure)]))
+
+(defn model-response-clone-into [(target (dyn Allocator))
+                                 (source ModelResponse)] (-> ModelResponse)
+  (let [result (primitive/alloc-stack ModelResponse)
+        (mut calls) (al-new [ToolCall] target)
+        source-calls (field source tool-calls)
+        (mut at) 0
+        count (al-len [ToolCall] (load source-calls))]
+    (al-reserve! [ToolCall] (mut calls) count)
+    (loop (if (>= (load at) count)
+              (break)
+              (do
+                (al-push! [ToolCall]
+                          (mut calls)
+                          (tool-call-clone-into target
+                                                (al-get [ToolCall] (load source-calls) (load at))))
+                (set! at (+ (load at) 1)))))
+    (set! (.provider result) (json-copy-string target (.provider source)))
+    (set! (.model result) (json-copy-string target (.model source)))
+    (set! (.response-id result) (json-copy-string target (.response-id source)))
+    (set! (.provider-session-id result) (json-copy-string target (.provider-session-id source)))
+    (set! (.output-text result) (json-copy-string target (.output-text source)))
+    (set! (.tool-calls result) (load calls))
+    (set! (.usage result) (.usage source))
+    (set! (.raw-output result) (json-clone target (.raw-output source)))
+    (load result)))
+
+(defn model-failure-clone-into [(target (dyn Allocator))
+                                (source ModelFailure)] (-> ModelFailure)
+  (let [result (primitive/alloc-stack ModelFailure)]
+    (set! (.kind result) (.kind source))
+    (set! (.provider result) (json-copy-string target (.provider source)))
+    (set! (.status-code result) (.status-code source))
+    (set! (.message result) (json-copy-string target (.message source)))
+    (set! (.retryable result) (.retryable source))
+    (load result)))
+
+(defn model-result-clone-into [(target (dyn Allocator))
+                               (source ModelResult)] (-> ModelResult)
+  (match source
+    (ModelOk [response] (ModelOk (model-response-clone-into target response)))
+    (ModelErr [failure] (ModelErr (model-failure-clone-into target failure)))))
+
+;; Capabilities are explicit provider-boundary facts used by routing and UIs. Cost
+;; tier is a relative policy input (1 is cheapest), not a billing estimate.
+(defstruct ProviderCapabilities
+  [(streaming bool)
+   (harness-tools bool)
+   (parallel-tools bool)
+   (reasoning bool)
+   (subscription-auth bool)
+   (cost-tier i64)])
+
+(defn provider-capabilities-for [(name (slice u8))] (-> ProviderCapabilities)
+  (let [capabilities (primitive/alloc-stack ProviderCapabilities)
+        codex (or (= name "codex-direct") (= name "codex"))
+        claude (or (= name "claude") (= name "claude-anthropic"))
+        agent-sdk (= name "agent-sdk")]
+    (set! (.streaming capabilities) true)
+    (set! (.harness-tools capabilities) true)
+    (set! (.parallel-tools capabilities) true)
+    (set! (.reasoning capabilities) true)
+    (set! (.subscription-auth capabilities) (or agent-sdk (or codex claude)))
+    (store! (field capabilities cost-tier)
+            (cond (= name "openrouter") 1
+                  (or (= name "deepseek-openai")
+                      (= name "deepseek-anthropic"))
+                    1
+                  (or agent-sdk (or codex claude)) 2
+                  (or (= name "openai")
+                      (= name "openai-responses"))
+                    3
+                  :else 0))
+    (load capabilities)))
+
+(deftrait ModelProvider [Self]
+  (provider-name [(self (ptr Self))] (-> (slice u8)))
+  (provider-capabilities [(self (ptr Self))] (-> ProviderCapabilities))
+  (execute-model [(self (ptr Self))
+                  (request (ptr ModelRequest))
+                  (emitter (ptr EventEmitter))
+                  (allocator (dyn Allocator))]
+                 (-> ModelResult)))
+
+(defn message-role-name [(role MessageRole)] (-> (slice u8))
+  (match role
+    (SystemRole [] "system")
+    (UserRole [] "user")
+    (AssistantRole [] "assistant")))

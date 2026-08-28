@@ -1,0 +1,289 @@
+(module harness-json-schema)
+
+(import "coil.primitive" :as primitive)
+
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.match" :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "harness-json" :use *)
+
+(defstruct SchemaValidation
+  [(ok bool)
+   (path (slice u8))
+   (message (slice u8))])
+
+(defn schema-valid [] (-> SchemaValidation)
+  (let [result (primitive/alloc-stack SchemaValidation)]
+    (set! (.ok result) true)
+    (set! (.path result) "$")
+    (set! (.message result) "")
+    (load result)))
+
+(defn schema-invalid [(path (slice u8)) (message (slice u8))] (-> SchemaValidation)
+  (let [result (primitive/alloc-stack SchemaValidation)]
+    (set! (.ok result) false)
+    (set! (.path result) path)
+    (set! (.message result) message)
+    (load result)))
+
+(defn json-value-type [(value Json)] (-> (slice u8))
+  (match value
+    (JsonNull [] "null")
+    (JsonBool [flag] "boolean")
+    (JsonNumber [raw]
+                (if (or (match (str-find raw ".") (Some [index] true) (None [] false))
+                        (or (match (str-find raw "e") (Some [index] true) (None [] false))
+                            (match (str-find raw "E") (Some [index] true) (None [] false))))
+                    "number"
+                    "integer"))
+    (JsonString [text] "string")
+    (JsonArray [items] "array")
+    (JsonObject [keys values] "object")))
+
+(defn schema-type-matches? [(expected (slice u8)) (value Json)] (-> bool)
+  (let [actual (json-value-type value)]
+    (or (= expected actual)
+        (and (= expected "number") (= actual "integer")))))
+
+(defn schema-allows-type? [(schema Json) (value Json)] (-> bool)
+  (let [wire (json-get schema "type")]
+    (match wire
+           (JsonNull [] true)
+           (JsonString [expected] (schema-type-matches? expected value))
+           (JsonArray [items]
+                      (let [(mut i) 0
+                            n (al-len [Json] (load items))
+                            (mut allowed) false]
+                        (loop (if (>= (load i) n)
+                                  (break)
+                                  (match (al-get [Json] (load items) (load i))
+                                         (JsonString [expected]
+                                                     (if (schema-type-matches? expected value)
+                                                         (do (set! allowed true) (break))
+                                                         (set! i (+ (load i) 1))))
+                                         (_ (set! i (+ (load i) 1))))))
+                        (load allowed)))
+           (_ false))))
+
+(defn json-schema-equal? [(allocator (dyn Allocator)) (left Json) (right Json)] (-> bool)
+  (= (json-stringify allocator left) (json-stringify allocator right)))
+
+(defn schema-enum-valid? [(allocator (dyn Allocator)) (schema Json) (value Json)] (-> bool)
+  (match (json-get schema "enum")
+         (JsonNull [] true)
+         (JsonArray [items]
+                    (let [(mut i) 0
+                          n (al-len [Json] (load items))
+                          (mut found) false]
+                      (loop (if (>= (load i) n)
+                                (break)
+                                (if (json-schema-equal? allocator
+                                                        (al-get [Json] (load items) (load i))
+                                                        value)
+                                    (do (set! found true) (break))
+                                    (set! i (+ (load i) 1)))))
+                      (load found)))
+         (_ false)))
+
+(defn schema-required-valid? [(schema Json) (value Json)] (-> bool)
+  (match (json-get schema "required")
+         (JsonNull [] true)
+         (JsonArray [required]
+                    (let [(mut i) 0
+                          n (al-len [Json] (load required))
+                          (mut valid) true]
+                      (loop (if (>= (load i) n)
+                                (break)
+                                (match (al-get [Json] (load required) (load i))
+                                       (JsonString [key]
+                                                   (if (json-has-key? value key)
+                                                       (set! i (+ (load i) 1))
+                                                       (do (set! valid false) (break))))
+                                       (_ (do (set! valid false) (break))))))
+                      (load valid)))
+         (_ false)))
+
+(defn schema-properties-valid? [(allocator (dyn Allocator)) (schema Json) (value Json) (depth i64)] (-> SchemaValidation)
+  (let [properties (json-get schema "properties")]
+    (match (json-object-keys value)
+      (None [] (schema-valid))
+      (Some [keys]
+            (let [(mut i) 0
+                  n (al-len [(slice u8)] (load keys))
+                  (mut result) (schema-valid)
+                  additional
+                    (match (json-bool-value (json-get schema "additionalProperties"))
+                      (Some [flag] flag)
+                      (None [] true))]
+              (loop (if (or (>= (load i) n) (not (.ok result)))
+                        (break)
+                        (let [key (al-get [(slice u8)] (load keys) (load i))]
+                          (if (json-has-key? properties key)
+                              (set! result
+                                    (json-schema-validate-depth allocator
+                                                                (json-get properties key)
+                                                                (json-get value key)
+                                                                key
+                                                                (+ depth 1)))
+                              (if additional
+                                  0
+                                  (set! result (schema-invalid key "additional property is not allowed"))))
+                          (set! i (+ (load i) 1)))))
+              (load result))))))
+
+(defn schema-array-valid? [(allocator (dyn Allocator)) (schema Json) (value Json) (path (slice u8)) (depth i64)] (-> SchemaValidation)
+  (let [item-schema (json-get schema "items")]
+    (match value
+           (JsonArray [items]
+                      (let [(mut i) 0
+                            n (al-len [Json] (load items))
+                            (mut result) (schema-valid)]
+                        (loop (if (or (>= (load i) n) (not (.ok result)))
+                                  (break)
+                                  (do
+                                    (set! result
+                                          (json-schema-validate-depth allocator
+                                                                      item-schema
+                                                                      (al-get [Json] (load items) (load i))
+                                                                      path
+                                                                      (+ depth 1)))
+                                    (set! i (+ (load i) 1)))))
+                        (load result)))
+           (_ (schema-valid)))))
+
+(defn schema-any-of-valid? [(allocator (dyn Allocator)) (schema Json) (value Json) (path (slice u8)) (depth i64)] (-> bool)
+  (match (json-get schema "anyOf")
+         (JsonNull [] true)
+         (JsonArray [choices]
+                    (let [(mut i) 0
+                          n (al-len [Json] (load choices))
+                          (mut valid) false]
+                      (loop (if (>= (load i) n)
+                                (break)
+                                (let [result
+                                        (json-schema-validate-depth allocator
+                                                                    (al-get [Json] (load choices) (load i))
+                                                                    value
+                                                                    path
+                                                                    (+ depth 1))]
+                                  (if (.ok result)
+                                      (do (set! valid true) (break))
+                                      (set! i (+ (load i) 1))))))
+                      (load valid)))
+         (_ false)))
+
+;; Validate the JSON Schema subset shared by OpenAI strict tools and DeepSeek:
+;; object/properties/required/additionalProperties, arrays/items, primitive types,
+;; nullable type unions, enum, and anyOf. Unknown annotation keywords are ignored.
+(defn json-schema-validate-depth [(allocator (dyn Allocator))
+                                  (schema Json)
+                                  (value Json)
+                                  (path (slice u8))
+                                  (depth i64)] (-> SchemaValidation)
+  (if (> depth 64)
+      (schema-invalid path "schema nesting exceeds 64 levels")
+      (if (json-has-key? schema "anyOf")
+          (if (schema-any-of-valid? allocator schema value path depth)
+              (schema-valid)
+              (schema-invalid path "value does not match anyOf"))
+          (if (not (schema-allows-type? schema value))
+              (schema-invalid path "value has the wrong JSON type")
+              (if (not (schema-enum-valid? allocator schema value))
+                  (schema-invalid path "value is not in enum")
+                  (let [actual (json-value-type value)]
+                    (cond (= actual "object")
+                            (if (schema-required-valid? schema value)
+                                (schema-properties-valid? allocator schema value depth)
+                                (schema-invalid path "required property is missing"))
+                          (= actual "array") (schema-array-valid? allocator schema value path depth)
+                          :else (schema-valid))))))))
+
+(defn json-schema-validate [(allocator (dyn Allocator)) (schema Json) (value Json)] (-> SchemaValidation)
+  (json-schema-validate-depth allocator schema value "$" 0))
+
+;; OpenAI strict function schemas require every declared object property to be
+;; named in `required`, and forbid additional properties. Check this recursively
+;; before a tool can advertise itself as strict so provider rejection cannot be
+;; deferred until a live model request.
+(defn schema-required-contains? [(required Json) (key (slice u8))] (-> bool)
+  (match required
+         (JsonArray [items]
+                    (let [(mut i) 0
+                          n (al-len [Json] (load items))
+                          (mut found) false]
+                      (loop (if (or (>= (load i) n) (load found))
+                                (break)
+                                (match (al-get [Json] (load items) (load i))
+                                       (JsonString [candidate]
+                                                   (if (= candidate key)
+                                                       (set! found true)
+                                                       (set! i (+ (load i) 1))))
+                                       (_ (set! i (+ (load i) 1))))))
+                      (load found)))
+         (_ false)))
+
+(defn json-schema-strict-compatible-depth? [(schema Json) (depth i64)] (-> bool)
+  (if (> depth 64)
+      false
+      (if (json-has-key? schema "anyOf")
+          (match-else (json-array-items (json-get schema "anyOf"))
+                      (Some [choices]
+                            (let [(mut i) 0
+                                  n (al-len [Json] (load choices))
+                                  (mut valid) true]
+                              (loop (if (or (>= (load i) n) (not (load valid)))
+                                        (break)
+                                        (do
+                                          (when (not (json-schema-strict-compatible-depth? (al-get [Json]
+                                                                                                   (load choices)
+                                                                                                   (load i))
+                                                                                           (+ depth 1)))
+                                            (store! valid false)
+                                            0)
+                                          (store! i (+ (load i) 1)))))
+                              (load valid)))
+                      (None [] false))
+          (let [kind
+                  (match (json-string-at schema "type")
+                    (Some [value] value)
+                    (None [] ""))]
+            (cond (= kind "object")
+                    (and (match (json-bool-value (json-get schema "additionalProperties"))
+                           (Some [allowed] (not allowed))
+                           (None [] false))
+                         (match-else (json-object-keys (json-get schema "properties"))
+                                     (Some [keys]
+                                           (let [(mut i) 0
+                                                 n (al-len [(slice u8)] (load keys))
+                                                 (mut valid) true
+                                                 required (json-get schema "required")]
+                                             (loop (if (or (>= (load i) n)
+                                                           (not (load valid)))
+                                                       (break)
+                                                       (let [key
+                                                               (al-get [(slice u8)]
+                                                                       (load keys)
+                                                                       (load i))]
+                                                         (when (not (and (schema-required-contains? required
+                                                                                                    key)
+                                                                         (json-schema-strict-compatible-depth? (json-get (json-get schema
+                                                                                                                                   "properties")
+                                                                                                                         key)
+                                                                                                               (+ depth
+                                                                                                                  1))))
+                                                           (store! valid false)
+                                                           0)
+                                                         (store! i (+ (load i) 1)))))
+                                             (load valid)))
+                                     (None [] false)))
+                  (= kind "array")
+                    (and (json-has-key? schema "items")
+                         (json-schema-strict-compatible-depth? (json-get schema "items")
+                                                               (+ depth 1)))
+                  :else true)))))
+
+(defn json-schema-strict-compatible? [(schema Json)] (-> bool)
+  (json-schema-strict-compatible-depth? schema 0))

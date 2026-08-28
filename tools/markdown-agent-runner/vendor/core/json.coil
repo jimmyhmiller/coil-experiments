@@ -1,0 +1,561 @@
+(module harness-json)
+
+(import "coil.alloc" :as alloc :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.arraylist" :use *)
+(import "coil.match" :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+
+;; A deliberately small, owned JSON tree. Numbers retain their source spelling so
+;; identifiers and usage counters never lose precision through an f64 round trip.
+;; Object member order is preserved, which makes request snapshots deterministic.
+(defsum Json
+  (JsonNull [])
+  (JsonBool [(value bool)])
+  (JsonNumber [(raw (slice u8))])
+  (JsonString [(value (slice u8))])
+  (JsonArray [(items (ptr (ArrayList Json)))])
+  (JsonObject [(keys (ptr (ArrayList (slice u8))))
+               (values (ptr (ArrayList Json)))]))
+
+(defstruct JsonParseResult
+  [(ok bool)
+   (value Json)
+   (error (slice u8))
+   (error-pos i64)])
+
+(defstruct JsonParser
+  [(source (slice u8))
+   (position i64)
+   (allocator (dyn Allocator))
+   (ok bool)
+   (error (slice u8))
+   (error-pos i64)])
+
+;; Construct an empty JSON array owned by `allocator`.
+(defn json-array [(allocator (dyn Allocator))] (-> Json)
+  (JsonArray (box! allocator (ArrayList Json) (al-new [Json] allocator))))
+
+;; Construct an empty insertion-ordered JSON object owned by `allocator`.
+(defn json-object [(allocator (dyn Allocator))] (-> Json)
+  (JsonObject (box! allocator (ArrayList (slice u8)) (al-new [(slice u8)] allocator))
+              (box! allocator (ArrayList Json) (al-new [Json] allocator))))
+
+(defn json-copy-string [(allocator (dyn Allocator))
+                        (value (slice u8))] (-> (slice u8))
+  (let [(mut buffer) (sb-new allocator)]
+    (sb-push-str! (mut buffer) value)
+    (sb-str (load buffer))))
+
+(defn json-clone [(allocator (dyn Allocator)) (value Json)] (-> Json)
+  (match value
+    (JsonNull [] (JsonNull))
+    (JsonBool [boolean] (JsonBool boolean))
+    (JsonNumber [raw] (JsonNumber (json-copy-string allocator raw)))
+    (JsonString [text] (JsonString (json-copy-string allocator text)))
+    (JsonArray [items]
+               (let [(mut cloned) (json-array allocator)
+                     (mut i) 0
+                     n (al-len [Json] (load items))]
+                 (loop (if (>= (load i) n)
+                           (break)
+                           (do
+                             (json-array-push! (mut cloned)
+                                               (json-clone allocator
+                                                           (al-get [Json]
+                                                                   (load items)
+                                                                   (load i))))
+                             (set! i (+ (load i) 1)))))
+                 (load cloned)))
+    (JsonObject [keys values]
+                (let [(mut cloned) (json-object allocator)
+                      (mut i) 0
+                      n (al-len [(slice u8)] (load keys))]
+                  (loop (if (>= (load i) n)
+                            (break)
+                            (do
+                              (json-object-put! (mut cloned)
+                                                (json-copy-string allocator
+                                                                  (al-get [(slice u8)]
+                                                                          (load keys)
+                                                                          (load i)))
+                                                (json-clone allocator
+                                                            (al-get [Json]
+                                                                    (load values)
+                                                                    (load i))))
+                              (set! i (+ (load i) 1)))))
+                  (load cloned)))))
+
+;; Append a value to an array. Returns false when `array` is not an array.
+(defn json-array-push! [(array (mut Json)) (value Json)] (-> bool)
+  (match (load array) (JsonArray [items] (do (al-push! [Json] items value) true)) (_ false)))
+
+;; Insert or replace an object member. Keys are copied into the object's allocator
+;; indirectly by the owning request arena; callers must keep that arena alive.
+(defn json-object-put! [(object (mut Json)) (key (slice u8)) (value Json)] (-> bool)
+  (match (load object)
+         (JsonObject [keys values]
+                     (let [(mut i) 0
+                           n (al-len [(slice u8)] (load keys))
+                           (mut found) false]
+                       (loop (if (>= (load i) n)
+                                 (break)
+                                 (if (= (al-get [(slice u8)] (load keys) (load i)) key)
+                                     (do
+                                       (al-set! [Json] values (load i) value)
+                                       (set! found true)
+                                       (break))
+                                     (set! i (+ (load i) 1)))))
+                       (if (load found)
+                           true
+                           (do
+                             (al-push! [(slice u8)] keys key)
+                             (al-push! [Json] values value)
+                             true))))
+         (_ false)))
+
+;; Return an object member or JsonNull when absent/not an object.
+(defn json-get [(value Json) (key (slice u8))] (-> Json)
+  (match value
+         (JsonObject [keys values]
+                     (let [(mut i) 0
+                           n (al-len [(slice u8)] (load keys))
+                           (mut result) (JsonNull)]
+                       (loop (if (>= (load i) n)
+                                 (break)
+                                 (if (= (al-get [(slice u8)] (load keys) (load i)) key)
+                                     (do (set! result (al-get [Json] (load values) (load i))) (break))
+                                     (set! i (+ (load i) 1)))))
+                       (load result)))
+         (_ (JsonNull))))
+
+(defn json-object-has? [(value Json) (key (slice u8))] (-> bool)
+  (match value
+         (JsonObject [keys values]
+                     (let [(mut i) 0
+                           n (al-len [(slice u8)] (load keys))
+                           (mut found) false]
+                       (loop (if (>= (load i) n)
+                                 (break)
+                                 (if (= (al-get [(slice u8)] (load keys) (load i)) key)
+                                     (do (set! found true) (break))
+                                     (set! i (+ (load i) 1)))))
+                       (load found)))
+         (_ false)))
+
+(defn json-bool-value [(value Json)] (-> (Option bool))
+  (match value (JsonBool [flag] (Some flag)) (_ (None [bool]))))
+
+(defn json-has-key? [(value Json) (key (slice u8))] (-> bool)
+  (match value
+         (JsonObject [keys values]
+                     (let [(mut i) 0
+                           n (al-len [(slice u8)] (load keys))
+                           (mut found) false]
+                       (loop (if (>= (load i) n)
+                                 (break)
+                                 (if (= (al-get [(slice u8)] (load keys) (load i)) key)
+                                     (do (set! found true) (break))
+                                     (set! i (+ (load i) 1)))))
+                       (load found)))
+         (_ false)))
+
+(defn json-object-keys [(value Json)] (-> (Option (ptr (ArrayList (slice u8)))))
+  (match value (JsonObject [keys values] (Some keys)) (_ (None [(ptr (ArrayList (slice u8)))]))))
+
+(defn json-string-value [(value Json)] (-> (Option (slice u8)))
+  (match value (JsonString [text] (Some text)) (_ (None [(slice u8)]))))
+
+(defn json-string-at [(value Json) (key (slice u8))] (-> (Option (slice u8)))
+  (json-string-value (json-get value key)))
+
+(defn json-array-items [(value Json)] (-> (Option (ptr (ArrayList Json))))
+  (match value (JsonArray [items] (Some items)) (_ (None [(ptr (ArrayList Json))]))))
+
+(defn json-array-length [(value Json)] (-> i64)
+  (match value (JsonArray [items] (al-len [Json] (load items))) (_ 0)))
+
+(defn json-array-get [(value Json) (index i64)] (-> Json)
+  (match value
+         (JsonArray [items]
+                    (if (and (>= index 0)
+                             (< index (al-len [Json] (load items))))
+                        (al-get [Json] (load items) index)
+                        (JsonNull)))
+         (_ (JsonNull))))
+
+(defn parser-peek [(parser (ptr JsonParser))] (-> i64)
+  (if (>= (.position parser)
+          (slice-len [u8] (.source parser)))
+      -1
+      (cast i64
+            (slice-get [u8]
+                       (.source parser)
+                       (.position parser)))))
+
+(defn parser-advance [(parser (ptr JsonParser))] (-> i64)
+  (let [current (parser-peek parser)]
+    (if (>= current 0)
+        (set! (.position parser) (+ (.position parser) 1))
+        0)
+    current))
+
+(defn json-whitespace? [(byte i64)] (-> bool)
+  (or (= byte 32)
+      (or (= byte 9)
+          (or (= byte 10) (= byte 13)))))
+
+(defn parser-skip-whitespace [(parser (ptr JsonParser))] (-> i64)
+  (loop (if (json-whitespace? (parser-peek parser))
+            (parser-advance parser)
+            (break)))
+  0)
+
+(defn parser-fail [(parser (ptr JsonParser)) (message (slice u8))] (-> i64)
+  (if (.ok parser)
+      (do
+        (set! (.ok parser) false)
+        (set! (.error parser) message)
+        (set! (.error-pos parser) (.position parser))
+        0)
+      0))
+
+(defn json-hex-value [(byte i64)] (-> i64)
+  (cond (and (>= byte 48) (<= byte 57)) (- byte 48)
+        (and (>= byte 65) (<= byte 70)) (+ 10 (- byte 65))
+        (and (>= byte 97) (<= byte 102)) (+ 10 (- byte 97))
+        :else -1))
+
+(defn parser-hex4 [(parser (ptr JsonParser))] (-> i64)
+  (let [(mut value) 0
+        (mut i) 0]
+    (loop (if (>= (load i) 4)
+              (break)
+              (let [digit (json-hex-value (parser-advance parser))]
+                (if (< digit 0)
+                    (do (parser-fail parser "invalid unicode escape") (break))
+                    (do
+                      (set! value (+ (* (load value) 16) digit))
+                      (set! i (+ (load i) 1)))))))
+    (load value)))
+
+(defn json-append-codepoint! [(buffer (mut StrBuf)) (codepoint i64)] (-> i64)
+  (cond (<= codepoint 127) (sb-push-byte! (mut buffer) (cast u8 codepoint))
+        (<= codepoint 2047)
+          (do
+            (sb-push-byte! (mut buffer) (cast u8 (primitive/ior 192 (primitive/ishr codepoint 6))))
+            (sb-push-byte! (mut buffer) (cast u8 (primitive/ior 128 (primitive/iand codepoint 63)))))
+        (<= codepoint 65535)
+          (do
+            (sb-push-byte! (mut buffer) (cast u8 (primitive/ior 224 (primitive/ishr codepoint 12))))
+            (sb-push-byte! (mut buffer) (cast u8 (primitive/ior 128 (primitive/iand (primitive/ishr codepoint 6) 63))))
+            (sb-push-byte! (mut buffer) (cast u8 (primitive/ior 128 (primitive/iand codepoint 63)))))
+        :else
+          (do
+            (sb-push-byte! (mut buffer) (cast u8 (primitive/ior 240 (primitive/ishr codepoint 18))))
+            (sb-push-byte! (mut buffer) (cast u8 (primitive/ior 128 (primitive/iand (primitive/ishr codepoint 12) 63))))
+            (sb-push-byte! (mut buffer) (cast u8 (primitive/ior 128 (primitive/iand (primitive/ishr codepoint 6) 63))))
+            (sb-push-byte! (mut buffer) (cast u8 (primitive/ior 128 (primitive/iand codepoint 63))))))
+  0)
+
+;; The decoded UTF-8 string can never exceed its encoded byte length. Reserving
+;; that bound once avoids Region's linear ownership lookup on every buffer grow.
+(defn parser-string-capacity [(parser (ptr JsonParser))] (-> i64)
+  (let [source (.source parser)
+        start (+ (.position parser) 1)
+        count (slice-len [u8] source)
+        (mut at) start
+        (mut escaped) false]
+    (loop (if (>= (load at) count)
+              (break)
+              (let [byte (cast i64 (slice-get [u8] source (load at)))]
+                (cond (load escaped) (store! escaped false)
+                      (= byte 92) (store! escaped true)
+                      (= byte 34) (break)
+                      :else 0)
+                (set! at (+ (load at) 1)))))
+    (- (load at) start)))
+
+(defn parser-string [(parser (ptr JsonParser))] (-> (slice u8))
+  (let [(mut buffer) (sb-new (.allocator parser))]
+    (al-reserve! [u8]
+                 (mut (.bytes buffer))
+                 (parser-string-capacity parser))
+    (if (!= (parser-advance parser) 34)
+        (parser-fail parser "expected string")
+        0)
+    (loop (let [byte (parser-advance parser)]
+            (cond (< byte 0) (do (parser-fail parser "unterminated string") (break))
+                  (= byte 34) (break)
+                  (< byte 32) (do (parser-fail parser "unescaped control byte in string") (break))
+                  (!= byte 92) (sb-push-byte! (mut buffer) (cast u8 byte))
+                  :else
+                    (let [escaped (parser-advance parser)]
+                      (cond (= escaped 34) (sb-push-byte! (mut buffer) (cast u8 34))
+                            (= escaped 92) (sb-push-byte! (mut buffer) (cast u8 92))
+                            (= escaped 47) (sb-push-byte! (mut buffer) (cast u8 47))
+                            (= escaped 98) (sb-push-byte! (mut buffer) (cast u8 8))
+                            (= escaped 102) (sb-push-byte! (mut buffer) (cast u8 12))
+                            (= escaped 110) (sb-push-byte! (mut buffer) (cast u8 10))
+                            (= escaped 114) (sb-push-byte! (mut buffer) (cast u8 13))
+                            (= escaped 116) (sb-push-byte! (mut buffer) (cast u8 9))
+                            (= escaped 117)
+                              (let [(mut codepoint) (parser-hex4 parser)]
+                                (when (and (>= (load codepoint) 55296)
+                                           (<= (load codepoint) 56319))
+                                  (if (and (= (parser-advance parser) 92)
+                                           (= (parser-advance parser) 117))
+                                      (let [low (parser-hex4 parser)]
+                                        (if (and (>= low 56320) (<= low 57343))
+                                            (store! codepoint
+                                                    (+ 65536
+                                                       (+ (* (- (load codepoint) 55296) 1024)
+                                                          (- low 56320))))
+                                            (parser-fail parser "invalid low surrogate")))
+                                      (parser-fail parser "missing low surrogate"))
+                                  0)
+                                (when (and (>= (load codepoint) 56320)
+                                           (<= (load codepoint) 57343))
+                                  (parser-fail parser "unexpected low surrogate")
+                                  0)
+                                (when (load (field parser ok))
+                                  (json-append-codepoint! (mut buffer) (load codepoint))
+                                  0)
+                                0)
+                            :else (parser-fail parser "invalid string escape"))))))
+    (sb-finish! (mut buffer))))
+
+(defn json-digit? [(byte i64)] (-> bool)
+  (and (>= byte 48) (<= byte 57)))
+
+(defn parser-number [(parser (ptr JsonParser))] (-> Json)
+  (let [start (.position parser)]
+    (when (= (parser-peek parser) 45) (parser-advance parser) 0)
+    (if (= (parser-peek parser) 48)
+        (parser-advance parser)
+        (if (and (>= (parser-peek parser) 49)
+                 (<= (parser-peek parser) 57))
+            (loop (if (json-digit? (parser-peek parser))
+                      (parser-advance parser)
+                      (break)))
+            (parser-fail parser "invalid number")))
+    (when (= (parser-peek parser) 46)
+      (parser-advance parser)
+      (if (json-digit? (parser-peek parser))
+          (loop (if (json-digit? (parser-peek parser))
+                    (parser-advance parser)
+                    (break)))
+          (parser-fail parser "fraction requires a digit"))
+      0)
+    (when (or (= (parser-peek parser) 101)
+              (= (parser-peek parser) 69))
+      (parser-advance parser)
+      (when (or (= (parser-peek parser) 43)
+                (= (parser-peek parser) 45))
+        (parser-advance parser)
+        0)
+      (if (json-digit? (parser-peek parser))
+          (loop (if (json-digit? (parser-peek parser))
+                    (parser-advance parser)
+                    (break)))
+          (parser-fail parser "exponent requires a digit"))
+      0)
+    (JsonNumber (subslice [u8]
+                          (.source parser)
+                          start
+                          (.position parser)))))
+
+(defn parser-literal [(parser (ptr JsonParser)) (text (slice u8))] (-> bool)
+  (let [(mut i) 0
+        n (slice-len [u8] text)
+        (mut equal) true]
+    (loop (if (>= (load i) n)
+              (break)
+              (if (= (parser-advance parser)
+                     (cast i64 (slice-get [u8] text (load i))))
+                  (set! i (+ (load i) 1))
+                  (do (set! equal false) (break)))))
+    (if (load equal)
+        true
+        (do (parser-fail parser "invalid literal") false))))
+
+(defn parser-value [(parser (ptr JsonParser))] (-> Json)
+  (parser-skip-whitespace parser)
+  (let [byte (parser-peek parser)]
+    (cond (= byte 34) (JsonString (parser-string parser))
+          (= byte 91) (parser-array parser)
+          (= byte 123) (parser-object parser)
+          (= byte 110) (do (parser-literal parser "null") (JsonNull))
+          (= byte 116) (do (parser-literal parser "true") (JsonBool true))
+          (= byte 102) (do (parser-literal parser "false") (JsonBool false))
+          (or (= byte 45) (json-digit? byte)) (parser-number parser)
+          :else (do (parser-fail parser "expected JSON value") (JsonNull)))))
+
+(defn parser-array [(parser (ptr JsonParser))] (-> Json)
+  (parser-advance parser)
+  (let [(mut result) (json-array (.allocator parser))]
+    (match (load result) (JsonArray [items] (al-reserve! [Json] items 8)) (_ 0))
+    (parser-skip-whitespace parser)
+    (if (= (parser-peek parser) 93)
+        (parser-advance parser)
+        (loop (json-array-push! (mut result) (parser-value parser))
+          (parser-skip-whitespace parser)
+          (let [next (parser-advance parser)]
+            (cond (= next 93) (break)
+                  (= next 44) (parser-skip-whitespace parser)
+                  :else (do (parser-fail parser "expected ',' or ']' in array") (break))))))
+    (load result)))
+
+;; Construct an integer JSON number without converting through floating point.
+(defn json-integer [(allocator (dyn Allocator)) (number i64)] (-> Json)
+  (if (= number 0)
+      (JsonNumber "0")
+      (let [(mut reversed) (sb-new allocator)
+            (mut output) (sb-new allocator)
+            negative (< number 0)
+            (mut value) (if (< number 0) (- 0 number) number)]
+        (loop (if (= (load value) 0)
+                  (break)
+                  (do
+                    (sb-push-byte! (mut reversed)
+                                   (cast u8 (+ 48 (% (load value) 10))))
+                    (set! value (/ (load value) 10)))))
+        (when negative (sb-push-byte! (mut output) (cast u8 45)) 0)
+        (let [(mut i) (al-len [u8] (.bytes reversed))]
+          (loop (if (<= (load i) 0)
+                    (break)
+                    (do
+                      (set! i (- (load i) 1))
+                      (sb-push-byte! (mut output)
+                                     (al-get [u8]
+                                             (.bytes reversed)
+                                             (load i)))))))
+        (sb-free! (mut reversed))
+        (JsonNumber (sb-finish! (mut output))))))
+
+(defn parser-object [(parser (ptr JsonParser))] (-> Json)
+  (parser-advance parser)
+  (let [(mut result) (json-object (.allocator parser))]
+    (match (load result)
+           (JsonObject [keys values]
+                       (do
+                         (al-reserve! [(slice u8)] keys 16)
+                         (al-reserve! [Json] values 16)
+                         0))
+           (_ 0))
+    (parser-skip-whitespace parser)
+    (if (= (parser-peek parser) 125)
+        (parser-advance parser)
+        (loop (if (!= (parser-peek parser) 34)
+                  (do (parser-fail parser "expected object key") (break))
+                  (let [key (parser-string parser)]
+                    (parser-skip-whitespace parser)
+                    (if (!= (parser-advance parser) 58)
+                        (do (parser-fail parser "expected ':' after object key") (break))
+                        (json-object-put! (mut result) key (parser-value parser)))))
+          (parser-skip-whitespace parser)
+          (let [next (parser-advance parser)]
+            (cond (= next 125) (break)
+                  (= next 44) (parser-skip-whitespace parser)
+                  :else (do (parser-fail parser "expected ',' or '}' in object") (break))))))
+    (load result)))
+
+;; Parse exactly one JSON value. Trailing non-whitespace bytes are rejected.
+(defn json-parse [(allocator (dyn Allocator)) (source (slice u8))] (-> JsonParseResult)
+  (let [parser (primitive/alloc-stack JsonParser)
+        result (primitive/alloc-stack JsonParseResult)]
+    (set! (.source parser) source)
+    (set! (.position parser) 0)
+    (set! (.allocator parser) allocator)
+    (set! (.ok parser) true)
+    (set! (.error parser) "")
+    (set! (.error-pos parser) 0)
+    (let [value (parser-value parser)]
+      (parser-skip-whitespace parser)
+      (when (and (load (field parser ok))
+                 (!= (parser-peek parser) -1))
+        (parser-fail parser "trailing bytes after JSON value")
+        0)
+      (set! (.ok result) (.ok parser))
+      (set! (.value result) value)
+      (set! (.error result) (.error parser))
+      (set! (.error-pos result) (.error-pos parser))
+      (load result))))
+
+(defn json-write-string! [(buffer (mut StrBuf)) (text (slice u8))] (-> i64)
+  (sb-push-byte! (mut buffer) (cast u8 34))
+  (let [(mut i) 0
+        n (slice-len [u8] text)]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [byte (cast i64 (slice-get [u8] text (load i)))]
+                (cond (= byte 34) (sb-push-str! (mut buffer) "\\\"")
+                      (= byte 92) (sb-push-str! (mut buffer) "\\\\")
+                      (= byte 8) (sb-push-str! (mut buffer) "\\b")
+                      (= byte 12) (sb-push-str! (mut buffer) "\\f")
+                      (= byte 10) (sb-push-str! (mut buffer) "\\n")
+                      (= byte 13) (sb-push-str! (mut buffer) "\\r")
+                      (= byte 9) (sb-push-str! (mut buffer) "\\t")
+                      (< byte 32)
+                        (do
+                          (sb-push-str! (mut buffer) "\\u00")
+                          (let [high (/ byte 16)
+                                low (% byte 16)]
+                            (sb-push-byte! (mut buffer) (cast u8 (if (< high 10) (+ 48 high) (+ 87 high))))
+                            (sb-push-byte! (mut buffer) (cast u8 (if (< low 10) (+ 48 low) (+ 87 low))))))
+                      :else (sb-push-byte! (mut buffer) (cast u8 byte)))
+                (set! i (+ (load i) 1))))))
+  (sb-push-byte! (mut buffer) (cast u8 34))
+  0)
+
+(defn json-write! [(buffer (mut StrBuf)) (value Json)] (-> i64)
+  (match value
+    (JsonNull [] (sb-push-str! (mut buffer) "null"))
+    (JsonBool [flag] (sb-push-str! (mut buffer) (if flag "true" "false")))
+    (JsonNumber [raw] (sb-push-str! (mut buffer) raw))
+    (JsonString [text] (json-write-string! (mut buffer) text))
+    (JsonArray [items]
+               (do
+                 (sb-push-byte! (mut buffer) (cast u8 91))
+                 (let [(mut i) 0
+                       n (al-len [Json] (load items))]
+                   (loop (if (>= (load i) n)
+                             (break)
+                             (do
+                               (when (> (load i) 0) (sb-push-byte! (mut buffer) (cast u8 44)) 0)
+                               (json-write! (mut buffer) (al-get [Json] (load items) (load i)))
+                               (set! i (+ (load i) 1))))))
+                 (sb-push-byte! (mut buffer) (cast u8 93))))
+    (JsonObject [keys values]
+                (do
+                  (sb-push-byte! (mut buffer) (cast u8 123))
+                  (let [(mut i) 0
+                        n (al-len [(slice u8)] (load keys))]
+                    (loop (if (>= (load i) n)
+                              (break)
+                              (do
+                                (when (> (load i) 0) (sb-push-byte! (mut buffer) (cast u8 44)) 0)
+                                (json-write-string! (mut buffer) (al-get [(slice u8)] (load keys) (load i)))
+                                (sb-push-byte! (mut buffer) (cast u8 58))
+                                (json-write! (mut buffer) (al-get [Json] (load values) (load i)))
+                                (set! i (+ (load i) 1))))))
+                  (sb-push-byte! (mut buffer) (cast u8 125)))))
+  0)
+
+;; Serialize a JSON tree into an owned byte slice allocated by `allocator`.
+(defn json-stringify [(allocator (dyn Allocator)) (value Json)] (-> (slice u8))
+  (let [(mut buffer) (sb-new allocator)]
+    (json-write! (mut buffer) value)
+    (sb-finish! (mut buffer))))
+
+;; A JSON number as an integer, or 0 when the value is not a number. Callers that
+;; must distinguish "absent" from "zero" test for the key first.
+(defn json-number-i64 [(value Json)] (-> i64)
+  (match value
+    (JsonNumber [raw]
+                (match (str-parse-int raw)
+                  (Some [number] number)
+                  (None [] 0)))
+    (_ 0)))
