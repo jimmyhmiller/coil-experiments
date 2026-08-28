@@ -1,0 +1,96 @@
+(module experiments.borrow-checker.runtime)
+
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use *)
+
+;; An affine heap owner. Box itself is a plain value, but because it implements
+;; Drop the typed ownership pass treats it as non-Copy, follows moves, and emits
+;; exactly one destructor on every live control-flow exit.
+(defstruct Box [T]
+  [(lease alloc/AllocatorLease)
+   (value (ptr T))])
+
+(defn box-live-cell [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defn box-live-count [] (-> i64)
+  (load (box-live-cell)))
+
+(defn box-live-inc! [] (-> i64)
+  (store! (box-live-cell) (+ (box-live-count) 1))
+  0)
+
+(defn box-live-dec! [] (-> i64)
+  (store! (box-live-cell) (- (box-live-count) 1))
+  0)
+
+(defn box-new [T] [(value T)] (-> (Box T))
+  (let [lease (alloc/malloc-allocator-lease)]
+    (match (alloc/lease-raw-alloc lease
+             (alloc/AllocRequest :type-id (alloc/type-id [T])
+                                 :count 1
+                                 :bytes (primitive/sizeof T)
+                                 :align (primitive/alignof T)))
+      (None [] (let [failed-lease lease]
+                 (alloc/abort)
+                 (primitive/zeroed (Box T))))
+      (Some [memory]
+        (let [pointer (primitive/cast (ptr T) memory)]
+          (store! pointer value)
+          (box-live-inc!)
+          (Box [T] :lease lease :value pointer))))))
+
+(defn box-borrow [T] [(owner (ref (Box T)))] (-> (ptr T))
+  (.value owner))
+
+(defn box-borrow-mut [T] [(owner (mut (Box T)))] (-> (ptr T))
+  (.value owner))
+
+(impl [T] Drop (Box T)
+  (drop [(self (mut (Box T)))] (-> void)
+    (let [pointer (.value self)
+          value (take! [T] pointer)
+          lease (take! [alloc/AllocatorLease] (mut (.lease self)))]
+      (alloc/lease-raw-free lease
+        (primitive/cast (ptr i8) pointer)
+        (alloc/AllocRequest :type-id (alloc/type-id [T])
+                            :count 1
+                            :bytes (primitive/sizeof T)
+                            :align (primitive/alignof T)))
+      (forget (box-live-dec!)))))
+
+;; A Rust-like owned growable vector. Its backing allocation and every element
+;; are destroyed recursively when the Vec leaves scope.
+(defstruct Vec [T]
+  [(inner (al/ArrayList T))])
+
+(defn vec-new [T] [] (-> (Vec T))
+  (Vec [T] :inner (al/al-new [T] (alloc/malloc-allocator))))
+
+(defn vec-push! [T] [(self (mut (Vec T))) (value T)] (-> i64)
+  (al/al-push! [T] (mut (.inner self)) value))
+
+(defn vec-len [T] [(self (ref (Vec T)))] (-> i64)
+  (al/al-len [T] (.inner self)))
+
+(defn vec-get [T] [(self (ref (Vec T))) (index i64)] (-> (ptr T))
+  (if (or (< index 0) (>= index (al/al-len [T] (.inner self))))
+      (do (alloc/abort) (primitive/cast (ptr T) 0))
+      (primitive/index (.data (.inner self)) index)))
+
+(defn vec-get-mut [T] [(self (mut (Vec T))) (index i64)] (-> (ptr T))
+  (al/al-elem [T] (mut (.inner self)) index))
+
+(defn vec-pop! [T] [(self (mut (Vec T)))] (-> (Option T))
+  (al/al-pop! [T] (mut (.inner self))))
+
+(impl [T] Drop (Vec T)
+  (drop [(self (mut (Vec T)))] (-> void)
+    (loop (if (= (al/al-len [T] (.inner self)) 0)
+              (break)
+              (match (al/al-pop! [T] (mut (.inner self)))
+                (Some [value] 0)
+                (None [] (break)))))
+    (forget (al/al-free! [T] (mut (.inner self))))))
