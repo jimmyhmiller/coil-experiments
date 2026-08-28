@@ -6,18 +6,380 @@
 ;; and monomorphic types, rejects invalid moves, and inserts Drop glue.
 
 (import "coil.primitive" :as primitive)
-(import "experiments.borrow-checker.runtime" :use * :reexport)
+(import "coil.slice" :as slice)
+(import "coil.str" :as str)
+(import "experiments.borrow-checker.runtime" :as runtime :use * :reexport)
+
+(export Box Vec Closure0 box-new box-live-count vec-new vec-push! vec-len vec-pop!
+        closure0-call owned-closure0
+        with-box-ref with-box-mut with-vec-ref with-vec-mut unsafe-borrow)
+
+(defn borrow-bindings-valid? [(bindings Code)] (-> bool)
+  (and (primitive/code-vector? bindings)
+       (or (= (primitive/code-count bindings) 2)
+           (= (primitive/code-count bindings) 3))
+       (primitive/code-sym? (primitive/code-nth bindings 0))))
+
+(defn borrow-owner [(bindings Code)] (-> Code)
+  (primitive/code-nth bindings (- (primitive/code-count bindings) 1)))
+
+(defn borrow-raw-call [(head Code) (bindings Code) (owner Code)] (-> Code)
+  (if (= (primitive/code-count bindings) 3)
+      `(~head [~(primitive/code-nth bindings 1)] ~owner)
+      `(~head ~owner)))
+
+(defn with-box-ref [(bindings Code) & (body Code)] (-> Code)
+  (if (not (borrow-bindings-valid? bindings))
+      (primitive/error "with-box-ref expects [name owner]")
+      (let [name (primitive/code-nth bindings 0)
+            owner (borrow-owner bindings)]
+        `(let [~name ~(borrow-raw-call `runtime/box-borrow-raw bindings owner)]
+           (do ~@body)))))
+
+(defn with-box-mut [(bindings Code) & (body Code)] (-> Code)
+  (if (not (borrow-bindings-valid? bindings))
+      (primitive/error "with-box-mut expects [name owner]")
+      (let [name (primitive/code-nth bindings 0)
+            owner (borrow-owner bindings)]
+        `(let [~name ~(borrow-raw-call `runtime/box-borrow-mut-raw bindings `(mut ~owner))]
+           (do ~@body)))))
+
+(defn with-vec-ref [(bindings Code) (index Code) & (body Code)] (-> Code)
+  (if (not (borrow-bindings-valid? bindings))
+      (primitive/error "with-vec-ref expects [name owner] index")
+      (let [name (primitive/code-nth bindings 0)
+            owner (primitive/code-nth bindings 1)]
+        `(let [~name (runtime/vec-get-raw ~owner ~index)]
+           (do ~@body)))))
+
+(defn with-vec-mut [(bindings Code) (index Code) & (body Code)] (-> Code)
+  (if (not (borrow-bindings-valid? bindings))
+      (primitive/error "with-vec-mut expects [name owner] index")
+      (let [name (primitive/code-nth bindings 0)
+            owner (primitive/code-nth bindings 1)]
+        `(let [~name (runtime/vec-get-mut-raw (mut ~owner) ~index)]
+           (do ~@body)))))
+
+;; Deliberate proof boundary for FFI and data structures whose lifetime
+;; invariant cannot yet be expressed in Coil's type system.
+(defn unsafe-borrow [(body Code)] (-> Code)
+  `(runtime/unsafe-borrow-boundary ~body))
+
+(defn owned-closure0 [(types Code) (function Code) (environment Code)] (-> Code)
+  (if (not (and (primitive/code-vector? types)
+                (= (primitive/code-count types) 2)))
+      (primitive/error "owned-closure0 expects [Environment Result] function environment")
+      `(runtime/closure0-new
+         [~(primitive/code-nth types 0) ~(primitive/code-nth types 1)]
+         ~environment
+         (runtime/unsafe-borrow-boundary (primitive/fnptr-of ~function)))))
 
 (defn borrow-checker-user-module? [(m Code)] (-> bool)
   (and (primitive/code-list? m)
        (> (primitive/code-count m) 1)
+       (let [name (primitive/code-nth m 0)]
+         (and (primitive/code-sym? name)
+              (not (str/starts-with (primitive/code-sym name)
+                                    "experiments.borrow-checker."))))
        (primitive/code-from-user? (primitive/code-nth m 1))))
+
+(defn bc-tail-named? [(form Code) (wanted (slice u8))] (-> bool)
+  (if (not (primitive/code-sym? form))
+      false
+      (let [name (primitive/code-sym form)
+            nn (slice/slice-len name)
+            nw (slice/slice-len wanted)]
+        (and (<= nw nn)
+             (= (slice/subslice name (- nn nw) nn) wanted)))))
+
+(defn bc-head? [(form Code) (wanted (slice u8))] (-> bool)
+  (and (primitive/code-list? form)
+       (> (primitive/code-count form) 0)
+       (bc-tail-named? (primitive/code-nth form 0) wanted)))
+
+(defn bc-borrow-init? [(form Code)] (-> bool)
+  (or (bc-head? form "box-borrow-raw")
+      (or (bc-head? form "box-borrow-mut-raw")
+          (or (bc-head? form "vec-get-raw")
+              (bc-head? form "vec-get-mut-raw")))))
+
+(defn bc-mut-borrow-init? [(form Code)] (-> bool)
+  (or (bc-head? form "box-borrow-mut-raw")
+      (bc-head? form "vec-get-mut-raw")))
+
+(defn bc-owner-root [(form Code)] (-> Code)
+  (if (and (primitive/code-list? form)
+           (= (primitive/code-count form) 2)
+           (or (bc-head? form "mut") (bc-head? form "ref")))
+      (primitive/code-nth form 1)
+      form))
+
+(defn bc-borrow-owner [(init Code)] (-> Code)
+  (if (and (primitive/code-list? init) (> (primitive/code-count init) 1))
+      (bc-owner-root (primitive/code-nth init (- (primitive/code-count init) 1)))
+      `:unknown))
+
+(defn bc-managed-type? [(ty Code)] (-> bool)
+  (if (primitive/code-sym? ty)
+      (or (bc-tail-named? ty "Box") (bc-tail-named? ty "Vec"))
+      (if (primitive/code-list? ty)
+          (bc-managed-type-kids? ty 0 (primitive/code-count ty))
+          false)))
+
+(defn bc-managed-type-kids? [(ty Code) (i i64) (n i64)] (-> bool)
+  (if (>= i n)
+      false
+      (or (bc-managed-type? (primitive/code-nth ty i))
+          (bc-managed-type-kids? ty (+ i 1) n))))
+
+(defn bc-owned-sum-init? [(init Code)] (-> bool)
+  (let [ty (primitive/type-of init)]
+    (and (primitive/code-list? ty)
+         (> (primitive/code-count ty) 1)
+         (let [head (primitive/code-nth ty 0)]
+           (and (or (bc-tail-named? head "Option")
+                    (bc-tail-named? head "Result"))
+                (bc-managed-type-kids? ty 1 (primitive/code-count ty)))))))
+
+(defn bc-matches-target? [(form Code) (name Code) (bid i64)] (-> bool)
+  (if (not (or (primitive/code-list? form) (primitive/code-vector? form)))
+      false
+      (let [n (primitive/code-count form)]
+        (or (and (bc-head? form "match")
+                 (> n 1)
+                 (bc-target? (primitive/code-nth form 1) name bid))
+            (bc-matches-target-kids? form name bid 0 n)))))
+
+(defn bc-matches-target-kids? [(form Code) (name Code) (bid i64)
+                               (i i64) (n i64)] (-> bool)
+  (if (>= i n)
+      false
+      (or (bc-matches-target? (primitive/code-nth form i) name bid)
+          (bc-matches-target-kids? form name bid (+ i 1) n))))
+
+(defn bc-validate-owned-sum-bindings [(bindings Code) (scope Code)
+                                      (i i64) (n i64)] (-> i64)
+  (if (>= (+ i 1) n)
+      0
+      (let [name (primitive/code-nth bindings i)
+            init (primitive/code-nth bindings (+ i 1))
+            bid (bc-find-binding-kids scope name 2 (primitive/code-count scope))]
+        (if (and (bc-owned-sum-init? init)
+                 (bc-matches-target-kids? scope name bid 2 (primitive/code-count scope)))
+            (do (primitive/error
+                  "borrow-checker: bind-and-match of an owned Option/Result is unsafe in this Coil version; match the producing expression directly")
+                0)
+            0)
+        (bc-validate-owned-sum-bindings bindings scope (+ i 2) n))))
+
+(defn bc-unsafe? [(form Code)] (-> bool)
+  (or (bc-head? form "unsafe-borrow")
+      (bc-head? form "unsafe-borrow-boundary")))
+
+(defn bc-extern-call? [(form Code)] (-> bool)
+  (if (not (and (primitive/code-list? form) (> (primitive/code-count form) 0)))
+      false
+      (let [head (primitive/code-nth form 0)]
+        (if (not (primitive/code-sym? head))
+            false
+            (let [call-decl (primitive/code-decl form)
+                  head-decl (primitive/code-decl head)
+                  decl (if (and (primitive/code-list? call-decl)
+                                (> (primitive/code-count call-decl) 0))
+                           call-decl
+                           head-decl)]
+              (and (primitive/code-list? decl)
+                   (> (primitive/code-count decl) 0)
+                   (or (bc-tail-named? (primitive/code-nth decl 0) "extern")
+                       (and (> (primitive/code-count decl) 2)
+                            (bc-tail-named? (primitive/code-nth decl 2) "extern")))))))))
+
+(defn bc-raw-operation? [(form Code)] (-> bool)
+  (and (primitive/code-list? form)
+       (> (primitive/code-count form) 0)
+       (let [head (primitive/code-nth form 0)]
+         (or (bc-tail-named? head "alloc-heap")
+             (or (bc-tail-named? head "alloc-stack")
+                 (or (bc-tail-named? head "alloc-static")
+                     (or (bc-tail-named? head "free")
+                         (or (bc-tail-named? head "alias-load")
+                             (or (bc-tail-named? head "alias-store!")
+                                 (or (bc-tail-named? head "llvm-ir")
+                                     (or (bc-tail-named? head "call-ptr")
+                                         (or (bc-tail-named? head "fnptr-of")
+                                             (bc-extern-call? form)))))))))))))
+
+(defn bc-validate-policy [(form Code)] (-> i64)
+  (if (not (or (primitive/code-list? form) (primitive/code-vector? form)))
+      0
+      (if (bc-unsafe? form)
+          0
+          (if (bc-raw-operation? form)
+              (do (primitive/error
+                    "borrow-checker: raw memory, indirect call, or FFI operation requires unsafe-borrow")
+                  0)
+              (bc-validate-policy-kids form 0 (primitive/code-count form))))))
+
+(defn bc-validate-policy-kids [(form Code) (i i64) (n i64)] (-> i64)
+  (if (>= i n)
+      0
+      (do (bc-validate-policy (primitive/code-nth form i))
+          (bc-validate-policy-kids form (+ i 1) n))))
+
+(defn bc-validate-user-modules [(modules Code) (i i64) (n i64)] (-> i64)
+  (if (>= i n)
+      0
+      (let [m (primitive/code-nth modules i)]
+        (if (borrow-checker-user-module? m)
+            (do (bc-validate-scopes m) (bc-validate-policy m))
+            0)
+        (bc-validate-user-modules modules (+ i 1) n))))
+
+(defn bc-find-binding [(form Code) (name Code)] (-> i64)
+  (if (primitive/code-sym? form)
+      (if (and (primitive/code-sym? name)
+               (= (primitive/code-sym form) (primitive/code-sym name)))
+          (primitive/binding-of form)
+          0)
+      (if (not (or (primitive/code-list? form) (primitive/code-vector? form)))
+          0
+          (bc-find-binding-kids form name 0 (primitive/code-count form)))))
+
+(defn bc-find-binding-kids [(form Code) (name Code) (i i64) (n i64)] (-> i64)
+  (if (>= i n)
+      0
+      (let [found (bc-find-binding (primitive/code-nth form i) name)]
+        (if (> found 0)
+            found
+            (bc-find-binding-kids form name (+ i 1) n)))))
+
+(defn bc-target? [(form Code) (name Code) (bid i64)] (-> bool)
+  (and (primitive/code-sym? form)
+       (if (> bid 0)
+           (= (primitive/binding-of form) bid)
+           (and (primitive/code-sym? name)
+                (= (primitive/code-sym form) (primitive/code-sym name))))))
+
+(defn bc-validate-owner-use [(form Code) (owner Code) (owner-bid i64) (mutable bool)] (-> i64)
+  (if (primitive/code-sym? form)
+      (if (bc-target? form owner owner-bid)
+          (do (primitive/error
+                (primitive/code-str
+                  "borrow-checker: owner is used or moved while its borrow is active: " form))
+              0)
+          0)
+      (if (not (or (primitive/code-list? form) (primitive/code-vector? form)))
+          0
+          (if (bc-unsafe? form)
+              0
+              (if (bc-borrow-init? form)
+                  (let [nested-owner (bc-borrow-owner form)
+                        same (and (primitive/code-sym? nested-owner)
+                                  (bc-target? nested-owner owner owner-bid))]
+                    (if same
+                        (if (or mutable (bc-mut-borrow-init? form))
+                            (do (primitive/error
+                                  "borrow-checker: conflicting borrow of an already borrowed owner")
+                                0)
+                            0)
+                        (bc-validate-owner-kids form owner owner-bid mutable 0
+                                                (primitive/code-count form))))
+                  (bc-validate-owner-kids form owner owner-bid mutable 0
+                                          (primitive/code-count form)))))))
+
+(defn bc-validate-owner-kids [(form Code) (owner Code) (owner-bid i64)
+                              (mutable bool) (i i64) (n i64)] (-> i64)
+  (if (>= i n)
+      0
+      (do (bc-validate-owner-use (primitive/code-nth form i) owner owner-bid mutable)
+          (bc-validate-owner-kids form owner owner-bid mutable (+ i 1) n))))
+
+(defn bc-validate-use [(form Code) (name Code) (bid i64) (place bool)] (-> i64)
+  (if (primitive/code-sym? form)
+      (if (and (bc-target? form name bid) (not place))
+          (do (primitive/error
+                (primitive/code-str
+                  "borrow-checker: borrowed view escapes its scoped place use: " form
+                  "; use unsafe-borrow for an audited raw-pointer boundary"))
+              0)
+          0)
+      (if (not (or (primitive/code-list? form) (primitive/code-vector? form)))
+          0
+          (if (bc-unsafe? form)
+              0
+              (let [n (primitive/code-count form)]
+                (if (= n 0)
+                    0
+                    (if (primitive/code-vector? form)
+                        (bc-validate-kids form name bid 0 n false)
+                        (let [head (primitive/code-nth form 0)]
+                          (cond (bc-borrow-init? form)
+                                  (bc-validate-kids form name bid 1 n true)
+                                (or (bc-tail-named? head "mut")
+                                    (bc-tail-named? head "ref"))
+                                  (bc-validate-kids form name bid 1 n true)
+                                (bc-tail-named? head "load")
+                                  (bc-validate-kids form name bid 1 n false)
+                                (or (bc-tail-named? head "field")
+                                        (and (primitive/code-sym? head)
+                                             (str/starts-with (primitive/code-sym head) ".")))
+                                  (bc-validate-kids form name bid 1 n true)
+                                (or (bc-tail-named? head "store!")
+                                    (bc-tail-named? head "set!"))
+                                  (do (if (> n 1) (bc-validate-use (primitive/code-nth form 1) name bid true) 0)
+                                      (if (> n 2) (bc-validate-use (primitive/code-nth form 2) name bid false) 0))
+                                :else (bc-validate-kids form name bid 1 n false))))))))))
+
+(defn bc-validate-kids [(form Code) (name Code) (bid i64) (i i64) (n i64) (place bool)] (-> i64)
+  (if (>= i n)
+      0
+      (do (bc-validate-use (primitive/code-nth form i) name bid place)
+          (bc-validate-kids form name bid (+ i 1) n place))))
+
+(defn bc-validate-scopes [(form Code)] (-> i64)
+  (if (not (or (primitive/code-list? form) (primitive/code-vector? form)))
+      0
+      (let [n (primitive/code-count form)]
+        (if (= n 0)
+            0
+            (do
+              (if (and (bc-head? form "let") (> n 2))
+                  (let [scope form]
+                    (let [bindings (primitive/code-nth scope 1)]
+                          (if (primitive/code-vector? bindings)
+                              (bc-validate-owned-sum-bindings bindings scope 0
+                                (primitive/code-count bindings))
+                              0)
+                          (if (and (primitive/code-vector? bindings)
+                                   (>= (primitive/code-count bindings) 2)
+                                   (bc-borrow-init? (primitive/code-nth bindings 1)))
+                              (let [name (primitive/code-nth bindings 0)
+                                    init (primitive/code-nth bindings 1)
+                                    bid (bc-find-binding-kids scope name 2 (primitive/code-count scope))
+                                    owner (bc-borrow-owner init)
+                                    owner-bid (if (primitive/code-sym? owner)
+                                                  (primitive/binding-of owner)
+                                                  0)]
+                                (bc-validate-kids scope name bid 2 (primitive/code-count scope) false)
+                                (bc-validate-owner-kids scope owner owner-bid
+                                                        (bc-mut-borrow-init? init)
+                                                        2 (primitive/code-count scope)))
+                              0)))
+                  0)
+              (bc-validate-scope-kids form 0 n))))))
+
+(defn bc-validate-scope-kids [(form Code) (i i64) (n i64)] (-> i64)
+  (if (>= i n)
+      0
+      (do (bc-validate-scopes (primitive/code-nth form i))
+          (bc-validate-scope-kids form (+ i 1) n))))
 
 (defn borrow-checker-validate-modules [(modules Code)] (-> Code)
   ;; This deliberately preserves the checked typed tree. Destruction and move
   ;; elaboration belong to Coil's typed ownership pass, not a surface rewrite.
   ;; Keeping a registered ownership-phase transform makes activation explicit
   ;; and gives this dialect a stable place for future policy checks.
-  `(do ~@modules))
+  (do (bc-validate-user-modules modules 0 (primitive/code-count modules))
+      `(do ~@modules)))
 
 (transform borrow-checker-validate-modules :phase ownership)
