@@ -1,0 +1,160 @@
+(module experiments.heap-inspector.native-demo-test)
+
+(import "coil.primitive" :as primitive)
+(import "coil.assert" :use *)
+(import "coil.atomic" :as atomic)
+(import "coil.thread" :as thread)
+(import "coil.slice" :use [slice-len slice-get])
+(import "experiments.heap-inspector.native-demo-api" :as demo)
+(import "experiments.heap-inspector.live" :as live)
+
+(defn demo-test-ticks [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn demo-test-tick [] (-> i64)
+  (store! (demo-test-ticks) (+ (load (demo-test-ticks)) 1))
+  0)
+(defn demo-test-value [(index i64) (field i64)] (-> i64)
+  (+ (* index 10) field))
+
+(defn demo-test-broken-value [(index i64) (field i64)] (-> i64)
+  (if (and (= index 0) (= field 2))
+      (do (live/live-condition-raise-c 2 -20) 0)
+      (+ (* index 10) field)))
+
+(defn concurrent-restart-results [] (-> (ptr (array i64 8)))
+  (primitive/alloc-static (array i64 8)))
+
+(defn concurrent-broken-frame-worker [(ctx (ptr i8))] (-> (ptr i8))
+  (let [index (primitive/cast i64 ctx)
+        particles (primitive/alloc-stack (array demo/NativeDemoParticle 18))]
+    (store! (primitive/index (concurrent-restart-results) index)
+      (demo/native-demo-read-frame!
+        (primitive/cast (ptr demo/NativeDemoParticle) particles))))
+  (primitive/cast (ptr i8) 0))
+
+(defn demo-test-contains? [(text (slice u8)) (needle (slice u8))] (-> bool)
+  (let [(mut at) 0 (mut found) false]
+    (loop (if (or (load found) (> (+ (load at) (slice-len needle)) (slice-len text)))
+              (break)
+              (let [(mut i) 0 (mut same) true]
+                (loop (if (or (not (load same)) (>= (load i) (slice-len needle)))
+                          (break)
+                          (if (= (slice-get text (+ (load at) (load i))) (slice-get needle (load i)))
+                              (set! i (+ (load i) 1))
+                              (set! same false))))
+                (if (load same) (set! found true) (set! at (+ (load at) 1))))))
+    (load found)))
+
+(deftest staged-native-demo-callbacks-publish-as-one-frame-api
+  (demo/native-demo-enable!)
+  (store! (demo-test-ticks) 0)
+  (assert-eq 0
+    (demo/native-demo-stage-callbacks!
+      (primitive/fnptr-of demo-test-tick)
+      (primitive/fnptr-of demo-test-value)))
+  (assert (not (.published (demo/native-demo-api))))
+  (assert-eq 0 (demo/native-demo-publish-staged!))
+  (let [frame (demo/native-demo-frame-json)]
+    (assert-eq 1 (load (demo-test-ticks)))
+    (assert (demo-test-contains? frame "\"supported\":true"))
+    (assert (demo-test-contains? frame "\"x\":170"))
+    (assert (demo-test-contains? frame "\"kind\":174")))
+  (live/live-condition-raise! 2 1)
+  (let [paused-frame (demo/native-demo-frame-json)]
+    (assert-eq 1 (load (demo-test-ticks)))
+    (assert (demo-test-contains? paused-frame "\"running\":false"))
+    (assert (demo-test-contains? paused-frame "\"pausedByCondition\":true")))
+  (live/live-condition-clear!)
+  (demo/native-demo-frame-json)
+  (assert-eq 2 (load (demo-test-ticks))))
+
+(deftest abort-does-not-publish-staged-callbacks
+  (set! (.published (demo/native-demo-api)) false)
+  (demo/native-demo-stage-callbacks!
+    (primitive/fnptr-of demo-test-tick)
+    (primitive/fnptr-of demo-test-value))
+  (demo/native-demo-abort-staged!)
+  (assert (not (.published (demo/native-demo-api)))))
+
+(deftest broken-callback-quarantines-the-entire-native-frame
+  (live/live-condition-clear!)
+  (demo/native-demo-enable!)
+  (demo/native-demo-stage-callbacks!
+    (primitive/fnptr-of demo-test-tick)
+    (primitive/fnptr-of demo-test-broken-value))
+  (demo/native-demo-publish-staged!)
+  (let [particles (primitive/alloc-stack (array demo/NativeDemoParticle 18))]
+    (for [i 0 18]
+      (let [p (primitive/index particles i)]
+        (set! (.x p) 777)
+        (set! (.y p) 777)
+        (set! (.radius p) 777)
+        (set! (.tint p) 777)
+        (set! (.kind p) 777)))
+    (assert-eq -20
+      (demo/native-demo-read-frame!
+        (primitive/cast (ptr demo/NativeDemoParticle) particles)))
+    (for [i 0 18]
+      (let [p (primitive/index particles i)]
+        (assert-eq 777 (.x p))
+        (assert-eq 777 (.y p))
+        (assert-eq 777 (.radius p))
+        (assert-eq 777 (.tint p))
+        (assert-eq 777 (.kind p))))
+    (assert-eq 0 (atomic/atomic-load (live/live-reader-count)))
+    (assert (live/live-condition-active?)))
+  (live/live-condition-clear!))
+
+(deftest concurrent-restart-boundaries-release-each-thread-source-stack
+  (live/live-condition-clear!)
+  (demo/native-demo-enable!)
+  (demo/native-demo-stage-callbacks!
+    (primitive/fnptr-of demo-test-tick)
+    (primitive/fnptr-of demo-test-broken-value))
+  (demo/native-demo-publish-staged!)
+  ; Avoid an unrelated race in the demo's presentation frame counter. Query
+  ; callbacks still execute while paused, so every thread reaches Broken.
+  (demo/native-demo-set-running! false)
+  (let [workers (primitive/alloc-stack (array thread/Thread 8))]
+    (for [i 0 8]
+      (do
+        (store! (primitive/index (concurrent-restart-results) i) 0)
+        (assert-eq 0 (primitive/cast i64
+                       (thread/thread-spawn (primitive/index workers i)
+                         (primitive/fnptr-of concurrent-broken-frame-worker)
+                         (primitive/cast (ptr i8) i))))))
+    (for [i 0 8]
+      (thread/thread-join (primitive/index workers i)))
+    (for [i 0 8]
+      (assert-eq -20 (load (primitive/index (concurrent-restart-results) i))))
+    (assert-eq 0 (atomic/atomic-load (live/live-reader-count)))
+    (for [i 0 (load (live/live-source-gate-count))]
+      (assert-eq 0
+        (atomic/atomic-load
+          (field (primitive/index (live/live-source-gates) i) active)))))
+  (demo/native-demo-set-running! true)
+  (live/live-condition-clear!))
+
+(deftest window-and-http-frame-drivers-serialize-complete-native-ticks
+  (live/live-condition-clear!)
+  (demo/native-demo-enable!)
+  (demo/native-demo-stage-callbacks!
+    (primitive/fnptr-of demo-test-tick)
+    (primitive/fnptr-of demo-test-value))
+  (demo/native-demo-publish-staged!)
+  (demo/native-demo-set-running! true)
+  (store! (demo-test-ticks) 0)
+  (let [workers (primitive/alloc-stack (array thread/Thread 8))]
+    (for [i 0 8]
+      (do
+        (store! (primitive/index (concurrent-restart-results) i) -99)
+        (assert-eq 0 (primitive/cast i64
+                       (thread/thread-spawn (primitive/index workers i)
+                         (primitive/fnptr-of concurrent-broken-frame-worker)
+                         (primitive/cast (ptr i8) i))))))
+    (for [i 0 8]
+      (thread/thread-join (primitive/index workers i)))
+    (for [i 0 8]
+      (assert-eq 0 (load (primitive/index (concurrent-restart-results) i))))
+    ; demo-test-tick is deliberately non-atomic. Exact count proves frame
+    ; execution, including persistent-world mutation, was serialized.
+    (assert-eq 8 (load (demo-test-ticks)))))

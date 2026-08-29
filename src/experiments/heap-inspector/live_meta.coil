@@ -1,0 +1,771 @@
+(module experiments.heap-inspector.live-meta)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :use *)
+
+; Compiler-session condition kinds are a metaprogram/runtime protocol, not
+; diagnostic text. Kind 1 is NeedsTransition.
+(defn live-mark-needs-transition! [] (-> Code)
+  (primitive/code-session-condition! 1))
+
+(defn live-text=? [(a (slice u8)) (b (slice u8))] (-> bool)
+  (if (!= (slice-len a) (slice-len b))
+      false
+      (let [(mut i) 0 (mut same) true]
+        (loop (if (or (>= (load i) (slice-len a)) (not (load same)))
+                  (break)
+                  (if (= (slice-get a (load i)) (slice-get b (load i)))
+                      (set! i (+ (load i) 1))
+                      (set! same false))))
+        (load same))))
+
+(defn live-field-index [(T Code) (name Code)] (-> i64)
+  (let [n (primitive/code-field-count T) (mut i) 0 (mut found) -1]
+    (loop (if (>= (load i) n)
+              (break)
+              (if (live-text=? (primitive/code-str (primitive/code-field-name T (load i)))
+                               (primitive/code-str name))
+                  (do (set! found (load i)) (break))
+                  (set! i (+ (load i) 1)))))
+    (load found)))
+
+(defn live-old-type [(T Code)] (-> Code)
+  ; The edit planner injects this declaration from the last accepted schema.
+  ; datum->syntax deliberately puts its stable generated spelling in the
+  ; edited module's context so code-decl/code-field-* resolve it there.
+  (primitive/datum->syntax T
+    (primitive/syntax->datum (primitive/code-symbol "__live_old_" T))))
+
+(defn live-struct-fields [(decl Code)] (-> Code)
+  (if (and (primitive/code-list? decl)
+           (and (>= (primitive/code-count decl) 3)
+                (primitive/code-eq (primitive/code-nth decl 0) `defstruct)))
+      (primitive/code-nth decl (- (primitive/code-count decl) 1))
+      (primitive/error "live migration: expected a defstruct declaration")))
+
+(defn live-raw-field-index [(decl Code) (name Code)] (-> i64)
+  (let [fields (live-struct-fields decl)
+        (mut i) 0 (mut found) -1]
+    (loop (if (>= (load i) (primitive/code-count fields))
+              (break)
+              (let [field (primitive/code-nth fields (load i))]
+                (if (live-text=? (primitive/code-str (primitive/code-nth field 0))
+                                 (primitive/code-str name))
+                    (do (set! found (load i)) (break))
+                    (set! i (+ (load i) 1))))))
+    (load found)))
+
+(defn live-raw-field-name [(decl Code) (i i64)] (-> Code)
+  (primitive/code-nth (primitive/code-nth (live-struct-fields decl) i) 0))
+
+(defn live-raw-field-type [(decl Code) (i i64)] (-> Code)
+  (primitive/code-nth (primitive/code-nth (live-struct-fields decl) i) 1))
+
+(defn live-raw-field-default? [(decl Code) (i i64)] (-> bool)
+  (let [field (primitive/code-nth (live-struct-fields decl) i)]
+    (and (= (primitive/code-count field) 4)
+         (primitive/code-eq (primitive/code-nth field 2) `:live-default))))
+
+(defn live-raw-field-default [(decl Code) (i i64)] (-> Code)
+  (primitive/code-nth (primitive/code-nth (live-struct-fields decl) i) 3))
+
+(defn live-pointer-target [(T Code)] (-> Code)
+  (if (and (primitive/code-list? T)
+           (and (= (primitive/code-count T) 2)
+                (primitive/code-eq (primitive/code-nth T 0) `ptr)))
+      (primitive/code-nth T 1)
+      `:unknown))
+
+(defn live-reference-kind [(T Code)] (-> i64)
+  (if (not (primitive/code-list? T))
+      0
+      (cond (and (= (primitive/code-count T) 2)
+                 (primitive/code-eq (primitive/code-nth T 0) `ptr)) 1
+            (and (= (primitive/code-count T) 2)
+                 (primitive/code-eq (primitive/code-nth T 0) `slice)) 2
+            (and (> (primitive/code-count T) 0)
+                 (primitive/code-eq (primitive/code-nth T 0) `fnptr)) 3
+            :else 0)))
+
+(defn live-reference-target [(T Code)] (-> Code)
+  (let [kind (live-reference-kind T)]
+    (cond (or (= kind 1) (= kind 2)) (primitive/code-nth T 1)
+          (= kind 3) `:native-code
+          :else `:unknown)))
+
+(defn live-historical-type-of? [(OldType Code) (NewType Code)] (-> bool)
+  (and (primitive/code-sym? OldType)
+       (and (primitive/code-sym? NewType)
+            (live-text=? (primitive/code-str OldType)
+                         (primitive/code-str "__live_old_" NewType)))))
+
+(defn live-nested-adapter-name [(T Code)] (-> Code)
+  (primitive/datum->syntax T
+    (primitive/syntax->datum (primitive/code-symbol T "--live-object-edge"))))
+
+(defn live-raw-copy-lines [(OldDecl Code) (NewDecl Code) (changed Code)
+                           (transition Code) (old-p Code) (new-p Code)] (-> Code)
+  (let [fields (live-struct-fields NewDecl)
+        out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count fields)]
+      (let [field-name (live-raw-field-name NewDecl i)
+            old-index (live-raw-field-index OldDecl field-name)
+            new-type (live-raw-field-type NewDecl i)]
+        (cond
+          (live-text=? (primitive/code-str field-name) (primitive/code-str changed))
+            (primitive/code-list-push! out
+              `(set! (field ~new-p ~field-name)
+                     (~transition (load (field ~old-p ~field-name)))))
+          (< old-index 0)
+            (if (live-raw-field-default? NewDecl i)
+                (primitive/code-list-push! out
+                  `(set! (field ~new-p ~field-name)
+                         ~(live-raw-field-default NewDecl i)))
+                (do (live-mark-needs-transition!)
+                    (primitive/error (primitive/code-str "live migration: new field '"
+                                                         (primitive/code-str field-name)
+                                                         "' requires a default or transition"))))
+          :else
+            (let [old-type (live-raw-field-type OldDecl old-index)]
+              (cond
+                (live-historical-type-of? old-type new-type)
+                  (primitive/code-list-push! out
+                    `(~(live-nested-adapter-name new-type)
+                       (primitive/cast (ptr i8) (field ~old-p ~field-name))
+                       (primitive/cast (ptr i8) (field ~new-p ~field-name))))
+                (not (primitive/code-eq old-type new-type))
+                  (do (live-mark-needs-transition!)
+                      (primitive/error (primitive/code-str "live migration: field '"
+                                                           (primitive/code-str field-name)
+                                                           "' changes type without migrate declaration")))
+                :else
+                  (primitive/code-list-push! out
+                    `(set! (field ~new-p ~field-name)
+                           (load (field ~old-p ~field-name)))))))))
+    (primitive/code-list-done out)))
+
+(defn live-migrate-from-declarations [(OldDecl Code) (NewDecl Code)
+                                      (field-name Code) (binding Code) (body Code)] (-> Code)
+  (let [Old (primitive/code-nth OldDecl 1)
+        T (primitive/code-nth NewDecl 1)
+        old-index (live-raw-field-index OldDecl field-name)
+        new-index (live-raw-field-index NewDecl field-name)]
+    (if (< old-index 0) (primitive/error "live migration: field absent from old schema") 0)
+    (if (< new-index 0) (primitive/error "live migration: field absent from new schema") 0)
+    (let [OldField (live-raw-field-type OldDecl old-index)
+          NewField (live-raw-field-type NewDecl new-index)
+          transition (primitive/datum->syntax T (primitive/syntax->datum (primitive/code-symbol T "--live-field-" field-name)))
+          adapter (primitive/datum->syntax T (primitive/syntax->datum (primitive/code-symbol T "--live-object-" field-name)))
+          abort (primitive/datum->syntax T (primitive/syntax->datum (primitive/code-symbol T "--live-abort-" field-name)))
+          retire (primitive/datum->syntax T (primitive/syntax->datum (primitive/code-symbol T "--live-retire-" field-name)))
+          old-raw (primitive/fresh-identifier "old_raw")
+          new-raw (primitive/fresh-identifier "new_raw")
+          old-p (primitive/fresh-identifier "old_value")
+          new-p (primitive/fresh-identifier "new_value")]
+      `((defn ~transition [(~binding ~OldField)] (-> ~NewField) ~body)
+        (defn ~adapter [(~old-raw (ptr i8)) (~new-raw (ptr i8))] (-> i64)
+          (let [~old-p (primitive/cast (ptr ~Old) ~old-raw)
+                ~new-p (primitive/cast (ptr ~T) ~new-raw)]
+            ~@(live-raw-copy-lines OldDecl NewDecl field-name transition old-p new-p)
+            0))
+        (defn ~abort [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0)
+        (defn ~retire [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0)))))
+
+(defn live-marker-for-field [(markers Code) (field-name Code)] (-> Code)
+  (let [(mut found) field-name]
+    (for [i 0 (primitive/code-count markers)]
+      (let [marker (primitive/code-nth markers i)]
+        (if (live-text=? (primitive/code-str (primitive/code-nth marker 2))
+                         (primitive/code-str field-name))
+            (set! found marker)
+            0)))
+    (load found)))
+
+(defn live-pure-head? [(head Code)] (-> bool)
+  (if (not (primitive/code-sym? head))
+      false
+      (let [s (primitive/code-str head)]
+        (or (primitive/code-eq head `do)
+            (or (primitive/code-eq head `primitive/cast)
+                (or (primitive/code-eq head `if)
+                (or (primitive/code-eq head `match)
+                    (or (primitive/code-eq head `+)
+                        (or (primitive/code-eq head `-)
+                            (or (primitive/code-eq head `*)
+                                (or (primitive/code-eq head `/)
+                                    (or (primitive/code-eq head `<)
+                                        (or (primitive/code-eq head `>)
+                                            (or (primitive/code-eq head `<=)
+                                                (or (primitive/code-eq head `>=)
+                                                    (or (primitive/code-eq head `=)
+                                                        (or (primitive/code-eq head `!=)
+                                                            (and (> (slice-len s) 0)
+                                                                 (let [c (primitive/cast i64 (slice-get s 0))]
+                                                                   (and (>= c 65) (<= c 90)))))))))))))))))))))
+
+(defn live-pure-expr? [(expr Code)] (-> bool)
+  (if (not (primitive/code-list? expr))
+      true
+      (if (= (primitive/code-count expr) 0)
+          true
+          (if (primitive/code-vector? expr)
+              (let [(mut i) 0 (mut pure) true]
+                (loop (if (or (not (load pure)) (>= (load i) (primitive/code-count expr)))
+                          (break)
+                          (do (if (not (live-pure-expr? (primitive/code-nth expr (load i))))
+                                  (set! pure false) 0)
+                              (set! i (+ (load i) 1)))))
+                (load pure))
+          (if (primitive/code-eq (primitive/code-nth expr 0) `match)
+              (let [(mut i) 2 (mut pure) (live-pure-expr? (primitive/code-nth expr 1))]
+                (loop (if (or (not (load pure)) (>= (load i) (primitive/code-count expr)))
+                          (break)
+                          (let [clause (primitive/code-nth expr (load i))]
+                            (if (or (< (primitive/code-count clause) 3)
+                                    (not (live-pure-expr?
+                                           (primitive/code-nth clause
+                                             (- (primitive/code-count clause) 1)))))
+                                (set! pure false) 0)
+                            (set! i (+ (load i) 1)))))
+                (load pure))
+          (if (not (live-pure-head? (primitive/code-nth expr 0)))
+              false
+              (let [(mut i) 1 (mut pure) true]
+                (loop (if (or (>= (load i) (primitive/code-count expr)) (not (load pure)))
+                          (break)
+                          (do
+                            (if (not (live-pure-expr? (primitive/code-nth expr (load i))))
+                                (set! pure false) 0)
+                            (set! i (+ (load i) 1)))))
+                (load pure))))))))
+
+(defn live-validate-markers! [(OldDecl Code) (NewDecl Code) (markers Code)] (-> i64)
+  ; Defaults execute while building the shadow graph, before publication. They
+  ; obey the same replay/rollback purity contract as explicit transitions.
+  (for [i 0 (primitive/code-count (live-struct-fields NewDecl))]
+    (if (and (live-raw-field-default? NewDecl i)
+             (not (live-pure-expr? (live-raw-field-default NewDecl i))))
+        (primitive/error
+          (primitive/code-str "live default for field '"
+                              (primitive/code-str (live-raw-field-name NewDecl i))
+                              "' is not pure"))
+        0))
+  (for [i 0 (primitive/code-count markers)]
+    (let [marker (primitive/code-nth markers i)
+          field-name (primitive/code-nth marker 2)
+          old-index (live-raw-field-index OldDecl field-name)
+          new-index (live-raw-field-index NewDecl field-name)]
+      (for [j 0 i]
+        (if (live-text=? (primitive/code-str field-name)
+                         (primitive/code-str (primitive/code-nth (primitive/code-nth markers j) 2)))
+            (primitive/error (primitive/code-str "duplicate migrate declaration for field '"
+                                                 (primitive/code-str field-name) "'"))
+            0))
+      (if (and (>= old-index 0)
+               (and (>= new-index 0)
+                    (primitive/code-eq (live-raw-field-type OldDecl old-index)
+                                       (live-raw-field-type NewDecl new-index))))
+          (primitive/error (primitive/code-str "migrate declaration targets unchanged field '"
+                                               (primitive/code-str field-name) "'"))
+          0)
+      (if (not (live-pure-expr? (primitive/code-nth marker 4)))
+          (primitive/error (primitive/code-str "live migration for field '"
+                                               (primitive/code-str field-name)
+                                               "' is not pure"))
+          0)))
+  0)
+
+(defn live-edge-copy-lines [(OldDecl Code) (NewDecl Code) (markers Code)
+                            (old-p Code) (new-p Code)] (-> Code)
+  (let [fields (live-struct-fields NewDecl) out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count fields)]
+      (let [field-name (live-raw-field-name NewDecl i)
+            marker (live-marker-for-field markers field-name)
+            old-index (live-raw-field-index OldDecl field-name)
+            new-type (live-raw-field-type NewDecl i)]
+        (if (and (primitive/code-list? marker)
+                 (and (> (primitive/code-count marker) 0)
+                      (primitive/code-eq (primitive/code-nth marker 0)
+                                         `live-migrate-declaration)))
+            (let [transition
+                    (if (> (primitive/code-count marker) 5)
+                        (primitive/code-nth marker 5)
+                        (primitive/datum->syntax (primitive/code-nth NewDecl 1)
+                          (primitive/syntax->datum
+                            (primitive/code-symbol (primitive/code-nth NewDecl 1)
+                                                   "--live-field-" field-name))))]
+              (primitive/code-list-push! out
+                `(set! (field ~new-p ~field-name)
+                       (~transition (load (field ~old-p ~field-name))))))
+            (if (< old-index 0)
+                (if (live-raw-field-default? NewDecl i)
+                    (primitive/code-list-push! out
+                      `(set! (field ~new-p ~field-name) ~(live-raw-field-default NewDecl i)))
+                    (do (live-mark-needs-transition!)
+                        (primitive/error (primitive/code-str "live migration: new field '"
+                                                             (primitive/code-str field-name)
+                                                             "' requires a default or transition"))))
+                (let [old-type (live-raw-field-type OldDecl old-index)]
+                  (cond
+                    (live-historical-type-of? old-type new-type)
+                      (primitive/code-list-push! out
+                        `(~(live-nested-adapter-name new-type)
+                           (primitive/cast (ptr i8) (field ~old-p ~field-name))
+                           (primitive/cast (ptr i8) (field ~new-p ~field-name))))
+                    (not (primitive/code-eq old-type new-type))
+                      (do (live-mark-needs-transition!)
+                          (primitive/error (primitive/code-str "live migration: field '"
+                                                               (primitive/code-str field-name)
+                                                               "' changes type without migrate declaration")))
+                    :else
+                      (primitive/code-list-push! out
+                        `(set! (field ~new-p ~field-name)
+                               (load (field ~old-p ~field-name))))))))))
+    (primitive/code-list-done out)))
+
+(defn live-migrate-edge-from-declarations-name [(LogicalT Code)
+                                                (OldDecl Code) (NewDecl Code)
+                                                (markers Code)
+                                                (adapter Code) (abort Code)
+                                                (retire Code)] (-> Code)
+  (let [Old (primitive/code-nth OldDecl 1)
+        T LogicalT
+        New (primitive/code-nth NewDecl 1)
+        out (primitive/code-list-new)]
+    (live-validate-markers! OldDecl NewDecl markers)
+    ; One typed function per explicit field transition.
+    (for [i 0 (primitive/code-count markers)]
+      (let [marker (primitive/code-nth markers i)
+            field-name (primitive/code-nth marker 2)
+            binding (primitive/code-nth marker 3)
+            body (primitive/code-nth marker 4)
+            old-index (live-raw-field-index OldDecl field-name)
+            new-index (live-raw-field-index NewDecl field-name)]
+        (if (< old-index 0) (primitive/error "live migration: field absent from old schema") 0)
+        (if (< new-index 0) (primitive/error "live migration: field absent from new schema") 0)
+        (let [transition
+                (if (> (primitive/code-count marker) 5)
+                    (primitive/code-nth marker 5)
+                    (primitive/datum->syntax T
+                      (primitive/syntax->datum
+                        (primitive/code-symbol T "--live-field-" field-name))))]
+          (primitive/code-list-push! out
+            `(defn ~transition [(~binding ~(live-raw-field-type OldDecl old-index))]
+               (-> ~(live-raw-field-type NewDecl new-index))
+               ~body)))))
+    (let [old-raw (primitive/fresh-identifier "old_raw")
+          new-raw (primitive/fresh-identifier "new_raw")
+          old-p (primitive/fresh-identifier "old_value")
+          new-p (primitive/fresh-identifier "new_value")]
+      (primitive/code-list-push! out
+        `(defn ~adapter [(~old-raw (ptr i8)) (~new-raw (ptr i8))] (-> i64)
+           (let [~old-p (primitive/cast (ptr ~Old) ~old-raw)
+                 ~new-p (primitive/cast (ptr ~New) ~new-raw)]
+             ~@(live-edge-copy-lines OldDecl NewDecl markers old-p new-p)
+             0)))
+      (primitive/code-list-push! out
+        `(defn ~abort [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0))
+      (primitive/code-list-push! out
+        `(defn ~retire [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0))
+      (primitive/code-list-done out))))
+
+(defn live-layout-hash [(decl Code)] (-> i64)
+  (let [fields (live-struct-fields decl) (mut h) 2166136261]
+    (for [field-index 0 (primitive/code-count fields)]
+      (let [field (primitive/code-nth fields field-index)]
+        (for [part 0 2]
+          (let [s (primitive/code-str (primitive/code-nth field part))]
+            (for [i 0 (slice-len s)]
+              (set! h (primitive/imul
+                        (primitive/ixor (load h) (primitive/cast i64 (slice-get s i)))
+                        16777619)))))))
+    (load h)))
+
+(defn live-code-hash [(node Code) (seed i64)] (-> i64)
+  (if (primitive/code-list? node)
+      (let [(mut h) (primitive/imul (primitive/ixor seed 40) 16777619)]
+        (for [i 0 (primitive/code-count node)]
+          (set! h (live-code-hash (primitive/code-nth node i) (load h))))
+        (primitive/imul (primitive/ixor (load h) 41) 16777619))
+      (let [s (primitive/code-str node) (mut h) seed]
+        (for [i 0 (slice-len s)]
+          (set! h (primitive/imul
+                    (primitive/ixor (load h) (primitive/cast i64 (slice-get s i)))
+                    16777619)))
+        (load h))))
+
+(defn live-declaration-hash [(decl Code)] (-> i64)
+  (live-code-hash decl 2166136261))
+
+(defn live-sum-variants [(decl Code)] (-> Code)
+  (if (and (primitive/code-list? decl)
+           (and (>= (primitive/code-count decl) 3)
+                (primitive/code-eq (primitive/code-nth decl 0) `defsum)))
+      (let [start (if (primitive/code-vector? (primitive/code-nth decl 2)) 3 2)
+            out (primitive/code-list-new)]
+        (for [i start (primitive/code-count decl)]
+          (primitive/code-list-push! out (primitive/code-nth decl i)))
+        (primitive/code-list-done out))
+      (primitive/error "live enum metadata: expected a defsum declaration")))
+
+(defn live-sum-schema-runtime-defs-for-name [(logical-decl Code)
+                                             (payload-decl Code)
+                                             (registrar Code) (destructor Code) (show Code)
+                                             (json Code)] (-> Code)
+  (let [T (primitive/code-nth logical-decl 1)
+        LayoutT (primitive/code-nth payload-decl 1)
+        schema (primitive/fresh-identifier "enum_schema")
+        variants (live-sum-variants logical-decl)
+        literal (live-c-literal T)]
+    `((defn ~show [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0)
+      (defn ~json [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0)
+      (defn ~registrar [] (-> i64)
+        (let [~schema
+                (~(primitive/syntax->datum `coil_live_register_type)
+                  (primitive/cast (ptr u8) ~literal)
+                  ~(slice-len (primitive/code-str T))
+                  ~(live-name-hash T) ~(live-declaration-hash logical-decl)
+                  (primitive/sizeof ~LayoutT) (primitive/alignof ~LayoutT) 0
+                  (primitive/llvm-ir (ptr i8) [(primitive/fnptr-of ~show)] "ret ptr $0")
+                  (primitive/llvm-ir (ptr i8) [(primitive/fnptr-of ~json)] "ret ptr $0"))]
+          (if (< ~schema 0)
+              -1
+              (do
+                (~(primitive/syntax->datum `coil_live_register_type_kind) ~schema 2)
+                (~(primitive/syntax->datum `coil_live_register_schema_destructor)
+                  ~schema
+                  (primitive/llvm-ir (ptr i8) [(primitive/fnptr-of ~destructor)] "ret ptr $0"))
+                ~@(let [calls (primitive/code-list-new)]
+                    (for [vi 0 (primitive/code-count variants)]
+                      (let [variant (primitive/code-nth variants vi)
+                            name (primitive/code-nth variant 0)
+                            fields (if (> (primitive/code-count variant) 1)
+                                       (primitive/code-nth variant 1) `[])
+                            variant-id (primitive/fresh-identifier "variant_id")]
+                        (primitive/code-list-push! calls
+                          `(let [~variant-id
+                                  (~(primitive/syntax->datum `coil_live_register_variant)
+                                    ~schema ~vi
+                                    (primitive/cast (ptr u8) ~(live-c-literal name))
+                                    ~(slice-len (primitive/code-str name))
+                                    ~(primitive/code-count fields))]
+                             (do
+                               ~@(let [field-calls (primitive/code-list-new)]
+                                   (for [fi 0 (primitive/code-count fields)]
+                                     (let [field (primitive/code-nth fields fi)
+                                           field-name (primitive/code-nth field 0)
+                                           field-type (primitive/code-nth field 1)]
+                                       (primitive/code-list-push! field-calls
+                                         `(~(primitive/syntax->datum `coil_live_register_variant_field)
+                                           ~variant-id ~fi
+                                           (primitive/cast (ptr u8) ~(live-c-literal field-name))
+                                           ~(slice-len (primitive/code-str field-name))
+                                           (primitive/cast (ptr u8) ~(live-c-literal field-type))
+                                           ~(slice-len (primitive/code-str field-type))))))
+                                   (primitive/code-list-done field-calls))
+                               0)))))
+                    (primitive/code-list-done calls))
+                ~schema)))))))
+
+(defn live-sum-variant-index [(decl Code) (name Code)] (-> i64)
+  (let [variants (live-sum-variants decl) (mut found) -1]
+    (for [i 0 (primitive/code-count variants)]
+      (if (live-text=?
+            (primitive/code-str (primitive/code-nth (primitive/code-nth variants i) 0))
+            (primitive/code-str name))
+          (set! found i) 0))
+    (load found)))
+
+(defn live-sum-edge-from-declarations-name
+  [(logical-old Code) (logical-new Code)
+   (payload-old Code) (payload-new Code)
+   (markers Code)
+   (adapter Code) (abort Code) (retire Code)] (-> Code)
+  (let [OldPayload (primitive/code-nth payload-old 1)
+        NewPayload (primitive/code-nth payload-new 1)
+        old-variants (live-sum-variants logical-old)
+        old-payload-variants (live-sum-variants payload-old)
+        new-variants (live-sum-variants logical-new)
+        new-payload-variants (live-sum-variants payload-new)
+        old-raw (primitive/fresh-identifier "old_sum_raw")
+        new-raw (primitive/fresh-identifier "new_sum_raw")
+        old-value (primitive/fresh-identifier "old_sum_value")
+        new-value (primitive/fresh-identifier "new_sum_value")
+        arms (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count markers)]
+      (let [marker (primitive/code-nth markers i)
+            variant-name (primitive/code-nth marker 2)]
+        (if (< (live-sum-variant-index logical-old variant-name) 0)
+            (primitive/error
+              (primitive/code-str "live sum migration: unknown old variant '"
+                (primitive/code-str variant-name) "'")) 0)
+        (for [j 0 i]
+          (if (live-text=? (primitive/code-str variant-name)
+                           (primitive/code-str
+                             (primitive/code-nth (primitive/code-nth markers j) 2)))
+              (primitive/error
+                (primitive/code-str "duplicate migrate declaration for variant '"
+                  (primitive/code-str variant-name) "'")) 0))
+        (if (not (live-pure-expr? (primitive/code-nth marker 4)))
+            (primitive/error
+              (primitive/code-str "live migration for variant '"
+                (primitive/code-str variant-name) "' is not pure")) 0)))
+    (for [i 0 (primitive/code-count old-variants)]
+      (let [source-variant (primitive/code-nth old-variants i)
+            source-name (primitive/code-nth source-variant 0)
+            new-index (live-sum-variant-index logical-new source-name)
+            marker (live-marker-for-field markers source-name)]
+        (let [old-fields (if (> (primitive/code-count source-variant) 1)
+                            (primitive/code-nth source-variant 1) `[])
+              old-payload-name
+                (primitive/code-nth (primitive/code-nth old-payload-variants i) 0)
+              binds (primitive/code-list-new)]
+          (if (primitive/code-list? marker)
+              (do
+                (let [marker-binds (primitive/code-nth marker 3)]
+                  (if (!= (primitive/code-count marker-binds)
+                          (primitive/code-count old-fields))
+                      (primitive/error
+                        (primitive/code-str "live sum migration: binding count for variant '"
+                          (primitive/code-str source-name) "' does not match its payload")) 0)
+                  (for [j 0 (primitive/code-count marker-binds)]
+                    (primitive/code-list-push! binds
+                      (primitive/code-nth marker-binds j))))
+                (primitive/code-list-push! arms
+                  `(~old-payload-name [~@(primitive/code-list-done binds)]
+                    (do (store! ~new-value ~(primitive/code-nth marker 4)) 0)))
+                0)
+              (do
+                (if (< new-index 0)
+                    (do
+                      (live-mark-needs-transition!)
+                      (primitive/error
+                        (primitive/code-str "live sum migration: removed variant '"
+                          (primitive/code-str source-name) "' requires a transition"))) 0)
+                (let [new-source-variant (primitive/code-nth new-variants new-index)
+                      new-fields (if (> (primitive/code-count new-source-variant) 1)
+                                    (primitive/code-nth new-source-variant 1) `[])
+                      new-payload-name
+                        (primitive/code-nth
+                          (primitive/code-nth new-payload-variants new-index) 0)]
+                  (if (!= (primitive/code-count old-fields) (primitive/code-count new-fields))
+                      (do
+                        (live-mark-needs-transition!)
+                        (primitive/error
+                          (primitive/code-str "live sum migration: payload of variant '"
+                            (primitive/code-str source-name) "' requires a transition"))) 0)
+                  (for [j 0 (primitive/code-count old-fields)]
+                    (if (not (primitive/code-eq
+                               (primitive/code-nth (primitive/code-nth old-fields j) 1)
+                               (primitive/code-nth (primitive/code-nth new-fields j) 1)))
+                        (do
+                          (live-mark-needs-transition!)
+                          (primitive/error
+                            (primitive/code-str "live sum migration: field type in variant '"
+                              (primitive/code-str source-name) "' requires a transition"))) 0)
+                    (primitive/code-list-push! binds
+                      (primitive/fresh-identifier "sum_field")))
+                  (primitive/code-list-push! arms
+                    `(~old-payload-name [~@(primitive/code-list-done binds)]
+                      (do
+                        (store! ~new-value
+                          (~new-payload-name ~@(primitive/code-list-done binds)))
+                        0))))
+                0)))))
+    `((defn ~adapter [(~old-raw (ptr i8)) (~new-raw (ptr i8))] (-> i64)
+        (let [~old-value (load (primitive/cast (ptr ~OldPayload) ~old-raw))
+              ~new-value (primitive/cast (ptr ~NewPayload) ~new-raw)]
+          (match ~old-value ~@(primitive/code-list-done arms))))
+      (defn ~abort [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0)
+      (defn ~retire [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0))))
+
+(defn live-name-hash [(name Code)] (-> i64)
+  (let [s (primitive/code-str name) (mut h) 2166136261]
+    (for [i 0 (slice-len s)]
+      (set! h (primitive/imul
+                (primitive/ixor (load h) (primitive/cast i64 (slice-get s i)))
+                16777619)))
+    (primitive/iand (load h) 9223372036854775807)))
+
+(defn live-c-literal [(text Code)] (-> Code)
+  (let [parsed (primitive/code-read
+                 (primitive/code-str "c\"" (primitive/code-str text) "\"")
+                 `(reader-config))]
+    (if (and (primitive/code-list? parsed)
+             (and (= (primitive/code-count parsed) 2)
+                  (primitive/code-eq (primitive/code-nth parsed 0) `do)))
+        (primitive/code-nth parsed 1)
+        parsed)))
+
+(defn live-schema-registrar-name [(T Code)] (-> Code)
+  (primitive/datum->syntax T
+    (primitive/syntax->datum (primitive/code-symbol T "--live-register-schema"))))
+
+(defn live-schema-runtime-defs-for-name [(LogicalT Code) (NewDecl Code)
+                                         (fingerprint i64)
+                                         (registrar Code) (show Code)
+                                         (json Code) (handle-fields Code)
+                                         (destructor Code)] (-> Code)
+  (let [T LogicalT
+        LayoutT (primitive/code-nth NewDecl 1)
+        runtime-id (primitive/fresh-identifier "runtime_id")
+        new-schema (primitive/fresh-identifier "new_schema")
+        nominal-id (live-name-hash T)
+        type-literal (live-c-literal T)
+        type-name-len (slice-len (primitive/code-str T))
+        fields (live-struct-fields NewDecl)]
+    `((defn ~show [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0)
+      (defn ~json [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0)
+      (defn ~registrar [] (-> i64)
+        (let [~runtime-id ~nominal-id
+              ~new-schema
+                (~(primitive/syntax->datum `coil_live_register_type)
+                  (primitive/cast (ptr u8) ~type-literal) ~type-name-len ~runtime-id ~fingerprint
+                  (primitive/sizeof ~LayoutT) (primitive/alignof ~LayoutT)
+                  ~(primitive/code-count fields)
+                  (primitive/llvm-ir (ptr i8) [(primitive/fnptr-of ~show)] "ret ptr $0")
+                  (primitive/llvm-ir (ptr i8) [(primitive/fnptr-of ~json)] "ret ptr $0"))]
+          (if (< ~new-schema 0)
+              -1
+              (do
+                (~(primitive/syntax->datum `coil_live_register_type_kind) ~new-schema 1)
+                (~(primitive/syntax->datum `coil_live_register_schema_destructor)
+                  ~new-schema
+                  (primitive/llvm-ir (ptr i8) [(primitive/fnptr-of ~destructor)] "ret ptr $0"))
+                ~@(let [calls (primitive/code-list-new)]
+                    (for [i 0 (primitive/code-count fields)]
+                      (let [field-name (live-raw-field-name NewDecl i)
+                            field-type (live-raw-field-type NewDecl i)
+                            pointer-target (live-reference-target field-type)
+                            reference-kind (live-reference-kind field-type)
+                            field-literal (live-c-literal field-name)
+                            field-type-literal (live-c-literal field-type)]
+                        (primitive/code-list-push! calls
+                          `(do
+                             (~(primitive/syntax->datum `coil_live_register_field)
+                               ~new-schema ~i
+                               (primitive/cast (ptr u8) ~field-literal)
+                               ~(slice-len (primitive/code-str field-name))
+                               (primitive/cast (ptr u8) ~field-type-literal)
+                               ~(slice-len (primitive/code-str field-type))
+                               (primitive/offsetof ~LayoutT ~field-name))
+                             ~@(if (primitive/code-eq pointer-target `:unknown)
+                                   `()
+                                   `((~(primitive/syntax->datum `coil_live_register_reference_field)
+                                      ~new-schema (primitive/offsetof ~T ~field-name)
+                                      ~(if (= reference-kind 3) 0
+                                           (live-name-hash pointer-target))
+                                      ~reference-kind)))
+                             0))))
+                    (primitive/code-list-done calls))
+                ~@(let [calls (primitive/code-list-new)]
+                    (for [i 0 (primitive/code-count handle-fields)]
+                      (let [entry (primitive/code-nth handle-fields i)
+                            field-name (primitive/code-nth entry 0)
+                            target (primitive/code-nth entry 1)]
+                        (primitive/code-list-push! calls
+                          `(~(primitive/syntax->datum `coil_live_register_reference_field)
+                            ~new-schema (primitive/offsetof ~LayoutT ~field-name)
+                            ~(live-name-hash target) 4))))
+                    (primitive/code-list-done calls))
+                ~new-schema)))))))
+
+(defn live-edge-runtime-defs-name [(T Code) (adapter Code) (abort Code)
+                                   (retire Code) (registrar Code)
+                                   (schema-registrar Code)] (-> Code)
+  (let [
+        runtime-id (primitive/fresh-identifier "runtime_id")
+        old-schema (primitive/fresh-identifier "old_schema")
+        new-schema (primitive/fresh-identifier "new_schema")
+        edge (primitive/fresh-identifier "edge")]
+    `((defn ~registrar [] (-> i64)
+        (let [~runtime-id ~(live-name-hash T)
+              ~old-schema (~(primitive/syntax->datum `coil_live_latest_schema) ~runtime-id)
+              ~new-schema (~schema-registrar)]
+          (if (or (< ~old-schema 0) (< ~new-schema 0))
+              -1
+              (let [~edge
+                      (~(primitive/syntax->datum `coil_live_register_transition)
+                        ~runtime-id ~old-schema ~new-schema
+                        (primitive/llvm-ir (ptr i8) [(primitive/fnptr-of ~adapter)] "ret ptr $0")
+                        (primitive/llvm-ir (ptr i8) [(primitive/fnptr-of ~abort)] "ret ptr $0")
+                        (primitive/llvm-ir (ptr i8) [(primitive/fnptr-of ~retire)] "ret ptr $0"))]
+                (if (< ~edge 0) -2 ~new-schema))))))))
+
+(defn live-copy-lines [(Old Code) (New Code) (changed Code)
+                       (transition Code) (old-p Code) (new-p Code)
+                       (i i64) (n i64)] (-> Code)
+  (let [out (primitive/code-list-new) (mut at) i]
+    (loop (if (>= (load at) n)
+              (break)
+              (let [field-name (primitive/code-field-name New (load at))
+                    old-index (live-field-index Old field-name)
+                    new-type (primitive/code-field-qtype New (load at))]
+                (if (primitive/code-eq field-name changed)
+                    (primitive/code-list-push! out
+                      `(set! (field ~new-p ~field-name)
+                             (~transition (load (field ~old-p ~field-name)))))
+                    (if (< old-index 0)
+                        (do
+                          (live-mark-needs-transition!)
+                          (primitive/error
+                            (primitive/code-str "live migration: new field '"
+                                                (primitive/code-str field-name)
+                                                "' requires a default or transition")))
+                        (let [old-type (primitive/code-field-qtype Old old-index)]
+                          (if (not (primitive/code-eq old-type new-type))
+                              (do
+                                (live-mark-needs-transition!)
+                                (primitive/error
+                                  (primitive/code-str "live migration: field '"
+                                                      (primitive/code-str field-name)
+                                                      "' changes type without migrate declaration")))
+                              (primitive/code-list-push! out
+                                `(set! (field ~new-p ~field-name)
+                                       (load (field ~old-p ~field-name))))))))
+                (set! at (+ (load at) 1)))))
+    (primitive/code-list-done out)))
+
+; Compile `migrate T.field(old) { BODY }` to a typed native field function and
+; an erased C-callable whole-object adapter. OldFieldType and NewFieldType come
+; from the two actual checked struct declarations; no erased value interpreter
+; or runtime type switch participates in evaluating BODY.
+(defn live-migrate [(T Code) (field-name Code) (binding Code) (body Code)] (-> Code)
+  (let [Old (live-old-type T)
+        old-index (live-field-index Old field-name)
+        new-index (live-field-index T field-name)]
+    (if (< old-index 0)
+        (primitive/error (primitive/code-str "live migration: old schema has no field '"
+                                             (primitive/code-str field-name) "'")) 0)
+    (if (< new-index 0)
+        (primitive/error (primitive/code-str "live migration: new schema has no field '"
+                                             (primitive/code-str field-name) "'")) 0)
+    (let [OldField (primitive/code-field-qtype Old old-index)
+          NewField (primitive/code-field-qtype T new-index)
+          transition (primitive/datum->syntax T
+                       (primitive/syntax->datum
+                         (primitive/code-symbol T "--live-field-" field-name)))
+          adapter (primitive/datum->syntax T
+                    (primitive/syntax->datum
+                      (primitive/code-symbol T "--live-object-" field-name)))
+          abort (primitive/datum->syntax T
+                  (primitive/syntax->datum
+                    (primitive/code-symbol T "--live-abort-" field-name)))
+          retire (primitive/datum->syntax T
+                   (primitive/syntax->datum
+                     (primitive/code-symbol T "--live-retire-" field-name)))
+          old-raw (primitive/fresh-identifier "old_raw")
+          new-raw (primitive/fresh-identifier "new_raw")
+          old-p (primitive/fresh-identifier "old_value")
+          new-p (primitive/fresh-identifier "new_value")]
+      `(do
+         (defn ~transition [(~binding ~OldField)] (-> ~NewField) ~body)
+         (defn ~adapter [(~old-raw (ptr i8)) (~new-raw (ptr i8))] (-> i64)
+           (let [~old-p (primitive/cast (ptr ~Old) ~old-raw)
+                 ~new-p (primitive/cast (ptr ~T) ~new-raw)]
+             ~@(live-copy-lines Old T field-name transition old-p new-p
+                                0 (primitive/code-field-count T))
+             0))
+         (defn ~abort [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0)
+         (defn ~retire [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0)))))
