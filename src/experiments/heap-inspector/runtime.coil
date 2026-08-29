@@ -5,6 +5,7 @@
 (import "coil.arraylist" :as arraylist)
 (import "coil.slice" :use *)
 (import "coil.result" :use *)
+(import "experiments.heap-inspector.live-api" :as live-api)
 
 (extern printf :cc c [(ptr i8) ...] (-> i32))
 (extern malloc :cc c [u64] (-> (ptr i8)))
@@ -17,7 +18,11 @@
 (defstruct Entry
   [(id i64)
    (p (ptr i8))
+   ; Nominal process-local identity and the exact registered layout that
+   ; created this allocation are deliberately separate. A hot JIT generation
+   ; reuses `type-id` while a struct's size/offsets may change.
    (type-id i64)
+   (schema-id i64)
    (count i64)
    (initialized i64)
    (container-kind i64)
@@ -28,11 +33,25 @@
 (defstruct TypeInfo
   [(name (slice u8))
    (runtime-id i64)
+   (version i64)
+   (fingerprint i64)
+   ; 1 = struct/product, 2 = enum/sum.
+   (kind i64)
    (size i64)
    (align i64)
    (fields i64)
    (show (fnptr c [(ptr i8)] i64))
    (json (fnptr c [(ptr i8)] i64))])
+(defstruct VariantInfo
+  [(schema-id i64)
+   (index i64)
+   (name (slice u8))
+   (fields i64)])
+(defstruct VariantFieldInfo
+  [(variant-id i64)
+   (index i64)
+   (name (slice u8))
+   (type-name (slice u8))])
 (defstruct FieldInfo
   [(type-id i64)
    (index i64)
@@ -63,6 +82,10 @@
   (primitive/alloc-static (array TypeInfo 256)))
 (defn fields [] (-> (ptr (array FieldInfo 4096)))
   (primitive/alloc-static (array FieldInfo 4096)))
+(defn variants [] (-> (ptr (array VariantInfo 2048)))
+  (primitive/alloc-static (array VariantInfo 2048)))
+(defn variant-fields [] (-> (ptr (array VariantFieldInfo 4096)))
+  (primitive/alloc-static (array VariantFieldInfo 4096)))
 (defn functions [] (-> (ptr (array FunctionInfo 512)))
   (primitive/alloc-static (array FunctionInfo 512)))
 (defn function-params [] (-> (ptr (array FunctionParam 2048)))
@@ -73,6 +96,8 @@
   (primitive/alloc-static i64))
 (defn field-n [] (-> (ptr i64))
   (primitive/alloc-static i64))
+(defn variant-n [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn variant-field-n [] (-> (ptr i64)) (primitive/alloc-static i64))
 (defn function-n [] (-> (ptr i64))
   (primitive/alloc-static i64))
 (defn function-param-n [] (-> (ptr i64))
@@ -343,6 +368,11 @@
                   (set! i (+ (load i) 1)))))
     (load found)))
 
+(defn entry-type-index [(e (ptr Entry))] (-> i64)
+  (if (and (>= (.schema-id e) 0) (< (.schema-id e) (load (type-n))))
+      (.schema-id e)
+      (type-index-for-runtime-id (.type-id e))))
+
 (defn entry-containing [(address i64)] (-> (ptr Entry))
   (let [(mut i) 0 (mut found) (primitive/cast (ptr Entry) 0)]
     (loop (if (>= (load i) (load (entry-n)))
@@ -361,7 +391,7 @@
         target-end (+ (primitive/cast i64 (.p target)) (.bytes target))]
     (for [i 0 (load (entry-n))]
       (let [source (primitive/index (entries) i)
-            ti (type-index-for-runtime-id (.type-id source))]
+            ti (entry-type-index source)]
         (if (and (.live source) (>= ti 0))
             (let [t (primitive/index (types) ti)
                   visible (if (>= (.initialized source) 0) (.initialized source) (.count source))]
@@ -391,7 +421,7 @@
   0))
 
 (defn json-entry-value! [(e (ptr Entry))] (-> i64)
-  (let [ti (type-index-for-runtime-id (.type-id e))]
+  (let [ti (entry-type-index e)]
     (json-text! "\"value\":")
     (if (>= ti 0)
         (let [t (primitive/index (types) ti)]
@@ -451,7 +481,7 @@
                 (if (and (.live e) (= (.id e) id))
                     (do (json-text! "{\"id\":") (json-int! id) (json-byte! (primitive/cast u8 #\,))
                         (json-entry-value! e)
-                        (let [ti (type-index-for-runtime-id (.type-id e))]
+                        (let [ti (entry-type-index e)]
                           (if (or (< ti 0) (= (.size (primitive/index (types) ti)) 1))
                               (json-slice-references-to! e)
                               (json-text! ",\"sliceRefs\":[]")))
@@ -472,12 +502,16 @@
       (if (> i 0) (json-byte! (primitive/cast u8 #\,)) 0)
       (for [j 0 (load (entry-n))]
         (let [e (primitive/index (entries) j)]
-          (if (and (.live e) (= (.type-id e) (.runtime-id t)))
+          (if (and (.live e) (= (.schema-id e) i))
               (do (set! live (+ (load live) 1))
                   (set! slots (+ (load slots) (.count e))))
               0)))
       (json-text! "{\"id\":") (json-int! i)
       (json-text! ",\"runtimeId\":") (json-int! (.runtime-id t))
+      (json-text! ",\"version\":") (json-int! (.version t))
+      (json-text! ",\"fingerprint\":") (json-int! (.fingerprint t))
+      (json-text! ",\"kind\":")
+      (json-quoted! (if (= (.kind t) 2) "enum" "struct"))
       (json-text! ",\"name\":") (json-quoted! (.name t))
       (json-text! ",\"size\":") (json-int! (.size t))
       (json-text! ",\"align\":") (json-int! (.align t))
@@ -497,6 +531,31 @@
                   (json-text! ",\"offset\":") (json-int! (.offset f))
                   (json-byte! (primitive/cast u8 #\})))
                 0))))
+      (json-text! "],\"variants\":[")
+      (let [(mut first-variant) true]
+        (for [j 0 (load (variant-n))]
+          (let [v (primitive/index (variants) j)]
+            (if (= (.schema-id v) i)
+                (do
+                  (if (load first-variant) (set! first-variant false)
+                      (json-byte! (primitive/cast u8 #\,)))
+                  (json-text! "{\"index\":") (json-int! (.index v))
+                  (json-text! ",\"name\":") (json-quoted! (.name v))
+                  (json-text! ",\"fields\":[")
+                  (let [(mut first-field) true]
+                    (for [k 0 (load (variant-field-n))]
+                      (let [f (primitive/index (variant-fields) k)]
+                        (if (= (.variant-id f) j)
+                            (do
+                              (if (load first-field) (set! first-field false)
+                                  (json-byte! (primitive/cast u8 #\,)))
+                              (json-text! "{\"index\":") (json-int! (.index f))
+                              (json-text! ",\"name\":") (json-quoted! (.name f))
+                              (json-text! ",\"type\":") (json-quoted! (.type-name f))
+                              (json-byte! (primitive/cast u8 #\})))
+                            0))))
+                  (json-text! "]}"))
+                0))))
       (json-text! "]}")))
   (json-text! "],\"allocations\":[")
   (let [(mut first) true (mut total-bytes) 0 (mut live-count) 0]
@@ -510,7 +569,8 @@
               (json-text! "{\"id\":") (json-int! (.id e))
               (json-text! ",\"address\":") (json-int! (primitive/cast i64 (.p e)))
               (json-text! ",\"typeId\":") (json-int! (.type-id e))
-              (let [ti (type-index-for-runtime-id (.type-id e))]
+              (json-text! ",\"schemaId\":") (json-int! (.schema-id e))
+              (let [ti (entry-type-index e)]
               (json-text! ",\"type\":")
                 (if (>= ti 0) (json-quoted! (.name (primitive/index (types) ti))) (json-text! "null")))
               (json-text! ",\"count\":") (json-int! (.count e))
@@ -536,8 +596,20 @@
   (printf c"raw allocation at 0x%lx\n" (primitive/cast i64 p))
   0)
 
+; Stable live-language nominal identity. It intentionally does not include the
+; synthetic `replsession` module used by the JIT. Layout identity is the
+; independent fingerprint stored on each schema version.
+(defn live-type-id [(name (slice u8))] (-> i64)
+  (let [(mut h) 2166136261]
+    (for [i 0 (slice-len name)]
+      (set! h (primitive/imul
+                (primitive/ixor (load h) (primitive/cast i64 (slice-get name i)))
+                16777619)))
+    (primitive/iand (load h) 9223372036854775807)))
+
 (defn register-type [(name (slice u8))
                      (runtime-id i64)
+                     (fingerprint i64)
                      (size i64)
                      (align i64)
                      (fields i64)
@@ -545,15 +617,25 @@
                      (json (fnptr c [(ptr i8)] i64))] (-> i64)
   (lock!)
   (let [(mut i) 0
-        (mut found) -1]
+        (mut latest-index) -1
+        (mut latest-version) 0]
     (loop (if (>= (load i) (load (type-n)))
               (break)
               (let [t (primitive/index (types) (load i))]
                 (if (= (.runtime-id t) runtime-id)
-                    (do (set! found (load i)) (break))
-                    (set! i (+ (load i) 1))))))
-    (if (>= (load found) 0)
-        (do (unlock!) (load found))
+                    (do
+                      (if (> (.version t) (load latest-version))
+                          (do (set! latest-version (.version t))
+                              (set! latest-index (load i)))
+                          0))
+                    0)
+                (set! i (+ (load i) 1)))))
+    ; Re-registering the currently accepted declaration is idempotent. A
+    ; later forward revert to an older fingerprint is still a new schema
+    ; version: historical identity is an ordered lineage, not a set of layouts.
+    (if (and (>= (load latest-index) 0)
+             (= (.fingerprint (primitive/index (types) (load latest-index))) fingerprint))
+        (do (unlock!) (load latest-index))
         (let [id (load (type-n))
               t (if (< id 256) (primitive/index (types) id) (primitive/cast (ptr TypeInfo) 0))]
           (if (>= id 256)
@@ -561,6 +643,8 @@
               (do
                 (set! (.name t) name)
                 (set! (.runtime-id t) runtime-id)
+                (set! (.version t) (+ (load latest-version) 1))
+                (set! (.fingerprint t) fingerprint)
                 (set! (.size t) size)
                 (set! (.align t) align)
                 (set! (.fields t) fields)
@@ -612,11 +696,52 @@
 (defn track-create [T] [(o (Option (ptr T)))
                         (tid i64)
                         (show (fnptr c [(ptr i8)] i64))] (-> (Option (ptr T)))
-  o)
+  (match o
+    (None [] o)
+    (Some [p]
+      (do
+        (lock!)
+        (let [e (find-live-entry (primitive/cast (ptr i8) p))]
+          (if (or (= (primitive/cast i64 e) 0) (or (< tid 0) (>= tid (load (type-n)))))
+              0
+              (let [t (primitive/index (types) tid)]
+                (set! (.type-id e) (.runtime-id t))
+                (set! (.schema-id e) tid)
+                (set! (.show e) show)
+                (set! (.initialized e) 1))))
+        (unlock!)
+        (if (and (>= tid 0) (< tid (load (type-n))))
+            (let [t (primitive/index (types) tid)]
+              (live-api/live-api-track-object!
+                (primitive/cast (ptr i8) p) (.runtime-id t) tid
+                (primitive/sizeof T) (primitive/alignof T) 1))
+            0)
+        o))))
 (defn track-alloc [T] [(o (Option (slice T)))
                        (tid i64)
                        (show (fnptr c [(ptr i8)] i64))] (-> (Option (slice T)))
-  o)
+  (match o
+    (None [] o)
+    (Some [s]
+      (do
+        (lock!)
+        (let [e (find-live-entry (primitive/cast (ptr i8) (slice-data s)))]
+          (if (or (= (primitive/cast i64 e) 0) (or (< tid 0) (>= tid (load (type-n)))))
+              0
+              (let [t (primitive/index (types) tid)]
+                (set! (.type-id e) (.runtime-id t))
+                (set! (.schema-id e) tid)
+                (set! (.show e) show)
+                (set! (.initialized e) (slice-len s)))))
+        (unlock!)
+        (if (and (>= tid 0) (< tid (load (type-n))))
+            (let [t (primitive/index (types) tid)]
+              (live-api/live-api-track-object!
+                (primitive/cast (ptr i8) (slice-data s)) (.runtime-id t) tid
+                (* (primitive/sizeof T) (slice-len s)) (primitive/alignof T)
+                (slice-len s)))
+            0)
+        o))))
 (defn track-arraylist-push [T] [(result i64)
                                 (list (mut (arraylist/ArrayList T)))
                                 (tid i64)] (-> i64)
@@ -630,6 +755,7 @@
           (if (= (primitive/cast i64 e) 0)
               0
               (do (set! (.type-id e) (.runtime-id t))
+                  (set! (.schema-id e) tid)
                   (set! (.container-kind e) 1)
                   (set! (.initialized e) (load (field list len))))))
         (unlock!)
@@ -660,6 +786,7 @@
           (set! (.id e) id)
           (set! (.p e) p)
           (set! (.type-id e) (.type-id request))
+          (set! (.schema-id e) -1)
           (set! (.count e) (.count request))
           (set! (.initialized e) -1)
           (set! (.container-kind e) 0)
@@ -682,6 +809,7 @@
                     0)
                 (set! i (+ (load i) 1)))))
     (unlock!)
+    (live-api/live-api-untrack-object! p)
     0))
 
 (defn find-live-entry [(p (ptr i8))] (-> (ptr Entry))
@@ -713,6 +841,7 @@
             (let [e (find-live-entry memory)]
               (if (= (primitive/cast i64 e) 0) 0
                   (do (set! (.type-id e) (.type-id new))
+                      (set! (.schema-id e) -1)
                       (set! (.count e) (.count new))
                       (set! (.bytes e) (.bytes new))
                       (set! (.align e) (.align new)))))
@@ -734,9 +863,76 @@
                   0
                   (do (set! (.p e) p)
                       (set! (.type-id e) (.type-id new))
+                      (set! (.schema-id e) -1)
                       (set! (.count e) (.count new))
                       (set! (.bytes e) (.bytes new))
                       (set! (.align e) (.align new)))))
+            (unlock!)
+            result)))))
+
+(defn register-type-kind [(schema-id i64) (kind i64)] (-> i64)
+  (if (or (< schema-id 0) (>= schema-id (load (type-n))))
+      -1
+      (do (lock!)
+          (set! (.kind (primitive/index (types) schema-id)) kind)
+          (unlock!)
+          schema-id)))
+
+(defn register-variant [(schema-id i64) (index i64)
+                         (name (slice u8)) (field-count i64)] (-> i64)
+  (if (or (< schema-id 0) (>= schema-id (load (type-n))))
+      -1
+      (do
+        (lock!)
+        (let [(mut i) 0 (mut found) -1]
+          (loop (if (>= (load i) (load (variant-n)))
+                    (break)
+                    (let [v (primitive/index (variants) (load i))]
+                      (if (and (= (.schema-id v) schema-id) (= (.index v) index))
+                          (do (set! found (load i)) (break))
+                          (set! i (+ (load i) 1))))))
+          (let [result
+                (if (>= (load found) 0)
+                    (load found)
+                    (let [at (load (variant-n))]
+                      (if (>= at 2048)
+                          -2
+                          (let [v (primitive/index (variants) at)]
+                            (set! (.schema-id v) schema-id)
+                            (set! (.index v) index)
+                            (set! (.name v) name)
+                            (set! (.fields v) field-count)
+                            (set! (variant-n) (+ at 1))
+                            at))))]
+            (unlock!)
+            result)))))
+
+(defn register-variant-field [(variant-id i64) (index i64)
+                               (name (slice u8)) (type-name (slice u8))] (-> i64)
+  (if (or (< variant-id 0) (>= variant-id (load (variant-n))))
+      -1
+      (do
+        (lock!)
+        (let [(mut i) 0 (mut found) -1]
+          (loop (if (>= (load i) (load (variant-field-n)))
+                    (break)
+                    (let [f (primitive/index (variant-fields) (load i))]
+                      (if (and (= (.variant-id f) variant-id) (= (.index f) index))
+                          (do (set! found (load i)) (break))
+                          (set! i (+ (load i) 1))))))
+          (let [result
+                (if (>= (load found) 0)
+                    (load found)
+                    (let [at (load (variant-field-n))]
+                      (if (>= at 4096)
+                          -2
+                          (let [f (primitive/index (variant-fields) at)]
+                            (set! (.variant-id f) variant-id)
+                            (set! (.index f) index)
+                            (set! (.name f) name)
+                            (set! (.type-name f) type-name)
+                            (set! (variant-field-n) (+ at 1))
+                            at))))]
             (unlock!)
             result)))))
 
@@ -820,6 +1016,7 @@
               0
               (do
                 (set! (.type-id e) (.runtime-id t))
+                (set! (.schema-id e) tid)
                 (set! (.count e) (if (>= (.bytes e) size) (primitive/idiv (.bytes e) size) 1))
                 (set! (.initialized e) (.count e))
                 (set! (.show e) show))))
@@ -851,6 +1048,8 @@
                     (let [t (primitive/index (types) id)]
                       (set! (.name t) name)
                       (set! (.runtime-id t) (- 0 (+ 1000000 id)))
+                      (set! (.version t) 1)
+                      (set! (.fingerprint t) (+ (* size 131) align))
                       (set! (.size t) size)
                       (set! (.align t) align)
                       (set! (.fields t) 0)
@@ -867,6 +1066,7 @@
                     0
                     (do
                       (set! (.type-id e) (.runtime-id t))
+                      (set! (.schema-id e) (load ti))
                       (set! (.count e) (if (>= (.bytes e) size) (primitive/idiv (.bytes e) size) 1))
                       (set! (.initialized e) (.count e))
                       (set! (.show e) (primitive/fnptr-of show-raw)))))
@@ -883,7 +1083,7 @@
           (mut live) 0]
       (for [j 0 (load (entry-n))]
         (let [e (primitive/index (entries) j)]
-          (if (and (.live e) (= (.type-id e) (.runtime-id t))) (set! live (+ (load live) 1)) 0)))
+          (if (and (.live e) (= (.schema-id e) i)) (set! live (+ (load live) 1)) 0)))
       (printf c"  type=%ld name=" i)
       (print-text (.name t))
       (printf c" size=%ld align=%ld fields=%ld live=%ld\n"
@@ -1015,7 +1215,7 @@
   (for [i 0 (load (entry-n))]
     (let [e (primitive/index (entries) i)]
       (if (.live e) (printf c"  id=%ld type=%ld ptr=0x%lx count=%ld bytes=%ld align=%ld\n"
-                            (.id e) (.type-id e) (primitive/cast i64 (.p e))
+                            (.id e) (.schema-id e) (primitive/cast i64 (.p e))
                             (.count e) (.bytes e) (.align e)) 0)))
   0)
 (defn inspector-inspect [(id i64)] (-> i64)
@@ -1031,7 +1231,7 @@
                         (loop (if (>= (load j) (load (type-n)))
                                   (break)
                                   (let [t (primitive/index (types) (load j))]
-                                    (if (= (.runtime-id t) (.type-id e))
+                                    (if (= (load j) (.schema-id e))
                                         (do (primitive/call-ptr (.show t) (.p e))
                                             (set! shown true)
                                             (break))
@@ -1043,8 +1243,64 @@
                 (set! i (+ (load i) 1)))))
     (if (load found) 0 (do (printf c"instance %ld is not live\n" id) 1))))
 
+(defn live-register-type-c [(name (ptr u8))
+                            (name-len i64)
+                            (runtime-id i64)
+                            (fingerprint i64)
+                            (size i64)
+                            (align i64)
+                            (field-count i64)
+                            (show (ptr i8))
+                            (json (ptr i8))] (-> i64)
+  (register-type (slice-new name name-len)
+                 runtime-id fingerprint size align field-count
+                 (primitive/llvm-ir (fnptr c [(ptr i8)] i64) [show] "ret ptr $0")
+                 (primitive/llvm-ir (fnptr c [(ptr i8)] i64) [json] "ret ptr $0")))
+
+(defn live-register-field-c [(tid i64)
+                             (index i64)
+                             (name (ptr u8))
+                             (name-len i64)
+                             (type-name (ptr u8))
+                             (type-name-len i64)
+                             (offset i64)] (-> i64)
+  (register-field tid index
+                  (slice-new name name-len)
+                  (slice-new type-name type-name-len)
+                  offset))
+
+(defn live-register-variant-c [(schema-id i64) (index i64)
+                                (name (ptr u8)) (name-len i64)
+                                (field-count i64)] (-> i64)
+  (register-variant schema-id index (slice-new name name-len) field-count))
+
+(defn live-register-variant-field-c [(variant-id i64) (index i64)
+                                      (name (ptr u8)) (name-len i64)
+                                      (type-name (ptr u8))
+                                      (type-name-len i64)] (-> i64)
+  (register-variant-field variant-id index
+                          (slice-new name name-len)
+                          (slice-new type-name type-name-len)))
+
+(defn live-latest-schema [(runtime-id i64)] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
+    (lock!)
+    (loop (if (>= (load i) (load (type-n)))
+              (break)
+              (let [t (primitive/index (types) (load i))]
+                (if (= (.runtime-id t) runtime-id) (set! found (load i)) 0)
+                (set! i (+ (load i) 1)))))
+    (unlock!)
+    (load found)))
+
 ;; JIT submissions reach the host registry through dlsym(RTLD_DEFAULT). Importing
 ;; this module in a submission would create a second set of `primitive/alloc-static` cells.
 (export-c [inspector-list-types :as "coil_inspector_list_types"]
           [inspector-list-instances :as "coil_inspector_list_instances"]
-          [inspector-inspect :as "coil_inspector_inspect"])
+          [inspector-inspect :as "coil_inspector_inspect"]
+          [live-register-type-c :as "coil_live_register_type"]
+          [live-register-field-c :as "coil_live_register_field"]
+          [register-type-kind :as "coil_live_register_type_kind"]
+          [live-register-variant-c :as "coil_live_register_variant"]
+          [live-register-variant-field-c :as "coil_live_register_variant_field"]
+          [live-latest-schema :as "coil_live_latest_schema"])

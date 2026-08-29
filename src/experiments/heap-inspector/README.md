@@ -1,5 +1,26 @@
 # Coil heap inspector
 
+## Native Typed But Live demo
+
+The dedicated demo recreates the `live-but-static` particle sequence using the
+ordinary Coil compiler and native REPL JIT. There is no bytecode VM. A native
+Coil process owns the persistent `World`, checks ordinary s-expression Coil snippets,
+compiles accepted generations to machine code, migrates struct state, and
+executes every animation tick. The website is only the editor, tutorial, and
+control surface; drawing happens in a separate AppKit/CALayer window.
+
+From the repository root:
+
+```sh
+PATH=/path/to/current/coil/bin:$PATH ./scripts/native-live-demo.sh
+```
+
+Then open <http://127.0.0.1:7391/native-demo>. The numbered source presets cover
+function replacement, defaulted struct fields, a rejected bool-to-enum edit,
+an explicit field transition, enum dispatch, a rejected non-exhaustive match,
+and repair. Rejected candidates remain visible with their compiler diagnostic;
+the last accepted native generation and its state remain intact.
+
 An opt-in whole-program metaprogram that adds a live allocation inspector to an
 ordinary Coil program. It borrows the product shape of `lang-with-inspector`—a
 viewer attached to a running process—but follows Coil's allocator-oriented memory
@@ -81,13 +102,103 @@ layered over the same typed adapters later.
 
 `main` is omitted because recursively entering the program entry point is not a
 meaningful live operation. Uninstantiated generic definitions still require a type
-argument/monomorph selection layer. Imported-module catalogs and live code
-redefinition are also later layers; the current registry describes the entry
-module's concrete callable surface.
+argument/monomorph selection layer. Imported-module catalogs remain a later layer;
+native live redefinition is provided separately by the opt-in live controller below.
 
 The endpoints are `GET /api/functions` and `POST /api/call/<id>`. Calls carry one
 plain-text scalar per line in signature order. Function IDs are process-local and
 stable for the lifetime of that process.
+
+### Native live programming
+
+Programs that initialize `experiments.heap-inspector.controller` gain a **Live
+code** view and two additional endpoints: `GET /api/live` and `POST
+/api/live/edit`. Ordinary inspected programs do not link the compiler; a small
+callback registry advertises the capability only when the controller is present.
+
+The native demo editor accepts normal s-expression Coil. A durable layout edit is
+written directly against the current type:
+
+```coil
+(defsum Visibility (Hidden) (Visible))
+
+(defstruct Particle
+  [(visible Visibility (Visible))
+   (hue i64 20)])
+
+(migrate Particle visible old
+  (if old (Visible) (Hidden)))
+```
+
+The controller retains the last accepted user source and injects private,
+versioned historical declarations during expansion. Users never declare or name
+old-layout implementation types. Each `migrate T.field(old)` becomes a checked
+native function from the immediately preceding field type to the candidate field
+type, plus a native whole-object adapter. Compatible fields copy, new fields use
+declared defaults, and missing conversions reject the candidate as
+`NeedsTransition`.
+
+Each request contains only the submitted snippet. Successful snippets merge into
+accepted history with last-definition-wins semantics. Rejected normal-Coil snippets
+form a pending branch, so a later request can submit only the root-cause repair.
+
+Edits use Coil's normal in-process checker and REPL JIT. The candidate image is
+prepared without publication, its private commit entry registers exact schemas
+and transition edges and builds shadow roots, and the controller publishes code
+and roots only after the complete batch succeeds. A parse/type/transition error
+keeps the accepted source and generation running. Root aliases block migration;
+multi-version roots traverse every accepted edge in order.
+
+This is native Coil, not a VM or interpreter. `letonce` declarations lower to
+stable typed indirection cells and registered persistent roots. Structs and sums
+carry stable nominal IDs plus exact versioned schema IDs; enum variant and payload
+metadata is versioned alongside layouts. Live functions—including generic
+functions after monomorphization—run as ordinary native Coil behind generated
+read-side quiescence adapters.
+
+Migration is a graph transaction. All affected roots and allocator-authorized
+heap objects are converted into private storage before any address is published.
+Sharing and cycles use a complete forwarding table. Direct pointers, array-element
+pointers, and slices are rewritten by element index, so changing an element's size
+does not corrupt an interior reference. Misaligned, unregistered, or out-of-bounds
+references roll back the batch. Arrays transition elementwise through every exact
+historical edge.
+
+Inspector discovery alone never grants permission to move storage. The owning
+allocator must install native allocate/release callbacks. Active aliases, borrows,
+and FFI retains block migration with distinct states. Once staging begins, new
+borrows, FFI retains, and frees are rejected until commit or abort. Transition
+`abort` callbacks destroy uncommitted destinations; `retire` callbacks destroy
+accepted old values and successful intermediate versions with the correct schema.
+
+The edit endpoint accepts up to 1 MiB and reads the complete declared HTTP body.
+It copies the candidate into an owned background job, returns `202 Accepted`, and
+keeps status polling responsive; a concurrent submission receives `409 Conflict`.
+The UI follows `Checking`, `Staged`, `WaitingForQuiescence`, `Migrating`, and the terminal state
+instead of treating queue acceptance as publication.
+
+Every native backend records current and retired generations. Images/engines that
+introduce persistent static cells are pinned; unpinned retired generations are
+reclaimed while the live writer gate proves no adapter frame is running. Explicit
+generation leases cover escaped native callbacks, and non-null function pointers
+stored in reflected persistent state acquire conservative leases automatically.
+Reloadable function pointers themselves target permanent, signature-specific
+trampolines backed by one-time static implementation cells; they never expose
+reclaimable candidate text. Same-signature edits update an existing trampoline,
+while a signature change creates a new ABI lineage and leaves the old callback
+valid. Ordinary compiled modules can opt into this lowering with
+`(reloadable-module)` after importing `coil.jit.reload`.
+Reset and reclamation refuse to proceed while a lease is held. The live status API
+reports retained generations, leases, persistent code escapes, and the most recent
+reclamation count. It also reports the conservative complete-snapshot dependency
+closure, root/object/schema/transition counts, and structured blocker metadata.
+
+Long-running native loops can check `coil_live_reload_requested` at a safe
+backedge and return to a stable outer driver. The poll never drops a read lease
+in place, because doing so could leave an old-layout stack local alive across a
+layout publication. Nested by-value struct edits propagate through containing
+layout fingerprints and invoke exact native inner adapters. Defaults and explicit
+transitions are both checked against the migration purity contract.
 
 ### Byte buffers and slice references
 
@@ -191,13 +302,19 @@ that optimization level.
   stdout/JIT query functions.
 - `viewer.coil` — background localhost HTTP server and asset/API routing.
 - `viewer/` — separate HTML, JavaScript, and CSS viewer assets.
+- `controller.coil` and `live_api.coil` — staged JIT edit session and optional
+  viewer bridge.
+- `live_reader.coil` and `live_meta.coil` — exact live syntax, accepted-history
+  injection, checked transition planning, and native adapter generation.
+- `live.coil` — persistent roots, exact transition chains, shadow staging,
+  quiescence gate, atomic publication, rollback, and alias accounting.
 - `demo.coil` — typed allocations, inspection, snapshot, and free behavior.
 - `viewer_demo.coil` — live heap values plus scalar functions used to exercise
   browser-side discovery and in-process invocation.
 - `c_struct_demo.coil` — translated-C marker and explicit-layout value regression.
 - `jit_demo.coil` — runtime query submission through Coil JIT.
 
-## Remaining production work
+## Optional inspector extensions
 
 - Dynamic/segmented registry storage with recursion-safe bootstrap allocation.
 - Rendering for all Coil scalar widths, slices, arrays, sums, nested values, and
@@ -205,11 +322,10 @@ that optimization level.
 - Allocator-instance identity and grouping in the viewer.
 - Observable arena lifecycle/reset where an existing checked API provides it.
 - Configurable bind address/port and authentication before non-loopback binding.
-- Browser and concurrency stress tests.
+- Broader browser stress tests.
 - Imported-module function catalogs, rich editors/renderers over the universal raw
-  representation, generic monomorph selection, invocation coordination with
-  application threads, and opt-in live redefinition through Coil's typed `Var`
-  machinery.
+  representation, and interactive generic monomorph selection. These extend the
+  inspector UI; they are not alternate execution machinery for native live edits.
 
 The architectural constraint remains fixed: this stays an opt-in transparent
 metaprogram; none of it belongs in Coil core or `coil.alloc`.

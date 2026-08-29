@@ -1,0 +1,211 @@
+(module experiments.heap-inspector.native-demo-api)
+
+(import "coil.primitive" :as primitive)
+(import "coil.atomic" :as atomic)
+(import "coil.slice" :use [slice-new])
+(import "experiments.heap-inspector.runtime" :as inspector)
+(import "experiments.heap-inspector.live" :as live)
+
+(extern _setjmp :cc c [(ptr i8)] (-> i32))
+
+(defstruct NativeDemoParticle
+  [(x i64) (y i64) (radius i64) (tint i64) (kind i64)])
+
+(defstruct NativeDemoApi
+  [(enabled bool)
+   (published bool)
+   (staged bool)
+   (running bool)
+   (frame i64)
+   (tick (fnptr c [] i64))
+   (value (fnptr c [i64 i64] i64))
+   (staged-tick (fnptr c [] i64))
+   (staged-value (fnptr c [i64 i64] i64))
+   (last-frame (array NativeDemoParticle 18))
+   (has-frame bool)])
+
+(defn native-demo-api [] (-> (ptr NativeDemoApi))
+  (primitive/alloc-static NativeDemoApi))
+
+(defn native-demo-lock-cell [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+; Window drawing and HTTP frame inspection are independent native threads, but
+; both drive the same persistent World. This lock serializes a complete tick +
+; snapshot transaction. It is deliberately distinct from callback publication:
+; candidate publication never needs it, avoiding a source-gate lock inversion.
+(defn native-demo-frame-lock-cell [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defn native-demo-focus-cell [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defn native-demo-request-focus! [] (-> i64)
+  (atomic/atomic-store (native-demo-focus-cell) 1))
+
+(defn native-demo-take-focus-request! [] (-> bool)
+  (= (atomic/atomic-cas (native-demo-focus-cell) 1 0) 1))
+
+(defn native-demo-lock! [] (-> i64)
+  (loop (if (= (atomic/atomic-cas (native-demo-lock-cell) 0 1) 0) (break) 0))
+  0)
+
+(defn native-demo-unlock! [] (-> i64)
+  (atomic/atomic-store (native-demo-lock-cell) 0))
+
+(defn native-demo-frame-lock! [] (-> i64)
+  (loop (if (= (atomic/atomic-cas (native-demo-frame-lock-cell) 0 1) 0)
+            (break) 0))
+  0)
+
+(defn native-demo-frame-unlock! [] (-> i64)
+  (atomic/atomic-store (native-demo-frame-lock-cell) 0))
+
+(defn native-demo-enable! [] (-> i64)
+  (let [api (native-demo-api)]
+    (set! (.enabled api) true)
+    (set! (.running api) true)
+    0))
+
+; Called by a prepared candidate while the controller publication gate is held.
+; These pointers are deliberately not visible to frame requests until the JIT
+; backend has successfully published the complete native generation.
+(defn native-demo-stage-callbacks! [(tick (fnptr c [] i64))
+                                     (value (fnptr c [i64 i64] i64))] (-> i64)
+  (let [api (native-demo-api)]
+    (set! (.staged-tick api) tick)
+    (set! (.staged-value api) value)
+    (set! (.staged api) true)
+    0))
+
+(defn native-demo-publish-staged! [] (-> i64)
+  (let [api (native-demo-api)]
+    (if (.staged api)
+        (do (native-demo-lock!)
+            (set! (.tick api) (.staged-tick api))
+            (set! (.value api) (.staged-value api))
+            (set! (.published api) true)
+            (set! (.staged api) false)
+            (native-demo-unlock!))
+        0)))
+
+(defn native-demo-abort-staged! [] (-> i64)
+  (set! (.staged (native-demo-api)) false)
+  0)
+
+(defn native-demo-set-running! [(running bool)] (-> i64)
+  (native-demo-frame-lock!)
+  (set! (.running (native-demo-api)) running)
+  (native-demo-frame-unlock!))
+
+(defn native-demo-running? [] (-> bool)
+  (native-demo-frame-lock!)
+  (let [running (.running (native-demo-api))]
+    (native-demo-frame-unlock!)
+    running))
+
+; Fill one host-owned frame directly from native live functions. The outer
+; reader lease makes the update and every query one coherent generation.
+(defn native-demo-read-frame! [(particles (ptr NativeDemoParticle))] (-> i64)
+  (let [api (native-demo-api)
+        boundary (primitive/alloc-stack live/LiveRestartBoundary)
+        staging (primitive/alloc-stack (array NativeDemoParticle 18))]
+    (native-demo-frame-lock!)
+    (live/live-enter!)
+    (live/live-restart-boundary-push! boundary)
+    (let [jumped (_setjmp (primitive/cast (ptr i8) (field boundary buffer)))]
+    (if (!= jumped (primitive/cast i32 0))
+        (do
+          (live/live-restart-boundary-recover! boundary)
+          (live/live-exit!)
+          (native-demo-frame-unlock!)
+          -20)
+        (do
+    (native-demo-lock!)
+    (let [published (.published api)
+          running (.running api)
+          paused (live/live-condition-active?)
+          tick (.tick api)
+          value (.value api)
+          (mut result) -1]
+      (native-demo-unlock!)
+      (if published
+          (do
+            (if (and running (not paused))
+                (do (primitive/call-ptr tick)
+                    (set! (.frame api) (+ (.frame api) 1)))
+                0)
+            (for [i 0 18]
+              (let [p (primitive/index staging i)]
+                (set! (.x p) (primitive/call-ptr value i 0))
+                (set! (.y p) (primitive/call-ptr value i 1))
+                (set! (.radius p) (primitive/call-ptr value i 2))
+                (set! (.tint p) (primitive/call-ptr value i 3))
+                (set! (.kind p) (primitive/call-ptr value i 4))))
+            ; Host-visible frame publication is the restart boundary's commit:
+            ; no partial query results escape if a Broken entry jumps out.
+            (for [i 0 18]
+              (do
+                (set! (primitive/index particles i)
+                      (load (primitive/index staging i)))
+                (set! (primitive/index (field api last-frame) i)
+                      (load (primitive/index staging i)))))
+            (set! (.has-frame api) true)
+            (set! result 0))
+          0)
+      ; atomic-add returns the reader count from the lease operation, not this
+      ; function's success status. Release first, then preserve the frame result.
+      (live/live-restart-boundary-pop! boundary)
+      (live/live-exit!)
+      (native-demo-frame-unlock!)
+      (load result)))))))
+
+(defn native-demo-frame-json [] (-> (slice u8))
+  (let [api (native-demo-api)
+        particles (primitive/alloc-stack (array NativeDemoParticle 18))]
+    ; The same explicit restart/quarantine path serves JSON tooling and the
+    ; native host. On a Broken callback, `particles` remains the last frame.
+    (native-demo-read-frame! (primitive/cast (ptr NativeDemoParticle) particles))
+    (native-demo-frame-lock!)
+    (if (.has-frame api)
+        (for [i 0 18]
+          (set! (primitive/index particles i)
+                (load (primitive/index (field api last-frame) i)))) 0)
+    (native-demo-lock!)
+    (let [published (.published api)]
+    (native-demo-unlock!)
+    (let [running (.running api)
+          paused (live/live-condition-active?)]
+    (inspector/lock!)
+    (inspector/json-reset!)
+    (inspector/json-text! "{\"supported\":")
+    (inspector/json-text! (if (and (.enabled api) published) "true" "false"))
+    (inspector/json-text! ",\"running\":")
+    (inspector/json-text! (if (and running (not paused)) "true" "false"))
+    (inspector/json-text! ",\"pausedByCondition\":")
+    (inspector/json-text! (if paused "true" "false"))
+    (inspector/json-text! ",\"frame\":")
+    (inspector/json-int! (.frame api))
+    (inspector/json-text! ",\"particles\":[")
+    (if published
+        (for [i 0 18]
+          (do (if (> i 0) (inspector/json-text! ",") 0)
+              (inspector/json-text! "{\"x\":")
+              (inspector/json-int! (.x (primitive/index particles i)))
+              (inspector/json-text! ",\"y\":")
+              (inspector/json-int! (.y (primitive/index particles i)))
+              (inspector/json-text! ",\"radius\":")
+              (inspector/json-int! (.radius (primitive/index particles i)))
+              (inspector/json-text! ",\"tint\":")
+              (inspector/json-int! (.tint (primitive/index particles i)))
+              (inspector/json-text! ",\"kind\":")
+              (inspector/json-int! (.kind (primitive/index particles i)))
+              (inspector/json-text! "}")))
+        0)
+    (inspector/json-text! "]}")
+    (let [result (slice-new (inspector/json-buffer) (load (inspector/json-length)))]
+      (inspector/unlock!)
+      (native-demo-frame-unlock!)
+      result)))))
+
+(export-c [native-demo-stage-callbacks! :as "coil_native_demo_stage_callbacks"])

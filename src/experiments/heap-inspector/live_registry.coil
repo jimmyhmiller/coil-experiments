@@ -1,0 +1,1255 @@
+(module experiments.heap-inspector.live-registry)
+
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use [slice-len slice-get subslice])
+
+;; The registry is compile-time data owned by the live metaprogram. Stable
+;; identity is structural, not a hash and not a generated linker spelling:
+;;
+;;   (live-def-id <module-id> <kind> <source-name>)
+;;
+;; Hashes may accelerate a runtime table later, but they are never identity.
+
+(defn registry-head? [(form Code) (head Code)] (-> bool)
+  (and (primitive/code-list? form)
+       (and (> (primitive/code-count form) 0)
+            (primitive/code-eq (primitive/code-nth form 0) head))))
+
+(defn registry-name=? [(a Code) (b Code)] (-> bool)
+  (let [left (primitive/code-str a) right (primitive/code-str b)]
+    (if (!= (slice-len left) (slice-len right))
+        false
+        (let [(mut i) 0 (mut same) true]
+          (loop (if (or (not (load same)) (>= (load i) (slice-len left)))
+                    (break)
+                    (if (= (slice-get left (load i)) (slice-get right (load i)))
+                        (set! i (+ (load i) 1))
+                        (set! same false))))
+          (load same)))))
+
+; Definition IDs are source identities. Syntax objects from separate JIT
+; submissions have different provenance even when they denote the same source
+; definition, so pointer/context-sensitive code-eq is not identity equality.
+(defn registry-id=? [(a Code) (b Code)] (-> bool)
+  (registry-name=? a b))
+
+(defn registry-definition-kind [(form Code)] (-> Code)
+  (cond
+    (registry-head? form `defn) `:function
+    (registry-head? form `defstruct) `:struct
+    (registry-head? form `defsum) `:sum
+    (registry-head? form `deftrait) `:trait
+    (registry-head? form `impl) `:impl
+    (registry-head? form `defclosure) `:closure
+    (registry-head? form `letonce) `:root
+    (registry-head? form `live-migrate-declaration) `:migration
+    (registry-head? form `export) `:export
+    :else `:none))
+
+(defn registry-definition? [(form Code)] (-> bool)
+  (not (primitive/code-eq (registry-definition-kind form) `:none)))
+
+(defn registry-impl-method-form? [(form Code)] (-> bool)
+  (and (primitive/code-list? form)
+       (and (> (primitive/code-count form) 2)
+            (and (primitive/code-vector? (primitive/code-nth form 1))
+                 (registry-head? (primitive/code-nth form 2) `->)))))
+
+(defn registry-impl-method-start [(form Code)] (-> i64)
+  (let [(mut found) (primitive/code-count form)]
+    (for [i 1 (primitive/code-count form)]
+      (if (and (= (load found) (primitive/code-count form))
+               (registry-impl-method-form? (primitive/code-nth form i)))
+          (set! found i)
+          0))
+    (load found)))
+
+(defn registry-impl-name [(form Code)] (-> Code)
+  (let [out (primitive/code-list-new)
+        method-start (registry-impl-method-start form)]
+    (primitive/code-list-push! out `impl-key)
+    (for [i 1 method-start]
+      (primitive/code-list-push! out (primitive/code-nth form i)))
+    (primitive/code-list-done out)))
+
+(defn registry-definition-name [(form Code)] (-> Code)
+  (if (and (registry-definition? form) (> (primitive/code-count form) 1))
+      (if (and (registry-head? form `live-migrate-declaration)
+               (> (primitive/code-count form) 2))
+          `(~(primitive/code-nth form 1) ~(primitive/code-nth form 2))
+          (if (and (registry-head? form `impl)
+                   (> (primitive/code-count form) 2))
+              ; An impl is nominally selected by its declared trait/head and
+              ; implementing type surface. Methods receive child identities
+              ; under this stable parent during lowering.
+              (registry-impl-name form)
+              (primitive/code-nth form 1)))
+      (primitive/error "live registry: definition has no source name")))
+
+(defn registry-stable-id [(module-id Code) (kind Code) (name Code)] (-> Code)
+  `(live-def-id ~module-id ~kind ~name))
+
+(defn registry-id-for-form [(module-id Code) (form Code)] (-> Code)
+  (registry-stable-id module-id (registry-definition-kind form)
+                      (registry-definition-name form)))
+
+;; A definition record deliberately retains the normalized original form. Its
+;; generated artifacts are descriptors registered by the code which creates
+;; them; nobody later reverse engineers their source owner from their names.
+;;
+;;   (live-definition id kind name version original-form
+;;     (value-dependencies ...)
+;;     (type-dependencies ...)
+;;     (generated-artifacts ...))
+
+(defn registry-empty-record [(module-id Code) (form Code)] (-> Code)
+  (let [kind (registry-definition-kind form)
+        name (registry-definition-name form)]
+    `(live-definition
+       ~(registry-stable-id module-id kind name)
+       ~kind ~name :initial ~form
+       (value-dependencies)
+       (type-dependencies)
+       (generated-artifacts))))
+
+(defn registry-impl-method-key [(impl-name Code) (method-name Code)] (-> Code)
+  `(impl-method-key ~impl-name ~method-name))
+
+(defn registry-impl-method-record [(module-id Code) (impl-form Code)
+                                   (method Code)] (-> Code)
+  (let [impl-name (registry-definition-name impl-form)
+        method-name (primitive/code-nth method 0)
+        name (registry-impl-method-key impl-name method-name)]
+    `(live-definition
+       ~(registry-stable-id module-id `:impl-method name)
+       :impl-method ~name :initial ~method
+       (value-dependencies)
+       (type-dependencies)
+       (generated-artifacts))))
+
+(defn registry-discover [(module-id Code) (forms Code)] (-> Code)
+  (let [records (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count forms)]
+      (let [form (primitive/code-nth forms i)]
+        (if (registry-definition? form)
+            (do
+              (primitive/code-list-push! records
+                (registry-empty-record module-id form))
+              (if (registry-head? form `impl)
+                  (for [j (registry-impl-method-start form)
+                          (primitive/code-count form)]
+                    (let [method (primitive/code-nth form j)]
+                      (if (and (primitive/code-list? method)
+                               (> (primitive/code-count method) 3))
+                          (do
+                            (primitive/code-list-push! records
+                              (registry-impl-method-record module-id form method))
+                            0)
+                          (primitive/error
+                            "live registry: malformed impl method declaration"))))
+                  0)
+              0)
+            0)))
+    `(live-registry ~module-id ~@(primitive/code-list-done records))))
+
+(defn registry-record-count [(registry Code)] (-> i64)
+  (if (registry-head? registry `live-registry)
+      (- (primitive/code-count registry) 2)
+      (primitive/error "live registry: expected live-registry")))
+
+(defn registry-record-at [(registry Code) (index i64)] (-> Code)
+  (primitive/code-nth registry (+ index 2)))
+
+(defn registry-record-id [(record Code)] (-> Code) (primitive/code-nth record 1))
+(defn registry-record-kind [(record Code)] (-> Code) (primitive/code-nth record 2))
+(defn registry-record-name [(record Code)] (-> Code) (primitive/code-nth record 3))
+(defn registry-record-form [(record Code)] (-> Code) (primitive/code-nth record 5))
+(defn registry-record-value-dependencies [(record Code)] (-> Code)
+  (primitive/code-nth record 6))
+(defn registry-record-type-dependencies [(record Code)] (-> Code)
+  (primitive/code-nth record 7))
+(defn registry-record-artifacts [(record Code)] (-> Code)
+  (primitive/code-nth record 8))
+
+(defn registry-tagged-append-unique [(tagged Code) (item Code)] (-> Code)
+  (let [out (primitive/code-list-new) (mut present) false]
+    (primitive/code-list-push! out (primitive/code-nth tagged 0))
+    (for [i 1 (primitive/code-count tagged)]
+      (let [existing (primitive/code-nth tagged i)]
+        (if (primitive/code-eq existing item) (set! present true) 0)
+        (primitive/code-list-push! out existing)))
+    (if (not (load present)) (primitive/code-list-push! out item) out)
+    (primitive/code-list-done out)))
+
+(defn registry-record-with-edges [(record Code) (values Code) (types Code)] (-> Code)
+  `(live-definition
+     ~(registry-record-id record)
+     ~(registry-record-kind record)
+     ~(registry-record-name record)
+     ~(primitive/code-nth record 4)
+     ~(registry-record-form record)
+     ~values ~types ~(registry-record-artifacts record)))
+
+(defn registry-record-with-artifacts [(record Code) (artifacts Code)] (-> Code)
+  `(live-definition
+     ~(registry-record-id record)
+     ~(registry-record-kind record)
+     ~(registry-record-name record)
+     ~(primitive/code-nth record 4)
+     ~(registry-record-form record)
+     ~(registry-record-value-dependencies record)
+     ~(registry-record-type-dependencies record)
+     ~artifacts))
+
+(defn registry-find-index [(registry Code) (kind Code) (name Code)] (-> i64)
+  (let [(mut found) -1]
+    (for [i 0 (registry-record-count registry)]
+      (let [record (registry-record-at registry i)]
+        (if (and (primitive/code-eq (registry-record-kind record) kind)
+                 (registry-name=? (registry-record-name record) name))
+            (set! found i)
+            0)))
+    (load found)))
+
+(defn registry-find [(registry Code) (kind Code) (name Code)] (-> Code)
+  (let [index (registry-find-index registry kind name)]
+    (if (< index 0)
+        `:missing
+        (registry-record-at registry index))))
+
+(defn registry-find-value-definition [(registry Code) (name Code)] (-> Code)
+  (let [function (registry-find registry `:function name)]
+    (if (registry-head? function `live-definition)
+        function
+        (registry-find registry `:root name))))
+
+(defn registry-find-type-definition [(registry Code) (name Code)] (-> Code)
+  (let [record (registry-find registry `:struct name)]
+    (if (registry-head? record `live-definition)
+        record
+        (registry-find registry `:sum name))))
+
+(defn registry-bound? [(bound Code) (name Code)] (-> bool)
+  (let [(mut present) false]
+    (for [i 0 (primitive/code-count bound)]
+      (if (registry-name=? (primitive/code-nth bound i) name)
+          (set! present true) 0))
+    (load present)))
+
+(defn registry-bound-add [(bound Code) (name Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count bound)]
+      (primitive/code-list-push! out (primitive/code-nth bound i)))
+    (primitive/code-list-push! out name)
+    (primitive/code-list-done out)))
+
+(defn registry-last-name-start [(text (slice u8))] (-> i64)
+  (let [(mut i) 0 (mut start) 0]
+    (loop (if (>= (load i) (slice-len text))
+              (break)
+              (do
+                (let [c (slice-get text (load i))]
+                  (if (or (= c (primitive/cast u8 46))
+                          (= c (primitive/cast u8 47)))
+                      (set! start (+ (load i) 1)) 0))
+                (set! i (+ (load i) 1)))))
+    (load start)))
+
+(defn registry-reference-name [(node Code)] (-> Code)
+  (let [text (primitive/code-str node)]
+    (primitive/syntax->datum
+      (primitive/code-symbol
+        (subslice text (registry-last-name-start text) (slice-len text))))))
+
+(defn registry-resolved-record [(registry Code) (node Code)] (-> Code)
+  (if (not (primitive/code-sym? node))
+      `:missing
+      (let [decl (primitive/code-decl node)]
+        (if (or (not (primitive/code-list? decl))
+                (< (primitive/code-count decl) 3))
+            `:missing
+            (let [module-id (primitive/code-nth decl 1)
+                  decl-kind (primitive/code-nth decl 2)
+                  kind (cond
+                         (primitive/code-eq decl-kind `fn) `:function
+                         (primitive/code-eq decl-kind `struct) `:struct
+                         (primitive/code-eq decl-kind `sum) `:sum
+                         :else `:none)]
+              (if (or (not (primitive/code-eq module-id
+                             (primitive/code-nth registry 1)))
+                      (primitive/code-eq kind `:none))
+                  `:missing
+                  (registry-find registry kind (registry-reference-name node))))))))
+
+(defn registry-semantic-collect [(registry Code) (node Code) (bound Code) (position Code)
+                                 (values CodeBuilder) (types CodeBuilder)] (-> i64)
+  (if (primitive/code-sym? node)
+      (if (or (registry-bound? bound node) (!= (primitive/binding-of node) 0))
+          0
+          (let [target (registry-resolved-record registry node)]
+            (if (not (registry-head? target `live-definition))
+                0
+                (let [kind (registry-record-kind target)]
+                  (cond
+                    (primitive/code-eq kind `:function)
+                      (do (primitive/code-list-push! values
+                            `(value-dependency ~(registry-record-id target) ~position))
+                          0)
+                    (or (primitive/code-eq kind `:struct)
+                        (primitive/code-eq kind `:sum))
+                      (do (primitive/code-list-push! types
+                            `(type-dependency ~(registry-record-id target)
+                               ~(if (primitive/code-eq position `:signature)
+                                    `:signature `:body-type)))
+                          0)
+                    :else 0)))))
+      (if (not (primitive/code-list? node))
+          0
+          (if (= (primitive/code-count node) 0)
+              0
+              (let [head (primitive/code-nth node 0)]
+                (if (and (primitive/code-eq head `let)
+                         (> (primitive/code-count node) 1))
+                    (let [bindings (primitive/code-nth node 1) (mut scoped) bound]
+                      (for [i 0 (primitive/code-count bindings)]
+                        (if (= (primitive/iand i 1) 1)
+                            (do
+                              (registry-semantic-collect registry
+                                (primitive/code-nth bindings i) (load scoped)
+                                `:value values types)
+                              (set! scoped
+                                (registry-bound-add (load scoped)
+                                  (registry-binder-name
+                                    (primitive/code-nth bindings (- i 1))))))
+                            0))
+                      (for [i 2 (primitive/code-count node)]
+                        (registry-semantic-collect registry
+                          (primitive/code-nth node i) (load scoped)
+                          position values types))
+                      0)
+                    (do
+                      (registry-semantic-collect registry head bound
+                        (if (primitive/code-vector? node) position `:call)
+                        values types)
+                      (for [i 1 (primitive/code-count node)]
+                        (registry-semantic-collect registry
+                          (primitive/code-nth node i) bound position values types))
+                      0)))))))
+
+(defn registry-semantic-enrich-function [(registry Code) (record Code)
+                                         (checked-form Code)] (-> Code)
+  (let [generic? (primitive/code-vector? (primitive/code-nth checked-form 3))
+        params (primitive/code-nth checked-form (if generic? 3 2))
+        return-form (primitive/code-nth checked-form (if generic? 4 3))
+        body-start (if generic? 5 4)
+        values (primitive/code-list-new)
+        types (primitive/code-list-new)]
+    (primitive/code-list-push! values `value-dependencies)
+    (primitive/code-list-push! types `type-dependencies)
+    (for [i 0 (primitive/code-count params)]
+      (let [param (primitive/code-nth params i)]
+        (if (> (primitive/code-count param) 1)
+            (registry-semantic-collect registry (primitive/code-nth param 1)
+              `() `:signature values types) 0)))
+    (registry-semantic-collect registry return-form `() `:signature values types)
+    (for [i body-start (primitive/code-count checked-form)]
+      (registry-semantic-collect registry (primitive/code-nth checked-form i)
+        (registry-function-bound params) `:value values types))
+    (registry-record-with-edges record
+      (primitive/code-list-done values) (primitive/code-list-done types))))
+
+(defn registry-checked-form [(checked-module Code) (kind Code) (name Code)] (-> Code)
+  (let [(mut found) `:missing]
+    (for [i 1 (primitive/code-count checked-module)]
+      (let [form (primitive/code-nth checked-module i)]
+        (if (and (registry-definition? form)
+                 (and (primitive/code-eq (registry-definition-kind form) kind)
+                      (registry-name=? (registry-definition-name form) name)))
+            (set! found form) 0)))
+    (load found)))
+
+(defn registry-semantic-enrich-module [(registry Code)
+                                       (checked-module Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (primitive/code-list-push! out `live-registry)
+    (primitive/code-list-push! out (primitive/code-nth registry 1))
+    (for [i 0 (registry-record-count registry)]
+      (let [record (registry-record-at registry i)
+            kind (registry-record-kind record)
+            checked (registry-checked-form checked-module kind
+                      (registry-record-name record))]
+        (primitive/code-list-push! out
+          (if (and (primitive/code-eq kind `:function)
+                   (registry-head? checked `defn))
+              (registry-semantic-enrich-function registry record checked)
+              record))))
+    (primitive/code-list-done out)))
+
+(defn registry-semantic-test-module? [(module Code)] (-> bool)
+  (and (> (primitive/code-count module) 0)
+       (registry-name=? (primitive/code-nth module 0)
+                        `experiments.heap-inspector.live-registry-semantic-test)))
+
+(defn registry-semantic-test-transform [(modules Code)] (-> Code)
+  (for [mi 0 (primitive/code-count modules)]
+    (let [module (primitive/code-nth modules mi)]
+      (if (registry-semantic-test-module? module)
+          (let [forms (primitive/code-rest module)
+                discovered (registry-discover (primitive/code-nth module 0) forms)
+                exact (registry-semantic-enrich-module discovered module)
+                target (registry-find exact `:function `semantic-target)
+                caller (registry-find exact `:function `semantic-caller)
+                shadow (registry-find exact `:function `semantic-shadow)]
+            (if (not (registry-tagged-contains?
+                       (registry-record-value-dependencies caller)
+                       `(value-dependency ~(registry-record-id target) :call)))
+                (primitive/error "live semantic registry: resolved call edge is missing") 0)
+            (if (registry-tagged-contains?
+                  (registry-record-value-dependencies shadow)
+                  `(value-dependency ~(registry-record-id target) :value))
+                (primitive/error "live semantic registry: local binding resolved as global") 0)
+            0)
+          0)))
+  `(do ~@modules))
+
+(defn registry-binder-name [(binder Code)] (-> Code)
+  (if (and (primitive/code-list? binder) (> (primitive/code-count binder) 1))
+      (primitive/code-nth binder 1)
+      binder))
+
+(defn registry-collect-value-symbol [(registry Code) (name Code) (bound Code)
+                                     (use-kind Code) (out CodeBuilder)] (-> i64)
+  (if (or (not (primitive/code-sym? name)) (registry-bound? bound name))
+      0
+      (let [target (registry-find-value-definition registry name)]
+        (if (registry-head? target `live-definition)
+            (do (primitive/code-list-push! out
+                  `(value-dependency ~(registry-record-id target) ~use-kind))
+                0)
+            0))))
+
+(defn registry-collect-values [(registry Code) (node Code) (bound Code)
+                               (position Code) (out CodeBuilder)] (-> i64)
+  (if (primitive/code-sym? node)
+      (registry-collect-value-symbol registry node bound position out)
+      (if (not (primitive/code-list? node))
+          0
+          (if (= (primitive/code-count node) 0)
+              0
+              (let [head (primitive/code-nth node 0)]
+                (cond
+                  (or (primitive/code-eq head `quote)
+                      (primitive/code-eq head `quasiquote)) 0
+                  (and (primitive/code-eq head `let)
+                       (> (primitive/code-count node) 1))
+                    (let [bindings (primitive/code-nth node 1) (mut scoped) bound]
+                      (for [i 0 (primitive/code-count bindings)]
+                        (let [entry (primitive/code-nth bindings i)]
+                          (if (= (primitive/iand i 1) 0)
+                              0
+                              (do
+                                (registry-collect-values registry entry (load scoped)
+                                  `:value out)
+                                (set! scoped
+                                  (registry-bound-add (load scoped)
+                                    (registry-binder-name
+                                      (primitive/code-nth bindings (- i 1)))))))))
+                      (for [i 2 (primitive/code-count node)]
+                        (registry-collect-values registry (primitive/code-nth node i)
+                          (load scoped) `:value out))
+                      0)
+                  (and (primitive/code-eq head `for)
+                       (> (primitive/code-count node) 1))
+                    (let [control (primitive/code-nth node 1)
+                          loop-bound (registry-bound-add bound
+                            (registry-binder-name (primitive/code-nth control 0)))]
+                      (for [i 1 (primitive/code-count control)]
+                        (registry-collect-values registry (primitive/code-nth control i)
+                          bound `:value out))
+                      (for [i 2 (primitive/code-count node)]
+                        (registry-collect-values registry (primitive/code-nth node i)
+                          loop-bound `:value out))
+                      0)
+                  :else
+                    (do
+                      (registry-collect-values registry head bound `:call out)
+                      (for [i 1 (primitive/code-count node)]
+                        (registry-collect-values registry (primitive/code-nth node i)
+                          bound `:value out))
+                      0)))))))
+
+(defn registry-collect-types [(registry Code) (node Code) (edge-kind Code)
+                              (out CodeBuilder)] (-> i64)
+  (if (primitive/code-sym? node)
+      (let [target (registry-find-type-definition registry node)]
+        (if (registry-head? target `live-definition)
+            (do (primitive/code-list-push! out
+                  `(type-dependency ~(registry-record-id target) ~edge-kind))
+                0)
+            0))
+      (if (not (primitive/code-list? node))
+          0
+          (do
+            (for [i 0 (primitive/code-count node)]
+              (registry-collect-types registry (primitive/code-nth node i) edge-kind out))
+            0))))
+
+(defn registry-sum-owning-variant [(registry Code) (variant-name Code)] (-> Code)
+  (let [(mut found) `:missing]
+    (for [i 0 (registry-record-count registry)]
+      (let [record (registry-record-at registry i)]
+        (if (primitive/code-eq (registry-record-kind record) `:sum)
+            (let [form (registry-record-form record)
+                  start (if (and (> (primitive/code-count form) 2)
+                                 (primitive/code-vector? (primitive/code-nth form 2)))
+                            3 2)]
+              (for [j start (primitive/code-count form)]
+                (let [variant (primitive/code-nth form j)]
+                  (if (registry-name=? (primitive/code-nth variant 0) variant-name)
+                      (set! found record) 0)))) 0)))
+    (load found)))
+
+(defn registry-collect-exhaustive-matches [(registry Code) (node Code)
+                                           (out CodeBuilder)] (-> i64)
+  (if (not (primitive/code-list? node))
+      0
+      (do
+        (if (and (> (primitive/code-count node) 2)
+                 (primitive/code-eq (primitive/code-nth node 0) `match))
+            (for [i 2 (primitive/code-count node)]
+              (let [arm (primitive/code-nth node i)]
+                (if (and (primitive/code-list? arm)
+                         (> (primitive/code-count arm) 0))
+                    (let [owner
+                            (registry-sum-owning-variant registry
+                              (primitive/code-nth arm 0))]
+                      (if (registry-head? owner `live-definition)
+                          (do
+                            (primitive/code-list-push! out
+                              `(type-dependency ~(registry-record-id owner)
+                                 :exhaustive-match))
+                            0)
+                          0))
+                    0))) 0)
+        (for [i 0 (primitive/code-count node)]
+          (registry-collect-exhaustive-matches registry
+            (primitive/code-nth node i) out))
+        0)))
+
+(defn registry-function-bound [(params Code)] (-> Code)
+  (let [bound (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count params)]
+      (primitive/code-list-push! bound
+        (primitive/code-nth (primitive/code-nth params i) 0)))
+    (primitive/code-list-done bound)))
+
+(defn registry-enrich-record [(registry Code) (record Code)] (-> Code)
+  (let [form (registry-record-form record)
+        kind (registry-record-kind record)
+        values-builder (primitive/code-list-new)
+        types-builder (primitive/code-list-new)]
+    (primitive/code-list-push! values-builder `value-dependencies)
+    (primitive/code-list-push! types-builder `type-dependencies)
+    (cond
+      (primitive/code-eq kind `:function)
+        (let [generic? (primitive/code-vector? (primitive/code-nth form 3))
+              params (primitive/code-nth form (if generic? 3 2))
+              return-form (primitive/code-nth form (if generic? 4 3))
+              body-start (if generic? 5 4)
+              bound (registry-function-bound params)]
+          (registry-collect-types registry params `:signature types-builder)
+          (registry-collect-types registry return-form `:signature types-builder)
+          (for [i body-start (primitive/code-count form)]
+            (registry-collect-values registry (primitive/code-nth form i)
+              bound `:value values-builder)
+            (registry-collect-types registry (primitive/code-nth form i)
+              `:body-type types-builder)
+            (registry-collect-exhaustive-matches registry
+              (primitive/code-nth form i) types-builder))
+          0)
+      (primitive/code-eq kind `:closure)
+        (let [captures (primitive/code-nth form 2)
+              params (primitive/code-nth form 3)
+              ret (primitive/code-nth form 4)
+              (mut bound) (registry-function-bound captures)]
+          ; Captures are the fields of the generated versioned environment;
+          ; parameters and return type are the permanent callable ABI.
+          (registry-collect-types registry captures `:capture types-builder)
+          (registry-collect-types registry params `:signature types-builder)
+          (registry-collect-types registry ret `:signature types-builder)
+          (for [i 0 (primitive/code-count params)]
+            (set! bound
+              (registry-bound-add (load bound)
+                (primitive/code-nth (primitive/code-nth params i) 0))))
+          (for [i 5 (primitive/code-count form)]
+            (registry-collect-values registry (primitive/code-nth form i)
+              (load bound) `:value values-builder)
+            (registry-collect-types registry (primitive/code-nth form i)
+              `:body-type types-builder)
+            (registry-collect-exhaustive-matches registry
+              (primitive/code-nth form i) types-builder))
+          0)
+      (or (primitive/code-eq kind `:struct) (primitive/code-eq kind `:sum))
+        (do
+          ;; Skip the declaration head and its own name. Only the declared
+          ;; generic/field/variant surface contributes schema edges. A source
+          ;; nominal live type is represented by its invariant handle at this
+          ;; boundary, so changing its payload does not change the containing
+          ;; schema's native layout.
+          (for [i 2 (primitive/code-count form)]
+            (registry-collect-types registry (primitive/code-nth form i)
+              `:handle types-builder))
+          0)
+      (primitive/code-eq kind `:root)
+        (do
+          (for [i 2 (primitive/code-count form)]
+            (registry-collect-values registry (primitive/code-nth form i)
+              `() `:initializer values-builder))
+          ;; A retained root owns the invariant handle returned by its outer
+          ;; constructor. Types nested in that initializer describe how the
+          ;; initial value was built, not payloads that must be rebuilt later.
+          (if (> (primitive/code-count form) 2)
+              (let [initializer (primitive/code-nth form 2)]
+                (if (and (primitive/code-list? initializer)
+                         (> (primitive/code-count initializer) 0))
+                    (let [head (primitive/code-nth initializer 0)
+                          sum-owner (registry-sum-owning-variant registry head)]
+                      (registry-collect-types registry head `:root types-builder)
+                      (if (registry-head? sum-owner `live-definition)
+                          (do
+                            (primitive/code-list-push! types-builder
+                              `(type-dependency ~(registry-record-id sum-owner) :root))
+                            0)
+                          0))
+                    0))
+              0)
+          0)
+      :else 0)
+    (let [values (primitive/code-list-done values-builder)
+          types (primitive/code-list-done types-builder)
+          retained-types
+            (if (and (primitive/code-eq kind `:root)
+                     (= (primitive/code-count types) 1))
+                (registry-record-type-dependencies record)
+                types)]
+      ;; Root type identity is resolved when the root is accepted and remains
+      ;; part of that stable source record.  A later sum edit may remove the
+      ;; variant constructor appearing in the one-time initializer; that stale
+      ;; expression must never erase or redefine the type of already-retained
+      ;; native storage.
+      (registry-record-with-edges record values retained-types))))
+
+(defn registry-enrich [(registry Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (primitive/code-list-push! out `live-registry)
+    (primitive/code-list-push! out (primitive/code-nth registry 1))
+    (for [i 0 (registry-record-count registry)]
+      (primitive/code-list-push! out
+        (registry-enrich-record registry (registry-record-at registry i))))
+    (primitive/code-list-done out)))
+
+(defn registry-register-artifact [(registry Code) (owner-id Code)
+                                  (artifact Code)] (-> Code)
+  (let [(mut result) registry (mut found) false]
+    (for [i 0 (registry-record-count registry)]
+      (let [record (registry-record-at registry i)]
+        (if (primitive/code-eq (registry-record-id record) owner-id)
+            (do
+              (set! result
+                (registry-replace-record (load result)
+                  (registry-record-with-artifacts record
+                    (registry-tagged-append-unique
+                      (registry-record-artifacts record) artifact))))
+              (set! found true))
+            0)))
+    (if (not (load found))
+        (primitive/error "live registry: artifact owner is not a source definition") 0)
+    (load result)))
+
+(defn registry-tagged-contains? [(tagged Code) (item Code)] (-> bool)
+  (let [(mut found) false]
+    (for [i 1 (primitive/code-count tagged)]
+      (if (primitive/code-eq (primitive/code-nth tagged i) item)
+          (set! found true) 0))
+    (load found)))
+
+(defn registry-artifact-role? [(artifact Code) (role Code)] (-> bool)
+  (and (registry-head? artifact `artifact)
+       (and (> (primitive/code-count artifact) 2)
+            (primitive/code-eq (primitive/code-nth artifact 1) role))))
+
+(defn registry-find-artifact [(record Code) (role Code)] (-> Code)
+  (let [artifacts (registry-record-artifacts record) (mut found) `:missing]
+    (for [i 1 (primitive/code-count artifacts)]
+      (let [artifact (primitive/code-nth artifacts i)]
+        (if (registry-artifact-role? artifact role)
+            (set! found artifact) 0)))
+    (load found)))
+
+(defn registry-id-list-contains? [(ids Code) (id Code)] (-> bool)
+  (let [(mut found) false]
+    (for [i 0 (primitive/code-count ids)]
+      (if (primitive/code-eq (primitive/code-nth ids i) id)
+          (set! found true) 0))
+    (load found)))
+
+(defn registry-find-by-id [(registry Code) (id Code)] (-> Code)
+  (let [(mut found) `:missing]
+    (for [i 0 (registry-record-count registry)]
+      (let [record (registry-record-at registry i)]
+        (if (primitive/code-eq (registry-record-id record) id)
+            (set! found record) 0)))
+    (load found)))
+
+(defn registry-dependencies-contain-target? [(dependencies Code)
+                                             (target-id Code)] (-> bool)
+  (let [(mut found) false]
+    (for [i 1 (primitive/code-count dependencies)]
+      (let [edge (primitive/code-nth dependencies i)]
+        (if (primitive/code-eq (primitive/code-nth edge 1) target-id)
+            (set! found true) 0)))
+    (load found)))
+
+(defn registry-type-edge? [(record Code) (target-id Code)
+                           (edge-kind Code)] (-> bool)
+  (registry-tagged-contains? (registry-record-type-dependencies record)
+    `(type-dependency ~target-id ~edge-kind)))
+
+(defn registry-tagged-add-id [(tagged Code) (id Code)] (-> Code)
+  (registry-tagged-append-unique tagged id))
+
+(defn registry-plan-impact [(plan Code)] (-> Code) (primitive/code-nth plan 1))
+(defn registry-plan-implementations [(plan Code)] (-> Code) (primitive/code-nth plan 2))
+(defn registry-plan-schemas [(plan Code)] (-> Code) (primitive/code-nth plan 3))
+(defn registry-plan-roots [(plan Code)] (-> Code) (primitive/code-nth plan 4))
+(defn registry-plan-artifacts [(plan Code)] (-> Code) (primitive/code-nth plan 5))
+
+(defn registry-plan-body-edit [(registry Code) (seed-id Code)] (-> Code)
+  (let [owner (registry-find-by-id registry seed-id)]
+    (if (not (registry-head? owner `live-definition))
+        (primitive/error "live planner: body edit seed is missing") 0)
+    `(live-edit-plan :body
+       (dirty-implementations ~seed-id)
+       (dirty-schemas)
+       (dirty-roots)
+       (dirty-artifacts ~@(let [out (primitive/code-list-new)
+                                artifacts (registry-record-artifacts owner)]
+                            (for [i 1 (primitive/code-count artifacts)]
+                              (primitive/code-list-push! out
+                                (primitive/code-nth artifacts i)))
+                            (primitive/code-list-done out))))))
+
+; A rejected implementation is different from an accepted body edit: every
+; transitive caller must enter Broken before any caller-local effects can run.
+; This is an exact reverse closure over recorded source value dependencies.
+(defn registry-broken-caller-closure [(registry Code) (seed-ids Code)] (-> Code)
+  (let [ids (primitive/code-list-new) (mut cursor) 0]
+    (for [i 0 (primitive/code-count seed-ids)]
+      (primitive/code-list-push! ids (primitive/code-nth seed-ids i)))
+    (loop (if (>= (load cursor) (primitive/code-count (primitive/code-list-done ids)))
+              (break)
+              (let [target (primitive/code-nth
+                             (primitive/code-list-done ids) (load cursor))]
+                (for [i 0 (registry-record-count registry)]
+                  (let [record (registry-record-at registry i)
+                        kind (registry-record-kind record)
+                        id (registry-record-id record)]
+                    (if (and (or (primitive/code-eq kind `:function)
+                                 (or (primitive/code-eq kind `:closure)
+                                     (primitive/code-eq kind `:impl-method)))
+                             (and (registry-dependencies-contain-target?
+                                    (registry-record-value-dependencies record)
+                                    target)
+                                  (not (registry-id-list-contains?
+                                         (primitive/code-list-done ids) id))))
+                        (do (primitive/code-list-push! ids id) 0) 0)))
+                (set! cursor (+ (load cursor) 1)))))
+    (primitive/code-list-done ids)))
+
+(defn registry-plan-signature-edit [(registry Code) (seed-id Code)] (-> Code)
+  (let [(mut implementations) `(dirty-implementations ~seed-id)
+        owner (registry-find-by-id registry seed-id)
+        (mut artifacts) `(dirty-artifacts)]
+    (for [i 1 (primitive/code-count (registry-record-artifacts owner))]
+      (set! artifacts (registry-tagged-append-unique (load artifacts)
+                        (primitive/code-nth (registry-record-artifacts owner) i))))
+    ;; A caller implementation must be rechecked against the new ABI, but the
+    ;; caller's own stable ABI has not changed, so invalidation stops there.
+    (for [i 0 (registry-record-count registry)]
+      (let [record (registry-record-at registry i)]
+        (if (registry-dependencies-contain-target?
+              (registry-record-value-dependencies record) seed-id)
+            (do
+              (if (or (primitive/code-eq (registry-record-kind record) `:function)
+                      (primitive/code-eq (registry-record-kind record) `:closure))
+                  (set! implementations
+                    (registry-tagged-add-id (load implementations)
+                      (registry-record-id record))) 0)
+              (for [j 1 (primitive/code-count (registry-record-artifacts record))]
+                (set! artifacts (registry-tagged-append-unique (load artifacts)
+                                  (primitive/code-nth
+                                    (registry-record-artifacts record) j))))
+              0)
+            0)))
+    `(live-edit-plan :signature
+       ~(load implementations) (dirty-schemas) (dirty-roots) ~(load artifacts))))
+
+(defn registry-schema-closure [(registry Code) (seed-id Code)] (-> Code)
+  (let [schemas (primitive/code-list-new) (mut cursor) 0]
+    (primitive/code-list-push! schemas seed-id)
+    (loop (if (>= (load cursor)
+                  (primitive/code-count (primitive/code-list-done schemas)))
+              (break)
+              (let [current (primitive/code-nth
+                              (primitive/code-list-done schemas) (load cursor))]
+                (for [i 0 (registry-record-count registry)]
+                  (let [record (registry-record-at registry i)
+                        kind (registry-record-kind record)
+                        id (registry-record-id record)]
+                    (if (and (or (primitive/code-eq kind `:struct)
+                                 (primitive/code-eq kind `:sum))
+                             (and (registry-type-edge? record current `:containment)
+                                  (not (registry-id-list-contains?
+                                         (primitive/code-list-done schemas) id))))
+                        (primitive/code-list-push! schemas id)
+                        schemas)))
+                (set! cursor (+ (load cursor) 1)))))
+    (primitive/code-list-done schemas)))
+
+(defn registry-plan-schema-edit [(registry Code) (seed-id Code)] (-> Code)
+  (let [schema-ids (registry-schema-closure registry seed-id)
+        (mut schemas) `(dirty-schemas)
+        (mut implementations) `(dirty-implementations)
+        (mut roots) `(dirty-roots)
+        (mut artifacts) `(dirty-artifacts)]
+    (for [i 0 (primitive/code-count schema-ids)]
+      (let [id (primitive/code-nth schema-ids i)
+            record (registry-find-by-id registry id)]
+        (set! schemas (registry-tagged-add-id (load schemas) id))
+        (for [j 1 (primitive/code-count (registry-record-artifacts record))]
+          (set! artifacts (registry-tagged-append-unique (load artifacts)
+                            (primitive/code-nth (registry-record-artifacts record) j))))))
+    ;; Once containing schemas are known, select all exact-version code and
+    ;; roots which mention any affected schema. Code consumers do not propagate
+    ;; farther because their stable callable ABI remains unchanged.
+    (for [i 0 (registry-record-count registry)]
+      (let [record (registry-record-at registry i) (mut uses-schema) false]
+        (for [j 0 (primitive/code-count schema-ids)]
+          (if (registry-dependencies-contain-target?
+                (registry-record-type-dependencies record)
+                (primitive/code-nth schema-ids j))
+              (set! uses-schema true) 0))
+        (if (load uses-schema)
+            (do
+              (if (or (primitive/code-eq (registry-record-kind record) `:function)
+                      (primitive/code-eq (registry-record-kind record) `:closure))
+                  (set! implementations
+                    (registry-tagged-add-id (load implementations)
+                      (registry-record-id record))) 0)
+              (if (primitive/code-eq (registry-record-kind record) `:root)
+                  (set! roots (registry-tagged-add-id (load roots)
+                                (registry-record-id record))) 0)
+              (for [j 1 (primitive/code-count (registry-record-artifacts record))]
+                (set! artifacts (registry-tagged-append-unique (load artifacts)
+                                  (primitive/code-nth
+                                    (registry-record-artifacts record) j))))
+              0)
+            0)))
+    ;; A function may reach an affected schema through a retained root without
+    ;; spelling the nominal type in its body (`(.speed settings)`). Root records
+    ;; carry the exact schema edge; follow the function's exact value edge to
+    ;; those dirty roots instead of guessing a field receiver from source text.
+    (for [i 0 (registry-record-count registry)]
+      (let [record (registry-record-at registry i)
+            kind (registry-record-kind record)
+            (mut reads-dirty-root) false]
+        (if (or (primitive/code-eq kind `:function)
+                (primitive/code-eq kind `:closure))
+            (for [j 1 (primitive/code-count (load roots))]
+              (if (registry-dependencies-contain-target?
+                    (registry-record-value-dependencies record)
+                    (primitive/code-nth (load roots) j))
+                  (set! reads-dirty-root true) 0))
+            0)
+        (if (load reads-dirty-root)
+            (do
+              (set! implementations
+                (registry-tagged-add-id (load implementations)
+                  (registry-record-id record)))
+              (for [j 1 (primitive/code-count (registry-record-artifacts record))]
+                (set! artifacts (registry-tagged-append-unique (load artifacts)
+                                  (primitive/code-nth
+                                    (registry-record-artifacts record) j))))
+              0)
+            0)))
+    `(live-edit-plan :schema ~(load implementations) ~(load schemas)
+       ~(load roots) ~(load artifacts))))
+
+(defn registry-plan-edit [(registry Code) (seed-id Code) (impact Code)] (-> Code)
+  (cond
+    (primitive/code-eq impact `:body)
+      (registry-plan-body-edit registry seed-id)
+    (primitive/code-eq impact `:signature)
+      (registry-plan-signature-edit registry seed-id)
+    (primitive/code-eq impact `:schema)
+      (registry-plan-schema-edit registry seed-id)
+    :else (primitive/error "live planner: unsupported edit impact")))
+
+(defn registry-replace-record [(registry Code) (replacement Code)] (-> Code)
+  (let [out (primitive/code-list-new)
+        replacement-id (registry-record-id replacement)
+        (mut replaced) false]
+    (primitive/code-list-push! out `live-registry)
+    (primitive/code-list-push! out (primitive/code-nth registry 1))
+    (for [i 0 (registry-record-count registry)]
+      (let [record (registry-record-at registry i)]
+        (if (primitive/code-eq (registry-record-id record) replacement-id)
+            (do (primitive/code-list-push! out replacement)
+                (set! replaced true)
+                0)
+            (do (primitive/code-list-push! out record) 0))))
+    (if (not (load replaced))
+        (do (primitive/code-list-push! out replacement) 0)
+        0)
+    (primitive/code-list-done out)))
+
+(defn registry-replace-form [(registry Code) (form Code)] (-> Code)
+  (let [module-id (primitive/code-nth registry 1)
+        prior (registry-find registry (registry-definition-kind form)
+                             (registry-definition-name form))
+        next-version (if (registry-head? prior `live-definition)
+                         `(next-version ~(primitive/code-nth prior 4))
+                         `:initial)
+        fresh (registry-empty-record module-id form)
+        replacement
+          `(live-definition
+             ~(if (registry-head? prior `live-definition)
+                  (registry-record-id prior)
+                  (registry-record-id fresh))
+             ~(registry-record-kind fresh)
+             ~(registry-record-name fresh)
+             ~next-version
+             ~form
+             (value-dependencies)
+             (type-dependencies)
+             ~(if (registry-head? prior `live-definition)
+                  (registry-record-artifacts prior)
+                  `(generated-artifacts)))]
+    (registry-replace-record registry replacement)))
+
+(defn registry-method-child-of? [(record Code) (impl-name Code)] (-> bool)
+  (if (not (primitive/code-eq (registry-record-kind record) `:impl-method))
+      false
+      (let [name (registry-record-name record)]
+        (and (registry-head? name `impl-method-key)
+             (and (> (primitive/code-count name) 2)
+                  (primitive/code-eq (primitive/code-nth name 1) impl-name))))))
+
+(defn registry-without-impl-methods [(registry Code) (impl-name Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (primitive/code-list-push! out `live-registry)
+    (primitive/code-list-push! out (primitive/code-nth registry 1))
+    (for [i 0 (registry-record-count registry)]
+      (let [record (registry-record-at registry i)]
+        (if (registry-method-child-of? record impl-name)
+            0
+            (do (primitive/code-list-push! out record) 0))))
+    (primitive/code-list-done out)))
+
+(defn registry-replace-impl [(registry Code) (form Code)] (-> Code)
+  (let [module-id (primitive/code-nth registry 1)
+        impl-name (registry-definition-name form)
+        (mut result)
+          (registry-without-impl-methods
+            (registry-replace-form registry form) impl-name)]
+    (for [i (registry-impl-method-start form) (primitive/code-count form)]
+      (let [method (primitive/code-nth form i)
+            method-name (registry-impl-method-key impl-name
+                          (primitive/code-nth method 0))
+            prior (registry-find registry `:impl-method method-name)
+            fresh (registry-impl-method-record module-id form method)
+            replacement
+              `(live-definition
+                 ~(if (registry-head? prior `live-definition)
+                      (registry-record-id prior)
+                      (registry-record-id fresh))
+                 :impl-method ~method-name
+                 ~(if (registry-head? prior `live-definition)
+                      `(next-version ~(primitive/code-nth prior 4))
+                      `:initial)
+                 ~method
+                 (value-dependencies)
+                 (type-dependencies)
+                 ~(if (registry-head? prior `live-definition)
+                      (registry-record-artifacts prior)
+                      `(generated-artifacts)))]
+        (set! result (registry-replace-record (load result) replacement))))
+    (load result)))
+
+(defn registry-function-signature [(form Code)] (-> Code)
+  (let [generic? (primitive/code-vector? (primitive/code-nth form 3))]
+    (if generic?
+        `(function-signature
+           ~(primitive/code-nth form 2)
+           ~(primitive/code-nth form 3)
+           ~(primitive/code-nth form 4))
+        `(function-signature
+           [] ~(primitive/code-nth form 2) ~(primitive/code-nth form 3)))))
+
+(defn registry-closure-signature [(form Code)] (-> Code)
+  `(closure-signature ~(primitive/code-nth form 3)
+                      ~(primitive/code-nth form 4)))
+
+(defn registry-closure-captures [(form Code)] (-> Code)
+  `(closure-captures ~@(primitive/code-nth form 2)))
+
+(defn registry-classify-edit [(accepted Code) (candidate Code)] (-> Code)
+  (let [old-kind (registry-definition-kind accepted)
+        new-kind (registry-definition-kind candidate)]
+    (if (not (primitive/code-eq old-kind new-kind))
+        `:replacement
+        (cond
+          (primitive/code-eq new-kind `:function)
+            (if (primitive/code-eq (registry-function-signature accepted)
+                                   (registry-function-signature candidate))
+                `:body `:signature)
+          (primitive/code-eq new-kind `:closure)
+            (if (not (primitive/code-eq (registry-closure-signature accepted)
+                                        (registry-closure-signature candidate)))
+                `:signature
+                (if (primitive/code-eq (registry-closure-captures accepted)
+                                       (registry-closure-captures candidate))
+                    `:body
+                    `:capture-schema))
+          (or (primitive/code-eq new-kind `:struct)
+              (primitive/code-eq new-kind `:sum)) `:schema
+          (primitive/code-eq new-kind `:trait) `:trait-declaration
+          (primitive/code-eq new-kind `:impl) `:impl-declaration
+          (primitive/code-eq new-kind `:root) `:root
+          :else `:declaration))))
+
+(defn registry-apply-form [(registry Code) (form Code)] (-> Code)
+  ;; Re-enrich the entire source graph because replacing one original form can
+  ;; remove as well as add edges. Stable records and artifact ownership survive.
+  (registry-enrich
+    (if (registry-head? form `impl)
+        (registry-replace-impl registry form)
+        (registry-replace-form registry form))))
+
+(defn registry-plan-candidate [(registry Code) (form Code)] (-> Code)
+  (let [kind (registry-definition-kind form)
+        name (registry-definition-name form)
+        accepted (registry-find registry kind name)]
+    (if (not (registry-head? accepted `live-definition))
+        (primitive/error "live planner: adding definitions is not implemented yet") 0)
+    (let [impact (registry-classify-edit (registry-record-form accepted) form)
+          candidate (registry-apply-form registry form)
+          seed-id (registry-record-id accepted)]
+      (cond
+        (primitive/code-eq impact `:body)
+          `(candidate-transaction ~candidate
+             ~(registry-plan-edit candidate seed-id `:body))
+        (primitive/code-eq impact `:signature)
+          `(candidate-transaction ~candidate
+             ~(registry-plan-edit candidate seed-id `:signature))
+        (primitive/code-eq impact `:schema)
+          `(candidate-transaction ~candidate
+             ~(registry-plan-edit candidate seed-id `:schema))
+        (primitive/code-eq impact `:capture-schema)
+          `(candidate-transaction ~candidate
+             (live-edit-plan :capture-schema
+               (dirty-implementations ~seed-id)
+               (dirty-schemas ~seed-id)
+               (dirty-roots)
+               (dirty-artifacts
+                 ~@(let [out (primitive/code-list-new)
+                         artifacts (registry-record-artifacts accepted)]
+                     (for [i 1 (primitive/code-count artifacts)]
+                       (primitive/code-list-push! out
+                         (primitive/code-nth artifacts i)))
+                     (primitive/code-list-done out)))))
+        :else
+          `(candidate-transaction ~candidate
+             (live-edit-plan ~impact
+               (dirty-implementations) (dirty-schemas)
+               (dirty-roots ~seed-id) (dirty-artifacts)))))))
+
+;; Phase-A self-checks execute while compiling this module's test consumer.
+;; Returning `(do)` means the assertions generated no runtime implementation.
+(defn registry-phase-a-self-check [] (-> Code)
+  (let [forms `((defstruct Particle [(x f64)])
+                (defstruct World [(particle Particle)])
+                (letonce world (World :particle (Particle :x 0.0)))
+                (defn radius [(p Particle)] (-> f64) 4.0)
+                (defn advance [(p Particle)] (-> Particle)
+                  (do (radius p) p))
+                (defn frame [(p Particle)] (-> Particle)
+                  (advance p))
+                (defn shadowed [(radius i64)] (-> i64) radius)
+                (defclosure particle-radius [(p Particle)] [(scale f64)] f64
+                  (* scale (radius p)))
+                (deftrait Scaled [Self]
+                  (scaled [(value Self)] (-> Self)))
+                (impl Scaled i64
+                  (scaled [(value i64)] (-> i64) value)))
+        discovered (registry-discover `demo forms)
+        first (registry-enrich discovered)
+        second (registry-enrich (registry-discover `demo forms))
+        edited (registry-replace-form first
+                 `(defn radius [(p Particle)] (-> f64) 8.0))
+        radius (registry-find first `:function `radius)
+        advance (registry-find first `:function `advance)
+        frame (registry-find first `:function `frame)
+        shadowed (registry-find first `:function `shadowed)
+        world-type (registry-find first `:struct `World)
+        world-root (registry-find first `:root `world)
+        edited-radius (registry-find edited `:function `radius)
+        particle-radius (registry-find first `:closure `particle-radius)
+        scaled-trait (registry-find first `:trait `Scaled)
+        scaled-impl (registry-find first `:impl `(impl-key Scaled i64))
+        scaled-method (registry-find first `:impl-method
+                        `(impl-method-key (impl-key Scaled i64) scaled))
+        edited-impl-registry
+          (registry-apply-form first
+            `(impl Scaled i64
+               (scaled [(value i64)] (-> i64) (+ value value))))
+        edited-scaled-method
+          (registry-find edited-impl-registry `:impl-method
+            `(impl-method-key (impl-key Scaled i64) scaled))
+        with-artifact (registry-register-artifact first
+                        (registry-record-id radius)
+                        `(artifact :entry-slot radius-entry :abi-lineage 0))
+        artifact-radius (registry-find with-artifact `:function `radius)
+        body-plan (registry-plan-edit first (registry-record-id radius) `:body)
+        signature-plan (registry-plan-edit first (registry-record-id radius) `:signature)
+        schema-plan (registry-plan-edit first
+                      (registry-record-id
+                        (registry-find first `:struct `Particle)) `:schema)
+        broken-closure (registry-broken-caller-closure first
+                         `(~(registry-record-id radius)))
+        body-transaction (registry-plan-candidate first
+                           `(defn radius [(p Particle)] (-> f64) 9.0))
+        signature-transaction (registry-plan-candidate first
+                                `(defn radius [(p Particle) (scale f64)]
+                                   (-> f64) scale))]
+    (if (not (primitive/code-eq first second))
+        (primitive/error "live registry: discovery is not deterministic") 0)
+    (if (!= (registry-record-count first) 11)
+        (primitive/error "live registry: discovery missed a source definition") 0)
+    (if (not (primitive/code-eq (registry-record-id radius)
+                                `(live-def-id demo :function radius)))
+        (primitive/error "live registry: source identity is not structural") 0)
+    (if (not (primitive/code-eq (registry-record-id scaled-trait)
+                                `(live-def-id demo :trait Scaled)))
+        (primitive/error "live registry: trait identity is not structural") 0)
+    (if (not (primitive/code-eq (registry-record-id particle-radius)
+                                `(live-def-id demo :closure particle-radius)))
+        (primitive/error "live registry: closure identity is not structural") 0)
+    (if (not (registry-tagged-contains?
+               (registry-record-value-dependencies particle-radius)
+               `(value-dependency ~(registry-record-id radius) :call)))
+        (primitive/error "live registry: closure body call edge is missing") 0)
+    (if (not (registry-tagged-contains?
+               (registry-record-type-dependencies particle-radius)
+               `(type-dependency
+                  ~(registry-record-id (registry-find first `:struct `Particle))
+                  :capture)))
+        (primitive/error "live registry: closure capture schema edge is missing") 0)
+    (if (not (primitive/code-eq
+               (registry-classify-edit
+                 (registry-record-form particle-radius)
+                 `(defclosure particle-radius [(p Particle) (bias f64)]
+                    [(scale f64)] f64 (* scale (+ bias (radius p)))))
+               `:capture-schema))
+        (primitive/error "live registry: closure capture edit was misclassified") 0)
+    (if (not (primitive/code-eq (registry-record-id scaled-impl)
+                                `(live-def-id demo :impl (impl-key Scaled i64))))
+        (primitive/error "live registry: impl identity is not structural") 0)
+    (if (not (primitive/code-eq (registry-record-id scaled-method)
+                                `(live-def-id demo :impl-method
+                                   (impl-method-key (impl-key Scaled i64) scaled))))
+        (primitive/error "live registry: impl method child identity is missing") 0)
+    (if (not (primitive/code-eq (registry-record-id scaled-method)
+                                (registry-record-id edited-scaled-method)))
+        (primitive/error "live registry: impl edit changed method child identity") 0)
+    (if (not (primitive/code-eq (primitive/code-nth edited-scaled-method 4)
+                                `(next-version :initial)))
+        (primitive/error "live registry: impl method version did not advance") 0)
+    (if (not (primitive/code-eq (primitive/code-nth edited-radius 4)
+                                `(next-version :initial)))
+        (primitive/error "live registry: replacement did not advance the version") 0)
+    (if (not (primitive/code-eq (registry-record-id radius)
+                                (registry-record-id edited-radius)))
+        (primitive/error "live registry: body edit changed stable identity") 0)
+    (if (not (registry-tagged-contains?
+               (registry-record-value-dependencies advance)
+               `(value-dependency ~(registry-record-id radius) :call)))
+        (primitive/error "live registry: direct source call edge is missing") 0)
+    (if (registry-tagged-contains?
+          (registry-record-value-dependencies shadowed)
+          `(value-dependency ~(registry-record-id radius) :value))
+        (primitive/error "live registry: lexical shadow became a false dependency") 0)
+    (if (not (registry-tagged-contains?
+               (registry-record-type-dependencies world-type)
+               `(type-dependency
+                  ~(registry-record-id (registry-find first `:struct `Particle))
+                  :handle)))
+        (primitive/error "live registry: invariant live-handle edge is missing") 0)
+    (if (registry-id-list-contains?
+          (registry-schema-closure first
+            (registry-record-id (registry-find first `:struct `Particle)))
+          (registry-record-id world-type))
+        (primitive/error "live registry: payload edit dirtied invariant containing handle") 0)
+    (if (not (registry-tagged-contains?
+               (registry-record-type-dependencies world-root)
+               `(type-dependency ~(registry-record-id world-type) :root)))
+        (primitive/error "live registry: persistent root type edge is missing") 0)
+    (if (not (registry-tagged-contains?
+               (registry-record-artifacts artifact-radius)
+               `(artifact :entry-slot radius-entry :abi-lineage 0)))
+        (primitive/error "live registry: explicit artifact ownership is missing") 0)
+    (if (not (registry-tagged-contains?
+               (registry-plan-implementations body-plan)
+               (registry-record-id radius)))
+        (primitive/error "live planner: body edit omitted its implementation") 0)
+    (if (registry-tagged-contains?
+          (registry-plan-implementations body-plan)
+          (registry-record-id advance))
+        (primitive/error "live planner: body edit incorrectly rebuilt a caller") 0)
+    (if (not (and (registry-id-list-contains? broken-closure
+                    (registry-record-id advance))
+                  (and (registry-id-list-contains? broken-closure
+                         (registry-record-id frame))
+                       (registry-id-list-contains? broken-closure
+                         (registry-record-id particle-radius)))))
+        (primitive/error
+          "live Broken plan omitted a direct, transitive, or closure caller") 0)
+    (if (not (registry-tagged-contains?
+               (registry-plan-implementations signature-plan)
+               (registry-record-id advance)))
+        (primitive/error "live planner: signature edit omitted a direct caller") 0)
+    (if (registry-tagged-contains?
+          (registry-plan-schemas schema-plan)
+          (registry-record-id world-type))
+        (primitive/error "live planner: schema edit dirtied an invariant containing handle") 0)
+    (if (registry-tagged-contains?
+          (registry-plan-roots schema-plan)
+          (registry-record-id world-root))
+        (primitive/error "live planner: payload edit dirtied an invariant handle root") 0)
+    (if (not (registry-tagged-contains?
+               (registry-plan-implementations schema-plan)
+               (registry-record-id advance)))
+        (primitive/error "live planner: schema edit missed exact-version code") 0)
+    (if (not (primitive/code-eq
+               (registry-plan-impact (primitive/code-nth body-transaction 2))
+               `:body))
+        (primitive/error "live planner: same ABI was not classified as body-only") 0)
+    (if (registry-tagged-contains?
+          (registry-plan-implementations (primitive/code-nth body-transaction 2))
+          (registry-record-id advance))
+        (primitive/error "live planner: candidate body edit expanded beyond one function") 0)
+    (if (not (primitive/code-eq
+               (registry-plan-impact (primitive/code-nth signature-transaction 2))
+               `:signature))
+        (primitive/error "live planner: ABI change was not classified as signature") 0)
+    `(do)))

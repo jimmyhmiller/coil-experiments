@@ -1,5 +1,5 @@
 "use strict";
-const state={snapshot:null,previous:null,functions:[],callResults:new Map(),callDrafts:new Map(),calling:new Set(),visibleValueIds:new Set(),valueListKey:null,selectedType:null,selectedContainer:null,selectedAllocation:null,selectedSlot:null,view:"allocations",query:"",sort:"id",paused:false,showZeroTypes:false,history:[],loading:false,memory:null,memoryOffset:0,memoryLoading:false,details:new Map(),detailLoading:new Set()};
+const state={snapshot:null,previous:null,functions:[],live:null,liveDraft:"",liveDirty:false,liveSubmitting:false,liveObservedBusy:false,liveSubmissionEpoch:0,liveSubmittedDraft:"",callResults:new Map(),callDrafts:new Map(),calling:new Set(),visibleValueIds:new Set(),valueListKey:null,selectedType:null,selectedContainer:null,selectedAllocation:null,selectedSlot:null,view:"allocations",query:"",sort:"id",paused:false,showZeroTypes:false,history:[],loading:false,memory:null,memoryOffset:0,memoryLoading:false,details:new Map(),detailLoading:new Set()};
 let valueObserver=null;
 const colors=["#77a7ff","#69d59f","#e8ae6d","#c491e8","#62c6d8","#ef7b83","#a6d46f"];
 const $=s=>document.querySelector(s);
@@ -18,12 +18,22 @@ const isByteStorage=(allocation,type)=>!allocation?.type||type?.size===1;
 async function load(){
   if(state.loading)return;state.loading=true;const started=performance.now();
   try{
-    const [next,functionData]=await Promise.all([
+    const [next,functionData,liveData]=await Promise.all([
       fetch("/api/snapshot",{cache:"no-store"}).then(r=>{if(!r.ok)throw Error("HTTP "+r.status);return r.json()}),
-      fetch("/api/functions",{cache:"no-store"}).then(r=>{if(!r.ok)throw Error("HTTP "+r.status);return r.json()})
+      fetch("/api/functions",{cache:"no-store"}).then(r=>{if(!r.ok)throw Error("HTTP "+r.status);return r.json()}),
+      fetch("/api/live",{cache:"no-store"}).then(r=>{if(!r.ok)throw Error("HTTP "+r.status);return r.json()})
     ]);
     state.previous=state.snapshot;state.snapshot=next;
     state.functions=functionData.functions||[];
+    state.live=liveData;
+    const liveBusy=["Checking","Staged","Waiting","Migrating"].includes(liveData.state);
+    if(state.liveSubmitting){
+      if(liveBusy)state.liveObservedBusy=true;
+      const rejected=["TypeErrors","NeedsTransition","BlockedByAlias","BlockedByOwnership","BlockedByBorrow","BlockedByFFI","BlockedByInteriorReference","RolledBack"].includes(liveData.state);
+      const finished=(state.liveObservedBusy&&!liveBusy)||(liveData.jitEpoch??0)>state.liveSubmissionEpoch||rejected;
+      if(finished){state.liveSubmitting=false;if(liveData.state==="Committed"){state.liveDirty=false;state.liveDraft=liveData.accepted||state.liveSubmittedDraft;showToast(`Live generation committed · reclaimed ${Math.max(0,liveData.jitLastReclaimed??0)}`)}else{state.liveDirty=true;state.liveDraft=liveData.pending||state.liveSubmittedDraft;showToast(liveData.diagnostic||liveData.state||"Candidate rejected")}}
+    }
+    if(liveData.supported&&!state.liveDirty)state.liveDraft=liveData.pending||liveData.accepted||"";
     state.history.push({time:Date.now(),allocations:next.summary.allocations,bytes:next.summary.bytes});
     if(state.history.length>60)state.history.shift();
     setConnection("live",Math.round(performance.now()-started)+" ms");
@@ -38,9 +48,12 @@ function render({renderFunctionContent=false}={}){
   $("#top-stats").innerHTML=`<span><b>${summary.allocations}</b> allocations</span><span><b>${formatBytes(summary.bytes)}</b> live</span>`;
   $("#all-count").textContent=summary.allocations;
   $("#function-count").textContent=state.functions.length;
-  $("#overview").style.display=state.view==="functions"?"none":"grid";
+  $("#live-nav").hidden=!state.live?.supported;
+  $("#live-state-badge").textContent=state.live?.state||"idle";
+  if(state.view==="live"&&!state.live?.supported)state.view="allocations";
+  $("#overview").style.display=state.view==="allocations"?"grid":"none";
   renderOverview();renderTypes();renderHeapMap();
-  if(state.view!=="functions"||renderFunctionContent)renderContent();
+  if(state.view==="live")renderLive();else if(state.view!=="functions"||renderFunctionContent)renderContent();
   renderDetail();
 }
 function metric(label,value,sub,series){return `<article class="metric"><div class="metric-label">${label}</div><div class="metric-value">${value}</div><div class="metric-sub">${sub}</div>${series?`<canvas data-series="${series}"></canvas>`:""}</article>`}
@@ -114,6 +127,20 @@ function renderHeapMap(){
   $("#heap-panel").style.display=state.view==="allocations"?"block":"none";
   $("#heap-map").innerHTML=allocations.length?allocations.map(a=>`<div class="heap-block ${state.selectedAllocation===a.id?"selected":""}" data-allocation="${a.id}" style="flex-grow:${Math.max(1,Math.sqrt(a.bytes))};background:${typeColor(a.typeId)}" title="#${a.id} · ${shortType(a.type)} · ${formatBytes(a.bytes)} · ${formatAddress(a.address)}"></div>`).join(""):'<div class="heap-empty">No live allocations in this view</div>';
   document.querySelectorAll(".heap-block").forEach(el=>el.onclick=()=>selectAllocation(Number(el.dataset.allocation)));
+}
+function renderLive(){
+  const live=state.live||{},failed=["TypeErrors","NeedsTransition","BlockedByAlias","BlockedByOwnership","BlockedByBorrow","BlockedByFFI","BlockedByInteriorReference","RolledBack"].includes(live.state),busy=["Checking","Staged","WaitingForQuiescence","Migrating"].includes(live.state);
+  $("#heap-panel").style.display="none";$("#sort").style.display="none";
+  $("#content-kicker").textContent="Native JIT edit session";$("#title").textContent="Live Coil";$("#visible-count").textContent=`JIT ${live.jitEpoch??0} · data ${live.migrationEpoch??0}`;
+  const blocker=live.blocker||{},blockerText=blocker.kind?`${blocker.type||"unknown type"} · kind ${blocker.kind} · schema ${blocker.schemaId} · index ${blocker.index} · address ${blocker.address} · ${blocker.registrationSite}`:"none";
+  $("#content").innerHTML=`<div class="live-workbench"><div class="live-status-row"><span class="live-phase ${failed?"error":live.state==="Committed"?"ok":""}">${escapeHtml(live.state||"Idle")}</span><span>candidate <code>${live.result??0}</code></span><span>migration <code>${live.migrationStatus??0}</code></span><span>active calls <code>${live.activeCalls??0}</code></span><span>JIT generations <code>${live.jitGenerations??"—"}</code></span><span>leases <code>${live.jitGenerationLeases??0}</code></span><span>reclaimed <code>${live.jitLastReclaimed??0}</code></span><span>roots <code>${live.registeredRoots??0}</code></span><span>objects <code>${live.managedObjects??0}</code></span><span>schemas <code>${live.schemaVersions??0}</code></span></div><div class="live-status-row"><span>closure <code>${escapeHtml(live.dependencyClosure||"—")}</code></span><span>transition edges <code>${live.transitionEdges??0}</code></span><span>persistent callbacks <code>${live.persistentCodeEscapes??0}</code></span><span>blocker <code>${escapeHtml(blockerText)}</code></span></div><label class="live-editor-label"><span>Candidate source</span><textarea id="live-source" spellcheck="false" ${busy||state.liveSubmitting?"disabled":""}>${escapeHtml(state.liveDraft)}</textarea></label><div class="live-actions"><button id="live-submit" class="invoke-button" ${busy||state.liveSubmitting||!state.liveDirty?"disabled":""}>${state.liveSubmitting?"Publishing…":"Check, migrate, publish"}</button><span>Accepted code remains active unless the complete candidate commits.</span></div>${live.diagnostic?`<section class="live-diagnostic ${failed?"error":""}"><b>Diagnostic</b><pre>${escapeHtml(live.diagnostic)}</pre></section>`:""}${live.pending&&live.pending!==state.liveDraft?`<details><summary>Rejected or pending candidate</summary><pre>${escapeHtml(live.pending)}</pre></details>`:""}<details><summary>Accepted source</summary><pre>${escapeHtml(live.accepted||"")}</pre></details></div>`;
+  const editor=$("#live-source");if(editor)editor.oninput=()=>{state.liveDraft=editor.value;state.liveDirty=editor.value!==(state.live?.accepted||"");const submit=$("#live-submit");if(submit)submit.disabled=!state.liveDirty};
+  const submit=$("#live-submit");if(submit)submit.onclick=submitLiveEdit;
+}
+async function submitLiveEdit(){
+  if(state.liveSubmitting)return;state.liveSubmitting=true;state.liveObservedBusy=false;state.liveSubmissionEpoch=state.live?.jitEpoch??0;state.liveSubmittedDraft=state.liveDraft;renderLive();
+  try{const response=await fetch("/api/live/edit",{method:"POST",headers:{"Content-Type":"text/plain; charset=utf-8"},body:state.liveSubmittedDraft}),data=await response.json();state.live=data;if(response.status===202){if(["Checking","Staged","WaitingForQuiescence","Migrating"].includes(data.state))state.liveObservedBusy=true;showToast("Candidate accepted for checking")}else{state.liveSubmitting=false;showToast(data.diagnostic||data.state||"Edit request rejected")}}
+  catch(error){state.liveSubmitting=false;showToast(String(error))}finally{render()}
 }
 function renderContent(){
   if(state.view==="functions"){renderFunctions();return}

@@ -1,0 +1,1912 @@
+(module experiments.heap-inspector.live)
+
+(import "coil.primitive" :as primitive)
+(import "coil.atomic" :as atomic)
+(import "coil.slice" :use [slice-new slice-len slice-get slice-data])
+(import "experiments.heap-inspector.runtime" :as inspector)
+
+(extern malloc :cc c [u64] (-> (ptr i8)))
+(extern calloc :cc c [u64 u64] (-> (ptr i8)))
+(extern free :cc c [(ptr i8)] (-> i64))
+(extern pthread_key_create :cc c [(ptr u64) (ptr i8)] (-> i32))
+(extern pthread_getspecific :cc c [u64] (-> (ptr i8)))
+(extern pthread_setspecific :cc c [u64 (ptr i8)] (-> i32))
+(extern _longjmp :cc c [(ptr i8) i32] (-> void))
+
+; A native, checked edge between two exact schema versions. `apply` writes a
+; fully initialized destination without mutating the source. `abort` cleans a
+; partially initialized destination after apply reports failure. `retire`
+; destroys an old value after the root batch has committed.
+(defstruct LiveTransition
+  [(runtime-id i64)
+   (from-schema i64)
+   (to-schema i64)
+   (apply (fnptr c [(ptr i8) (ptr i8)] i64))
+   (abort (fnptr c [(ptr i8)] i64))
+   (retire (fnptr c [(ptr i8)] i64))])
+
+; Stable object identity for every opted-in live nominal value. User-visible
+; wrapper structs contain only a pointer to this header; version-specific native
+; layout lives behind `payload`. The header is never relocated or exposed as a
+; typed payload pointer across a live safe point.
+(defstruct LiveHandle
+  [(id i64)
+   (refs i64)
+   (runtime-id i64)
+   (schema-id i64)
+   (payload (ptr i8))
+   (root-id i64)
+   (borrows i64)
+   (ffi-retains i64)
+   (pins i64)
+   (live bool)
+   (next (ptr LiveHandle))])
+
+; `slot` is the persistent indirection cell generated for a letonce/live root.
+; Native clients load through the slot; publication replaces every slot only
+; after the complete shadow batch succeeds.
+(defstruct LiveRoot
+  [(id i64)
+   (name (slice u8))
+   (runtime-id i64)
+   (schema-id i64)
+   (slot (ptr (ptr i8)))
+   ; Non-null for a stable live object handle. Publication updates the payload
+   ; slot and schema field together while the world gate is closed.
+   (handle (ptr LiveHandle))
+   (aliases i64)
+   (live bool)])
+
+(defstruct StagedRoot
+  [(root-index i64)
+   (old-value (ptr i8))
+   (new-value (ptr i8))
+   (old-schema i64)
+   (new-schema i64)
+   ; Only the first staged root for a shared object owns cleanup/retirement.
+   (owner bool)
+   (abort (fnptr c [(ptr i8)] i64))
+   ; The final edge owns destruction of `old-value` after commit.
+   (retire (fnptr c [(ptr i8)] i64))])
+
+; A handle is a managed graph vertex, not a source root. It has its own staged
+; publication record so nested values migrate without appearing in LiveRoot.
+(defstruct StagedHandle
+  [(handle (ptr LiveHandle))
+   (old-value (ptr i8))
+   (new-value (ptr i8))
+   (old-schema i64)
+   (new-schema i64)
+   (owner bool)
+   (abort (fnptr c [(ptr i8)] i64))
+   (retire (fnptr c [(ptr i8)] i64))])
+
+(defstruct LiveForward
+  [(old-value (ptr i8))
+   (new-value (ptr i8))
+   (runtime-id i64)
+   (new-schema i64)
+   (abort (fnptr c [(ptr i8)] i64))
+   (retire (fnptr c [(ptr i8)] i64))])
+
+(defstruct LiveReferenceField
+  [(schema-id i64)
+   (offset i64)
+   (target-runtime-id i64)
+   ; 1 = direct tracked pointer. Slice/interior rules are registered separately.
+   (kind i64)])
+
+(defstruct LiveSchemaDestructor
+  [(schema-id i64)
+   (destroy (fnptr c [(ptr i8)] i64))])
+
+; Source identities emitted by the metaprogram for one accepted transaction.
+; Names are copied into host-owned storage because candidate syntax and JIT
+; literals may disappear when their compiler arena or native image retires.
+(defstruct LiveAffected
+  [(identity i64)
+   (kind i64)
+   (name (slice u8))
+   (next (ptr LiveAffected))])
+
+; Permanent runtime gate for one structural source identity. The identity text
+; is the canonical `(live-def-id module kind name)` emitted by the metaprogram;
+; hashes are deliberately not used as identity. Gate records have session
+; lifetime so generated entries can cache no reclaimable runtime address.
+(defstruct LiveSourceGate
+  [(identity i64)
+   (active i64)
+   (closed i64)
+   ; Broken is source state, independent of the implementation slot. Keeping
+   ; it here means rejected publication never destroys the last healthy fnptr.
+   (broken i64)])
+
+; Structured runtime condition observed at explicit native restart boundaries.
+; Source diagnostics remain compiler-owned; this record is the stable control
+; protocol that pauses and resumes native work without inspecting error text.
+(defstruct LiveCondition
+  [(active i64)
+   ; 1 = NeedsTransition, 2 = Broken, 3 = Blocked.
+   (kind i64)
+   (status i64)
+   (raised-epoch i64)
+   (serial i64)])
+
+; Per-thread call depth and nearest explicit restart boundary. Only the
+; outermost live call contributes to the global quiescence reader count; nested
+; wrappers are represented by depth so non-local condition recovery can restore
+; accounting exactly instead of leaking reader leases.
+(defstruct LiveRestartBoundary
+  [(buffer (array i64 32))
+   (previous (ptr LiveRestartBoundary))
+   (saved-depth i64)])
+
+(defstruct LiveThreadState
+  [(depth i64)
+   (gates (array i64 256))
+   ; Only the publication owner may execute candidate constructors/defaults
+   ; behind closed affected gates while building the unpublished shadow graph.
+   (publishing i64)
+   (boundary (ptr LiveRestartBoundary))])
+
+; Heap-inspector allocations become graph vertices when a live controller is
+; installed. Their allocator is not assumed to be libc: without explicit
+; relocation hooks they are enumerable references but block a layout migration.
+(defstruct LiveManagedObject
+  [(address (ptr i8))
+   (runtime-id i64)
+   (schema-id i64)
+   (bytes i64)
+   (align i64)
+   (count i64)
+   (borrows i64)
+   (ffi-retains i64)
+   (movable bool)
+   (allocate (fnptr c [i64 i64] (ptr i8)))
+   (release (fnptr c [(ptr i8) i64 i64] i64))
+   (migrating bool)
+   (live bool)])
+
+(defstruct StagedManagedObject
+  [(object-index i64)
+   (old-value (ptr i8))
+   (new-value (ptr i8))
+   (old-schema i64)
+   (new-schema i64)
+   (old-bytes i64)
+   (new-bytes i64)
+   (align i64)
+   (count i64)
+   (abort (fnptr c [(ptr i8)] i64))
+   (retire (fnptr c [(ptr i8)] i64))
+   (release (fnptr c [(ptr i8) i64 i64] i64))])
+
+(defn live-transitions [] (-> (ptr (array LiveTransition 512)))
+  (primitive/alloc-static (array LiveTransition 512)))
+(defn live-transition-count [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-roots [] (-> (ptr (array LiveRoot 512)))
+  (primitive/alloc-static (array LiveRoot 512)))
+(defn live-root-count [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-handle-head [] (-> (ptr (ptr LiveHandle)))
+  (primitive/alloc-static (ptr LiveHandle)))
+(defn live-handle-count [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-staged [] (-> (ptr (array StagedRoot 512)))
+  (primitive/alloc-static (array StagedRoot 512)))
+(defn live-staged-count [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-staged-handles [] (-> (ptr (array StagedHandle 4096)))
+  (primitive/alloc-static (array StagedHandle 4096)))
+(defn live-staged-handle-count [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-forwards [] (-> (ptr (array LiveForward 1024)))
+  (primitive/alloc-static (array LiveForward 1024)))
+(defn live-forward-count [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-reference-fields [] (-> (ptr (array LiveReferenceField 4096)))
+  (primitive/alloc-static (array LiveReferenceField 4096)))
+(defn live-reference-field-count [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-schema-destructors [] (-> (ptr (array LiveSchemaDestructor 4096)))
+  (primitive/alloc-static (array LiveSchemaDestructor 4096)))
+(defn live-schema-destructor-count [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-managed-objects [] (-> (ptr (array LiveManagedObject 4096)))
+  (primitive/alloc-static (array LiveManagedObject 4096)))
+(defn live-managed-object-count [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-staged-managed [] (-> (ptr (array StagedManagedObject 4096)))
+  (primitive/alloc-static (array StagedManagedObject 4096)))
+(defn live-staged-managed-count [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-blocker-kind [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-blocker-index [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-blocker-schema [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-blocker-address [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-affected-head [] (-> (ptr (ptr LiveAffected)))
+  (primitive/alloc-static (ptr LiveAffected)))
+(defn live-staged-affected-head [] (-> (ptr (ptr LiveAffected)))
+  (primitive/alloc-static (ptr LiveAffected)))
+(defn live-affected-count [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-staged-affected-count [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-source-gates [] (-> (ptr (array LiveSourceGate 4096)))
+  (primitive/alloc-static (array LiveSourceGate 4096)))
+(defn live-source-gate-count [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-source-gate-lock [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-publication-lock [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-affected-publication-active [] (-> (ptr i64)) (primitive/alloc-static i64))
+
+(defn live-condition [] (-> (ptr LiveCondition))
+  (primitive/alloc-static LiveCondition))
+(defn live-condition-lock-cell [] (-> (ptr i64)) (primitive/alloc-static i64))
+
+(defn live-condition-lock! [] (-> i64)
+  (loop (if (= (atomic/atomic-cas (live-condition-lock-cell) 0 1) 0) (break) 0)) 0)
+(defn live-condition-unlock! [] (-> i64)
+  (atomic/atomic-store (live-condition-lock-cell) 0))
+
+(defn live-thread-key [] (-> (ptr u64)) (primitive/alloc-static u64))
+(defn live-thread-key-ready [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-thread-key-lock [] (-> (ptr i64)) (primitive/alloc-static i64))
+
+(defn live-thread-key-init! [] (-> i64)
+  (if (= (atomic/atomic-load (live-thread-key-ready)) 0)
+      (do
+        (loop (if (= (atomic/atomic-cas (live-thread-key-lock) 0 1) 0) (break) 0))
+        (if (= (atomic/atomic-load (live-thread-key-ready)) 0)
+            (if (= (pthread_key_create (live-thread-key)
+                     (primitive/cast (ptr i8) 0)) 0)
+                (atomic/atomic-store (live-thread-key-ready) 1)
+                0)
+            0)
+        (atomic/atomic-store (live-thread-key-lock) 0))
+      0)
+  (if (= (atomic/atomic-load (live-thread-key-ready)) 1) 0 -1))
+
+(defn live-thread-state [] (-> (ptr LiveThreadState))
+  (if (!= (live-thread-key-init!) 0)
+      (primitive/cast (ptr LiveThreadState) 0)
+      (let [existing (pthread_getspecific (load (live-thread-key)))]
+        (if (!= (primitive/cast i64 existing) 0)
+            (primitive/cast (ptr LiveThreadState) existing)
+            (let [created (primitive/cast (ptr LiveThreadState)
+                            (calloc 1 (primitive/cast u64
+                                        (primitive/sizeof LiveThreadState))))]
+              (if (= (primitive/cast i64 created) 0)
+                  created
+                  (if (= (pthread_setspecific (load (live-thread-key))
+                           (primitive/cast (ptr i8) created)) 0)
+                      created
+                      (do (free (primitive/cast (ptr i8) created))
+                          (primitive/cast (ptr LiveThreadState) 0)))))))))
+
+(defn live-restart-boundary-push! [(boundary (ptr LiveRestartBoundary))] (-> i64)
+  (let [thread (live-thread-state)]
+    (if (= (primitive/cast i64 thread) 0)
+        -1
+        (do
+          (set! (.previous boundary) (.boundary thread))
+          (set! (.saved-depth boundary) (.depth thread))
+          (set! (.boundary thread) boundary)
+          0))))
+
+(defn live-restart-boundary-pop! [(boundary (ptr LiveRestartBoundary))] (-> i64)
+  (let [thread (live-thread-state)]
+    (if (or (= (primitive/cast i64 thread) 0)
+            (!= (primitive/cast i64 (.boundary thread))
+                (primitive/cast i64 boundary)))
+        -1
+        (do (set! (.boundary thread) (.previous boundary)) 0))))
+
+(defn live-restart-boundary-recover! [(boundary (ptr LiveRestartBoundary))] (-> i64)
+  (let [thread (live-thread-state)]
+    (if (= (primitive/cast i64 thread) 0)
+        -1
+        (do
+          ; Non-local recovery releases every exact source gate entered after
+          ; the boundary. This is per-frame rather than outermost-only because
+          ; a nested affected callee must be drainable without parking its
+          ; unrelated caller.
+          (for [i (.saved-depth boundary) (.depth thread)]
+            (let [gate-index (load (primitive/index (field thread gates) i))]
+              (if (and (>= gate-index 0)
+                       (< gate-index (load (live-source-gate-count))))
+                  (do
+                    (atomic/atomic-add
+                      (field (primitive/index (live-source-gates) gate-index) active)
+                      -1)
+                    (atomic/atomic-add (live-reader-count) -1))
+                  0)))
+          (set! (.depth thread) (.saved-depth boundary))
+          (set! (.boundary thread) (.previous boundary))
+          0))))
+
+(defn live-condition-raise! [(kind i64) (status i64)] (-> i64)
+  (live-condition-lock!)
+  (let [condition (live-condition)]
+    (set! (.kind condition) kind)
+    (set! (.status condition) status)
+    (set! (.raised-epoch condition) (load (live-epoch-cell)))
+    (set! (.serial condition) (+ (.serial condition) 1))
+    ; Publish active last so a boundary never observes a partially written
+    ; condition record.
+    (atomic/atomic-store (field condition active) 1)
+    (let [serial (.serial condition)]
+      (live-condition-unlock!)
+      serial)))
+
+(defn live-condition-clear! [] (-> i64)
+  (live-condition-lock!)
+  (let [condition (live-condition)]
+    (atomic/atomic-store (field condition active) 0)
+    (set! (.kind condition) 0)
+    (set! (.status condition) 0)
+    (set! (.serial condition) (+ (.serial condition) 1))
+    (let [serial (.serial condition)]
+      (live-condition-unlock!)
+      serial)))
+
+(defn live-condition-active? [] (-> bool)
+  (!= (atomic/atomic-load (field (live-condition) active)) 0))
+
+(defn live-condition-kind [] (-> i64)
+  (live-condition-lock!)
+  (let [kind (if (live-condition-active?) (.kind (live-condition)) 0)]
+    (live-condition-unlock!)
+    kind))
+
+(defn live-condition-serial [] (-> i64)
+  (live-condition-lock!)
+  (let [serial (.serial (live-condition))]
+    (live-condition-unlock!)
+    serial))
+
+(defn live-condition-raise-c [(kind i64) (status i64)] (-> i64)
+  (let [serial (live-condition-raise! kind status)
+        thread (live-thread-state)]
+    (if (and (!= (primitive/cast i64 thread) 0)
+             (!= (primitive/cast i64 (.boundary thread)) 0))
+        (do
+          (_longjmp (primitive/cast (ptr i8)
+                      (field (.boundary thread) buffer))
+                    (primitive/cast i32 1))
+          0)
+        0)
+    serial))
+
+(defn live-affected-clear! [(head (ptr (ptr LiveAffected)))
+                            (count (ptr i64))] (-> i64)
+  (let [(mut node) (load head)]
+    (loop (if (= (primitive/cast i64 (load node)) 0)
+              (break)
+              (let [next (.next (load node))
+                    name (.name (load node))]
+                (if (> (slice-len name) 0)
+                    (free (primitive/cast (ptr i8) (slice-data name))) 0)
+                (free (primitive/cast (ptr i8) (load node)))
+                (set! node next)))))
+  (store! head (primitive/cast (ptr LiveAffected) 0))
+  (store! count 0)
+  0)
+
+(defn live-copy-bytes [(source (ptr u8)) (len i64)] (-> (ptr u8))
+  (let [owned (primitive/cast (ptr u8)
+                (malloc (primitive/cast u64 (if (= len 0) 1 len))))]
+    (if (!= (primitive/cast i64 owned) 0)
+        (for [i 0 len]
+          (store! (primitive/index owned i) (load (primitive/index source i)))) 0)
+    owned))
+
+(defn live-stage-affected! [(identity i64) (kind i64) (name-p (ptr u8))
+                            (name-len i64)] (-> i64)
+  (if (or (<= identity 0) (< name-len 0))
+      -1
+      (let [owned-name (live-copy-bytes name-p name-len)
+            node (primitive/cast (ptr LiveAffected)
+                   (malloc (primitive/cast u64 (primitive/sizeof LiveAffected))))]
+        (if (or (= (primitive/cast i64 owned-name) 0)
+                (= (primitive/cast i64 node) 0))
+            (do
+              (if (!= (primitive/cast i64 owned-name) 0)
+                  (free (primitive/cast (ptr i8) owned-name)) 0)
+              (if (!= (primitive/cast i64 node) 0)
+                  (free (primitive/cast (ptr i8) node)) 0)
+              -2)
+            (do
+              (set! (.identity node) identity)
+              (set! (.kind node) kind)
+              (set! (.name node) (slice-new owned-name name-len))
+              (set! (.next node) (load (live-staged-affected-head)))
+              (store! (live-staged-affected-head) node)
+              (store! (live-staged-affected-count)
+                (+ (load (live-staged-affected-count)) 1))
+              0)))))
+
+(defn live-record-blocker! [(kind i64) (index i64) (schema i64)
+                            (address (ptr i8))] (-> i64)
+  (set! (live-blocker-kind) kind)
+  (set! (live-blocker-index) index)
+  (set! (live-blocker-schema) schema)
+  (set! (live-blocker-address) (primitive/cast i64 address))
+  0)
+(defn live-managed-lock-cell [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-last-status [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-epoch-cell [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-writer-cell [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn live-reader-count [] (-> (ptr i64)) (primitive/alloc-static i64))
+
+; Status values are a stable API for the inspector. 0 success; negative values
+; leave every accepted root untouched.
+(defn live-status [] (-> i64) (load (live-last-status)))
+(defn live-set-status! [(status i64)] (-> i64)
+  (set! (live-last-status) status)
+  status)
+(defn live-epoch [] (-> i64) (load (live-epoch-cell)))
+
+; Gate registry mutation is rare (the first call of each source definition and
+; publication planning). Entry counters remain atomic after exact identity
+; lookup. Holding this lock while closing gates makes lookup/increment linearize
+; before or after publication, never through it.
+(defn live-source-gate-lock! [] (-> i64)
+  (loop (if (= (atomic/atomic-cas (live-source-gate-lock) 0 1) 0) (break) 0)) 0)
+(defn live-source-gate-unlock! [] (-> i64)
+  (atomic/atomic-store (live-source-gate-lock) 0))
+
+(defn live-source-gate-index-locked! [(identity i64)] (-> i64)
+  (let [(mut found) -1]
+    (for [i 0 (load (live-source-gate-count))]
+      (if (and (= (load found) -1)
+               (= (.identity (primitive/index (live-source-gates) i)) identity))
+          (set! found i) 0))
+    (if (!= (load found) -1) (load found)
+        (let [i (load (live-source-gate-count))]
+          (if (>= i 4096) -2
+              (do
+                (set! (.identity (primitive/index (live-source-gates) i)) identity)
+                (set! (.active (primitive/index (live-source-gates) i)) 0)
+                (set! (.closed (primitive/index (live-source-gates) i)) 0)
+                (set! (.broken (primitive/index (live-source-gates) i)) 0)
+                (set! (live-source-gate-count) (+ i 1))
+                i))))))
+
+(defn live-source-broken? [(identity i64)] (-> bool)
+  (live-source-gate-lock!)
+  (let [index (live-source-gate-index-locked! identity)
+        result (and (>= index 0)
+                    (!= (atomic/atomic-load
+                          (field (primitive/index (live-source-gates) index)
+                                 broken)) 0))]
+    (live-source-gate-unlock!)
+    result))
+
+(defn live-mark-source-broken! [(identity i64)] (-> i64)
+  (live-source-gate-lock!)
+  (let [index (live-source-gate-index-locked! identity)]
+    (if (>= index 0)
+        (atomic/atomic-store
+          (field (primitive/index (live-source-gates) index) broken) 1) 0)
+    (live-source-gate-unlock!)
+    index))
+
+(defn live-clear-broken-sources! [] (-> i64)
+  (live-source-gate-lock!)
+  (for [i 0 (load (live-source-gate-count))]
+    (atomic/atomic-store
+      (field (primitive/index (live-source-gates) i) broken) 0))
+  (live-source-gate-unlock!))
+
+(defn live-enter-source! [(identity i64)] (-> i64)
+  (let [thread (live-thread-state) (mut entered) false (mut failure) 0]
+    (if (= (primitive/cast i64 thread) 0) (set! failure -1)
+        (if (>= (.depth thread) 256) (set! failure -4)
+            (loop
+              (live-source-gate-lock!)
+              (let [gate-index
+                      (live-source-gate-index-locked! identity)]
+                (if (< gate-index 0)
+                    (do (set! failure gate-index)
+                        (live-source-gate-unlock!)
+                        (break))
+                    (let [gate (primitive/index (live-source-gates) gate-index)]
+                      (if (or (!= (.publishing thread) 0)
+                              (and (= (atomic/atomic-load (live-writer-cell)) 0)
+                                   (= (atomic/atomic-load (field gate closed)) 0)))
+                          (do
+                            (atomic/atomic-add (field gate active) 1)
+                            (atomic/atomic-add (live-reader-count) 1)
+                            (store! (primitive/index (field thread gates)
+                                      (.depth thread)) gate-index)
+                            (set! (.depth thread) (+ (.depth thread) 1))
+                            (set! entered true)
+                            (live-source-gate-unlock!)
+                            (break))
+                          (live-source-gate-unlock!))))))))
+    (if (load entered) (live-epoch) (load failure))))
+
+; Runtime unit tests and non-transformed internal helpers use one explicit
+; source identity. Production live entries always receive their structural ID
+; from the metaprogram-generated wrapper.
+(defn live-enter! [] (-> i64)
+  (live-enter-source! 9223372036854775806))
+
+(defn live-exit! [] (-> i64)
+  (let [thread (live-thread-state)]
+    (if (or (= (primitive/cast i64 thread) 0) (<= (.depth thread) 0))
+        -1
+        (do
+          (set! (.depth thread) (- (.depth thread) 1))
+          (let [gate-index
+                  (load (primitive/index (field thread gates) (.depth thread)))]
+            (atomic/atomic-add
+              (field (primitive/index (live-source-gates) gate-index) active) -1)
+            (atomic/atomic-add (live-reader-count) -1))))))
+
+; Cooperative long-running code checks this at a safe loop backedge and returns
+; to its stable outer driver when true. It intentionally does not drop/reacquire
+; the lease itself: an old-layout stack local must never survive publication.
+(defn live-reload-requested? [] (-> bool)
+  (let [thread (live-thread-state)]
+    (or (!= (atomic/atomic-load (live-writer-cell)) 0)
+        (and (!= (primitive/cast i64 thread) 0)
+             (and (> (.depth thread) 0)
+                  (!= (atomic/atomic-load
+                        (field (primitive/index (live-source-gates)
+                          (load (primitive/index (field thread gates)
+                                  (- (.depth thread) 1)))) closed)) 0))))))
+
+(defn live-publication-lock! [] (-> i64)
+  (loop (if (= (atomic/atomic-cas (live-publication-lock) 0 1) 0) (break) 0)) 0)
+(defn live-publication-unlock! [] (-> i64)
+  (atomic/atomic-store (live-publication-lock) 0))
+
+(defn live-begin-affected-publication! [] (-> i64)
+  ; Allocate publication-owner TLS before acquiring any lock. Failure must not
+  ; leave the publication flag set without a thread capable of crossing the
+  ; closed candidate gates.
+  (let [thread (live-thread-state)]
+    (if (= (primitive/cast i64 thread) 0) -1
+        (do
+          (live-publication-lock!)
+          (atomic/atomic-store (live-affected-publication-active) 1)
+          (set! (.publishing thread) 1)
+          (live-source-gate-lock!)
+          (let [(mut affected) (load (live-staged-affected-head))
+                (mut failure) 0]
+            (loop
+              (if (= (primitive/cast i64 (load affected)) 0) (break)
+                  (let [identity (.identity (load affected))
+                        index (live-source-gate-index-locked! identity)]
+                    (if (< index 0) (do (set! failure index) (break))
+                        (do
+                          (atomic/atomic-store
+                            (field (primitive/index (live-source-gates) index)
+                                   closed) 1)
+                          (set! affected (.next (load affected))))))))
+            (live-source-gate-unlock!)
+            (if (!= (load failure) 0)
+                (do
+                  (for [i 0 (load (live-source-gate-count))]
+                    (atomic/atomic-store
+                      (field (primitive/index (live-source-gates) i) closed) 0))
+                  (live-publication-unlock!)
+                  (atomic/atomic-store (live-affected-publication-active) 0)
+                  (set! (.publishing thread) 0)
+                  (load failure))
+                (do
+                  (let [(mut pending) true]
+                    (loop
+                      (if (not (load pending)) (break)
+                          (do
+                            (set! pending false)
+                            (for [i 0 (load (live-source-gate-count))]
+                              (if (and (!= (atomic/atomic-load
+                                            (field (primitive/index
+                                              (live-source-gates) i) closed)) 0)
+                                       (> (atomic/atomic-load
+                                            (field (primitive/index
+                                              (live-source-gates) i) active)) 0))
+                                  (set! pending true) 0))))))
+                  0)))))))
+
+(defn live-end-affected-publication! [] (-> i64)
+  (if (= (atomic/atomic-load (live-affected-publication-active)) 0) 0
+      (do
+        (live-source-gate-lock!)
+        (for [i 0 (load (live-source-gate-count))]
+          (atomic/atomic-store
+            (field (primitive/index (live-source-gates) i) closed) 0))
+        (live-source-gate-unlock!)
+        (let [thread (live-thread-state)]
+          (if (!= (primitive/cast i64 thread) 0) (set! (.publishing thread) 0) 0))
+        (atomic/atomic-store (live-affected-publication-active) 0)
+        (live-publication-unlock!))))
+
+(defn live-begin-publication! [] (-> i64)
+  (live-publication-lock!)
+  (loop (if (= (atomic/atomic-cas (live-writer-cell) 0 1) 0) (break) 0))
+  (loop (if (= (atomic/atomic-load (live-reader-count)) 0) (break) 0))
+  0)
+
+(defn live-end-publication! [] (-> i64)
+  (atomic/atomic-store (live-writer-cell) 0)
+  (live-publication-unlock!))
+
+(defn live-managed-lock! [] (-> i64)
+  (loop (if (= (atomic/atomic-cas (live-managed-lock-cell) 0 1) 0) (break) 0))
+  0)
+
+(defn live-managed-unlock! [] (-> i64)
+  (atomic/atomic-store (live-managed-lock-cell) 0))
+
+(defn live-noop [(p (ptr i8))] (-> i64)
+  (primitive/cast i64 p)
+  0)
+
+(defn live-text=? [(a (slice u8)) (b (slice u8))] (-> bool)
+  (if (!= (slice-len a) (slice-len b))
+      false
+      (let [(mut i) 0 (mut same) true]
+        (loop (if (or (not (load same)) (>= (load i) (slice-len a)))
+                  (break)
+                  (if (= (slice-get a (load i)) (slice-get b (load i)))
+                      (set! i (+ (load i) 1))
+                      (set! same false))))
+        (load same))))
+
+(defn live-register-transition [(runtime-id i64)
+                                (from-schema i64)
+                                (to-schema i64)
+                                (apply (fnptr c [(ptr i8) (ptr i8)] i64))
+                                (abort (fnptr c [(ptr i8)] i64))
+                                (retire (fnptr c [(ptr i8)] i64))] (-> i64)
+  (if (or (< from-schema 0) (<= to-schema from-schema))
+      -1
+      (let [(mut i) 0 (mut found) -1]
+        (loop (if (>= (load i) (load (live-transition-count)))
+                  (break)
+                  (let [edge (primitive/index (live-transitions) (load i))]
+                    (if (and (= (.runtime-id edge) runtime-id)
+                             (= (.from-schema edge) from-schema))
+                        (do (set! found (load i)) (break))
+                        (set! i (+ (load i) 1))))))
+        (if (>= (load found) 0)
+            ; An accepted historical edge is immutable. Re-registering the
+            ; exact edge is idempotent; replacing its meaning is rejected.
+            (let [edge (primitive/index (live-transitions) (load found))]
+              (if (= (.to-schema edge) to-schema)
+                  (load found)
+                  -2))
+            (let [at (load (live-transition-count))]
+              (if (>= at 512)
+                  -3
+                  (let [edge (primitive/index (live-transitions) at)]
+                    (set! (.runtime-id edge) runtime-id)
+                    (set! (.from-schema edge) from-schema)
+                    (set! (.to-schema edge) to-schema)
+                    (set! (.apply edge) apply)
+                    (set! (.abort edge) abort)
+                    (set! (.retire edge) retire)
+                    (set! (live-transition-count) (+ at 1))
+                    at)))))))
+
+(defn live-find-transition [(runtime-id i64) (from-schema i64)] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
+    (loop (if (>= (load i) (load (live-transition-count)))
+              (break)
+              (let [edge (primitive/index (live-transitions) (load i))]
+                (if (and (= (.runtime-id edge) runtime-id)
+                         (= (.from-schema edge) from-schema))
+                    (do (set! found (load i)) (break))
+                    (set! i (+ (load i) 1))))))
+    (load found)))
+
+(defn live-register-root [(name (slice u8))
+                          (runtime-id i64)
+                          (schema-id i64)
+                          (slot (ptr (ptr i8)))] (-> i64)
+  (if (or (= (primitive/cast i64 slot) 0)
+          (= (primitive/cast i64 (load slot)) 0))
+      -1
+      (let [(mut i) 0 (mut existing) -1 (mut reusable) -1]
+        (loop (if (>= (load i) (load (live-root-count)))
+                  (break)
+                  (let [root (primitive/index (live-roots) (load i))]
+                    (if (and (not (.live root)) (< (load reusable) 0))
+                        (set! reusable (load i)) 0)
+                    (if (and (.live root)
+                             (and (> (slice-len name) 0)
+                                  (and (= (.runtime-id root) runtime-id))
+                                  (live-text=? (.name root) name)))
+                        (do (set! existing (load i)) (break))
+                        (set! i (+ (load i) 1))))))
+        (if (>= (load existing) 0)
+            (let [root (primitive/index (live-roots) (load existing))]
+              ; A persistent name may only re-register the same stable slot.
+              ; Changing its slot would strand aliases held by accepted code.
+              (if (= (primitive/cast i64 (.slot root)) (primitive/cast i64 slot))
+                  (.id root)
+                  -3))
+            (let [at (if (>= (load reusable) 0)
+                         (load reusable) (load (live-root-count)))]
+              (if (and (< (load reusable) 0) (>= at 512))
+                  -2
+                  (let [root (primitive/index (live-roots) at)
+                        owned-name (primitive/cast (ptr u8)
+                                     (malloc (primitive/cast u64
+                                       (if (= (slice-len name) 0)
+                                           1 (slice-len name)))))]
+                    (if (= (primitive/cast i64 owned-name) 0)
+                        -4
+                        (do
+                    (for [name-index 0 (slice-len name)]
+                      (store! (primitive/index owned-name name-index)
+                        (slice-get name name-index)))
+                    (if (> (slice-len (.name root)) 0)
+                        (free (primitive/cast (ptr i8)
+                                (slice-data (.name root)))) 0)
+                    (set! (.id root) (+ at 1))
+                    (set! (.name root) (slice-new owned-name (slice-len name)))
+                    (set! (.runtime-id root) runtime-id)
+                    (set! (.schema-id root) schema-id)
+                    (set! (.slot root) slot)
+                    (set! (.handle root) (primitive/cast (ptr LiveHandle) 0))
+                    (set! (.aliases root) 0)
+                    (set! (.live root) true)
+                    (if (< (load reusable) 0)
+                        (set! (live-root-count) (+ at 1)) 0)
+                    (.id root))))))))))
+
+(defn live-register-root-c [(name (ptr u8)) (name-len i64)
+                             (runtime-id i64) (schema-id i64)
+                             (slot (ptr (ptr i8)))] (-> i64)
+  (live-register-root (slice-new name name-len)
+                      runtime-id schema-id slot))
+
+(defn live-handle-new! [(runtime-id i64) (schema-id i64)
+                        (payload (ptr i8))] (-> (ptr LiveHandle))
+  (if (= (primitive/cast i64 payload) 0)
+      (primitive/cast (ptr LiveHandle) 0)
+      (let [raw (calloc 1 (primitive/cast u64 (primitive/sizeof LiveHandle)))]
+        (if (= (primitive/cast i64 raw) 0)
+            (primitive/cast (ptr LiveHandle) 0)
+            (let [handle (primitive/cast (ptr LiveHandle) raw)]
+              (live-managed-lock!)
+              (set! (.id handle) (+ (load (live-handle-count)) 1))
+              (set! (.refs handle) 1)
+              (set! (.runtime-id handle) runtime-id)
+              (set! (.schema-id handle) schema-id)
+              (set! (.payload handle) payload)
+              (set! (.live handle) true)
+              (set! (.next handle) (load (live-handle-head)))
+              (set! (live-handle-head) handle)
+              (set! (live-handle-count) (+ (load (live-handle-count)) 1))
+              (set! (.root-id handle) 0)
+              (live-managed-unlock!)
+              handle)))))
+
+(defn live-register-handle-root [(name (slice u8))
+                                 (handle (ptr LiveHandle))] (-> i64)
+  (if (or (= (primitive/cast i64 handle) 0) (not (.live handle)))
+      -1
+      (let [root-id (live-register-root name (.runtime-id handle)
+                        (.schema-id handle) (field handle payload))
+            root (live-root-by-id root-id)]
+        (if (> root-id 0)
+            (do
+              (set! (.handle root) handle)
+              ; This is diagnostic metadata only: one handle may be reachable
+              ; through multiple named roots, so release scans by handle.
+              (if (= (.root-id handle) 0) (set! (.root-id handle) root-id) 0))
+            0)
+        root-id)))
+
+(defn live-register-handle-root-c [(name (ptr u8)) (name-len i64)
+                                   (handle (ptr i8))] (-> i64)
+  (live-register-handle-root (slice-new name name-len)
+    (primitive/cast (ptr LiveHandle) handle)))
+
+(defn live-handle-retain! [(handle (ptr LiveHandle))] (-> i64)
+  (if (or (= (primitive/cast i64 handle) 0) (not (.live handle)))
+      -1
+      (do
+        (live-managed-lock!)
+        (set! (.refs handle) (+ (.refs handle) 1))
+        (let [refs (.refs handle)]
+          (live-managed-unlock!)
+          refs))))
+
+(defn live-handle-payload [(handle (ptr LiveHandle))
+                           (runtime-id i64) (schema-id i64)] (-> (ptr i8))
+  (if (or (= (primitive/cast i64 handle) 0)
+          (or (not (.live handle))
+              (or (!= (.runtime-id handle) runtime-id)
+                  (!= (.schema-id handle) schema-id))))
+      (primitive/cast (ptr i8) 0)
+      (.payload handle)))
+
+; A payload pointer may escape a live entry only through an explicit scoped
+; borrow. Publication reports BlockedByBorrow until every such scope releases.
+(defn live-handle-borrow-payload! [(handle (ptr LiveHandle))
+                                   (runtime-id i64)
+                                   (schema-id i64)] (-> (ptr i8))
+  (live-managed-lock!)
+  (let [valid (and (!= (primitive/cast i64 handle) 0)
+                   (and (.live handle)
+                        (and (= (.runtime-id handle) runtime-id)
+                             (= (.schema-id handle) schema-id))))
+        result (if valid (.payload handle) (primitive/cast (ptr i8) 0))]
+    (if valid (set! (.borrows handle) (+ (.borrows handle) 1)) 0)
+    (live-managed-unlock!)
+    result))
+
+(defn live-handle-release-borrow! [(handle (ptr LiveHandle))] (-> i64)
+  (live-managed-lock!)
+  (let [result
+          (if (or (= (primitive/cast i64 handle) 0)
+                  (or (not (.live handle)) (<= (.borrows handle) 0)))
+              -1
+              (do
+                (set! (.borrows handle) (- (.borrows handle) 1))
+                (.borrows handle)))]
+    (live-managed-unlock!)
+    result))
+
+; Foreign retention and pinning both retain the stable header lifetime in
+; addition to blocking payload relocation. They must be paired explicitly.
+(defn live-handle-ffi-retain! [(handle (ptr LiveHandle))] (-> i64)
+  (live-managed-lock!)
+  (let [result
+          (if (or (= (primitive/cast i64 handle) 0) (not (.live handle)))
+              -1
+              (do
+                (set! (.refs handle) (+ (.refs handle) 1))
+                (set! (.ffi-retains handle) (+ (.ffi-retains handle) 1))
+                (.ffi-retains handle)))]
+    (live-managed-unlock!)
+    result))
+
+(defn live-handle-ffi-release! [(handle (ptr LiveHandle))] (-> i64)
+  (live-managed-lock!)
+  (let [valid (and (!= (primitive/cast i64 handle) 0)
+                   (and (.live handle) (> (.ffi-retains handle) 0)))]
+    (if valid (set! (.ffi-retains handle) (- (.ffi-retains handle) 1)) 0)
+    (live-managed-unlock!)
+    (if valid (live-handle-release! handle) -1)))
+
+(defn live-handle-pin! [(handle (ptr LiveHandle))] (-> i64)
+  (live-managed-lock!)
+  (let [result
+          (if (or (= (primitive/cast i64 handle) 0) (not (.live handle)))
+              -1
+              (do
+                (set! (.refs handle) (+ (.refs handle) 1))
+                (set! (.pins handle) (+ (.pins handle) 1))
+                (.pins handle)))]
+    (live-managed-unlock!)
+    result))
+
+(defn live-handle-unpin! [(handle (ptr LiveHandle))] (-> i64)
+  (live-managed-lock!)
+  (let [valid (and (!= (primitive/cast i64 handle) 0)
+                   (and (.live handle) (> (.pins handle) 0)))]
+    (if valid (set! (.pins handle) (- (.pins handle) 1)) 0)
+    (live-managed-unlock!)
+    (if valid (live-handle-release! handle) -1)))
+
+(defn live-handle-new-c [(runtime-id i64) (schema-id i64)
+                         (payload (ptr i8))] (-> (ptr i8))
+  (primitive/cast (ptr i8) (live-handle-new! runtime-id schema-id payload)))
+
+(defn live-handle-payload-c [(handle (ptr i8))
+                             (runtime-id i64) (schema-id i64)] (-> (ptr i8))
+  (live-handle-payload (primitive/cast (ptr LiveHandle) handle)
+                       runtime-id schema-id))
+
+(defn live-handle-borrow-payload-c [(handle (ptr i8))
+                                    (runtime-id i64)
+                                    (schema-id i64)] (-> (ptr i8))
+  (live-handle-borrow-payload! (primitive/cast (ptr LiveHandle) handle)
+    runtime-id schema-id))
+
+(defn live-handle-release-borrow-c [(handle (ptr i8))] (-> i64)
+  (live-handle-release-borrow! (primitive/cast (ptr LiveHandle) handle)))
+
+(defn live-handle-ffi-retain-c [(handle (ptr i8))] (-> i64)
+  (live-handle-ffi-retain! (primitive/cast (ptr LiveHandle) handle)))
+
+(defn live-handle-ffi-release-c [(handle (ptr i8))] (-> i64)
+  (live-handle-ffi-release! (primitive/cast (ptr LiveHandle) handle)))
+
+(defn live-handle-pin-c [(handle (ptr i8))] (-> i64)
+  (live-handle-pin! (primitive/cast (ptr LiveHandle) handle)))
+
+(defn live-handle-unpin-c [(handle (ptr i8))] (-> i64)
+  (live-handle-unpin! (primitive/cast (ptr LiveHandle) handle)))
+
+(defn live-register-schema-destructor [(schema-id i64)
+                                        (destroy (fnptr c [(ptr i8)] i64))] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
+    (loop (if (>= (load i) (load (live-schema-destructor-count)))
+              (break)
+              (let [entry (primitive/index (live-schema-destructors) (load i))]
+                (if (= (.schema-id entry) schema-id)
+                    (do (set! found (load i)) (break))
+                    (set! i (+ (load i) 1))))))
+    (if (>= (load found) 0)
+        (load found)
+        (let [at (load (live-schema-destructor-count))]
+          (if (>= at 4096)
+              -1
+              (let [entry (primitive/index (live-schema-destructors) at)]
+                (set! (.schema-id entry) schema-id)
+                (set! (.destroy entry) destroy)
+                (set! (live-schema-destructor-count) (+ at 1))
+                at))))))
+
+(defn live-register-schema-destructor-c [(schema-id i64) (destroy (ptr i8))] (-> i64)
+  (live-register-schema-destructor schema-id
+    (primitive/llvm-ir (fnptr c [(ptr i8)] i64) [destroy] "ret ptr $0")))
+
+(defn live-handle-release! [(handle (ptr LiveHandle))] (-> i64)
+  (if (or (= (primitive/cast i64 handle) 0) (not (.live handle)))
+      -1
+      (if (or (> (.borrows handle) 0)
+              (or (> (.ffi-retains handle) 0) (> (.pins handle) 0)))
+          -2
+          (do
+            (live-managed-lock!)
+            (if (> (.refs handle) 1)
+                (do
+                  (set! (.refs handle) (- (.refs handle) 1))
+                  (let [refs (.refs handle)]
+                    (live-managed-unlock!)
+                    refs))
+                (do
+                  (let [(mut link) (live-handle-head)]
+                    (loop (let [current (load (load link))]
+                            (if (= (primitive/cast i64 current) 0)
+                                (break)
+                                (if (= (primitive/cast i64 current)
+                                       (primitive/cast i64 handle))
+                                    (do (store! (load link) (.next current)) (break))
+                                    (set! link (field current next)))))))
+                  (for [root-index 0 (load (live-root-count))]
+                    (let [root (primitive/index (live-roots) root-index)]
+                      (if (and (.live root)
+                               (= (primitive/cast i64 (.handle root))
+                                  (primitive/cast i64 handle)))
+                          (set! (.live root) false) 0)))
+                  (set! (.refs handle) 0)
+                  (set! (.live handle) false)
+                  (set! (live-handle-count) (- (load (live-handle-count)) 1))
+                  (let [payload (.payload handle)
+                        schema-id (.schema-id handle)]
+                    (set! (.payload handle) (primitive/cast (ptr i8) 0))
+                    (live-managed-unlock!)
+                    (let [(mut destructor-found) false]
+                      (for [i 0 (load (live-schema-destructor-count))]
+                        (let [entry (primitive/index (live-schema-destructors) i)]
+                          (if (= (.schema-id entry) schema-id)
+                              (do
+                                (primitive/call-ptr (.destroy entry) payload)
+                                (set! destructor-found true))
+                              0)))
+                      ; Manually registered schemas can lack a typed destructor.
+                      (if (not (load destructor-found))
+                          (for [i 0 (load (live-reference-field-count))]
+                            (let [rule (primitive/index (live-reference-fields) i)]
+                              (if (and (= (.schema-id rule) schema-id) (= (.kind rule) 4))
+                                  (let [nested
+                                          (load (primitive/cast (ptr (ptr LiveHandle))
+                                            (primitive/index payload (.offset rule))))]
+                                    (if (!= (primitive/cast i64 nested) 0)
+                                        (live-handle-release! nested) 0))
+                                  0)))
+                          0))
+                    (free payload)
+                    (free (primitive/cast (ptr i8) handle))
+                    0)))))))
+
+(defn live-handle-release-c [(handle (ptr i8))] (-> i64)
+  (live-handle-release! (primitive/cast (ptr LiveHandle) handle)))
+
+(defn live-handle-retain-c [(handle (ptr i8))] (-> i64)
+  (live-handle-retain! (primitive/cast (ptr LiveHandle) handle)))
+
+(defn live-register-reference-field [(schema-id i64) (offset i64)
+                                      (target-runtime-id i64) (kind i64)] (-> i64)
+  ; Raw implementation pointers can never prove their owning generation. Live
+  ; function values must use metaprogram-generated permanent ABI-lineage
+  ; trampolines/records, not an untyped persistent fnptr field.
+  (if (= kind 3)
+      -15
+      (let [(mut i) 0 (mut found) -1]
+    (loop (if (>= (load i) (load (live-reference-field-count)))
+              (break)
+              (let [field (primitive/index (live-reference-fields) (load i))]
+                (if (and (= (.schema-id field) schema-id) (= (.offset field) offset))
+                    (do (set! found (load i)) (break))
+                    (set! i (+ (load i) 1))))))
+    (if (>= (load found) 0)
+        (load found)
+        (let [at (load (live-reference-field-count))]
+          (if (>= at 4096)
+              -1
+              (let [field (primitive/index (live-reference-fields) at)]
+                (set! (.schema-id field) schema-id)
+                (set! (.offset field) offset)
+                (set! (.target-runtime-id field) target-runtime-id)
+                (set! (.kind field) kind)
+                (set! (live-reference-field-count) (+ at 1))
+                at)))))))
+
+(defn live-managed-object-by-address [(address (ptr i8))] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
+    (loop (if (>= (load i) (load (live-managed-object-count)))
+              (break)
+              (let [object (primitive/index (live-managed-objects) (load i))]
+                (if (and (.live object)
+                         (= (primitive/cast i64 (.address object))
+                            (primitive/cast i64 address)))
+                    (do (set! found (load i)) (break))
+                    (set! i (+ (load i) 1))))))
+    (load found)))
+
+(defn live-track-inspector-object! [(address (ptr i8)) (runtime-id i64)
+                                    (schema-id i64) (bytes i64) (align i64)
+                                    (count i64)] (-> i64)
+  (if (or (= (primitive/cast i64 address) 0) (< schema-id 0))
+      -1
+      (do
+      (live-managed-lock!)
+      (let [existing (live-managed-object-by-address address)
+            (mut result) -2]
+        (if (>= existing 0)
+            (set! result existing)
+            (let [at (load (live-managed-object-count))]
+              (if (>= at 4096)
+                  0
+                  (let [object (primitive/index (live-managed-objects) at)]
+                    (set! (.address object) address)
+                    (set! (.runtime-id object) runtime-id)
+                    (set! (.schema-id object) schema-id)
+                    (set! (.bytes object) bytes)
+                    (set! (.align object) align)
+                    (set! (.count object) count)
+                    (set! (.borrows object) 0)
+                    (set! (.ffi-retains object) 0)
+                    ; Inspector allocation callbacks cannot invent the owning
+                    ; allocator's prepare/commit/abort protocol.
+                    (set! (.movable object) false)
+                    (set! (.allocate object)
+                          (primitive/cast (fnptr c [i64 i64] (ptr i8))
+                                          (primitive/cast (ptr i8) 0)))
+                    (set! (.release object)
+                          (primitive/cast (fnptr c [(ptr i8) i64 i64] i64)
+                                          (primitive/cast (ptr i8) 0)))
+                    (set! (.migrating object) false)
+                    (set! (.live object) true)
+                    (set! (live-managed-object-count) (+ at 1))
+                    (set! result at)))))
+        (live-managed-unlock!)
+        (load result)))))
+
+; Opt-in relocation policy for allocator-owned objects. Discovery through the
+; inspector remains non-movable; only the allocator that owns an object can
+; provide transactional allocation and release callbacks.
+(defn live-authorize-managed-object! [(address (ptr i8))
+                                      (allocate (fnptr c [i64 i64] (ptr i8)))
+                                      (release (fnptr c [(ptr i8) i64 i64] i64))] (-> i64)
+  (live-managed-lock!)
+  (let [index (live-managed-object-by-address address)]
+    (if (< index 0)
+        (do (live-managed-unlock!) -1)
+        (let [object (primitive/index (live-managed-objects) index)]
+          (set! (.allocate object) allocate)
+          (set! (.release object) release)
+          (set! (.movable object) true)
+          (live-managed-unlock!)
+          index))))
+
+(defn live-untrack-inspector-object! [(address (ptr i8))] (-> i64)
+  (live-managed-lock!)
+  (let [index (live-managed-object-by-address address)]
+    (let [result (if (< index 0)
+                     0
+                     (let [object (primitive/index (live-managed-objects) index)]
+                       (if (.migrating object) -2
+                           (do (set! (.live object) false) 0))))]
+    (live-managed-unlock!)
+    result)))
+
+(defn live-managed-retain-borrow! [(address (ptr i8))] (-> i64)
+  (live-managed-lock!)
+  (let [index (live-managed-object-by-address address) (mut result) -1]
+    (if (< index 0) 0
+        (let [object (primitive/index (live-managed-objects) index)]
+          (if (.migrating object)
+              (set! result -2)
+              (do (set! (.borrows object) (+ (.borrows object) 1))
+                  (set! result (.borrows object))))))
+    (live-managed-unlock!)
+    (load result)))
+
+(defn live-managed-release-borrow! [(address (ptr i8))] (-> i64)
+  (live-managed-lock!)
+  (let [index (live-managed-object-by-address address) (mut result) -1]
+    (if (< index 0) 0
+        (let [object (primitive/index (live-managed-objects) index)]
+          (if (<= (.borrows object) 0) 0
+              (do (set! (.borrows object) (- (.borrows object) 1))
+                  (set! result (.borrows object))))))
+    (live-managed-unlock!)
+    (load result)))
+
+(defn live-managed-retain-ffi! [(address (ptr i8))] (-> i64)
+  (live-managed-lock!)
+  (let [index (live-managed-object-by-address address) (mut result) -1]
+    (if (< index 0) 0
+        (let [object (primitive/index (live-managed-objects) index)]
+          (if (.migrating object)
+              (set! result -2)
+              (do (set! (.ffi-retains object) (+ (.ffi-retains object) 1))
+                  (set! result (.ffi-retains object))))))
+    (live-managed-unlock!)
+    (load result)))
+
+(defn live-managed-release-ffi! [(address (ptr i8))] (-> i64)
+  (live-managed-lock!)
+  (let [index (live-managed-object-by-address address) (mut result) -1]
+    (if (< index 0) 0
+        (let [object (primitive/index (live-managed-objects) index)]
+          (if (<= (.ffi-retains object) 0) 0
+              (do (set! (.ffi-retains object) (- (.ffi-retains object) 1))
+                  (set! result (.ffi-retains object))))))
+    (live-managed-unlock!)
+    (load result)))
+
+(defn live-root-by-id [(id i64)] (-> (ptr LiveRoot))
+  (if (or (<= id 0) (> id (load (live-root-count))))
+      (primitive/cast (ptr LiveRoot) 0)
+      (let [root (primitive/index (live-roots) (- id 1))]
+        (if (.live root) root (primitive/cast (ptr LiveRoot) 0)))))
+
+(defn live-root-retain! [(id i64)] (-> i64)
+  (let [root (live-root-by-id id)]
+    (if (= (primitive/cast i64 root) 0)
+        -1
+        (do (set! (.aliases root) (+ (.aliases root) 1)) (.aliases root)))))
+
+(defn live-root-release! [(id i64)] (-> i64)
+  (let [root (live-root-by-id id)]
+    (if (or (= (primitive/cast i64 root) 0) (<= (.aliases root) 0))
+        -1
+        (do (set! (.aliases root) (- (.aliases root) 1)) (.aliases root)))))
+
+(defn live-unregister-root! [(id i64)] (-> i64)
+  (let [root (live-root-by-id id)]
+    (if (= (primitive/cast i64 root) 0)
+        -1
+        (if (> (.aliases root) 0)
+            -2
+            (do (set! (.live root) false) 0)))))
+
+(defn live-schema-size [(schema-id i64)] (-> i64)
+  (if (or (< schema-id 0) (>= schema-id (load (inspector/type-n))))
+      -1
+      (.size (primitive/index (inspector/types) schema-id))))
+
+(defn live-abort-staged! [] (-> i64)
+  (for [i 0 (load (live-staged-count))]
+    (let [staged (primitive/index (live-staged) i)]
+      (if (and (.owner staged) (!= (primitive/cast i64 (.new-value staged)) 0))
+          (do
+            ; The final destination was fully produced by apply. `abort`
+            ; handles owned subfields, then the coordinator frees storage.
+            (primitive/call-ptr (.abort staged) (.new-value staged))
+            (free (.new-value staged)))
+          0)))
+  (set! (live-staged-count) 0)
+  (for [i 0 (load (live-staged-handle-count))]
+    (let [staged (primitive/index (live-staged-handles) i)]
+      (if (and (.owner staged) (!= (primitive/cast i64 (.new-value staged)) 0))
+          (do
+            (primitive/call-ptr (.abort staged) (.new-value staged))
+            (free (.new-value staged)))
+          0)))
+  (set! (live-staged-handle-count) 0)
+  (for [i 0 (load (live-staged-managed-count))]
+    (let [staged (primitive/index (live-staged-managed) i)
+          element-size (live-schema-size (.new-schema staged))]
+      (for [j 0 (.count staged)]
+        (primitive/call-ptr (.abort staged)
+          (primitive/index (.new-value staged) (* j element-size))))
+      (primitive/call-ptr (.release staged) (.new-value staged)
+                          (.new-bytes staged) (.align staged))))
+  (set! (live-staged-managed-count) 0)
+  (set! (live-forward-count) 0)
+  (live-managed-lock!)
+  (for [i 0 (load (live-managed-object-count))]
+    (set! (.migrating (primitive/index (live-managed-objects) i)) false))
+  (live-managed-unlock!)
+  (live-affected-clear! (live-staged-affected-head)
+                        (live-staged-affected-count))
+  0)
+
+(defn live-stage-managed-object! [(object-index i64) (target-schema i64)] (-> i64)
+  (let [object (primitive/index (live-managed-objects) object-index)
+        original (.address object)
+        (mut current) original
+        (mut current-bytes) (.bytes object)
+        (mut schema) (.schema-id object)
+        (mut current-abort) (primitive/fnptr-of live-noop)
+        (mut original-retire) (primitive/fnptr-of live-noop)
+        (mut failed) 0]
+    (loop (if (or (!= (load failed) 0) (= (load schema) target-schema))
+              (break)
+              (let [edge-id (live-find-transition (.runtime-id object) (load schema))]
+                (if (< edge-id 0)
+                    (set! failed -4)
+                    (let [edge (primitive/index (live-transitions) edge-id)
+                          element-size (live-schema-size (.to-schema edge))
+                          bytes (* element-size (.count object))]
+                      (if (or (<= element-size 0) (> (.to-schema edge) target-schema))
+                          (set! failed -5)
+                          (let [next (primitive/call-ptr (.allocate object) bytes (.align object))]
+                            (if (= (primitive/cast i64 next) 0)
+                                (set! failed -6)
+                                (let [(mut j) 0 (mut edge-failed) false]
+                                  (loop (if (or (load edge-failed) (>= (load j) (.count object)))
+                                            (break)
+                                            (let [old-element-size (live-schema-size (load schema))
+                                                  rc (primitive/call-ptr (.apply edge)
+                                                       (primitive/index (load current)
+                                                         (* (load j) old-element-size))
+                                                       (primitive/index next
+                                                         (* (load j) element-size)))]
+                                              (if (!= rc 0)
+                                                  (do
+                                                    (primitive/call-ptr (.abort edge)
+                                                      (primitive/index next
+                                                        (* (load j) element-size)))
+                                                    (set! edge-failed true))
+                                                  (set! j (+ (load j) 1))))))
+                                  (if (load edge-failed)
+                                      (do
+                                        (for [k 0 (load j)]
+                                          (primitive/call-ptr (.abort edge)
+                                            (primitive/index next (* k element-size))))
+                                        (primitive/call-ptr (.release object) next bytes (.align object))
+                                        (set! failed -7))
+                                      (do
+                                        (if (= (primitive/cast i64 (load current))
+                                               (primitive/cast i64 original))
+                                            (set! original-retire (.retire edge))
+                                            (do
+                                              (let [prior-size (live-schema-size (load schema))]
+                                                (for [k 0 (.count object)]
+                                                  (primitive/call-ptr (.retire edge)
+                                                    (primitive/index (load current) (* k prior-size)))))
+                                              (primitive/call-ptr (.release object) (load current)
+                                                                  (load current-bytes) (.align object))))
+                                        (set! current next)
+                                        (set! current-bytes bytes)
+                                        (set! schema (.to-schema edge))
+                                        (set! current-abort (.abort edge)))))))))))))
+    (if (!= (load failed) 0)
+        (do
+          (if (!= (primitive/cast i64 (load current)) (primitive/cast i64 original))
+              (do
+                (let [element-size (live-schema-size (load schema))]
+                  (for [k 0 (.count object)]
+                    (primitive/call-ptr (load current-abort)
+                      (primitive/index (load current) (* k element-size)))))
+                (primitive/call-ptr (.release object) (load current)
+                                    (load current-bytes) (.align object))) 0)
+          (load failed))
+        (let [at (load (live-staged-managed-count)) forward-at (load (live-forward-count))]
+          (if (or (>= at 4096) (>= forward-at 1024))
+              -9
+              (let [staged (primitive/index (live-staged-managed) at)
+                    forward (primitive/index (live-forwards) forward-at)]
+                (set! (.old-value forward) original)
+                (set! (.new-value forward) (load current))
+                (set! (.runtime-id forward) (.runtime-id object))
+                (set! (.new-schema forward) target-schema)
+                (set! (.abort forward) (load current-abort))
+                (set! (.retire forward) (load original-retire))
+                (set! (live-forward-count) (+ forward-at 1))
+                (set! (.object-index staged) object-index)
+                (set! (.old-value staged) original)
+                (set! (.new-value staged) (load current))
+                (set! (.old-schema staged) (.schema-id object))
+                (set! (.new-schema staged) target-schema)
+                (set! (.old-bytes staged) (.bytes object))
+                (set! (.new-bytes staged) (load current-bytes))
+                (set! (.align staged) (.align object))
+                (set! (.count staged) (.count object))
+                (set! (.abort staged) (load current-abort))
+                (set! (.retire staged) (load original-retire))
+                (set! (.release staged) (.release object))
+                (set! (live-staged-managed-count) (+ at 1))
+                0))))))
+
+(defn live-find-forward [(old-value (ptr i8)) (runtime-id i64)
+                          (target-schema i64)] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
+    (loop (if (>= (load i) (load (live-forward-count)))
+              (break)
+              (let [forward (primitive/index (live-forwards) (load i))]
+                (if (and (= (primitive/cast i64 (.old-value forward))
+                            (primitive/cast i64 old-value))
+                         (and (= (.runtime-id forward) runtime-id)
+                              (= (.new-schema forward) target-schema)))
+                    (do (set! found (load i)) (break))
+                    (set! i (+ (load i) 1))))))
+    (load found)))
+
+(defn live-stage-forwarded-root! [(root-index i64) (forward-index i64)] (-> i64)
+  (let [at (load (live-staged-count))]
+    (if (>= at 512)
+        -9
+        (let [root (primitive/index (live-roots) root-index)
+              forward (primitive/index (live-forwards) forward-index)
+              staged (primitive/index (live-staged) at)]
+          (set! (.root-index staged) root-index)
+          (set! (.old-value staged) (load (.slot root)))
+          (set! (.new-value staged) (.new-value forward))
+          (set! (.old-schema staged) (.schema-id root))
+          (set! (.new-schema staged) (.new-schema forward))
+          (set! (.owner staged) false)
+          (set! (.abort staged) (primitive/fnptr-of live-noop))
+          (set! (.retire staged) (primitive/fnptr-of live-noop))
+          (set! (live-staged-count) (+ at 1))
+          0))))
+
+; Stage one root through every exact edge up to target. Intermediate values are
+; private and may be retired immediately; the accepted old root remains intact
+; until the batch commit.
+(defn live-stage-root! [(root-index i64) (target-schema i64)] (-> i64)
+  (let [root (primitive/index (live-roots) root-index)
+        original (load (.slot root))
+        forwarded (live-find-forward original (.runtime-id root) target-schema)
+        (mut current) original
+        (mut schema) (.schema-id root)
+        (mut current-abort) (primitive/fnptr-of live-noop)
+        (mut final-retire) (primitive/fnptr-of live-noop)
+        (mut failed) 0]
+    (if (>= forwarded 0)
+        (live-stage-forwarded-root! root-index forwarded)
+    (do
+    (loop (if (or (!= (load failed) 0) (= (load schema) target-schema))
+              (break)
+              (let [edge-id (live-find-transition (.runtime-id root) (load schema))]
+                (if (< edge-id 0)
+                    (set! failed -4)
+                    (let [edge (primitive/index (live-transitions) edge-id)
+                          bytes (live-schema-size (.to-schema edge))]
+                      (if (or (<= bytes 0) (> (.to-schema edge) target-schema))
+                          (set! failed -5)
+                          (let [next (calloc 1 (primitive/cast u64 bytes))]
+                            (if (= (primitive/cast i64 next) 0)
+                                (set! failed -6)
+                                (let [rc (primitive/call-ptr (.apply edge) (load current) next)]
+                                  (if (!= rc 0)
+                                      (do
+                                        (primitive/call-ptr (.abort edge) next)
+                                        (free next)
+                                        (set! failed -7))
+                                      (do
+                                        ; The accepted allocation still has the
+                                        ; original schema. Its destructor is the
+                                        ; first edge's retire callback, not the
+                                        ; final edge in a multi-hop chain.
+                                        (if (= (primitive/cast i64 (load current))
+                                               (primitive/cast i64 original))
+                                            (set! final-retire (.retire edge)) 0)
+                                        ; Intermediate staged values are not
+                                        ; accepted roots and can be retired now.
+                                        (if (!= (primitive/cast i64 (load current))
+                                                (primitive/cast i64 original))
+                                            (do
+                                              (primitive/call-ptr (.retire edge) (load current))
+                                              (free (load current)))
+                                            0)
+                                        (set! current next)
+                                        (set! schema (.to-schema edge))
+                                        (set! current-abort (.abort edge)))))))))))))
+    (if (!= (load failed) 0)
+        (do
+          (if (!= (primitive/cast i64 (load current)) (primitive/cast i64 original))
+              (do
+                (primitive/call-ptr (load current-abort) (load current))
+                (free (load current)))
+              0)
+          (load failed))
+        (let [at (load (live-staged-count)) forward-at (load (live-forward-count))]
+          (if (or (>= at 512) (>= forward-at 1024))
+              -9
+              (let [staged (primitive/index (live-staged) at)
+                    forward (primitive/index (live-forwards) forward-at)]
+                (set! (.old-value forward) original)
+                (set! (.new-value forward) (load current))
+                (set! (.runtime-id forward) (.runtime-id root))
+                (set! (.new-schema forward) target-schema)
+                (set! (.abort forward) (load current-abort))
+                (set! (.retire forward) (load final-retire))
+                (set! (live-forward-count) (+ forward-at 1))
+                (set! (.root-index staged) root-index)
+                (set! (.old-value staged) original)
+                (set! (.new-value staged) (load current))
+                (set! (.old-schema staged) (.schema-id root))
+                (set! (.new-schema staged) target-schema)
+                (set! (.owner staged) true)
+                (set! (.abort staged) (load current-abort))
+                (set! (.retire staged) (load final-retire))
+                (set! (live-staged-count) (+ at 1))
+                0))))))))
+
+(defn live-stage-forwarded-handle! [(handle (ptr LiveHandle))
+                                    (forward-index i64)] (-> i64)
+  (let [at (load (live-staged-handle-count))]
+    (if (>= at 4096)
+        -9
+        (let [forward (primitive/index (live-forwards) forward-index)
+              staged (primitive/index (live-staged-handles) at)]
+          (set! (.handle staged) handle)
+          (set! (.old-value staged) (.payload handle))
+          (set! (.new-value staged) (.new-value forward))
+          (set! (.old-schema staged) (.schema-id handle))
+          (set! (.new-schema staged) (.new-schema forward))
+          (set! (.owner staged) false)
+          (set! (.abort staged) (primitive/fnptr-of live-noop))
+          (set! (.retire staged) (primitive/fnptr-of live-noop))
+          (set! (live-staged-handle-count) (+ at 1))
+          0))))
+
+; Stage a managed handle through the same exact transition graph as roots. The
+; handle header stays put; only its private payload is replaced at publication.
+(defn live-stage-handle! [(handle (ptr LiveHandle))
+                          (target-schema i64)] (-> i64)
+  (let [original (.payload handle)
+        forwarded (live-find-forward original (.runtime-id handle) target-schema)
+        (mut current) original
+        (mut schema) (.schema-id handle)
+        (mut current-abort) (primitive/fnptr-of live-noop)
+        (mut final-retire) (primitive/fnptr-of live-noop)
+        (mut failed) 0]
+    (if (>= forwarded 0)
+        (live-stage-forwarded-handle! handle forwarded)
+        (do
+          (loop (if (or (!= (load failed) 0) (= (load schema) target-schema))
+                    (break)
+                    (let [edge-id (live-find-transition (.runtime-id handle) (load schema))]
+                      (if (< edge-id 0)
+                          (set! failed -4)
+                          (let [edge (primitive/index (live-transitions) edge-id)
+                                bytes (live-schema-size (.to-schema edge))]
+                            (if (or (<= bytes 0) (> (.to-schema edge) target-schema))
+                                (set! failed -5)
+                                (let [next (calloc 1 (primitive/cast u64 bytes))]
+                                  (if (= (primitive/cast i64 next) 0)
+                                      (set! failed -6)
+                                      (let [rc (primitive/call-ptr (.apply edge)
+                                                   (load current) next)]
+                                        (if (!= rc 0)
+                                            (do
+                                              (primitive/call-ptr (.abort edge) next)
+                                              (free next)
+                                              (set! failed -7))
+                                            (do
+                                              (if (= (primitive/cast i64 (load current))
+                                                     (primitive/cast i64 original))
+                                                  (set! final-retire (.retire edge)) 0)
+                                              (if (!= (primitive/cast i64 (load current))
+                                                      (primitive/cast i64 original))
+                                                  (do
+                                                    (primitive/call-ptr (.retire edge)
+                                                      (load current))
+                                                    (free (load current)))
+                                                  0)
+                                              (set! current next)
+                                              (set! schema (.to-schema edge))
+                                              (set! current-abort (.abort edge)))))))))))))
+          (if (!= (load failed) 0)
+              (do
+                (if (!= (primitive/cast i64 (load current))
+                        (primitive/cast i64 original))
+                    (do
+                      (primitive/call-ptr (load current-abort) (load current))
+                      (free (load current)))
+                    0)
+                (load failed))
+              (let [at (load (live-staged-handle-count))
+                    forward-at (load (live-forward-count))]
+                (if (or (>= at 4096) (>= forward-at 1024))
+                    -9
+                    (let [staged (primitive/index (live-staged-handles) at)
+                          forward (primitive/index (live-forwards) forward-at)]
+                      (set! (.old-value forward) original)
+                      (set! (.new-value forward) (load current))
+                      (set! (.runtime-id forward) (.runtime-id handle))
+                      (set! (.new-schema forward) target-schema)
+                      (set! (.abort forward) (load current-abort))
+                      (set! (.retire forward) (load final-retire))
+                      (set! (live-forward-count) (+ forward-at 1))
+                      (set! (.handle staged) handle)
+                      (set! (.old-value staged) original)
+                      (set! (.new-value staged) (load current))
+                      (set! (.old-schema staged) (.schema-id handle))
+                      (set! (.new-schema staged) target-schema)
+                      (set! (.owner staged) true)
+                      (set! (.abort staged) (load current-abort))
+                      (set! (.retire staged) (load final-retire))
+                      (set! (live-staged-handle-count) (+ at 1))
+                      0))))))))
+
+; Migrate every registered root of one nominal type as one transaction.
+(defn live-begin-staging-locked! [] (-> i64)
+  (live-abort-staged!)
+  (set! (live-last-status) 0)
+  (live-record-blocker! 0 -1 -1 (primitive/cast (ptr i8) 0))
+  0)
+
+(defn live-stage-type-roots-locked! [(runtime-id i64) (target-schema i64)] (-> i64)
+  (set! (live-last-status) 0)
+  (let [(mut i) 0 (mut failure) 0]
+    ; Allocator-tracked graph objects are visible, but relocation is permitted
+    ; only when their owner supplies a transactional policy. Borrows and FFI
+    ; retention are stronger blockers and receive distinct status codes.
+    (live-managed-lock!)
+    (loop (if (>= (load i) (load (live-managed-object-count)))
+              (break)
+              (let [object (primitive/index (live-managed-objects) (load i))]
+                (if (and (.live object)
+                         (and (= (.runtime-id object) runtime-id)
+                              (!= (.schema-id object) target-schema)))
+                    (cond (> (.borrows object) 0)
+                            (do (live-record-blocker! 3 (load i) (.schema-id object) (.address object))
+                                (set! failure -13) (break))
+                          (> (.ffi-retains object) 0)
+                            (do (live-record-blocker! 4 (load i) (.schema-id object) (.address object))
+                                (set! failure -14) (break))
+                          (not (.movable object))
+                            (do (live-record-blocker! 2 (load i) (.schema-id object) (.address object))
+                                (set! failure -12) (break))
+                          :else 0)
+                    0)
+                (set! i (+ (load i) 1)))))
+    (if (= (load failure) 0)
+        (for [j 0 (load (live-managed-object-count))]
+          (let [object (primitive/index (live-managed-objects) j)]
+            (if (and (.live object)
+                     (and (.movable object)
+                          (and (= (.runtime-id object) runtime-id)
+                               (!= (.schema-id object) target-schema))))
+                (set! (.migrating object) true) 0)))
+        0)
+    (live-managed-unlock!)
+    (set! i 0)
+    ; Stable handles are the managed live graph. They are distinct from named
+    ; source roots and include nested values that have no top-level binding.
+    (let [(mut handle) (load (live-handle-head))]
+      (loop (if (or (!= (load failure) 0)
+                    (= (primitive/cast i64 (load handle)) 0))
+                (break)
+                (do
+                  (if (and (.live (load handle))
+                           (and (= (.runtime-id (load handle)) runtime-id)
+                                (!= (.schema-id (load handle)) target-schema)))
+                      (cond (> (.borrows (load handle)) 0)
+                              (do
+                                (live-record-blocker! 3 (.id (load handle))
+                                  (.schema-id (load handle)) (.payload (load handle)))
+                                (set! failure -13))
+                            (> (.ffi-retains (load handle)) 0)
+                              (do
+                                (live-record-blocker! 4 (.id (load handle))
+                                  (.schema-id (load handle)) (.payload (load handle)))
+                                (set! failure -14))
+                            (> (.pins (load handle)) 0)
+                              (do
+                                (live-record-blocker! 2 (.id (load handle))
+                                  (.schema-id (load handle)) (.payload (load handle)))
+                                (set! failure -12))
+                            :else
+                              (let [rc (live-stage-handle! (load handle) target-schema)]
+                                (if (!= rc 0) (set! failure rc) 0)))
+                      0)
+                  (set! handle (.next (load handle)))))))
+    (set! i 0)
+    ; Alias validation precedes allocation and transition execution.
+    (loop (if (or (!= (load failure) 0) (>= (load i) (load (live-root-count))))
+              (break)
+              (let [root (primitive/index (live-roots) (load i))]
+                (if (and (.live root) (= (.runtime-id root) runtime-id))
+                    (if (> (.aliases root) 0)
+                        (do (live-record-blocker! 1 (load i) (.schema-id root) (load (.slot root)))
+                            (set! failure -8) (break))
+                        0)
+                    0)
+                (set! i (+ (load i) 1)))))
+    (set! i 0)
+    ; Movable allocator-owned graph vertices participate in the same forwarding
+    ; table and rollback transaction as roots.
+    (loop (if (or (!= (load failure) 0)
+                  (>= (load i) (load (live-managed-object-count))))
+              (break)
+              (let [object (primitive/index (live-managed-objects) (load i))]
+                (if (and (.live object)
+                         (and (.movable object)
+                              (and (= (.runtime-id object) runtime-id)
+                                   (!= (.schema-id object) target-schema))))
+                    (let [rc (live-stage-managed-object! (load i) target-schema)]
+                      (if (!= rc 0) (set! failure rc) 0))
+                    0)
+                (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (or (!= (load failure) 0) (>= (load i) (load (live-root-count))))
+              (break)
+              (let [root (primitive/index (live-roots) (load i))]
+                (if (and (.live root)
+                         (and (= (primitive/cast i64 (.handle root)) 0)
+                         (and (= (.runtime-id root) runtime-id)
+                              (!= (.schema-id root) target-schema))))
+                    (let [rc (live-stage-root! (load i) target-schema)]
+                      (if (!= rc 0) (set! failure rc) 0))
+                    0)
+                (set! i (+ (load i) 1)))))
+    (if (!= (load failure) 0)
+        (do
+          (live-abort-staged!)
+          (set! (live-last-status) (load failure))
+          (load failure))
+        0)))
+
+(defn live-stage-roots-locked! [(runtime-id i64) (target-schema i64)] (-> i64)
+  (live-begin-staging-locked!)
+  (live-stage-type-roots-locked! runtime-id target-schema))
+
+(defn live-forward-by-address [(old-value (ptr i8)) (target-runtime-id i64)] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
+    (loop (if (>= (load i) (load (live-forward-count)))
+              (break)
+              (let [forward (primitive/index (live-forwards) (load i))]
+                (if (and (= (primitive/cast i64 (.old-value forward))
+                            (primitive/cast i64 old-value))
+                         (= (.runtime-id forward) target-runtime-id))
+                    (do (set! found (load i)) (break))
+                    (set! i (+ (load i) 1))))))
+    (load found)))
+
+(defn live-root-address-known? [(address (ptr i8)) (target-runtime-id i64)] (-> bool)
+  (let [(mut i) 0 (mut found) false]
+    (loop (if (or (load found) (>= (load i) (load (live-root-count))))
+              (break)
+              (let [root (primitive/index (live-roots) (load i))]
+                (if (and (.live root)
+                         (and (= (.runtime-id root) target-runtime-id)
+                              (= (primitive/cast i64 (load (.slot root)))
+                                 (primitive/cast i64 address))))
+                    (set! found true)
+                    (set! i (+ (load i) 1))))))
+    (if (load found)
+        true
+        (do
+          (live-managed-lock!)
+          (let [object-index (live-managed-object-by-address address)
+                known (and (>= object-index 0)
+                           (= (.runtime-id
+                                (primitive/index (live-managed-objects) object-index))
+                              target-runtime-id))]
+            (live-managed-unlock!)
+            known)))))
+
+(defn live-resolve-forward! [(address (ptr i8)) (target-runtime-id i64)
+                             (length i64) (out (ptr (ptr i8)))] (-> i64)
+  (let [(mut i) 0 (mut result) -1]
+    (loop (if (or (!= (load result) -1)
+                  (>= (load i) (load (live-staged-managed-count))))
+              (break)
+              (let [staged (primitive/index (live-staged-managed) (load i))
+                    object (primitive/index (live-managed-objects) (.object-index staged))
+                    base (primitive/cast i64 (.old-value staged))
+                    at (primitive/cast i64 address)]
+                (if (and (= (.runtime-id object) target-runtime-id)
+                         (and (>= at base) (< at (+ base (.old-bytes staged)))))
+                    (let [old-size (live-schema-size (.old-schema staged))
+                          new-size (live-schema-size (.new-schema staged))
+                          delta (- at base)]
+                      (if (or (<= old-size 0)
+                              (or (!= (% delta old-size) 0)
+                                  (> (+ (/ delta old-size) length) (.count staged))))
+                          (set! result -11)
+                          (do
+                            (store! out (primitive/index (.new-value staged)
+                                          (* (/ delta old-size) new-size)))
+                            (set! result 0))))
+                    (set! i (+ (load i) 1))))))
+    (if (= (load result) -1)
+        (let [forward-id (live-forward-by-address address target-runtime-id)]
+          (if (>= forward-id 0)
+              (do (store! out (.new-value (primitive/index (live-forwards) forward-id))) 0)
+              -1))
+        (load result))))
+
+(defn live-rewrite-reference! [(base (ptr i8)) (rule (ptr LiveReferenceField))] (-> i64)
+  (let [place (primitive/cast (ptr (ptr i8)) (primitive/index base (.offset rule)))
+        old-target (load place)
+        length (if (= (.kind rule) 2)
+                   (load (primitive/cast (ptr i64)
+                           (primitive/index base (+ (.offset rule) 8))))
+                   1)
+        rewritten (primitive/alloc-stack (ptr i8))]
+    (if (= (primitive/cast i64 old-target) 0)
+        (if (= length 0) 0 -11)
+        (let [status (live-resolve-forward! old-target (.target-runtime-id rule)
+                                             length rewritten)]
+          (cond (= status 0) (do (store! place (load rewritten)) 0)
+                (= status -11)
+                  (do (live-record-blocker! 6 -1 (.schema-id rule) old-target) -11)
+                (live-root-address-known? old-target (.target-runtime-id rule)) 0
+                :else (do (live-record-blocker! 5 -1 (.schema-id rule) old-target) -10))))))
+
+; All roots have been staged before this pass. Rewriting through the complete
+; forwarding table preserves sharing and cycles without recursively descending
+; before a cycle's destination exists. A non-null unregistered pointer blocks
+; publication instead of leaving an old-layout address reachable from new code.
+(defn live-rewrite-staged-references! [] (-> i64)
+  (let [(mut failure) 0]
+    (for [i 0 (load (live-staged-count))]
+      (let [staged (primitive/index (live-staged) i)]
+        (if (.owner staged)
+            (for [j 0 (load (live-reference-field-count))]
+              (let [rule (primitive/index (live-reference-fields) j)]
+                (if (and (= (.schema-id rule) (.new-schema staged))
+                         (or (= (.kind rule) 1) (= (.kind rule) 2)))
+                    (let [status (live-rewrite-reference! (.new-value staged) rule)]
+                      (if (!= status 0) (set! failure status) 0))
+                    0)))
+            0)))
+    (for [i 0 (load (live-staged-managed-count))]
+      (let [staged (primitive/index (live-staged-managed) i)
+            element-size (live-schema-size (.new-schema staged))]
+        (for [element 0 (.count staged)]
+          (for [j 0 (load (live-reference-field-count))]
+            (let [rule (primitive/index (live-reference-fields) j)]
+              (if (and (= (.schema-id rule) (.new-schema staged))
+                       (or (= (.kind rule) 1) (= (.kind rule) 2)))
+                  (let [status (live-rewrite-reference!
+                                 (primitive/index (.new-value staged)
+                                   (* element element-size)) rule)]
+                    (if (!= status 0) (set! failure status) 0))
+                  0))))))
+    (for [i 0 (load (live-staged-handle-count))]
+      (let [staged (primitive/index (live-staged-handles) i)]
+        (if (.owner staged)
+            (for [j 0 (load (live-reference-field-count))]
+              (let [rule (primitive/index (live-reference-fields) j)]
+                (if (and (= (.schema-id rule) (.new-schema staged))
+                         (or (= (.kind rule) 1) (= (.kind rule) 2)))
+                    (let [status (live-rewrite-reference! (.new-value staged) rule)]
+                      (if (!= status 0) (set! failure status) 0))
+                    0)))
+            0)))
+    (load failure)))
+
+; After successful staging, publication and retirement are bounded and cannot
+; fail. The caller must still hold the writer gate.
+(defn live-publish-staged-locked! [] (-> i64)
+  (let [reference-status (live-rewrite-staged-references!)]
+  (if (!= reference-status 0)
+      (do (live-abort-staged!)
+          (set! (live-last-status) reference-status)
+          reference-status)
+  (do
+  (for [j 0 (load (live-staged-count))]
+    (let [staged (primitive/index (live-staged) j)
+          root (primitive/index (live-roots) (.root-index staged))]
+      (store! (.slot root) (.new-value staged))
+      (set! (.schema-id root) (.new-schema staged))
+      (let [handle (.handle root)]
+        (if (!= (primitive/cast i64 handle) 0)
+            (set! (.schema-id handle) (.new-schema staged)) 0))))
+  ; Handles publish independently of source roots. Every alias observes the
+  ; new payload because the stable header address never changes.
+  (for [j 0 (load (live-staged-handle-count))]
+    (let [staged (primitive/index (live-staged-handles) j)
+          handle (.handle staged)]
+      (set! (.payload handle) (.new-value staged))
+      (set! (.schema-id handle) (.new-schema staged))))
+  ; Publish every allocator-owned vertex before retiring any of its old storage.
+  ; References were already rewritten through the complete forwarding map.
+  (live-managed-lock!)
+  (for [j 0 (load (live-staged-managed-count))]
+    (let [staged (primitive/index (live-staged-managed) j)
+          object (primitive/index (live-managed-objects) (.object-index staged))]
+      (set! (.address object) (.new-value staged))
+      (set! (.schema-id object) (.new-schema staged))
+      (set! (.bytes object) (.new-bytes staged))
+      (set! (.migrating object) false)))
+  (live-managed-unlock!)
+  (for [j 0 (load (live-staged-count))]
+    (let [staged (primitive/index (live-staged) j)]
+      (if (.owner staged)
+          (do (primitive/call-ptr (.retire staged) (.old-value staged))
+              (free (.old-value staged)))
+          0)))
+  (for [j 0 (load (live-staged-handle-count))]
+    (let [staged (primitive/index (live-staged-handles) j)]
+      (if (.owner staged)
+          (do (primitive/call-ptr (.retire staged) (.old-value staged))
+              (free (.old-value staged)))
+          0)))
+  (for [j 0 (load (live-staged-managed-count))]
+    (let [staged (primitive/index (live-staged-managed) j)
+          old-element-size (live-schema-size (.old-schema staged))]
+      (for [element 0 (.count staged)]
+        (primitive/call-ptr (.retire staged)
+          (primitive/index (.old-value staged) (* element old-element-size))))
+      (primitive/call-ptr (.release staged) (.old-value staged)
+                          (.old-bytes staged) (.align staged))))
+  (set! (live-staged-count) 0)
+  (set! (live-staged-handle-count) 0)
+  (set! (live-staged-managed-count) 0)
+  (set! (live-forward-count) 0)
+  (live-affected-clear! (live-affected-head) (live-affected-count))
+  (store! (live-affected-head) (load (live-staged-affected-head)))
+  (store! (live-affected-count) (load (live-staged-affected-count)))
+  (store! (live-staged-affected-head) (primitive/cast (ptr LiveAffected) 0))
+  (store! (live-staged-affected-count) 0)
+  (set! (live-epoch-cell) (+ (load (live-epoch-cell)) 1))
+  0))))
+
+(defn live-cancel-staged-locked! [] (-> i64)
+  (live-abort-staged!))
+
+(defn live-migrate-roots! [(runtime-id i64) (target-schema i64)] (-> i64)
+  (live-begin-publication!)
+  (let [(mut status) (live-stage-roots-locked! runtime-id target-schema)]
+    (if (= (load status) 0)
+        (set! status (live-publish-staged-locked!)) 0)
+    (live-end-publication!)
+    (load status)))
+
+(defn live-register-transition-c [(runtime-id i64)
+                                   (from-schema i64)
+                                   (to-schema i64)
+                                   (apply (ptr i8))
+                                   (abort (ptr i8))
+                                   (retire (ptr i8))] (-> i64)
+  (live-register-transition
+    runtime-id from-schema to-schema
+    (primitive/llvm-ir (fnptr c [(ptr i8) (ptr i8)] i64) [apply] "ret ptr $0")
+    (primitive/llvm-ir (fnptr c [(ptr i8)] i64) [abort] "ret ptr $0")
+    (primitive/llvm-ir (fnptr c [(ptr i8)] i64) [retire] "ret ptr $0")))
+
+; Candidate generations declare these as externs. They must share this host
+; registry rather than importing a second copy of its alloc-static cells.
+(export-c [live-register-transition-c :as "coil_live_register_transition"]
+          [live-handle-new-c :as "coil_live_handle_new"]
+          [live-handle-payload-c :as "coil_live_handle_payload"]
+          [live-handle-borrow-payload-c :as "coil_live_handle_borrow_payload"]
+          [live-handle-release-borrow-c :as "coil_live_handle_release_borrow"]
+          [live-handle-ffi-retain-c :as "coil_live_handle_ffi_retain"]
+          [live-handle-ffi-release-c :as "coil_live_handle_ffi_release"]
+          [live-handle-pin-c :as "coil_live_handle_pin"]
+          [live-handle-unpin-c :as "coil_live_handle_unpin"]
+          [live-handle-retain-c :as "coil_live_handle_retain"]
+          [live-handle-release-c :as "coil_live_handle_release"]
+          [live-register-schema-destructor-c :as "coil_live_register_schema_destructor"]
+          [live-register-root-c :as "coil_live_register_root"]
+          [live-register-handle-root-c :as "coil_live_register_handle_root"]
+          [live-register-reference-field :as "coil_live_register_reference_field"]
+          [live-begin-staging-locked! :as "coil_live_begin_staging_locked"]
+          [live-stage-type-roots-locked! :as "coil_live_stage_type_roots_locked"]
+          [live-stage-roots-locked! :as "coil_live_stage_roots_locked"]
+          [live-publish-staged-locked! :as "coil_live_publish_staged_locked"]
+          [live-cancel-staged-locked! :as "coil_live_cancel_staged_locked"]
+          [live-stage-affected! :as "coil_live_stage_affected"]
+          [live-begin-affected-publication! :as "coil_live_begin_affected_publication"]
+          [live-end-affected-publication! :as "coil_live_end_affected_publication"]
+          [live-set-status! :as "coil_live_set_status"]
+          [live-condition-raise-c :as "coil_live_raise_condition"]
+          [live-condition-active? :as "coil_live_condition_active"]
+          [live-source-broken? :as "coil_live_source_broken"]
+          [live-mark-source-broken! :as "coil_live_mark_source_broken"]
+          [live-clear-broken-sources! :as "coil_live_clear_broken_sources"]
+          [live-enter-source! :as "coil_live_enter_source"]
+          [live-exit! :as "coil_live_exit"]
+          [live-reload-requested? :as "coil_live_reload_requested"])

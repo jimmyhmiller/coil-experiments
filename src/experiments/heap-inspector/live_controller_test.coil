@@ -1,0 +1,141 @@
+(module experiments.heap-inspector.live-controller-test)
+
+(import "coil.primitive" :as primitive)
+(import "coil.assert" :use *)
+(import "coil.atomic" :as atomic)
+(import "coil.thread" :as thread)
+(import "coil.jit" :as jit)
+(import "experiments.heap-inspector.controller" :as controller)
+(import "experiments.heap-inspector.live" :as live)
+(import "experiments.heap-inspector.native-demo-api" :as demo)
+
+(defn controller-observed [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defn controller-observe! [(value i64)] (-> i64)
+  (atomic/atomic-store (controller-observed) value)
+  0)
+
+(defn unbounded-tick-result [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn call-native-tick-without-boundary [(ctx (ptr i8))] (-> (ptr i8))
+  (primitive/cast i64 ctx)
+  (atomic/atomic-store (unbounded-tick-result)
+    (primitive/call-ptr (.tick (demo/native-demo-api))))
+  (primitive/cast (ptr i8) 0))
+
+(export-c [controller-observe! :as "coil_live_controller_test_observe"])
+
+(deftest controller-submits-only-native-s-expression-coil
+  (assert-eq 0 (controller/live-controller-init!))
+  (assert-eq 0 (controller/live-controller-enable-native-demo!))
+  (assert-eq 0
+    (controller/live-controller-edit-source!
+      "(extern coil_live_controller_test_observe :cc c [i64] (-> i64))
+       (defn live-value [] (-> i64) 10)
+       (defn healthy-value [] (-> i64) 91)
+       (defstruct Settings [(speed i64)])
+       (letonce settings (Settings :speed 7))
+       (defn settings-speed [] (-> i64) (.speed settings))
+       (defn demo_tick [] (-> i64)
+         (do (coil_live_controller_test_observe 777) (live-value)))
+       (defn demo_value [(index i64) (field i64)] (-> i64)
+         (+ index field))"))
+  (assert-eq 0
+    (controller/live-controller-edit-source!
+      "(defn live-value [] (-> i64) 27)"))
+  (store! (controller-observed) 0)
+  (assert-eq 0
+    (jit/jit-submit! (field (controller/live-controller) session)
+      "(coil_live_controller_test_observe (live-value))"))
+  (assert-eq 27 (atomic/atomic-load (controller-observed)))
+  ; This candidate passes parsing/checking/emission, then fails while the JIT
+  ; resolves the implementation's actual native relocation. No slot, Code
+  ; state, callback, root, or epoch from the candidate may publish.
+  (assert (!= 0
+    (controller/live-controller-edit-source!
+      "(extern coil_live_test_missing_symbol :cc c [] (-> i64))
+       (defn live-value [] (-> i64) (coil_live_test_missing_symbol))")))
+  (assert-eq 8 (controller/live-controller-phase))
+  (assert-eq 0
+    (jit/jit-submit! (field (controller/live-controller) session)
+      "(coil_live_controller_test_observe (live-value))"))
+  (assert-eq 27 (atomic/atomic-load (controller-observed)))
+  ; Pending source retains the rejected branch. Replacing the definition makes
+  ; its unresolved extern declaration unused; exact relocation ownership lets
+  ; the repaired candidate load and commit without source-text heuristics.
+  (assert-eq 0
+    (controller/live-controller-edit-source!
+      "(defn live-value [] (-> i64) 28)"))
+  (assert-eq 0
+    (jit/jit-submit! (field (controller/live-controller) session)
+      "(coil_live_controller_test_observe (live-value))"))
+  (assert-eq 28 (atomic/atomic-load (controller-observed)))
+  ; A rejected body publishes the typed Broken entry without pausing unrelated
+  ; code. Reaching that exact function raises the structured condition.
+  (assert-eq 1
+    (controller/live-controller-edit-source!
+      "(defn live-value [] (-> i64) true)"))
+  (assert-eq 15 (controller/live-controller-phase))
+  (assert (not (live/live-condition-active?)))
+  (assert-eq 2 (load (live/live-affected-count)))
+  (store! (controller-observed) 0)
+  (assert-eq 0
+    (jit/jit-submit! (field (controller/live-controller) session)
+      "(coil_live_controller_test_observe (healthy-value))"))
+  (assert-eq 91 (atomic/atomic-load (controller-observed)))
+  (assert (not (live/live-condition-active?)))
+  (let [frame (primitive/alloc-stack (array demo/NativeDemoParticle 18))]
+    (assert-eq -20
+      (demo/native-demo-read-frame!
+        (primitive/cast (ptr demo/NativeDemoParticle) frame))))
+  ; Broken propagated through the exact reverse call closure to demo_tick, so
+  ; its caller-local effect never ran before the restart boundary paused.
+  (assert-eq 91 (atomic/atomic-load (controller-observed)))
+  (assert (live/live-condition-active?))
+  (assert-eq 2 (live/live-condition-kind))
+  (let [raised-serial (live/live-condition-serial)]
+    ; Without an installed native restart boundary, the same permanent callback
+    ; parks at its source entry and releases its gate. Repair can therefore
+    ; publish; the parked call reacquires the gate and runs the repaired slot.
+    (atomic/atomic-store (unbounded-tick-result) -1)
+    (let [worker (primitive/alloc-stack thread/Thread)]
+      (assert-eq 0 (primitive/cast i64
+                     (thread/thread-spawn worker
+                       (primitive/fnptr-of call-native-tick-without-boundary)
+                       (primitive/cast (ptr i8) 0))))
+      (loop (if (> (live/live-condition-serial) raised-serial) (break) 0))
+      (assert-eq 91 (atomic/atomic-load (controller-observed)))
+    (assert-eq 0
+      (controller/live-controller-edit-source!
+        "(defn live-value [] (-> i64) 39)"))
+      ; Broken callers are parked by their persistent source-state bit. Only
+      ; the repaired implementation gate must drain for healthy publication.
+      (assert-eq 1 (load (live/live-affected-count)))
+      (assert (not (live/live-condition-active?)))
+      (thread/thread-join worker)
+      (assert-eq 39 (atomic/atomic-load (unbounded-tick-result))))
+    (assert (not (live/live-condition-active?)))
+    (assert-eq 0 (live/live-condition-kind))
+    (assert (> (live/live-condition-serial) raised-serial)))
+  (store! (controller-observed) 0)
+  (assert-eq 0
+    (jit/jit-submit! (field (controller/live-controller) session)
+      "(coil_live_controller_test_observe (live-value))"))
+  (assert-eq 39 (atomic/atomic-load (controller-observed)))
+  ; Missing schema data is classified structurally as NeedsTransition. The
+  ; pending source branch is repaired by a second small declaration.
+  (assert-eq 1
+    (controller/live-controller-edit-source!
+      "(defstruct Settings [(speed i64) (scale i64)])"))
+  (assert-eq 9 (controller/live-controller-phase))
+  (assert (live/live-condition-active?))
+  (assert-eq 1 (live/live-condition-kind))
+  (assert-eq 0
+    (controller/live-controller-edit-source!
+      "(defstruct Settings [(speed i64) (scale i64 2)])"))
+  (assert (not (live/live-condition-active?)))
+  (store! (controller-observed) 0)
+  (assert-eq 0
+    (jit/jit-submit! (field (controller/live-controller) session)
+      "(coil_live_controller_test_observe (settings-speed))"))
+  (assert-eq 7 (atomic/atomic-load (controller-observed))))

@@ -1,0 +1,686 @@
+(module experiments.heap-inspector.live-test)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.assert" :use *)
+(import "coil.atomic" :as atomic)
+(import "coil.slice" :use [slice-new slice-data slice-len])
+(import "coil.thread" :as thread)
+(import "experiments.heap-inspector.runtime" :as inspector)
+(import "experiments.heap-inspector.live" :use *)
+
+(extern calloc :cc c [u64 u64] (-> (ptr i8)))
+(extern free :cc c [(ptr i8)] (-> i64))
+
+(defn cooperative-live-loop [(ctx (ptr i8))] (-> (ptr i8))
+  (primitive/cast i64 ctx)
+  (live-enter!)
+  (loop (if (live-reload-requested?) (break) 0))
+  (live-exit!)
+  (primitive/cast (ptr i8) 0))
+
+(defn affected-nested-started [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn affected-nested-drained [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn affected-outer-release [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn affected-waiter-entered [] (-> (ptr i64)) (primitive/alloc-static i64))
+
+(defn affected-nested-worker [(ctx (ptr i8))] (-> (ptr i8))
+  (primitive/cast i64 ctx)
+  (live-enter-source! 2001)
+  (live-enter-source! 2002)
+  (atomic/atomic-store (affected-nested-started) 1)
+  (loop (if (live-reload-requested?) (break) 0))
+  (live-exit!)
+  (atomic/atomic-store (affected-nested-drained) 1)
+  (loop (if (!= (atomic/atomic-load (affected-outer-release)) 0) (break) 0))
+  (live-exit!)
+  (primitive/cast (ptr i8) 0))
+
+(defn affected-waiter-worker [(ctx (ptr i8))] (-> (ptr i8))
+  (primitive/cast i64 ctx)
+  (live-enter-source! 2002)
+  (atomic/atomic-store (affected-waiter-entered) 1)
+  (live-exit!)
+  (primitive/cast (ptr i8) 0))
+
+(deftest affected-gate-drains-only-affected-nested-frames
+  (atomic/atomic-store (affected-nested-started) 0)
+  (atomic/atomic-store (affected-nested-drained) 0)
+  (atomic/atomic-store (affected-outer-release) 0)
+  (atomic/atomic-store (affected-waiter-entered) 0)
+  (live-begin-staging-locked!)
+  (assert-eq 0 (live-stage-affected! 2002 1
+                 (primitive/cast (ptr u8) c"nested-callee") 13))
+  (let [nested (primitive/alloc-stack thread/Thread)
+        waiter (primitive/alloc-stack thread/Thread)]
+    (assert-eq 0 (primitive/cast i64
+                   (thread/thread-spawn nested
+                     (primitive/fnptr-of affected-nested-worker)
+                     (primitive/cast (ptr i8) 0))))
+    (loop (if (!= (atomic/atomic-load (affected-nested-started)) 0) (break) 0))
+    ; The affected callee sees its own closed gate at the loop poll and exits.
+    ; Its unrelated outer source frame stays active throughout publication.
+    (assert-eq 0 (live-begin-affected-publication!))
+    (loop (if (!= (atomic/atomic-load (affected-nested-drained)) 0) (break) 0))
+    (assert-eq 1 (atomic/atomic-load (affected-nested-drained)))
+    (assert-eq 1 (atomic/atomic-load (live-reader-count)))
+    (assert-eq 0 (primitive/cast i64
+                   (thread/thread-spawn waiter
+                     (primitive/fnptr-of affected-waiter-worker)
+                     (primitive/cast (ptr i8) 0))))
+    ; A new call to the exact affected source cannot enter the publication.
+    (for [i 0 100000] (primitive/cast i64 i))
+    (assert-eq 0 (atomic/atomic-load (affected-waiter-entered)))
+    (live-end-affected-publication!)
+    (thread/thread-join waiter)
+    (assert-eq 1 (atomic/atomic-load (affected-waiter-entered)))
+    (atomic/atomic-store (affected-outer-release) 1)
+    (thread/thread-join nested)
+    (assert-eq 0 (atomic/atomic-load (live-reader-count)))))
+
+(deftest cooperative-loop-poll-drains-old-native-frame
+  (let [worker (primitive/alloc-stack thread/Thread)]
+    (assert-eq 0 (primitive/cast i64
+                   (thread/thread-spawn worker
+                     (primitive/fnptr-of cooperative-live-loop)
+                     (primitive/cast (ptr i8) 0))))
+    (loop (if (> (atomic/atomic-load (live-reader-count)) 0) (break) 0))
+    ; Closing the writer gate makes the loop return through its wrapper. The
+    ; publisher cannot pass this call until the old native frame has exited.
+    (live-begin-publication!)
+    (assert-eq 0 (atomic/atomic-load (live-reader-count)))
+    (live-end-publication!)
+    (thread/thread-join worker)))
+
+(defstruct StateV1 [(count i64)])
+(defstruct StateV2 [(count i64) (step i64)])
+(defstruct StateV3 [(count i64) (step i64) (bias i64)])
+(defstruct NodeV1 [(value i64) (next (ptr NodeV1))])
+(defstruct NodeV2 [(value i64) (tag i64) (next (ptr NodeV2))])
+(defstruct RefV1 [(value (ptr StateV1))])
+(defstruct RefV2 [(value (ptr StateV3))])
+(defstruct SliceRefV1 [(values (slice StateV1))])
+(defstruct SliceRefV2 [(values (slice StateV2))])
+(defstruct CallbackHolder [(callback (fnptr c [i64] i64))])
+
+(defn show-value [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0)
+(defn json-value [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0)
+(defn no-fields [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0)
+(defn managed-allocate [(bytes i64) (align i64)] (-> (ptr i8))
+  (primitive/cast i64 align)
+  (calloc 1 (primitive/cast u64 bytes)))
+
+(defn failing-managed-allocate [(bytes i64) (align i64)] (-> (ptr i8))
+  (+ bytes align)
+  (primitive/cast (ptr i8) 0))
+(defn managed-release [(p (ptr i8)) (bytes i64) (align i64)] (-> i64)
+  (+ bytes align)
+  (free p))
+(defn retire-v1-count [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn retire-v2-count [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn retire-v1 [(p (ptr i8))] (-> i64)
+  (primitive/cast i64 p)
+  (set! (retire-v1-count) (+ (load (retire-v1-count)) 1)) 0)
+(defn retire-v2 [(p (ptr i8))] (-> i64)
+  (primitive/cast i64 p)
+  (set! (retire-v2-count) (+ (load (retire-v2-count)) 1)) 0)
+(defn callback-value [(value i64)] (-> i64) (+ value 1))
+
+(defn v1-to-v2 [(old (ptr i8)) (new (ptr i8))] (-> i64)
+  (let [a (primitive/cast (ptr StateV1) old)
+        b (primitive/cast (ptr StateV2) new)]
+    (set! (.count b) (.count a))
+    (set! (.step b) 2)
+    0))
+
+(defn v2-to-v3 [(old (ptr i8)) (new (ptr i8))] (-> i64)
+  (let [a (primitive/cast (ptr StateV2) old)
+        b (primitive/cast (ptr StateV3) new)]
+    (set! (.count b) (+ (.count a) 10))
+    (set! (.step b) (.step a))
+    (set! (.bias b) 7)
+    0))
+
+(deftest stable-handle-preserves-identity-while-payload-version-changes
+  (let [runtime-id 889901
+        schema-v1 (inspector/register-type "HandleState" runtime-id 7001
+                    (primitive/sizeof StateV1) (primitive/alignof StateV1) 1
+                    (primitive/fnptr-of show-value) (primitive/fnptr-of json-value))
+        schema-v2 (inspector/register-type "HandleState" runtime-id 7002
+                    (primitive/sizeof StateV2) (primitive/alignof StateV2) 2
+                    (primitive/fnptr-of show-value) (primitive/fnptr-of json-value))
+        payload (calloc 1 (primitive/cast u64 (primitive/sizeof StateV1)))]
+    (set! (.count (primitive/cast (ptr StateV1) payload)) 41)
+    (let [handle (live-handle-new! runtime-id schema-v1 payload)
+          identity (primitive/cast i64 handle)]
+      (assert (!= identity 0))
+      (assert-eq payload (live-handle-payload handle runtime-id schema-v1))
+      (assert (>= (live-register-transition runtime-id schema-v1 schema-v2
+                    (primitive/fnptr-of v1-to-v2)
+                    (primitive/fnptr-of no-fields)
+                    (primitive/fnptr-of no-fields)) 0))
+      (live-begin-publication!)
+      (assert-eq 0 (live-stage-type-roots-locked! runtime-id schema-v2))
+      (assert-eq 0 (live-publish-staged-locked!))
+      (live-end-publication!)
+      (assert-eq identity (primitive/cast i64 handle))
+      (assert-eq schema-v2 (.schema-id handle))
+      (let [next (primitive/cast (ptr StateV2)
+                   (live-handle-payload handle runtime-id schema-v2))]
+        (assert (!= (primitive/cast i64 next) 0))
+        (assert-eq 41 (.count next))
+        (assert-eq 2 (.step next)))
+      (assert-eq 1 (load (live-handle-count)))
+      (assert-eq 0 (live-handle-release! handle))
+      (assert-eq 0 (load (live-handle-count)))
+      (let [replacement-payload
+              (calloc 1 (primitive/cast u64 (primitive/sizeof StateV1)))
+            replacement
+              (live-handle-new! runtime-id schema-v1 replacement-payload)]
+        (assert (!= (primitive/cast i64 replacement) 0))
+        ; Managed handles are graph vertices, not persistent source roots.
+        (assert-eq 0 (load (live-root-count)))
+        (assert-eq 0 (live-handle-release! replacement))))))
+
+(deftest handle-borrow-ffi-retain-and-pin-block-relocation
+  (let [runtime-id 889902
+        schema-v1 (inspector/register-type "HandleBlockState" runtime-id 7101
+                    (primitive/sizeof StateV1) (primitive/alignof StateV1) 1
+                    (primitive/fnptr-of show-value) (primitive/fnptr-of json-value))
+        schema-v2 (inspector/register-type "HandleBlockState" runtime-id 7102
+                    (primitive/sizeof StateV2) (primitive/alignof StateV2) 2
+                    (primitive/fnptr-of show-value) (primitive/fnptr-of json-value))
+        payload (calloc 1 (primitive/cast u64 (primitive/sizeof StateV1)))]
+    (set! (.count (primitive/cast (ptr StateV1) payload)) 9)
+    (let [handle (live-handle-new! runtime-id schema-v1 payload)]
+      (assert (>= (live-register-transition runtime-id schema-v1 schema-v2
+                    (primitive/fnptr-of v1-to-v2)
+                    (primitive/fnptr-of no-fields)
+                    (primitive/fnptr-of no-fields)) 0))
+      (assert-eq payload
+        (live-handle-borrow-payload! handle runtime-id schema-v1))
+      (live-begin-publication!)
+      (assert-eq -13 (live-stage-roots-locked! runtime-id schema-v2))
+      (live-end-publication!)
+      (assert-eq 0 (live-handle-release-borrow! handle))
+      (assert-eq 1 (live-handle-ffi-retain! handle))
+      (live-begin-publication!)
+      (assert-eq -14 (live-stage-roots-locked! runtime-id schema-v2))
+      (live-end-publication!)
+      (assert-eq 1 (live-handle-ffi-release! handle))
+      (assert-eq 1 (live-handle-pin! handle))
+      (live-begin-publication!)
+      (assert-eq -12 (live-stage-roots-locked! runtime-id schema-v2))
+      (live-end-publication!)
+      (assert-eq 1 (live-handle-unpin! handle))
+      (live-begin-publication!)
+      (assert-eq 0 (live-stage-roots-locked! runtime-id schema-v2))
+      (assert-eq 0 (live-publish-staged-locked!))
+      (live-end-publication!)
+      (assert-eq schema-v2 (.schema-id handle))
+      (assert-eq 0 (live-handle-release! handle)))))
+
+(defn v3-to-v1-revert [(old (ptr i8)) (new (ptr i8))] (-> i64)
+  (set! (.count (primitive/cast (ptr StateV1) new))
+        (.count (primitive/cast (ptr StateV3) old)))
+  0)
+
+(defn always-fails [(old (ptr i8)) (new (ptr i8))] (-> i64)
+  (primitive/cast i64 old)
+  (primitive/cast i64 new)
+  1)
+
+(defn node-v1-to-v2 [(old (ptr i8)) (new (ptr i8))] (-> i64)
+  (let [a (primitive/cast (ptr NodeV1) old)
+        b (primitive/cast (ptr NodeV2) new)]
+    (set! (.value b) (.value a))
+    (set! (.tag b) 99)
+    ; The graph forwarding pass rewrites this old address after every node has
+    ; a destination, which is what makes cycles and sharing terminate.
+    (set! (.next b) (primitive/cast (ptr NodeV2) (.next a)))
+    0))
+
+(defn ref-v1-to-v2 [(old (ptr i8)) (new (ptr i8))] (-> i64)
+  (set! (.value (primitive/cast (ptr RefV2) new))
+        (primitive/cast (ptr StateV3) (.value (primitive/cast (ptr RefV1) old))))
+  0)
+
+(defn slice-ref-v1-to-v2 [(old (ptr i8)) (new (ptr i8))] (-> i64)
+  (let [source (.values (primitive/cast (ptr SliceRefV1) old))]
+    (set! (.values (primitive/cast (ptr SliceRefV2) new))
+          (slice-new (primitive/cast (ptr StateV2) (slice-data source))
+                     (slice-len source)))
+    0))
+
+(defn register-state-schemas [(runtime-id i64)] (-> (array i64 3))
+  (let [out (primitive/alloc-stack (array i64 3))]
+    (set! (primitive/index out 0)
+          (inspector/register-type "State" runtime-id 1001
+                                   (primitive/sizeof StateV1) (primitive/alignof StateV1) 1
+                                   (primitive/fnptr-of show-value) (primitive/fnptr-of json-value)))
+    (set! (primitive/index out 1)
+          (inspector/register-type "State" runtime-id 1002
+                                   (primitive/sizeof StateV2) (primitive/alignof StateV2) 2
+                                   (primitive/fnptr-of show-value) (primitive/fnptr-of json-value)))
+    (set! (primitive/index out 2)
+          (inspector/register-type "State" runtime-id 1003
+                                   (primitive/sizeof StateV3) (primitive/alignof StateV3) 3
+                                   (primitive/fnptr-of show-value) (primitive/fnptr-of json-value)))
+    (load out)))
+
+(defn new-v1 [(count i64)] (-> (ptr i8))
+  (let [p (calloc 1 (primitive/cast u64 (primitive/sizeof StateV1)))
+        s (primitive/cast (ptr StateV1) p)]
+    (set! (.count s) count)
+    p))
+
+(deftest native-transition-chain-commits-all-roots
+  (let [runtime-id 88001
+        schemas (register-state-schemas runtime-id)
+        slot-a (primitive/alloc-stack (ptr i8))
+        slot-b (primitive/alloc-stack (ptr i8))]
+    (store! slot-a (new-v1 3))
+    (store! slot-b (new-v1 9))
+    (assert (> (live-register-root "a" runtime-id (load (primitive/index schemas 0)) slot-a) 0))
+    (assert (> (live-register-root "b" runtime-id (load (primitive/index schemas 0)) slot-b) 0))
+    (assert (>= (live-register-transition runtime-id
+                                           (load (primitive/index schemas 0))
+                                           (load (primitive/index schemas 1))
+                                           (primitive/fnptr-of v1-to-v2)
+                                           (primitive/fnptr-of no-fields)
+                                           (primitive/fnptr-of no-fields)) 0))
+    (assert (>= (live-register-transition runtime-id
+                                           (load (primitive/index schemas 1))
+                                           (load (primitive/index schemas 2))
+                                           (primitive/fnptr-of v2-to-v3)
+                                           (primitive/fnptr-of no-fields)
+                                           (primitive/fnptr-of no-fields)) 0))
+    (let [before (live-epoch)]
+      (assert-eq 0 (live-migrate-roots! runtime-id (load (primitive/index schemas 2))))
+      (assert-eq (+ before 1) (live-epoch)))
+    (let [a (primitive/cast (ptr StateV3) (load slot-a))
+          b (primitive/cast (ptr StateV3) (load slot-b))]
+      (assert-eq 13 (.count a))
+      (assert-eq 19 (.count b))
+      (assert-eq 2 (.step a))
+      (assert-eq 7 (.bias b)))
+    ; Returning to an earlier physical layout is still a new forward schema
+    ; version and an explicit v3 -> v4 edge, never a jump back to schema v1.
+    (let [reverted (inspector/register-type "State" runtime-id 1001
+                     (primitive/sizeof StateV1) (primitive/alignof StateV1) 1
+                     (primitive/fnptr-of show-value) (primitive/fnptr-of json-value))]
+      (assert (> reverted (load (primitive/index schemas 2))))
+      (assert (>= (live-register-transition runtime-id
+                    (load (primitive/index schemas 2)) reverted
+                    (primitive/fnptr-of v3-to-v1-revert)
+                    (primitive/fnptr-of no-fields)
+                    (primitive/fnptr-of no-fields)) 0))
+      (assert-eq 0 (live-migrate-roots! runtime-id reverted))
+      (assert-eq 13 (.count (primitive/cast (ptr StateV1) (load slot-a))))
+      (assert-eq 19 (.count (primitive/cast (ptr StateV1) (load slot-b)))))
+    (free (load slot-a))
+    (free (load slot-b))))
+
+(deftest failure-and-alias-block-roll-back-entire-batch
+  (let [runtime-id 88002
+        schemas (register-state-schemas runtime-id)
+        slot-a (primitive/alloc-stack (ptr i8))
+        slot-b (primitive/alloc-stack (ptr i8))]
+    (store! slot-a (new-v1 4))
+    (store! slot-b (new-v1 8))
+    (let [root-a (live-register-root "rollback-a" runtime-id (load (primitive/index schemas 0)) slot-a)
+          root-b (live-register-root "rollback-b" runtime-id (load (primitive/index schemas 0)) slot-b)
+          original-a (load slot-a)
+          original-b (load slot-b)]
+      (assert (> root-a 0))
+      (assert (> root-b 0))
+      (assert (>= (live-register-transition runtime-id
+                                             (load (primitive/index schemas 0))
+                                             (load (primitive/index schemas 1))
+                                             (primitive/fnptr-of always-fails)
+                                             (primitive/fnptr-of no-fields)
+                                             (primitive/fnptr-of no-fields)) 0))
+      (assert-eq -7 (live-migrate-roots! runtime-id (load (primitive/index schemas 1))))
+      (assert-eq (primitive/cast i64 original-a) (primitive/cast i64 (load slot-a)))
+      (assert-eq (primitive/cast i64 original-b) (primitive/cast i64 (load slot-b)))
+      (live-root-retain! root-a)
+      (assert-eq -8 (live-migrate-roots! runtime-id (load (primitive/index schemas 1))))
+      (assert-eq 0 (live-root-release! root-a)))
+    (free (load slot-a))
+    (free (load slot-b))))
+
+(deftest shared-root-object-is-forwarded-once
+  (let [runtime-id 88003
+        schemas (register-state-schemas runtime-id)
+        shared (new-v1 12)
+        slot-a (primitive/alloc-stack (ptr i8))
+        slot-b (primitive/alloc-stack (ptr i8))]
+    (store! slot-a shared)
+    (store! slot-b shared)
+    (assert (> (live-register-root "shared-a" runtime-id
+                                   (load (primitive/index schemas 0)) slot-a) 0))
+    (assert (> (live-register-root "shared-b" runtime-id
+                                   (load (primitive/index schemas 0)) slot-b) 0))
+    (assert (>= (live-register-transition runtime-id
+                                           (load (primitive/index schemas 0))
+                                           (load (primitive/index schemas 1))
+                                           (primitive/fnptr-of v1-to-v2)
+                                           (primitive/fnptr-of no-fields)
+                                           (primitive/fnptr-of no-fields)) 0))
+    (assert-eq 0 (live-migrate-roots! runtime-id (load (primitive/index schemas 1))))
+    (assert-eq (primitive/cast i64 (load slot-a))
+               (primitive/cast i64 (load slot-b)))
+    (let [next (primitive/cast (ptr StateV2) (load slot-a))]
+      (assert-eq 12 (.count next))
+      (assert-eq 2 (.step next)))
+    ; The publication coordinator retired the shared old allocation once; the
+    ; two slots now share one staged allocation, which is likewise freed once.
+    (free (load slot-a))))
+
+(deftest cyclic-root-graph-rewrites-through-complete-forwarding-map
+  (let [runtime-id 88004
+        old-schema (inspector/register-type "Node" runtime-id 2001
+                                            (primitive/sizeof NodeV1)
+                                            (primitive/alignof NodeV1) 2
+                                            (primitive/fnptr-of show-value)
+                                            (primitive/fnptr-of json-value))
+        new-schema (inspector/register-type "Node" runtime-id 2002
+                                            (primitive/sizeof NodeV2)
+                                            (primitive/alignof NodeV2) 3
+                                            (primitive/fnptr-of show-value)
+                                            (primitive/fnptr-of json-value))
+        raw-a (calloc 1 (primitive/cast u64 (primitive/sizeof NodeV1)))
+        raw-b (calloc 1 (primitive/cast u64 (primitive/sizeof NodeV1)))
+        a (primitive/cast (ptr NodeV1) raw-a)
+        b (primitive/cast (ptr NodeV1) raw-b)
+        slot-a (primitive/alloc-stack (ptr i8))
+        slot-b (primitive/alloc-stack (ptr i8))]
+    (set! (.value a) 1) (set! (.value b) 2)
+    (set! (.next a) b) (set! (.next b) a)
+    (store! slot-a raw-a) (store! slot-b raw-b)
+    (assert (> (live-register-root "cycle-a" runtime-id old-schema slot-a) 0))
+    (assert (> (live-register-root "cycle-b" runtime-id old-schema slot-b) 0))
+    (assert (>= (live-register-reference-field new-schema
+                                                (primitive/offsetof NodeV2 next)
+                                                runtime-id 1) 0))
+    (assert (>= (live-register-transition runtime-id old-schema new-schema
+                                           (primitive/fnptr-of node-v1-to-v2)
+                                           (primitive/fnptr-of no-fields)
+                                           (primitive/fnptr-of no-fields)) 0))
+    (assert-eq 0 (live-migrate-roots! runtime-id new-schema))
+    (let [next-a (primitive/cast (ptr NodeV2) (load slot-a))
+          next-b (primitive/cast (ptr NodeV2) (load slot-b))]
+      (assert-eq (primitive/cast i64 next-b) (primitive/cast i64 (.next next-a)))
+      (assert-eq (primitive/cast i64 next-a) (primitive/cast i64 (.next next-b)))
+      (assert-eq 99 (.tag next-a))
+      (free next-a)
+      (free next-b))))
+
+(deftest unregistered-pointer-blocks-graph-publication
+  (let [runtime-id 88005
+        old-schema (inspector/register-type "UnsafeNode" runtime-id 3001
+                                            (primitive/sizeof NodeV1)
+                                            (primitive/alignof NodeV1) 2
+                                            (primitive/fnptr-of show-value)
+                                            (primitive/fnptr-of json-value))
+        new-schema (inspector/register-type "UnsafeNode" runtime-id 3002
+                                            (primitive/sizeof NodeV2)
+                                            (primitive/alignof NodeV2) 3
+                                            (primitive/fnptr-of show-value)
+                                            (primitive/fnptr-of json-value))
+        raw (calloc 1 (primitive/cast u64 (primitive/sizeof NodeV1)))
+        unregistered (calloc 1 (primitive/cast u64 (primitive/sizeof NodeV1)))
+        value (primitive/cast (ptr NodeV1) raw)
+        slot (primitive/alloc-stack (ptr i8))]
+    (set! (.next value) (primitive/cast (ptr NodeV1) unregistered))
+    (store! slot raw)
+    (assert (> (live-register-root "unsafe-pointer" runtime-id old-schema slot) 0))
+    (assert (>= (live-register-reference-field new-schema
+                                                (primitive/offsetof NodeV2 next)
+                                                runtime-id 1) 0))
+    (assert (>= (live-register-transition runtime-id old-schema new-schema
+                                           (primitive/fnptr-of node-v1-to-v2)
+                                           (primitive/fnptr-of no-fields)
+                                           (primitive/fnptr-of no-fields)) 0))
+    (assert-eq -10 (live-migrate-roots! runtime-id new-schema))
+    (assert-eq (primitive/cast i64 raw) (primitive/cast i64 (load slot)))
+    (free raw)
+    (free unregistered)))
+
+(deftest managed-object-ownership-borrow-and-ffi-retention-block-migration
+  (let [runtime-id 88006
+        schemas (register-state-schemas runtime-id)
+        old-schema (load (primitive/index schemas 0))
+        new-schema (load (primitive/index schemas 1))
+        raw (new-v1 42)]
+    (assert (>= (live-track-inspector-object! raw runtime-id old-schema
+                                               (primitive/sizeof StateV1)
+                                               (primitive/alignof StateV1) 1) 0))
+    ; Inspector discovery does not imply permission to move allocator-owned
+    ; storage. The default policy is therefore a precise ownership block.
+    (assert-eq -12 (live-migrate-roots! runtime-id new-schema))
+    ; Active language borrows and escaped FFI references take precedence and
+    ; retain distinct diagnostics while they are live.
+    (assert-eq 1 (live-managed-retain-borrow! raw))
+    (assert-eq -13 (live-migrate-roots! runtime-id new-schema))
+    (assert-eq 0 (live-managed-release-borrow! raw))
+    (assert-eq 1 (live-managed-retain-ffi! raw))
+    (assert-eq -14 (live-migrate-roots! runtime-id new-schema))
+    (assert-eq 0 (live-managed-release-ffi! raw))
+    (assert-eq 0 (live-untrack-inspector-object! raw))
+    ; Once ownership tracking ends, this object is outside the live graph and
+    ; no longer blocks an otherwise empty type migration.
+    (assert-eq 0 (live-migrate-roots! runtime-id new-schema))
+    (free raw)))
+
+(deftest allocator-failure-rolls-back-managed-object-transaction
+  (let [runtime-id 88012
+        schemas (register-state-schemas runtime-id)
+        old-schema (load (primitive/index schemas 0))
+        new-schema (load (primitive/index schemas 1))
+        raw (new-v1 73)
+        object-index (live-track-inspector-object! raw runtime-id old-schema
+                       (primitive/sizeof StateV1) (primitive/alignof StateV1) 1)]
+    (assert (>= object-index 0))
+    (assert (>= (live-register-transition runtime-id old-schema new-schema
+                  (primitive/fnptr-of v1-to-v2)
+                  (primitive/fnptr-of no-fields)
+                  (primitive/fnptr-of no-fields)) 0))
+    (assert (>= (live-authorize-managed-object! raw
+                  (primitive/fnptr-of failing-managed-allocate)
+                  (primitive/fnptr-of managed-release)) 0))
+    (assert-eq -6 (live-migrate-roots! runtime-id new-schema))
+    (let [object (primitive/index (live-managed-objects) object-index)]
+      (assert-eq (primitive/cast i64 raw) (primitive/cast i64 (.address object)))
+      (assert-eq old-schema (.schema-id object))
+      (assert-eq 73 (.count (primitive/cast (ptr StateV1) raw)))
+      (assert (not (.migrating object))))
+    (assert-eq 0 (live-untrack-inspector-object! raw))
+    (free raw)))
+
+(deftest allocator-authorized-array-migrates-transactionally-across-multiple-edges
+  (let [runtime-id 88007
+        schemas (register-state-schemas runtime-id)
+        old-schema (load (primitive/index schemas 0))
+        middle-schema (load (primitive/index schemas 1))
+        new-schema (load (primitive/index schemas 2))
+        bytes (* 2 (primitive/sizeof StateV1))
+        raw (calloc 1 (primitive/cast u64 bytes))
+        values (primitive/cast (ptr StateV1) raw)]
+    (set! (.count (primitive/index values 0)) 5)
+    (set! (.count (primitive/index values 1)) 9)
+    (set! (retire-v1-count) 0)
+    (set! (retire-v2-count) 0)
+    (let [object-index (live-track-inspector-object! raw runtime-id old-schema bytes
+                                                     (primitive/alignof StateV1) 2)]
+      (assert (>= object-index 0))
+      (assert (>= (live-authorize-managed-object! raw
+                    (primitive/fnptr-of managed-allocate)
+                    (primitive/fnptr-of managed-release)) 0))
+      (assert (>= (live-register-transition runtime-id old-schema middle-schema
+                    (primitive/fnptr-of v1-to-v2)
+                    (primitive/fnptr-of no-fields)
+                    (primitive/fnptr-of retire-v1)) 0))
+      (assert (>= (live-register-transition runtime-id middle-schema new-schema
+                    (primitive/fnptr-of v2-to-v3)
+                    (primitive/fnptr-of no-fields)
+                    (primitive/fnptr-of retire-v2)) 0))
+      (live-begin-publication!)
+      (live-begin-staging-locked!)
+      (assert-eq 0 (live-stage-type-roots-locked! runtime-id new-schema))
+      (assert-eq -2 (live-managed-retain-borrow! raw))
+      (assert-eq -2 (live-managed-retain-ffi! raw))
+      (assert-eq -2 (live-untrack-inspector-object! raw))
+      (assert-eq 0 (live-publish-staged-locked!))
+      (live-end-publication!)
+      (let [object (primitive/index (live-managed-objects) object-index)
+            next (primitive/cast (ptr StateV3) (.address object))]
+        (assert (!= (primitive/cast i64 raw) (primitive/cast i64 (.address object))))
+        (assert-eq new-schema (.schema-id object))
+        (assert-eq (* 2 (primitive/sizeof StateV3)) (.bytes object))
+        (assert-eq 15 (.count (primitive/index next 0)))
+        (assert-eq 19 (.count (primitive/index next 1)))
+        (assert-eq 2 (.step (primitive/index next 0)))
+        (assert-eq 7 (.bias (primitive/index next 1)))
+        ; The intermediate V2 values are retired by the V2->V3 edge. The
+        ; accepted V1 allocation is retired by the first edge exactly once per
+        ; array element.
+        (assert-eq 2 (load (retire-v1-count)))
+        (assert-eq 2 (load (retire-v2-count)))
+        (live-untrack-inspector-object! (.address object))
+        (free (.address object))))))
+
+(deftest element-pointer-is-forwarded-by-index-across-element-layout-change
+  (let [value-runtime 88008
+        ref-runtime 88009
+        value-schemas (register-state-schemas value-runtime)
+        old-value-schema (load (primitive/index value-schemas 0))
+        new-value-schema (load (primitive/index value-schemas 1))
+        old-ref-schema (inspector/register-type "Ref" ref-runtime 4001
+                         (primitive/sizeof RefV1) (primitive/alignof RefV1) 1
+                         (primitive/fnptr-of show-value) (primitive/fnptr-of json-value))
+        new-ref-schema (inspector/register-type "Ref" ref-runtime 4002
+                         (primitive/sizeof RefV2) (primitive/alignof RefV2) 1
+                         (primitive/fnptr-of show-value) (primitive/fnptr-of json-value))
+        array-raw (calloc 2 (primitive/cast u64 (primitive/sizeof StateV1)))
+        values (primitive/cast (ptr StateV1) array-raw)
+        ref-raw (calloc 1 (primitive/cast u64 (primitive/sizeof RefV1)))
+        ref (primitive/cast (ptr RefV1) ref-raw)
+        slot (primitive/alloc-stack (ptr i8))]
+    (set! (.count (primitive/index values 0)) 3)
+    (set! (.count (primitive/index values 1)) 8)
+    (set! (.value ref) (primitive/index values 1))
+    (store! slot ref-raw)
+    (let [object-index (live-track-inspector-object! array-raw value-runtime old-value-schema
+                          (* 2 (primitive/sizeof StateV1)) (primitive/alignof StateV1) 2)]
+      (live-authorize-managed-object! array-raw (primitive/fnptr-of managed-allocate)
+                                      (primitive/fnptr-of managed-release))
+      (live-register-root "element-ref" ref-runtime old-ref-schema slot)
+      (live-register-transition value-runtime old-value-schema new-value-schema
+        (primitive/fnptr-of v1-to-v2) (primitive/fnptr-of no-fields)
+        (primitive/fnptr-of no-fields))
+      (live-register-transition ref-runtime old-ref-schema new-ref-schema
+        (primitive/fnptr-of ref-v1-to-v2) (primitive/fnptr-of no-fields)
+        (primitive/fnptr-of no-fields))
+      (live-register-reference-field new-ref-schema (primitive/offsetof RefV2 value)
+                                     value-runtime 1)
+      (live-begin-publication!)
+      (live-begin-staging-locked!)
+      (assert-eq 0 (live-stage-type-roots-locked! value-runtime new-value-schema))
+      (assert-eq 0 (live-stage-type-roots-locked! ref-runtime new-ref-schema))
+      (assert-eq 0 (live-publish-staged-locked!))
+      (live-end-publication!)
+      (let [object (primitive/index (live-managed-objects) object-index)
+            next-ref (primitive/cast (ptr RefV2) (load slot))
+            next-values (primitive/cast (ptr StateV2) (.address object))]
+        (assert-eq (primitive/cast i64 (primitive/index next-values 1))
+                   (primitive/cast i64 (.value next-ref)))
+        (assert-eq 8 (.count (load (field next-ref value))))
+        (assert-eq 2 (.step (load (field next-ref value))))
+        (live-untrack-inspector-object! (.address object))
+        (free (.address object))
+        (free next-ref)))))
+
+(deftest slice-reference-preserves-index-and-bounds-during-layout-change
+  (let [value-runtime 88010
+        ref-runtime 88011
+        value-schemas (register-state-schemas value-runtime)
+        old-value-schema (load (primitive/index value-schemas 0))
+        new-value-schema (load (primitive/index value-schemas 1))
+        old-ref-schema (inspector/register-type "SliceRef" ref-runtime 5001
+                         (primitive/sizeof SliceRefV1) (primitive/alignof SliceRefV1) 1
+                         (primitive/fnptr-of show-value) (primitive/fnptr-of json-value))
+        new-ref-schema (inspector/register-type "SliceRef" ref-runtime 5002
+                         (primitive/sizeof SliceRefV2) (primitive/alignof SliceRefV2) 1
+                         (primitive/fnptr-of show-value) (primitive/fnptr-of json-value))
+        array-raw (calloc 2 (primitive/cast u64 (primitive/sizeof StateV1)))
+        values (primitive/cast (ptr StateV1) array-raw)
+        ref-raw (calloc 1 (primitive/cast u64 (primitive/sizeof SliceRefV1)))
+        ref (primitive/cast (ptr SliceRefV1) ref-raw)
+        slot (primitive/alloc-stack (ptr i8))]
+    (set! (.count (primitive/index values 0)) 4)
+    (set! (.count (primitive/index values 1)) 12)
+    ; Length two from the last element is intentionally out of bounds.
+    (set! (.values ref) (slice-new (primitive/index values 1) 2))
+    (store! slot ref-raw)
+    (let [object-index (live-track-inspector-object! array-raw value-runtime old-value-schema
+                          (* 2 (primitive/sizeof StateV1)) (primitive/alignof StateV1) 2)]
+      (live-authorize-managed-object! array-raw (primitive/fnptr-of managed-allocate)
+                                      (primitive/fnptr-of managed-release))
+      (live-register-root "slice-ref" ref-runtime old-ref-schema slot)
+      (live-register-transition value-runtime old-value-schema new-value-schema
+        (primitive/fnptr-of v1-to-v2) (primitive/fnptr-of no-fields)
+        (primitive/fnptr-of no-fields))
+      (live-register-transition ref-runtime old-ref-schema new-ref-schema
+        (primitive/fnptr-of slice-ref-v1-to-v2) (primitive/fnptr-of no-fields)
+        (primitive/fnptr-of no-fields))
+      (live-register-reference-field new-ref-schema (primitive/offsetof SliceRefV2 values)
+                                     value-runtime 2)
+      (live-begin-publication!)
+      (live-begin-staging-locked!)
+      (assert-eq 0 (live-stage-type-roots-locked! value-runtime new-value-schema))
+      (assert-eq 0 (live-stage-type-roots-locked! ref-runtime new-ref-schema))
+      (assert-eq -11 (live-publish-staged-locked!))
+      (live-end-publication!)
+      (assert-eq (primitive/cast i64 ref-raw) (primitive/cast i64 (load slot)))
+      (assert-eq (primitive/cast i64 array-raw)
+                 (primitive/cast i64 (.address (primitive/index (live-managed-objects)
+                                                  object-index))))
+      ; Repair the accepted slice and retry. Index one and length one are
+      ; translated using element indices under the larger V2 layout.
+      (set! (.values ref) (slice-new (primitive/index values 1) 1))
+      (live-begin-publication!)
+      (live-begin-staging-locked!)
+      (assert-eq 0 (live-stage-type-roots-locked! value-runtime new-value-schema))
+      (assert-eq 0 (live-stage-type-roots-locked! ref-runtime new-ref-schema))
+      (assert-eq 0 (live-publish-staged-locked!))
+      (live-end-publication!)
+      (let [object (primitive/index (live-managed-objects) object-index)
+            next-ref (primitive/cast (ptr SliceRefV2) (load slot))
+            migrated (.values next-ref)]
+        (assert-eq 1 (slice-len migrated))
+        (assert-eq (primitive/cast i64
+                     (primitive/index (primitive/cast (ptr StateV2) (.address object)) 1))
+                   (primitive/cast i64 (slice-data migrated)))
+        (assert-eq 12 (.count (slice-data migrated)))
+        (live-untrack-inspector-object! (.address object))
+        (free (.address object))
+        (free next-ref)))))
+
+(deftest raw-native-function-pointer-field-is-rejected
+  (let [runtime-id 88012
+        schema (inspector/register-type "CallbackHolder" runtime-id 6001
+                 (primitive/sizeof CallbackHolder) (primitive/alignof CallbackHolder) 1
+                 (primitive/fnptr-of show-value) (primitive/fnptr-of json-value))
+        raw (calloc 1 (primitive/cast u64 (primitive/sizeof CallbackHolder)))
+        value (primitive/cast (ptr CallbackHolder) raw)
+        slot (primitive/alloc-stack (ptr i8))]
+    (set! (.callback value) (primitive/fnptr-of callback-value))
+    (store! slot raw)
+    (assert-eq -15
+      (live-register-reference-field schema
+        (primitive/offsetof CallbackHolder callback) 0 3))
+    (let [root (live-register-root "callback-holder" runtime-id schema slot)]
+      (assert (> root 0))
+      (assert-eq 0 (live-unregister-root! root)))
+    (free raw)))

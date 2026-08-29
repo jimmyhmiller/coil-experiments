@@ -1,0 +1,68 @@
+(module experiments.heap-inspector.viewer-test)
+
+(import "coil.primitive" :as primitive)
+(import "coil.assert" :use *)
+(import "coil.atomic" :as atomic)
+(import "coil.slice" :use [slice-data slice-len])
+(import "coil.thread" :as thread)
+(import "experiments.heap-inspector.live-api" :as live-api)
+(import "experiments.heap-inspector.viewer" :as viewer)
+
+(extern strlen :cc c [(ptr i8)] (-> i64))
+
+(defn viewer-test-gate [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn viewer-test-seen [] (-> (ptr i64)) (primitive/alloc-static i64))
+
+(defn viewer-test-status [] (-> (slice u8)) "{\"supported\":true}")
+(defn viewer-test-edit [(source (slice u8))] (-> i64)
+  (if (and (= (slice-len source) 12)
+           (= (primitive/cast i64 (load (primitive/index (slice-data source) 0))) 97))
+      (atomic/atomic-store (viewer-test-seen) 1)
+      (atomic/atomic-store (viewer-test-seen) -1))
+  (loop (if (= (atomic/atomic-load (viewer-test-gate)) 1) (break) 0))
+  17)
+(defn viewer-test-track [(p (ptr i8)) (runtime-id i64) (schema-id i64)
+                         (bytes i64) (align i64) (count i64)] (-> i64)
+  (primitive/cast i64 p) (+ runtime-id (+ schema-id (+ bytes (+ align count)))) 0)
+(defn viewer-test-untrack [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0)
+
+(deftest live-edit-request-parser-retains-complete-declared-body
+  (let [request c"POST /api/live/edit HTTP/1.1\r\nHost: localhost\r\nContent-Length: 21\r\n\r\nfn answer() { 12345 }"
+        n (strlen request)
+        header-end (viewer/request-header-end request n)]
+    (assert (> header-end 0))
+    (assert-eq 21 (viewer/request-content-length request header-end))
+    (assert-eq 21 (slice-len (viewer/request-body request n)))))
+
+(deftest request-without-body-finishes-at-header
+  (let [request c"GET /api/live HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        n (strlen request)
+        header-end (viewer/request-header-end request n)]
+    (assert-eq n header-end)
+    (assert-eq 0 (viewer/request-content-length request header-end))
+    (assert-eq 0 (slice-len (viewer/request-body request n)))))
+
+(deftest request-prefix-recognizes-api-and-assets
+  (let [request c"GET /api/native-demo/frame HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        n (strlen request)]
+    (assert (viewer/request-prefix? request n c"GET /api/native-demo/frame"))
+    (assert (not (viewer/request-prefix? request n c"GET /api/live"))))
+  (let [request c"GET /app.js HTTP/1.1\r\nHost: localhost\r\n\r\n"]
+    (assert (viewer/request-prefix? request (strlen request) c"GET /app.js"))))
+
+(deftest live-edit-submission-is-owned-asynchronous-and-single-flight
+  (let [state (viewer/viewer-state)]
+    (live-api/live-api-register! (primitive/fnptr-of viewer-test-status)
+                                 (primitive/fnptr-of viewer-test-edit)
+                                 (primitive/fnptr-of viewer-test-track)
+                                 (primitive/fnptr-of viewer-test-untrack))
+    (atomic/atomic-store (viewer-test-gate) 0)
+    (atomic/atomic-store (viewer-test-seen) 0)
+    (assert-eq 0 (viewer/viewer-submit-edit! state "async-source"))
+    (assert-eq -2 (viewer/viewer-submit-edit! state "second"))
+    (atomic/atomic-store (viewer-test-gate) 1)
+    (thread/thread-join (field state edit-thread))
+    (set! (.edit-started state) false)
+    (assert-eq 1 (atomic/atomic-load (viewer-test-seen)))
+    (assert-eq 17 (.edit-result state))
+    (assert-eq 0 (atomic/atomic-load (field state edit-active)))))

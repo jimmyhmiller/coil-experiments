@@ -1,0 +1,438 @@
+(module experiments.heap-inspector.controller)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.atomic" :as atomic)
+(import "coil.jit" :as jit)
+(import "coil.slice" :use [slice-new slice-len slice-get subslice])
+(import "coil.str" :as str)
+(import "experiments.heap-inspector.live" :as live)
+(import "experiments.heap-inspector.live-api" :as api)
+(import "experiments.heap-inspector.native-demo-api" :as demo)
+(import "experiments.heap-inspector.runtime" :as inspector)
+
+(defstruct LiveController
+  [(session jit/JitSession)
+   (initialized bool)
+   (phase i64)
+   (last-result i64)
+   (last-reclaimed i64)
+   ; Exact backend generation token owning the permanent native-demo callback
+   ; trampolines. Zero until the first callback publication succeeds.
+   (native-callback-generation i64)
+   (pending-live (slice u8))
+   (pending-live-owned bool)
+   (broken-diagnostic (slice u8))
+   (broken-diagnostic-owned bool)
+   ; Host callback installation is runtime integration state, not accepted
+   ; source/metaprogram state. It is published once with the first native demo
+   ; candidate and never used to classify source.
+   (native-callbacks-published bool)
+   (native-demo bool)])
+
+(defn live-controller [] (-> (ptr LiveController))
+  (primitive/alloc-static LiveController))
+
+(defn live-controller-lock-cell [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defn live-controller-lock! [] (-> i64)
+  (loop (if (= (atomic/atomic-cas (live-controller-lock-cell) 0 1) 0) (break) 0))
+  0)
+
+(defn live-controller-unlock! [] (-> i64)
+  (atomic/atomic-store (live-controller-lock-cell) 0))
+
+(defn live-controller-set-phase! [(phase i64)] (-> i64)
+  (atomic/atomic-store (field (live-controller) phase) phase))
+
+(defn live-controller-phase [] (-> i64)
+  (atomic/atomic-load (field (live-controller) phase)))
+
+(defn live-controller-enable-native-demo! [] (-> i64)
+  (let [status (live-controller-init!)]
+    (if (!= status 0)
+        status
+        (do
+          (set! (.native-demo (live-controller)) true)
+          (demo/native-demo-enable!)))))
+
+(defn live-controller-enable-native-coil-demo! [] (-> i64)
+  (live-controller-enable-native-demo!))
+
+(defn live-controller-init! [] (-> i64)
+  ; Keep every C ABI entry used by candidate-generated code reachable in the
+  ; host image, including the cooperative loop poll which may not appear in the
+  ; accepted source itself.
+  (live/live-reload-requested?)
+  (let [controller (live-controller)]
+    (if (.initialized controller)
+        0
+        (do
+          (set! (.session controller) (jit/jit-session-new (alloc/malloc-allocator)))
+          ; The live metaprogram emits and owns typed slots, binders, ABI
+          ; lineages, and publication. Running the generic REPL reload transform
+          ; as well would create a second incompatible indirection system.
+          (let [policy-status
+                  (jit/jit-session-set-legacy-reload!
+                    (field controller session) false)]
+            (if (!= policy-status 0)
+                (do
+                  (live-controller-set-phase! 8)
+                  (set! (.last-result controller) policy-status)
+                  policy-status)
+                (do
+                  (let [provider-status
+                          (jit/jit-session-set-source-provider!
+                            (field controller session)
+                            "experiments.heap-inspector.live-reader"
+                            "live-source-provider"
+                            "experiments.heap-inspector.live-reader\nexperiments.heap-inspector.live-meta\nexperiments.heap-inspector.live-registry"
+                            "(import \"experiments.heap-inspector.live-types\" :use *)\n")]
+                    (if (!= provider-status 0)
+                        (do
+                          (live-controller-set-phase! 8)
+                          (set! (.last-result controller) provider-status)
+                          provider-status)
+                        (do
+                          (live-controller-set-phase! 1)
+                          (set! (.last-result controller) 0)
+                          (set! (.last-reclaimed controller) 0)
+                          (set! (.native-callback-generation controller) 0)
+                          (set! (.pending-live controller) "")
+                          (set! (.broken-diagnostic controller) "")
+                          (set! (.native-callbacks-published controller) false)
+                          (api/live-api-register! (primitive/fnptr-of live-controller-snapshot)
+                                                  (primitive/fnptr-of live-controller-edit-source!)
+                                                  (primitive/fnptr-of live/live-track-inspector-object!)
+                                                  (primitive/fnptr-of live/live-untrack-inspector-object!))
+                          (set! (.initialized controller) true)
+                          0))))))))))
+
+(defn live-controller-phase-name [] (-> (slice u8))
+  (let [phase (live-controller-phase)]
+    (cond
+      (= phase 1) "Idle"
+      (= phase 2) "Checking"
+      (= phase 3) "TypeErrors"
+      (= phase 4) "Staged"
+      (= phase 5) "Migrating"
+      (= phase 6) "WaitingForQuiescence"
+      (= phase 7) "Committed"
+      (= phase 8) "RolledBack"
+      (= phase 9) "NeedsTransition"
+      (= phase 10) "BlockedByAlias"
+      (= phase 11) "BlockedByOwnership"
+      (= phase 12) "BlockedByBorrow"
+      (= phase 13) "BlockedByFFI"
+      (= phase 14) "BlockedByInteriorReference"
+      (= phase 15) "Broken"
+      :else "Unavailable")))
+
+(defn live-source-kind-name [(kind i64)] (-> (slice u8))
+  (cond
+    (= kind 1) "function"
+    (= kind 2) "struct"
+    (= kind 3) "sum"
+    (= kind 4) "root"
+    (= kind 5) "migration"
+    (= kind 6) "export"
+    :else "unknown"))
+
+(defn live-controller-save-broken-diagnostic! [] (-> i64)
+  (let [controller (live-controller)
+        a (alloc/malloc-allocator)]
+    (if (.broken-diagnostic-owned controller)
+        (alloc/free [u8] a (.broken-diagnostic controller)) 0)
+    (set! (.broken-diagnostic controller)
+          (live-controller-copy
+            (jit/jit-diagnostic (field controller session))))
+    (set! (.broken-diagnostic-owned controller) true)
+    0))
+
+(defn live-controller-clear-broken-diagnostic! [] (-> i64)
+  (let [controller (live-controller)]
+    (if (.broken-diagnostic-owned controller)
+        (alloc/free [u8] (alloc/malloc-allocator)
+          (.broken-diagnostic controller)) 0)
+    (set! (.broken-diagnostic controller) "")
+    (set! (.broken-diagnostic-owned controller) false)
+    0))
+
+(defn live-controller-publish-broken-candidate! [] (-> i64)
+  (let [controller (live-controller)
+        recovery "(live-source-request \"\" :recovery)"]
+    (if (!= (jit/jit-prepare-replace-with-entry!
+              (field controller session) recovery "0")
+            0)
+        1
+        (do
+          (let [status (jit/jit-commit-prepared! (field controller session))]
+            (if (= status 0)
+                (set! (.last-reclaimed controller)
+                  (jit/jit-reclaim-retired! (field controller session))) 0)
+            (live/live-end-affected-publication!)
+            status)))))
+
+; `entry` is candidate-native Coil code. It normally registers the candidate's
+; reflected schemas and transition fnptrs through the host C ABI, stages every
+; affected root, and publishes the staged roots only if all transitions succeed.
+; The gate covers both that entry and the backend's final generation swap.
+(defn live-controller-edit! [(source (slice u8)) (entry (slice u8))] (-> i64)
+  (live-controller-init!)
+  (let [controller (live-controller)]
+    (live-controller-set-phase! 2)
+    (if (!= (jit/jit-prepare-replace-with-entry!
+              (field controller session) source entry)
+            0)
+        (do
+          (live-controller-save-broken-diagnostic!)
+          (let [condition-kind
+                  (if (= (jit/jit-condition-kind (field controller session)) 1)
+                      1 2)
+                recovered
+                  (if (= condition-kind 2)
+                      (= (live-controller-publish-broken-candidate!) 0)
+                      false)]
+            ; A typed Broken entry raises only when native execution reaches the
+            ; affected definition. Failures that cannot form the old ABI retain
+            ; the immediate global condition policy.
+            (if (not recovered)
+                (live/live-condition-raise! condition-kind 1) 0)
+            (live-controller-set-phase! (if (= condition-kind 1) 9 15))
+            (set! (.last-result controller) 1)
+            1))
+        (do
+          (live-controller-set-phase! 4)
+          (live-controller-set-phase! 6)
+          (live-controller-set-phase! 5)
+          (let [status (jit/jit-commit-prepared! (field controller session))]
+            (if (= status 0)
+                (do
+                  (if (.native-demo controller) (demo/native-demo-publish-staged!) 0)
+                  ; The native host receives permanent trampolines only on the
+                  ; first successful native-demo publication. Retain their exact
+                  ; owning image, not whichever generation happens to be current
+                  ; during a later edit.
+                  (if (and (.native-demo controller)
+                           (= (.native-callback-generation controller) 0))
+                      (set! (.native-callback-generation controller)
+                            (jit/jit-generation-retain-current!
+                              (field controller session)))
+                      0)
+                  (live/live-condition-clear!)
+                  (live-controller-clear-broken-diagnostic!)
+                  (set! (.last-reclaimed controller)
+                        (jit/jit-reclaim-retired! (field controller session))))
+                (do
+                  (if (.native-demo controller) (demo/native-demo-abort-staged!) 0)
+                  (live/live-condition-raise! 3 status)))
+            (live/live-end-affected-publication!)
+            (set! (.last-result controller) status)
+            (live-controller-set-phase!
+                  (cond (= status 0) 7
+                        (or (= status -8) (= status -10)) 10
+                        (= status -12) 11
+                        (= status -13) 12
+                        (= status -14) 13
+                        (= status -11) 14
+                        :else 8))
+            status)))))
+
+(defn live-controller-edit-source! [(source (slice u8))] (-> i64)
+  ; Phase is published before taking the mutation lock. A status request that
+  ; sees a transient phase uses stable user-source fields and never touches the
+  ; JIT session while this worker mutates it.
+  (live-controller-set-phase! 2)
+  (live-controller-lock!)
+  (let [controller (live-controller)]
+    (let [
+        a (alloc/malloc-allocator)
+        (mut candidate) (str/sb-new a)
+        (mut wrapper) (str/sb-new a)
+        ; The native host stores permanent reload trampolines. Only the first
+        ; generation has to publish them; a schema edit keeps those handles and
+        ; replaces the private definitions reached through their typed cells.
+        stage-native-callbacks
+          (and (.native-demo controller)
+               (not (.native-callbacks-published controller)))]
+    ; Rejected source is an editable candidate branch. A following snippet
+    ; repairs that branch while migration still compares it with committed code.
+    (when (> (slice-len (.pending-live controller)) 0)
+      (str/sb-push-str! (mut candidate) (.pending-live controller))
+      (str/sb-push-str! (mut candidate) "\n"))
+    (str/sb-push-str! (mut candidate) source)
+    (let [candidate-source (str/sb-finish! (mut candidate))]
+    (if (.pending-live-owned controller)
+        (alloc/free [u8] a (.pending-live controller)) 0)
+    (set! (.pending-live controller) (live-controller-copy candidate-source))
+    (set! (.pending-live-owned controller) true)
+    (str/sb-push-str! (mut wrapper)
+      "(live-source-request \"")
+    (live-controller-append-string! (mut wrapper) candidate-source)
+    (str/sb-push-str! (mut wrapper)
+      (if stage-native-callbacks "\" :native)" "\" :normal)"))
+      (let [status (live-controller-edit! (str/sb-finish! (mut wrapper))
+                                        "0")]
+      (if (= status 0)
+          (do
+            (if stage-native-callbacks
+                (set! (.native-callbacks-published controller) true) 0)
+            (alloc/free [u8] a (.pending-live controller))
+            (set! (.pending-live controller) "")
+            (set! (.pending-live-owned controller) false))
+          0)
+      (alloc/free [u8] a candidate-source)
+      (live-controller-unlock!)
+      status)))))
+
+; Test/UI text utility only. Transaction state classification never calls this;
+; it uses `jit-condition-kind` above.
+(defn live-controller-contains? [(text (slice u8)) (needle (slice u8))] (-> bool)
+  (let [(mut at) 0 (mut found) false]
+    (loop (if (or (load found) (> (+ (load at) (slice-len needle)) (slice-len text)))
+              (break)
+              (let [(mut i) 0 (mut same) true]
+                (loop (if (or (not (load same)) (>= (load i) (slice-len needle)))
+                          (break)
+                          (if (= (slice-get text (+ (load at) (load i)))
+                                 (slice-get needle (load i)))
+                              (set! i (+ (load i) 1))
+                              (set! same false))))
+                (if (load same) (set! found true) (set! at (+ (load at) 1))))))
+    (load found)))
+
+(defn live-controller-copy [(source (slice u8))] (-> (slice u8))
+  (match (alloc/alloc [u8] (alloc/malloc-allocator) (slice-len source))
+    (None [] "")
+    (Some [copy]
+      (do (for [i 0 (slice-len source)]
+            (set! (primitive/index (alloc/alloc-slice-data copy) i) (slice-get source i)))
+          copy))))
+
+(defn live-controller-append-string! [(out (mut str/StrBuf))
+                                       (source (slice u8))] (-> i64)
+  (for [i 0 (slice-len source)]
+    (let [c (slice-get source i)]
+      (cond
+        (= (primitive/cast i64 c) 34) (str/sb-push-str! (mut out) "\\\"")
+        (= (primitive/cast i64 c) 92) (str/sb-push-str! (mut out) "\\\\")
+        (= (primitive/cast i64 c) 10) (str/sb-push-str! (mut out) "\\n")
+        (= (primitive/cast i64 c) 13) (str/sb-push-str! (mut out) "\\r")
+        (= (primitive/cast i64 c) 9) (str/sb-push-str! (mut out) "\\t")
+        :else (str/sb-push-byte! (mut out) c))))
+  0)
+
+(defn live-controller-source [] (-> (slice u8))
+  (if (.initialized (live-controller))
+      (jit/jit-source (field (live-controller) session))
+      ""))
+
+(defn live-controller-pending [] (-> (slice u8))
+  (if (.initialized (live-controller))
+      (jit/jit-pending (field (live-controller) session))
+      ""))
+
+(defn live-controller-diagnostic [] (-> (slice u8))
+  (if (.initialized (live-controller))
+      (if (.broken-diagnostic-owned (live-controller))
+          (.broken-diagnostic (live-controller))
+          (jit/jit-diagnostic (field (live-controller) session)))
+      ""))
+
+(defn live-controller-status [] (-> i64)
+  (if (.initialized (live-controller))
+      (jit/jit-status (field (live-controller) session))
+      0))
+
+(defn live-controller-epoch [] (-> i64)
+  (if (.initialized (live-controller))
+      (jit/jit-epoch (field (live-controller) session))
+      0))
+
+(defn live-controller-snapshot [] (-> (slice u8))
+  (live-controller-init!)
+  (let [phase (live-controller-phase)
+        transient (or (= phase 2) (or (= phase 4) (or (= phase 5) (= phase 6))))]
+  (if (not transient) (live-controller-lock!) 0)
+  (inspector/lock!)
+  (inspector/json-reset!)
+  (inspector/json-text! "{\"supported\":true,\"state\":")
+  (inspector/json-quoted! (live-controller-phase-name))
+  (inspector/json-text! ",\"result\":")
+  (inspector/json-int! (.last-result (live-controller)))
+  (inspector/json-text! ",\"conditionKind\":")
+  (inspector/json-int! (live/live-condition-kind))
+  (inspector/json-text! ",\"conditionActive\":")
+  (inspector/json-text! (if (live/live-condition-active?) "true" "false"))
+  (inspector/json-text! ",\"conditionSerial\":")
+  (inspector/json-int! (live/live-condition-serial))
+  (inspector/json-text! ",\"jitEpoch\":")
+  (inspector/json-int! (live-controller-epoch))
+  (inspector/json-text! ",\"jitGenerations\":")
+  (inspector/json-int!
+    (if transient -1 (jit/jit-generation-count (field (live-controller) session))))
+  (inspector/json-text! ",\"jitGenerationLeases\":")
+  (inspector/json-int!
+    (jit/jit-generation-token-leases (field (live-controller) session)))
+  (inspector/json-text! ",\"nativeCallbackGeneration\":")
+  (inspector/json-int! (.native-callback-generation (live-controller)))
+  (inspector/json-text! ",\"jitLastReclaimed\":")
+  (inspector/json-int! (.last-reclaimed (live-controller)))
+  (inspector/json-text! ",\"migrationEpoch\":")
+  (inspector/json-int! (live/live-epoch))
+  (inspector/json-text! ",\"migrationStatus\":")
+  (inspector/json-int! (live/live-status))
+  (inspector/json-text! ",\"activeCalls\":")
+  (inspector/json-int! (atomic/atomic-load (live/live-reader-count)))
+  (inspector/json-text! ",\"registeredRoots\":")
+  (inspector/json-int! (load (live/live-root-count)))
+  (inspector/json-text! ",\"liveHandles\":")
+  (inspector/json-int! (load (live/live-handle-count)))
+  (inspector/json-text! ",\"managedObjects\":")
+  (inspector/json-int! (load (live/live-managed-object-count)))
+  (inspector/json-text! ",\"transitionEdges\":")
+  (inspector/json-int! (load (live/live-transition-count)))
+  (inspector/json-text! ",\"schemaVersions\":")
+  (inspector/json-int! (load (inspector/type-n)))
+  (inspector/json-text! ",\"affectedSourceIds\":[")
+  (let [(mut affected) (load (live/live-affected-head))
+        (mut first) true]
+    (loop (if (= (primitive/cast i64 (load affected)) 0)
+              (break)
+              (do
+                (if (load first) (set! first false) (inspector/json-text! ","))
+                (inspector/json-text! "{\"module\":\"replsession\",\"kind\":")
+                (inspector/json-quoted!
+                  (live-source-kind-name (.kind (load affected))))
+                (inspector/json-text! ",\"name\":")
+                (inspector/json-quoted! (.name (load affected)))
+                (inspector/json-text! "}")
+                (set! affected (.next (load affected)))))))
+  (inspector/json-text! "]")
+  (inspector/json-text! ",\"blocker\":{\"kind\":")
+  (inspector/json-int! (load (live/live-blocker-kind)))
+  (inspector/json-text! ",\"index\":")
+  (inspector/json-int! (load (live/live-blocker-index)))
+  (inspector/json-text! ",\"schemaId\":")
+  (inspector/json-int! (load (live/live-blocker-schema)))
+  (inspector/json-text! ",\"address\":")
+  (inspector/json-int! (load (live/live-blocker-address)))
+  (inspector/json-text! ",\"type\":")
+  (let [blocker-schema (load (live/live-blocker-schema))]
+    (if (and (>= blocker-schema 0) (< blocker-schema (load (inspector/type-n))))
+        (inspector/json-quoted! (.name (primitive/index (inspector/types) blocker-schema)))
+        (inspector/json-text! "null")))
+  (inspector/json-text! ",\"registrationSite\":\"inspector/live-state registry\"}")
+  (inspector/json-text! ",\"accepted\":")
+  ; Accepted source is intentionally not mirrored into runtime memory. The
+  ; compiler-session metaprogram owns its normalized forms and registry.
+  (inspector/json-quoted! "")
+  (inspector/json-text! ",\"pending\":")
+  (inspector/json-quoted! (if transient "" (.pending-live (live-controller))))
+  (inspector/json-text! ",\"diagnostic\":")
+  (inspector/json-quoted! (if transient "" (live-controller-diagnostic)))
+  (inspector/json-text! "}")
+  (inspector/unlock!)
+  (if (not transient) (live-controller-unlock!) 0)
+  (slice-new (inspector/json-buffer) (load (inspector/json-length)))))

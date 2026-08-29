@@ -1,22 +1,36 @@
 (module experiments.heap-inspector.viewer)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
+(import "coil.atomic" :as atomic)
 (import "coil.fs" :as fs)
 (import "coil.slice" :use *)
 (import "coil.result" :use *)
 (import "coil.socket" :as socket)
 (import "coil.thread" :as thread)
 (import "experiments.heap-inspector.runtime" :use *)
+(import "experiments.heap-inspector.live-api" :as live-api)
+(import "experiments.heap-inspector.native-demo-api" :as demo-api)
 
 (extern printf :cc c [(ptr i8) ...] (-> i32))
 (extern getenv :cc c [(ptr i8)] (-> (ptr i8)))
 (extern strlen :cc c [(ptr i8)] (-> i64))
 (extern sscanf :cc c [(ptr i8) (ptr i8) ...] (-> i32))
+(extern strstr :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+(extern malloc :cc c [u64] (-> (ptr i8)))
+(extern free :cc c [(ptr i8)] (-> i64))
+
+(const VIEWER_REQUEST_CAPACITY 1048576)
 
 (defstruct ViewerState
   [(listener socket/TcpListener)
    (connection socket/TcpConnection)
    (thread thread/Thread)
+   (edit-thread thread/Thread)
+   (edit-active i64)
+   (edit-started bool)
+   (edit-source (ptr u8))
+   (edit-source-len i64)
+   (edit-result i64)
    (started bool)
    (port i64)
    (asset-root (slice u8))])
@@ -53,6 +67,58 @@
         (slice-new (primitive/cast (ptr u8) buf) 0)
         (slice-new (primitive/cast (ptr u8) (primitive/index buf (load at))) (- n (load at))))))
 
+(defn request-header-end [(buf (ptr i8)) (n i64)] (-> i64)
+  (let [(mut i) 0 (mut at) -1]
+    (loop (if (> (+ (load i) 3) n)
+              (break)
+              (if (and (= (primitive/cast i64 (load (primitive/index buf (load i)))) 13)
+                       (and (= (primitive/cast i64 (load (primitive/index buf (+ (load i) 1)))) 10)
+                            (and (= (primitive/cast i64 (load (primitive/index buf (+ (load i) 2)))) 13)
+                                 (= (primitive/cast i64 (load (primitive/index buf (+ (load i) 3)))) 10))))
+                  (do (set! at (+ (load i) 4)) (break))
+                  (set! i (+ (load i) 1)))))
+    (load at)))
+
+(defn request-content-length [(buf (ptr i8)) (header-end i64)] (-> i64)
+  (primitive/cast i64 header-end)
+  (let [line (strstr buf c"Content-Length:")
+        result (primitive/alloc-stack i64)]
+    (store! result 0)
+    (if (= (primitive/cast i64 line) 0)
+        0
+        (if (= (sscanf line c"Content-Length: %ld" result) 1)
+            (load result)
+            0))))
+
+; Read through the declared HTTP body instead of assuming headers and source
+; arrive in one packet. The hard cap bounds untrusted memory consumption and is
+; large enough for a complete live source snapshot.
+(defn read-request! [(connection (ptr socket/TcpConnection))
+                     (buf (ptr i8)) (capacity i64)] (-> i64)
+  (let [(mut n) 0 (mut wanted) -1 (mut failed) false]
+    (loop (if (or (load failed)
+                  (and (>= (load wanted) 0) (>= (load n) (load wanted))))
+              (break)
+              (if (>= (load n) capacity)
+                  (set! failed true)
+                  (match (socket/tcp-read connection (primitive/index buf (load n))
+                                          (- capacity (load n)))
+                    (Err [e] (set! failed true))
+                    (Ok [got]
+                      (if (<= got 0)
+                          (set! failed true)
+                          (do
+                            (set! n (+ (load n) got))
+                            (set! (primitive/index buf (load n)) (primitive/cast i8 0))
+                            (let [header-end (request-header-end buf (load n))]
+                              (if (>= header-end 0)
+                                  (let [body-len (request-content-length buf header-end)]
+                                    (if (> body-len (- capacity header-end))
+                                        (set! failed true)
+                                        (set! wanted (+ header-end body-len))))
+                                  0)))))))))
+    (if (load failed) -1 (load n))))
+
 (defn send-all! [(connection (ptr socket/TcpConnection)) (bytes (slice u8))] (-> i64)
   (let [(mut at) 0 (mut failed) false]
     (loop (if (or (load failed) (>= (load at) (slice-len bytes)))
@@ -63,6 +129,57 @@
                 (Err [e] (set! failed true))
                 (Ok [n] (if (<= n 0) (set! failed true) (set! at (+ (load at) n)))))))
     (if (load failed) 1 0)))
+
+(defn viewer-edit-worker [(arg (ptr i8))] (-> (ptr i8))
+  (let [state (primitive/cast (ptr ViewerState) arg)
+        source (slice-new (.edit-source state) (.edit-source-len state))
+        result (live-api/live-api-edit! source)]
+    (set! (.edit-result state) result)
+    (free (primitive/cast (ptr i8) (.edit-source state)))
+    (set! (.edit-source state) (primitive/cast (ptr u8) 0))
+    (set! (.edit-source-len state) 0)
+    ; Release publishes both the result and all controller state produced by
+    ; the edit before a status request observes the worker as idle.
+    (atomic/atomic-store (field state edit-active) 0)
+    (primitive/cast (ptr i8) 0)))
+
+; Returns 0 when accepted for background compilation, -2 while another edit is
+; active, and -1 on allocation/thread failure. The copied source outlives the
+; request buffer and is released by the worker.
+(defn viewer-submit-edit! [(state (ptr ViewerState)) (source (slice u8))] (-> i64)
+  (if (!= (atomic/atomic-cas (field state edit-active) 0 1) 0)
+      -2
+      (do
+        (if (.edit-started state)
+            (do (thread/thread-join (field state edit-thread))
+                (set! (.edit-started state) false))
+            0)
+        (let [copy (malloc (primitive/cast u64 (if (> (slice-len source) 0)
+                                                   (slice-len source) 1)))]
+          (if (= (primitive/cast i64 copy) 0)
+              (do (atomic/atomic-store (field state edit-active) 0) -1)
+              (do
+                (for [i 0 (slice-len source)]
+                  (set! (primitive/index copy i) (primitive/cast i8 (slice-get source i))))
+                (set! (.edit-source state) (primitive/cast (ptr u8) copy))
+                (set! (.edit-source-len state) (slice-len source))
+                ; The in-process compiler is recursive over expanded Code. A
+                ; complete live snapshot can be substantially larger than an
+                ; ordinary callback, so do not rely on Darwin's small default
+                ; pthread stack for the compilation worker.
+                (let [status (thread/thread-spawn-configured
+                               (field state edit-thread)
+                               (primitive/fnptr-of viewer-edit-worker)
+                               (primitive/cast (ptr i8) state)
+                               (thread/thread-config 16777216 4096))]
+                  (if (= status 0)
+                      (do (set! (.edit-started state) true) 0)
+                      (do
+                        (free copy)
+                        (set! (.edit-source state) (primitive/cast (ptr u8) 0))
+                        (set! (.edit-source-len state) 0)
+                        (atomic/atomic-store (field state edit-active) 0)
+                        -1)))))))))
 
 (defn asset-path [(state (ptr ViewerState)) (name (slice u8))] (-> (slice u8))
   (let [root (.asset-root state)
@@ -100,18 +217,58 @@
           (alloc/free [u8] a path)
           0)))))
 
-(defn serve-one! [(state (ptr ViewerState))] (-> i64)
-  (let [request (primitive/alloc-stack (array i8 4096))]
-    (match (socket/tcp-read (field state connection) (primitive/index request 0) 4095)
-      (Err [e] 1)
-      (Ok [n]
-        (do
-        (set! (primitive/index request n) (primitive/cast i8 0))
-        (let [memory-id (primitive/alloc-stack i64)
+(defn serve-one! [(state (ptr ViewerState))
+                  (connection (ptr socket/TcpConnection))] (-> i64)
+  (let [request (malloc (primitive/cast u64 (+ VIEWER_REQUEST_CAPACITY 1)))]
+    (if (= (primitive/cast i64 request) 0)
+        1
+        (let [n (read-request! connection request VIEWER_REQUEST_CAPACITY)]
+          (if (< n 0)
+              (do (free request) 1)
+              (do
+                (set! (primitive/index request n) (primitive/cast i8 0))
+                (let [memory-id (primitive/alloc-stack i64)
               memory-offset (primitive/alloc-stack i64)
               allocation-id (primitive/alloc-stack i64)
               function-id (primitive/alloc-stack i64)]
-        (cond
+                  (cond
+          (request-prefix? (primitive/index request 0) n c"POST /api/live/edit")
+            (let [status (viewer-submit-edit! state
+                            (request-body (primitive/index request 0) n))]
+              (send-all! (field state connection)
+                         (cond (= status 0)
+                                 "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+                               (= status -2)
+                                 "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+                               :else
+                                 "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"))
+              (send-all! (field state connection) (live-api/live-api-status)))
+          (request-prefix? (primitive/index request 0) n c"GET /api/live")
+            (do (send-all! (field state connection)
+                           "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")
+                (send-all! (field state connection) (live-api/live-api-status)))
+          (request-prefix? (primitive/index request 0) n c"GET /api/native-demo/frame")
+            (do (send-all! (field state connection)
+                           "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")
+                (send-all! (field state connection) (demo-api/native-demo-frame-json)))
+          (request-prefix? (primitive/index request 0) n c"POST /api/native-demo/run")
+            (do (demo-api/native-demo-set-running! true)
+                (send-all! (field state connection)
+                           "HTTP/1.1 204 No Content\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"))
+          (request-prefix? (primitive/index request 0) n c"POST /api/native-demo/pause")
+            (do (demo-api/native-demo-set-running! false)
+                (send-all! (field state connection)
+                           "HTTP/1.1 204 No Content\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"))
+          (request-prefix? (primitive/index request 0) n c"POST /api/native-demo/step")
+            (do (demo-api/native-demo-set-running! true)
+                (demo-api/native-demo-frame-json)
+                (demo-api/native-demo-set-running! false)
+                (send-all! (field state connection)
+                           "HTTP/1.1 204 No Content\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"))
+          (request-prefix? (primitive/index request 0) n c"POST /api/native-demo/focus")
+            (do (demo-api/native-demo-request-focus!)
+                (send-all! (field state connection)
+                           "HTTP/1.1 204 No Content\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"))
           (= (sscanf (primitive/index request 0) c"GET /api/memory/%ld/%ld" memory-id memory-offset) 2)
             (do (send-all! (field state connection)
                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")
@@ -136,9 +293,17 @@
                                            (request-body (primitive/index request 0) n))))
           (request-prefix? (primitive/index request 0) n c"GET /app.js")
             (serve-asset! state "app.js" "application/javascript; charset=utf-8")
+          (request-prefix? (primitive/index request 0) n c"GET /native-demo.js")
+            (serve-asset! state "native-demo.js" "application/javascript; charset=utf-8")
+          (request-prefix? (primitive/index request 0) n c"GET /native-demo.css")
+            (serve-asset! state "native-demo.css" "text/css; charset=utf-8")
+          (request-prefix? (primitive/index request 0) n c"GET /native-demo")
+            (serve-asset! state "native-demo.html" "text/html; charset=utf-8")
           (request-prefix? (primitive/index request 0) n c"GET /style.css")
             (serve-asset! state "style.css" "text/css; charset=utf-8")
-          :else (serve-asset! state "index.html" "text/html; charset=utf-8"))))))))
+                    :else (serve-asset! state "index.html" "text/html; charset=utf-8"))
+                  (free request)
+                  0)))))))
 
 (defn viewer-thread [(arg (ptr i8))] (-> (ptr i8))
   (let [state (primitive/cast (ptr ViewerState) arg) (mut running) true]
@@ -147,7 +312,7 @@
               (match (socket/tcp-accept (field state listener) (field state connection))
                 (Err [e] (set! running false))
                 (Ok [c]
-                  (do (serve-one! state)
+                  (do (serve-one! state c)
                       (socket/tcp-connection-close! (field state connection))
                       0)))))
     (primitive/cast (ptr i8) 0)))

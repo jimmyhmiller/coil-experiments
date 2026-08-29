@@ -1,0 +1,577 @@
+(module experiments.heap-inspector.live-function-jit-test)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.assert" :use *)
+(import "coil.jit" :as jit)
+(import "coil.slice" :use [slice-len slice-data slice-get])
+(import "coil.str" :as str)
+(import "experiments.heap-inspector.live" :as live)
+(import "experiments.heap-inspector.runtime" :as runtime)
+
+(extern printf :cc c [(ptr i8) ...] (-> i32))
+
+(defn assert-jit-ok [(session (ptr jit/JitSession)) (source (slice u8))] (-> i64)
+  (let [status (jit/jit-submit! session source)]
+    (if (!= status 0)
+        (let [diagnostic (jit/jit-diagnostic session)]
+          (printf c"unexpected JIT rejection:\n%.*s\n"
+                  (primitive/cast i32 (slice-len diagnostic))
+                  (slice-data diagnostic)))
+        0)
+    (assert-eq 0 status)))
+
+(defn observed-value [] (-> (ptr i64)) (primitive/alloc-static i64))
+
+(defn slice-text=? [(left (slice u8)) (right (slice u8))] (-> bool)
+  (if (!= (slice-len left) (slice-len right))
+      false
+      (let [(mut i) 0 (mut same) true]
+        (loop (if (or (not (load same)) (>= (load i) (slice-len left)))
+                  (break)
+                  (if (= (slice-get left (load i)) (slice-get right (load i)))
+                      (set! i (+ (load i) 1))
+                      (set! same false))))
+        (load same))))
+
+(defn slice-contains? [(text (slice u8)) (needle (slice u8))] (-> bool)
+  (let [(mut at) 0 (mut found) false]
+    (loop (if (or (load found)
+                  (> (+ (load at) (slice-len needle)) (slice-len text)))
+              (break)
+              (let [(mut i) 0 (mut same) true]
+                (loop (if (or (not (load same)) (>= (load i) (slice-len needle)))
+                          (break)
+                          (if (= (slice-get text (+ (load at) (load i)))
+                                 (slice-get needle (load i)))
+                              (set! i (+ (load i) 1))
+                              (set! same false))))
+                (if (load same) (set! found true) (set! at (+ (load at) 1))))))
+    (load found)))
+
+(defn observe! [(value i64)] (-> i64)
+  (store! (observed-value) value)
+  0)
+
+(defn live-wrapper [(a (dyn alloc/Allocator)) (source (slice u8))] (-> (slice u8))
+  (let [(mut out) (str/sb-new a)]
+    (str/sb-push-str! (mut out)
+      "(import \"experiments.heap-inspector.live-reader\" :use *)\n(live-submit-coil \"")
+    (for [i 0 (slice-len source)]
+      (let [c (slice-get source i)]
+        (cond
+          (= (primitive/cast i64 c) 34) (str/sb-push-str! (mut out) "\\\"")
+          (= (primitive/cast i64 c) 92) (str/sb-push-str! (mut out) "\\\\")
+          (= (primitive/cast i64 c) 10) (str/sb-push-str! (mut out) "\\n")
+          (= (primitive/cast i64 c) 13) (str/sb-push-str! (mut out) "\\r")
+          (= (primitive/cast i64 c) 9) (str/sb-push-str! (mut out) "\\t")
+          :else (str/sb-push-byte! (mut out) c))))
+    (str/sb-push-str! (mut out) "\")")
+    (str/sb-finish! (mut out))))
+
+(defn apply-live! [(session (ptr jit/JitSession))
+                   (a (dyn alloc/Allocator))
+                   (source (slice u8))] (-> i64)
+  (let [prepared (jit/jit-prepare-replace-with-entry!
+                   session (live-wrapper a source) "(__live_candidate_commit)")]
+    (if (!= prepared 0) prepared
+        (let [status (jit/jit-commit-prepared! session)]
+          (live/live-end-affected-publication!)
+          status))))
+
+(export-c [observe! :as "coil_live_function_test_observe"])
+
+(deftest one-definition-body-update-swaps-the-owned-typed-slot
+  (let [a (alloc/malloc-allocator)
+        (mut session) (jit/jit-session-new a)]
+    (assert-eq 0 (jit/jit-session-set-legacy-reload! (mut session) false))
+    (store! (observed-value) 0)
+    (let [program
+            "(extern coil_live_function_test_observe :cc c [i64] (-> i64))
+             (defstruct Particle [(x i64)])
+             (defn radius [(p Particle)] (-> i64) (.x p))
+             (defn adjust [(value i64)] (-> i64) value)
+             (defn radius_caller [(x i64)] (-> i64) (radius (Particle :x x)))
+             (defn saved_adjust_initialized [] (-> (ptr bool)) (primitive/alloc-static bool))
+             (defn saved_adjust_cell [] (-> (ptr (fnptr c [i64] i64)))
+               (let [cell (primitive/alloc-static (fnptr c [i64] i64))]
+                 (if (not (load (saved_adjust_initialized)))
+                     (do (store! cell (primitive/fnptr-of adjust))
+                         (store! (saved_adjust_initialized) true)) 0)
+                 cell))
+             (defn saved_adjust_call [(value i64)] (-> i64)
+               (primitive/call-ptr (load (saved_adjust_cell)) value))"]
+      (assert-eq 0 (jit/jit-prepare-replace-with-entry!
+                     (mut session) (live-wrapper a program)
+                     "(__live_candidate_commit)"))
+      (assert-eq 0 (jit/jit-commit-prepared! (mut session)))
+      (live/live-end-affected-publication!))
+    (assert-jit-ok (mut session)
+      "(coil_live_function_test_observe (radius_caller 41))")
+    (assert-eq 41 (load (observed-value)))
+    (assert-eq 0 (jit/jit-submit! (mut session)
+                   "(coil_live_function_test_observe (saved_adjust_call 41))"))
+    (assert-eq 41 (load (observed-value)))
+    (assert-eq 0 (apply-live! (mut session) a
+                   "(defn radius [(p Particle)] (-> i64) (+ (.x p) 1))"))
+    (assert-eq 1 (load (live/live-affected-count)))
+    (assert-eq 1 (.kind (load (live/live-affected-head))))
+    (assert (slice-text=? (.name (load (live/live-affected-head))) "radius"))
+    (assert-eq 0 (jit/jit-submit! (mut session)
+                   "(coil_live_function_test_observe (radius_caller 41))"))
+    (assert-eq 42 (load (observed-value)))
+    (assert-eq 0 (apply-live! (mut session) a
+                   "(defn adjust [(value i64)] (-> i64) (+ value 1))"))
+    (assert-eq 1 (load (live/live-affected-count)))
+    (assert (slice-text=? (.name (load (live/live-affected-head))) "adjust"))
+    (assert-eq 0 (jit/jit-submit! (mut session)
+                   "(coil_live_function_test_observe (saved_adjust_call 41))"))
+    (assert-eq 42 (load (observed-value)))
+    (assert-eq 1 (apply-live! (mut session) a
+                   "(defn adjust [(value i64)] (-> i64) true)"))
+    (assert-eq 0 (jit/jit-submit! (mut session)
+                   "(coil_live_function_test_observe (saved_adjust_call 41))"))
+    (assert-eq 42 (load (observed-value)))))
+
+(deftest repeated-schema-edits-migrate-stable-handles-and-exact-functions
+  (let [a (alloc/malloc-allocator)
+        (mut session) (jit/jit-session-new a)]
+    (assert-eq 0 (jit/jit-session-set-legacy-reload! (mut session) false))
+    (store! (observed-value) 0)
+    (assert-eq 0 (apply-live! (mut session) a
+      "(extern coil_live_function_test_observe :cc c [i64] (-> i64))
+       (defstruct Particle [(x i64)])
+       (letonce particle (Particle :x 41))
+       (defn live-identity [T] [(value T)] (-> T) value)
+       (defn particle-read [] (-> i64) (live-identity (.x particle)))"))
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (particle-read))"))
+    (assert-eq 41 (load (observed-value)))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defstruct Particle [(x i64) (hue i64 20)])
+       (defn particle-read [] (-> i64) (+ (.x particle) (.hue particle)))"))
+    (assert-eq 2 (load (live/live-affected-count)))
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (particle-read))"))
+    (assert-eq 61 (load (observed-value)))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defstruct Particle [(x i64) (hue i64 20) (weight i64 2)])
+       (defn particle-read [] (-> i64)
+         (+ (.x particle) (+ (.hue particle) (.weight particle))))"))
+    (assert-eq 2 (load (live/live-affected-count)))
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (particle-read))"))
+    (assert-eq 63 (load (observed-value)))))
+
+(deftest generated-struct-matrix-reorders-removes-changes-and-reverts
+  (let [a (alloc/malloc-allocator)
+        (mut session) (jit/jit-session-new a)]
+    (assert-eq 0 (jit/jit-session-set-legacy-reload! (mut session) false))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(extern coil_live_function_test_observe :cc c [i64] (-> i64))
+       (defstruct Matrix [(a i64) (b i64)])
+       (letonce matrix (Matrix :a 10 :b 20))
+       (defn matrix-read [] (-> i64) (+ (.a matrix) (.b matrix)))"))
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (matrix-read))"))
+    (assert-eq 30 (load (observed-value)))
+
+    ; Reorder retained fields and add one defaulted field.
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defstruct Matrix [(b i64) (a i64) (c i64 3)])
+       (defn matrix-read [] (-> i64)
+         (+ (.a matrix) (+ (.b matrix) (.c matrix))))"))
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (matrix-read))"))
+    (assert-eq 33 (load (observed-value)))
+
+    ; Remove b. Retained fields are matched by source field identity, not offset.
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defstruct Matrix [(a i64) (c i64)])
+       (defn matrix-read [] (-> i64) (+ (.a matrix) (.c matrix)))"))
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (matrix-read))"))
+    (assert-eq 13 (load (observed-value)))
+
+    ; Change c's type with an explicit transition over the old typed value.
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defstruct Matrix [(a i64) (c bool)])
+       (migrate Matrix c old (= old 3))
+       (defn matrix-read [] (-> i64)
+         (+ (.a matrix) (if (.c matrix) 1 0)))"))
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (matrix-read))"))
+    (assert-eq 11 (load (observed-value)))
+
+    ; Returning to the original physical shape is another forward schema. The
+    ; newly reintroduced b receives its declared default; a retains identity.
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defstruct Matrix [(a i64) (b i64 8)])
+       (defn matrix-read [] (-> i64) (+ (.a matrix) (.b matrix)))"))
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (matrix-read))"))
+    (assert-eq 18 (load (observed-value)))))
+
+(deftest nested-live-fields-obey-clone-drop-and-survive-child-migration
+  (let [a (alloc/malloc-allocator)
+        before (load (live/live-handle-count))
+        (mut session) (jit/jit-session-new a)]
+    (assert-eq 0 (jit/jit-session-set-legacy-reload! (mut session) false))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(extern coil_live_function_test_observe :cc c [i64] (-> i64))
+       (defstruct Particle [(x i64)])
+       (defstruct World [(particle Particle)])
+       (letonce world (World :particle (Particle :x 4)))
+       (defn nested-x [] (-> i64) (.x (.particle world)))
+       (defn replace-particle [] (-> i64)
+         (set! (.particle world) (Particle :x 9)))"))
+    (assert-eq (+ before 2) (load (live/live-handle-count)))
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (nested-x))"))
+    (assert-eq 4 (load (observed-value)))
+    (assert-eq 0 (jit/jit-submit! (mut session) "(replace-particle)"))
+    (assert-eq (+ before 2) (load (live/live-handle-count)))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (nested-x))"))
+    (assert-eq 9 (load (observed-value)))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defstruct Particle [(x i64) (y i64 7)])"))
+    (assert-eq (+ before 2) (load (live/live-handle-count)))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defn nested-y [] (-> i64) (.y (.particle world)))"))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (nested-y))"))
+    (assert-eq 7 (load (observed-value)))
+    (assert-eq (+ before 2) (load (live/live-handle-count)))))
+
+(deftest live-sum-payloads-borrow-match-and-destroy-nested-handles
+  (let [a (alloc/malloc-allocator)
+        (mut session) (jit/jit-session-new a)
+        before (load (live/live-handle-count))]
+    (assert-eq 0 (jit/jit-session-set-legacy-reload! (mut session) false))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(extern coil_live_function_test_observe :cc c [i64] (-> i64))
+       (defstruct Particle [(x i64)])
+       (defsum Selection (Nothing) (Selected [(particle Particle)]))
+       (letonce particle (Particle :x 4))
+       (letonce selection (Selected :particle particle))
+       (defn selected-x [] (-> i64)
+         (match selection
+           (Nothing [] 0)
+           (Selected [p] (.x p))))
+       (defn temporary-selected-x [] (-> i64)
+         (match (Selected :particle particle)
+           (Nothing [] 0)
+           (Selected [p] (.x p))))"))
+    (assert-eq (+ before 2) (load (live/live-handle-count)))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (+ (selected-x) (temporary-selected-x)))"))
+    (assert-eq 8 (load (observed-value)))
+    ; The temporary sum and its cloned nested handle were destroyed at the call
+    ; boundary; matching the retained sum only borrowed its payload.
+    (assert-eq (+ before 2) (load (live/live-handle-count)))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defstruct Particle [(x i64) (y i64 7)])
+       (defn selected-y [] (-> i64)
+         (match selection
+           (Nothing [] 0)
+           (Selected [p] (.y p))))"))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (selected-y))"))
+    (assert-eq 7 (load (observed-value)))
+    (assert-eq (+ before 2) (load (live/live-handle-count)))))
+
+(deftest signature-change-creates-a-new-permanent-abi-lineage
+  (let [a (alloc/malloc-allocator)
+        (mut session) (jit/jit-session-new a)]
+    (assert-eq 0 (jit/jit-session-set-legacy-reload! (mut session) false))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(extern coil_live_function_test_observe :cc c [i64] (-> i64))
+       (defn evolve [(value i64)] (-> i64) (+ value 10))"))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defn evolve [(value f64)] (-> f64) (+ value 0.5))
+       (defn evolved-result [] (-> i64)
+         (primitive/cast i64 (evolve 4.0)))"))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (evolved-result))"))
+    (assert-eq 4 (load (observed-value)))
+    ; The original source-name trampoline is lineage 0 and remains callable
+    ; with its original ABI. Candidate source was rewritten to lineage 1.
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (evolve 4))"))
+    (assert-eq 14 (load (observed-value)))))
+
+(deftest recursive-and-mutually-recursive-calls-dispatch-through-stable-entries
+  (let [a (alloc/malloc-allocator)
+        (mut session) (jit/jit-session-new a)]
+    (assert-eq 0 (jit/jit-session-set-legacy-reload! (mut session) false))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(extern coil_live_function_test_observe :cc c [i64] (-> i64))
+       (defn parity-even [(n i64)] (-> i64)
+         (if (= n 0) 1 (parity-odd (- n 1))))
+       (defn parity-odd [(n i64)] (-> i64)
+         (if (= n 0) 0 (parity-even (- n 1))))
+       (defn recursive-sum [(n i64)] (-> i64)
+         (if (= n 0) 0 (+ n (recursive-sum (- n 1)))))"))
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (+ (parity-even 3) (recursive-sum 3)))"))
+    (assert-eq 6 (load (observed-value)))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defn parity-odd [(n i64)] (-> i64) (do (primitive/cast i64 n) 1))"))
+    (assert-eq 1 (load (live/live-affected-count)))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defn recursive-sum [(n i64)] (-> i64)
+         (if (= n 0) 1 (+ n (recursive-sum (- n 1)))))"))
+    (assert-eq 1 (load (live/live-affected-count)))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (+ (parity-even 3) (recursive-sum 3)))"))
+    (assert-eq 8 (load (observed-value)))))
+
+(deftest generic-source-edit-rebuilds-recorded-concrete-consumers
+  (let [a (alloc/malloc-allocator)
+        (mut session) (jit/jit-session-new a)]
+    (assert-eq 0 (jit/jit-session-set-legacy-reload! (mut session) false))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(extern coil_live_function_test_observe :cc c [i64] (-> i64))
+       (defn choose [T] [(left T) (right T)] (-> T)
+         left)
+       (defn choose-result [] (-> i64) (choose 10 20))"))
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (choose-result))"))
+    (assert-eq 10 (load (observed-value)))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defn choose [T] [(left T) (right T)] (-> T)
+         right)"))
+    (assert-eq 2 (load (live/live-affected-count)))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (choose-result))"))
+    (assert-eq 20 (load (observed-value)))
+    ; A concrete specialization first requested after the edit must use the
+    ; accepted generic source version, not a retained old monomorph.
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defn choose-bool-result [] (-> i64)
+         (if (choose false true) 1 0))"))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (choose-bool-result))"))
+    (assert-eq 1 (load (observed-value)))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defn accepted-monomorph-count [] (-> i64)
+         (live-accepted-artifact-count :concrete-monomorph))"))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (accepted-monomorph-count))"))
+    (assert (> (load (observed-value)) 0))))
+
+(deftest trait-selection-report-is-owned-by-the-exact-live-caller
+  (let [a (alloc/malloc-allocator)
+        (mut session) (jit/jit-session-new a)]
+    (assert-eq 0 (jit/jit-session-set-legacy-reload! (mut session) false))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(extern coil_live_function_test_observe :cc c [i64] (-> i64))
+       (deftrait LiveDouble [Self]
+         (live-double [(value Self)] (-> Self)))
+       (impl LiveDouble i64
+         (live-double [(value i64)] (-> i64) (+ value value)))
+       (defn doubled [] (-> i64) (live-double 5))"))
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (doubled))"))
+    (assert-eq 10 (load (observed-value)))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defn accepted-trait-use-count [] (-> i64)
+         (live-accepted-artifact-count :trait-use))"))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (accepted-trait-use-count))"))
+    (assert (> (load (observed-value)) 0))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(impl LiveDouble i64
+         (live-double [(value i64)] (-> i64)
+           (+ value (+ value value))))"))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (doubled))"))
+    (assert-eq 15 (load (observed-value)))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defn future-doubled [] (-> i64) (live-double 7))"))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (future-doubled))"))
+    (assert-eq 21 (load (observed-value)))
+    (assert-eq 1 (apply-live! (mut session) a
+      "(impl LiveDouble i64
+         (live-double [(value i64)] (-> i64) true))"))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (doubled))"))
+    (assert-eq 15 (load (observed-value)))))
+
+(deftest erased-trait-vtable-keeps-the-stable-live-method-entry
+  (let [a (alloc/malloc-allocator)
+        (mut session) (jit/jit-session-new a)]
+    (assert-eq 0 (jit/jit-session-set-legacy-reload! (mut session) false))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(extern coil_live_function_test_observe :cc c [i64] (-> i64))
+       (defstruct Model [(value i64)])
+       (deftrait LiveRead [Self]
+         (live-read [(self (ptr Self))] (-> i64)))
+       (impl LiveRead Model
+         (live-read [(self (ptr Model))] (-> i64) (.value self)))
+       (letonce model (Model :value 5))
+       (defn erased-result [] (-> i64)
+         (let [erased-model (primitive/make-dyn LiveRead model)]
+           (live-read erased-model)))"))
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (erased-result))"))
+    (assert-eq 5 (load (observed-value)))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(impl LiveRead Model
+         (live-read [(self (ptr Model))] (-> i64)
+           (+ (.value self) 10)))"))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (erased-result))"))
+    (assert-eq 15 (load (observed-value)))))
+
+(deftest live-closure-uses-a-stable-body-entry-and-versioned-environment
+  (let [a (alloc/malloc-allocator)
+        (mut session) (jit/jit-session-new a)]
+    (assert-eq 0 (jit/jit-session-set-legacy-reload! (mut session) false))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(extern coil_live_function_test_observe :cc c [i64] (-> i64))
+       (defclosure captured-adder [(base i64)] [(value i64)] i64
+         (+ base value))
+       (letonce saved-adder (captured-adder-new 5))
+       (defn call-new-adder [] (-> i64)
+         (let [(mut adder) (captured-adder-new 5)
+               result (captured-adder-call adder 7)]
+           (captured-adder-free (take! [captured-adder] (mut adder)))
+           result))
+       (defn call-saved-adder [] (-> i64)
+         (captured-adder-call saved-adder 7))"))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (call-new-adder))"))
+    (assert-eq 12 (load (observed-value)))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (call-saved-adder))"))
+    (assert-eq 12 (load (observed-value)))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defclosure captured-adder [(base i64)] [(value i64)] i64
+         (+ base (+ value 10)))"))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (call-new-adder))"))
+    (assert-eq 22 (load (observed-value)))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (call-saved-adder))"))
+    (assert-eq 22 (load (observed-value)))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defclosure captured-adder [(base i64) (bias i64 3)]
+         [(value i64)] i64
+         (+ base (+ bias value)))"))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (call-new-adder))"))
+    (assert-eq 15 (load (observed-value)))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (call-saved-adder))"))
+    (assert-eq 15 (load (observed-value)))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(migrate captured-adder base old-base
+         (primitive/cast f64 old-base))
+       (defclosure captured-adder [(base f64) (bias i64 3)]
+         [(value i64)] i64
+         (+ (primitive/cast i64 base) (+ bias value)))"))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (call-new-adder))"))
+    (assert-eq 15 (load (observed-value)))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (call-saved-adder))"))
+    (assert-eq 15 (load (observed-value)))))
+
+(deftest rejected-sum-candidate-does-not-pollute-accepted-abi
+  (let [a (alloc/malloc-allocator)
+        (mut session) (jit/jit-session-new a)]
+    (assert-eq 0 (jit/jit-session-set-legacy-reload! (mut session) false))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(extern coil_live_function_test_observe :cc c [i64] (-> i64))
+       (defstruct Particle [(visible bool)])
+       (letonce particle (Particle :visible true))
+       (defn visible-code [] (-> i64) (if (.visible particle) 1 0))"))
+    (assert-eq 1 (apply-live! (mut session) a
+      "(defsum Visibility (Hidden) (Visible))
+       (defstruct Particle [(visible Visibility)])"))
+    (assert (not (slice-contains? (jit/jit-abi-source (mut session)) "Visibility")))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defsum Visibility (Hidden) (Visible))
+       (defstruct Particle [(visible Visibility)])
+       (defsum Visibility (Hidden) (Visible))
+       (defstruct Particle [(visible Visibility (Visible))])
+       (migrate Particle visible old (if old (Visible) (Hidden)))
+       (defn visible-code [] (-> i64)
+         (match (.visible particle) (Hidden [] 0) (Visible [] 1)))"))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defsum Kind (Dot) (Ring))
+       (defn kind-of [] (-> Kind) (Ring))"))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(letonce current-kind (Ring))"))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defn kind-code [] (-> i64)
+         (match current-kind (Dot [] 0) (Ring [] 1)))"))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (kind-code))"))
+    (assert-eq 1 (load (observed-value)))
+    (assert-eq 1 (apply-live! (mut session) a
+      "(defsum Kind (Dot) (Ring) (Bar))
+       (defn kind-of [] (-> Kind) (Bar))"))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defsum Kind (Dot) (Ring) (Bar))
+       (defn kind-of [] (-> Kind) (Bar))
+       (defn kind-code [] (-> i64)
+         (match current-kind (Dot [] 0) (Ring [] 1) (Bar [] 2)))"))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (kind-code))"))
+    (assert-eq 1 (load (observed-value)))
+    (assert-eq 1 (apply-live! (mut session) a
+      "(defsum Kind (Dot) (Bar))
+       (defn kind-code [] (-> i64)
+         (match current-kind (Dot [] 0) (Bar [] 2)))"))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defsum Kind (Dot) (Bar))
+       (migrate Kind Ring _ (Bar))
+       (defn kind-code [] (-> i64)
+         (match current-kind (Dot [] 0) (Bar [] 2)))"))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (kind-code))"))
+    (assert-eq 2 (load (observed-value)))
+    (assert-eq 1 (apply-live! (mut session) a
+      "(defsum Kind (Dot) (Bar [(code i64)]))
+       (defn kind-of [] (-> Kind) (Bar :code 7))
+       (defn kind-code [] (-> i64)
+         (match current-kind (Dot [] 0) (Bar [code] code)))"))
+    (assert-eq 0 (apply-live! (mut session) a
+      "(defsum Kind (Dot) (Bar [(code i64)]))
+       (migrate Kind Bar _ (Bar :code 7))
+       (defn kind-of [] (-> Kind) (Bar :code 7))
+       (defn kind-code [] (-> i64)
+         (match current-kind (Dot [] 0) (Bar [code] code)))"))
+    (store! (observed-value) 0)
+    (assert-eq 0 (jit/jit-submit! (mut session)
+      "(coil_live_function_test_observe (kind-code))"))
+    (assert-eq 7 (load (observed-value)))))
