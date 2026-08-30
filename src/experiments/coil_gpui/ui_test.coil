@@ -2793,3 +2793,102 @@
              (let [second-scene (load (field second scene))]
                (assert-eq (al/al-len [Primitive] (load (field second-scene items))) 2))
              (window/window-host-free! (mut second)))))
+
+(deftest offscreen-metal-readback-renders-and-preserves-undamaged-pixels
+         (let [app (msg (ptr i8) (class c"NSApplication") (sel c"sharedApplication") [])
+               options (window/window-options c"Offscreen pixel test" 64.0 48.0)
+               (mut host) (window/window-host-new options)]
+           (do
+             (scene-rect! (mut (field host scene)) (rect 4.0 4.0 20.0 20.0)
+                          (rgb 1.0 0.0 0.0) 1)
+             (scene-rect! (mut (field host scene)) (rect 32.0 4.0 20.0 20.0)
+                          (rgb 0.0 0.0 1.0) 2)
+             (let [full (DamageRegion :bounds (rect 0.0 0.0 64.0 48.0) :valid true)
+                   (mut first) (metal/renderer-render-offscreen!
+                                 (mut (field host renderer))
+                                 (load (field host scene)) full)
+                   scale (primitive/cast i64 (load (field host scale)))
+                   left-x (* 12 scale)
+                   right-x (* 40 scale)
+                   sample-y (* 12 scale)]
+               (do
+                 (assert (metal/pixel-buffer-valid? first))
+                 ; BGRA8: opaque red and blue centers prove the production
+                 ; paint pipeline reached a CPU-readable Metal buffer.
+                 (assert (> (primitive/cast i64 (metal/pixel-buffer-byte first left-x sample-y 2)) 245))
+                 (assert (< (primitive/cast i64 (metal/pixel-buffer-byte first left-x sample-y 0)) 10))
+                 (assert (> (primitive/cast i64 (metal/pixel-buffer-byte first right-x sample-y 0)) 245))
+                 (assert (< (primitive/cast i64 (metal/pixel-buffer-byte first right-x sample-y 2)) 10))
+                 (scene-clear! (mut (field host scene)))
+                 (scene-rect! (mut (field host scene)) (rect 4.0 4.0 20.0 20.0)
+                              (rgb 0.0 1.0 0.0) 1)
+                 (scene-rect! (mut (field host scene)) (rect 32.0 4.0 20.0 20.0)
+                              (rgb 0.0 0.0 1.0) 2)
+                 (let [left-only (DamageRegion :bounds (rect 4.0 4.0 20.0 20.0) :valid true)
+                       (mut second) (metal/renderer-render-offscreen!
+                                     (mut (field host renderer))
+                                     (load (field host scene)) left-only)]
+                   (do
+                     (assert (metal/pixel-buffer-valid? second))
+                     (assert (> (primitive/cast i64 (metal/pixel-buffer-byte second left-x sample-y 1)) 245))
+                     (assert (< (primitive/cast i64 (metal/pixel-buffer-byte second left-x sample-y 2)) 10))
+                     ; The private backing texture retains pixels beyond the
+                     ; damage scissor instead of clearing the whole frame.
+                     (assert-eq (metal/pixel-buffer-byte second right-x sample-y 0)
+                                (metal/pixel-buffer-byte first right-x sample-y 0))
+                     (assert-eq (metal/pixel-buffer-byte second right-x sample-y 2)
+                                (metal/pixel-buffer-byte first right-x sample-y 2))
+                     (metal/pixel-buffer-free! (mut second))))
+                 (metal/pixel-buffer-free! (mut first))))
+             (window/window-host-free! (mut host)))))
+
+(deftest offscreen-metal-pixels-cover-rounding-clipping-and-alpha-blending
+         (let [app (msg (ptr i8) (class c"NSApplication") (sel c"sharedApplication") [])
+               options (window/window-options c"Offscreen effects test" 64.0 52.0)
+               (mut host) (window/window-host-new options)]
+           (do
+             (scene-rounded-rect! (mut (field host scene)) (rect 4.0 4.0 20.0 20.0)
+                                  (rgb 0.0 1.0 0.0) 8.0 0.0
+                                  (rgba 0.0 0.0 0.0 0.0) 1)
+             (let [prior (scene-push-clip! (mut (field host scene)) (rect 32.0 4.0 10.0 20.0))]
+               (do
+                 (scene-rect! (mut (field host scene)) (rect 28.0 4.0 20.0 20.0)
+                              (rgb 1.0 0.0 0.0) 2)
+                 (scene-pop-clip! (mut (field host scene)) prior)))
+             (scene-rect! (mut (field host scene)) (rect 4.0 30.0 20.0 18.0)
+                          (rgb 0.0 0.0 1.0) 3)
+             (scene-rect! (mut (field host scene)) (rect 4.0 30.0 20.0 18.0)
+                          (rgba 1.0 0.0 0.0 0.5) 4)
+             (let [full (DamageRegion :bounds (rect 0.0 0.0 64.0 52.0) :valid true)
+                   (mut pixels) (metal/renderer-render-offscreen!
+                                  (mut (field host renderer))
+                                  (load (field host scene)) full)
+                   scale (primitive/cast i64 (load (field host scale)))
+                   corner (* 5 scale)
+                   rounded-center (* 14 scale)
+                   clipped-inside (* 36 scale)
+                   clipped-outside (* 46 scale)
+                   upper-y (* 14 scale)
+                   blend-x (* 14 scale)
+                   blend-y (* 38 scale)]
+               (do
+                 (assert (metal/pixel-buffer-valid? pixels))
+                 ; The analytic corner lies outside the rounded SDF, while its center is green.
+                 (assert (< (primitive/cast i64 (metal/pixel-buffer-byte pixels corner corner 1)) 40))
+                 (assert (> (primitive/cast i64
+                              (metal/pixel-buffer-byte pixels rounded-center upper-y 1)) 245))
+                 ; A larger red primitive is visible only inside the nested clip.
+                 (assert (> (primitive/cast i64
+                              (metal/pixel-buffer-byte pixels clipped-inside upper-y 2)) 245))
+                 (assert (< (primitive/cast i64
+                              (metal/pixel-buffer-byte pixels clipped-outside upper-y 2)) 40))
+                 ; Half-alpha red over blue leaves substantial red and blue channels.
+                 (let [blue (primitive/cast i64
+                              (metal/pixel-buffer-byte pixels blend-x blend-y 0))
+                       red (primitive/cast i64
+                             (metal/pixel-buffer-byte pixels blend-x blend-y 2))]
+                   (do
+                     (assert (and (> blue 110) (< blue 145)))
+                     (assert (and (> red 110) (< red 145)))))
+                 (metal/pixel-buffer-free! (mut pixels))))
+             (window/window-host-free! (mut host)))))

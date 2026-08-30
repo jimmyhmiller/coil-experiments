@@ -74,6 +74,12 @@ layer in the runtime path.
   unchanged pixels, while a device-pixel scissor clears and replays only records
   intersecting damage. A framebuffer-only drawable is presented with one
   fullscreen GPU sample, retaining the layer's optimal allocation mode.
+- Drawable-free deterministic rendering reuses those exact production pipelines
+  against the private backing texture, then performs a row-aligned Metal blit to
+  an explicitly owned shared `PixelBuffer`. Tests read completed BGRA8 pixels to
+  verify solid paint, analytic rounded corners, nested clips, alpha composition,
+  and preservation outside a partial-damage scissor without screenshots or a
+  visible window.
 - Adaptive center-parameterized elliptical arcs with positive or negative sweeps,
   full-circle support, and the same caller-controlled geometric tolerance.
 - SVG endpoint-parameterized elliptical arcs with x-axis rotation, radii
@@ -209,7 +215,8 @@ layer in the runtime path.
   closure, and cooperatively cancel all remaining jobs before releasing their own
   storage. The demo owns its background checksum through such a scope.
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
-  batching, scheduler lifecycle, ABI, and allocation-reuse tests (81 total).
+  batching, scheduler lifecycle, ABI, allocation-reuse, and deterministic Metal
+  pixel tests (96 total).
 
 ## Architecture
 
@@ -236,6 +243,8 @@ ImageIO decode -> cached BGRA textures
         |
         v
 Metal text/image pipelines apply per-scene tint, clipping, and alpha composition
+
+private backing texture -> row-aligned Metal blit -> owned BGRA8 test pixels
 ```
 
 This follows GPUI's hybrid model: long-lived state owns focus, component values,
@@ -382,7 +391,7 @@ application. GPUI parity still requires substantial systems, notably:
   traversal, and logical actions work);
 - typed future values, worker-pool priority lanes and work stealing,
   non-image/remote asset sources,
-  editable style inspection, and deterministic pixel/event UI tests;
+  editable style inspection, and deterministic event UI tests;
 - deeper GPU/CPU profiling.
 
 These are explicit missing capabilities, not features claimed by the prototype.
@@ -413,8 +422,10 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI entity transfer between windows](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/move_entity_between_windows.rs)
 - [GPUI macOS Metal renderer](https://github.com/zed-industries/zed/blob/main/crates/gpui_macos/src/metal_renderer.rs)
 - [GPUI macOS Metal atlas](https://github.com/zed-industries/zed/blob/main/crates/gpui_macos/src/metal_atlas.rs)
+- [GPUI platform headless-renderer contract](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/platform.rs)
 - [GPUI text-input grapheme navigation example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/input.rs)
 - [Apple CAMetalLayer documentation](https://developer.apple.com/documentation/QuartzCore/CAMetalLayer)
 - [Apple MTLRenderCommandEncoder documentation](https://developer.apple.com/documentation/metal/mtlrendercommandencoder)
+- [Apple MTLBlitCommandEncoder documentation](https://developer.apple.com/documentation/metal/mtlblitcommandencoder)
 - [Apple CTRun documentation](https://developer.apple.com/documentation/coretext/ctrun)
 - [Apple ImageIO documentation](https://developer.apple.com/documentation/imageio)

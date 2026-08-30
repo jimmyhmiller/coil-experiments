@@ -6,10 +6,15 @@
 (import "coil.primitive" :as primitive)
 
 (export Renderer
+        PixelBuffer
         renderer-new
         renderer-resize!
         renderer-draw!
         renderer-draw-damage!
+        renderer-render-offscreen!
+        pixel-buffer-valid?
+        pixel-buffer-byte
+        pixel-buffer-free!
         renderer-valid?
         renderer-free!
         next-buffer-capacity
@@ -34,6 +39,14 @@
 
 (defstruct MTLClearColor [(r f64) (g f64) (b f64) (a f64)])
 (defstruct MTLScissorRect [(x i64) (y i64) (width i64) (height i64)])
+(defstruct MTLOrigin [(x u64) (y u64) (z u64)])
+(defstruct MTLSize [(width u64) (height u64) (depth u64)])
+
+;;; A completed BGRA8 readback. Metal owns `bytes` through `buffer`; callers
+;;; release that ownership explicitly with `pixel-buffer-free!`.
+(defstruct PixelBuffer
+  [(buffer (ptr i8)) (bytes (ptr u8))
+   (width i64) (height i64) (row-bytes i64)])
 
 (defstruct Renderer
   [(device (ptr i8))
@@ -489,9 +502,10 @@
                               (primitive/cast i64 (* height scale)))
     0))
 
-(defn renderer-draw-damage! [(renderer (mut Renderer))
-                             (scene ui/Scene)
-                             (damage ui/DamageRegion)] (-> i64)
+(defn renderer-draw-damage-internal! [(renderer (mut Renderer))
+                                      (scene ui/Scene)
+                                      (damage ui/DamageRegion)
+                                      (present bool)] (-> i64)
   (let [items (load (field scene items))
         shadows (load (field scene shadows))
         text-items (load (field scene text))
@@ -526,10 +540,14 @@
         0
         (if (< (renderer-ensure-capacity! (mut renderer) total-bytes) 0)
             0
-            (let [drawable (msg (ptr i8) (load (field renderer layer)) (sel c"nextDrawable") [])]
-              (if (= (primitive/cast i64 drawable) 0)
+            (let [drawable (if present
+                               (msg (ptr i8) (load (field renderer layer)) (sel c"nextDrawable") [])
+                               (primitive/cast (ptr i8) 0))]
+              (if (and present (= (primitive/cast i64 drawable) 0))
                   0
-                  (let [drawable-texture (msg (ptr i8) drawable (sel c"texture") [])
+                  (let [drawable-texture (if present
+                                             (msg (ptr i8) drawable (sel c"texture") [])
+                                             (primitive/cast (ptr i8) 0))
                         texture (load (field renderer backing-texture))
                         pass (msg (ptr i8) (class c"MTLRenderPassDescriptor") (sel c"renderPassDescriptor") [])
                         colors (msg (ptr i8) pass (sel c"colorAttachments") [])
@@ -830,7 +848,8 @@
                           ; remains framebuffer-only, allowing the driver to keep
                           ; its optimal drawable allocation while the private
                           ; backing texture remains sampleable and persistent.
-                          (let [present-pass
+                          (if present
+                           (let [present-pass
                                   (msg (ptr i8) (class c"MTLRenderPassDescriptor")
                                        (sel c"renderPassDescriptor") [])
                                 present-colors
@@ -855,7 +874,10 @@
                                        (sel c"drawPrimitives:vertexStart:vertexCount:")
                                        [i64 i64 i64] 3 0 3)
                                   (msg i64 present-encoder (sel c"endEncoding") [])))))
-                          (msg i64 command (sel c"presentDrawable:") [(ptr i8)] drawable)
+                           0)
+                          (if present
+                              (msg i64 command (sel c"presentDrawable:") [(ptr i8)] drawable)
+                              0)
                           (msg i64 command (sel c"commit") [])
                           (set! (.frames renderer) (+ (load (field renderer frames)) 1))
                           (set! (.backing-valid renderer) true)
@@ -866,6 +888,73 @@
                                             (load paint-runs))
                                          (load texture-runs)))))
                           1))))))))))
+
+(defn renderer-draw-damage! [(renderer (mut Renderer))
+                             (scene ui/Scene)
+                             (damage ui/DamageRegion)] (-> i64)
+  (renderer-draw-damage-internal! (mut renderer) scene damage true))
+
+(defn renderer-render-offscreen! [(renderer (mut Renderer))
+                                  (scene ui/Scene)
+                                  (damage ui/DamageRegion)] (-> PixelBuffer)
+  (let [(mut result) (primitive/zeroed PixelBuffer)
+        width (load (field renderer backing-width))
+        height (load (field renderer backing-height))]
+    (if (or (<= width 0)
+            (or (<= height 0)
+                (= (renderer-draw-damage-internal! (mut renderer) scene damage false) 0)))
+        (load result)
+        (let [row-bytes (* (/ (+ (* width 4) 255) 256) 256)
+              byte-count (* row-bytes height)
+              buffer (msg (ptr i8) (load (field renderer device))
+                          (sel c"newBufferWithLength:options:") [i64 u64]
+                          byte-count (primitive/cast u64 0))
+              command (msg (ptr i8) (load (field renderer queue)) (sel c"commandBuffer") [])
+              blit (msg (ptr i8) command (sel c"blitCommandEncoder") [])]
+          (if (or (= (primitive/cast i64 buffer) 0)
+                  (= (primitive/cast i64 blit) 0))
+              (do (release-object! buffer) (load result))
+              (do
+                (msg i64 blit
+                     (sel c"copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:")
+                     [(ptr i8) u64 u64 MTLOrigin MTLSize (ptr i8) u64 u64 u64]
+                     (load (field renderer backing-texture))
+                     (primitive/cast u64 0) (primitive/cast u64 0)
+                     (MTLOrigin :x 0 :y 0 :z 0)
+                     (MTLSize :width (primitive/cast u64 width)
+                              :height (primitive/cast u64 height) :depth 1)
+                     buffer (primitive/cast u64 0)
+                     (primitive/cast u64 row-bytes)
+                     (primitive/cast u64 byte-count))
+                (msg i64 blit (sel c"endEncoding") [])
+                (msg i64 command (sel c"commit") [])
+                (msg i64 command (sel c"waitUntilCompleted") [])
+                (set! (.buffer result) buffer)
+                (set! (.bytes result) (primitive/cast (ptr u8)
+                                      (msg (ptr i8) buffer (sel c"contents") [])))
+                (set! (.width result) width)
+                (set! (.height result) height)
+                (set! (.row-bytes result) row-bytes)
+                (load result)))))))
+
+(defn pixel-buffer-valid? [(pixels PixelBuffer)] (-> bool)
+  (!= (primitive/cast i64 (load (field pixels buffer))) 0))
+
+(defn pixel-buffer-byte [(pixels PixelBuffer) (x i64) (y i64) (channel i64)] (-> u8)
+  (if (or (< x 0) (or (>= x (load (field pixels width)))
+      (or (< y 0) (or (>= y (load (field pixels height)))
+      (or (< channel 0) (>= channel 4))))))
+      (primitive/cast u8 0)
+      (load (primitive/index (load (field pixels bytes))
+                             (+ (* y (load (field pixels row-bytes)))
+                                (+ (* x 4) channel))))))
+
+(defn pixel-buffer-free! [(pixels (mut PixelBuffer))] (-> i64)
+  (do
+    (release-object! (load (field pixels buffer)))
+    (set! (.buffer pixels) (primitive/cast (ptr i8) 0))
+    (set! (.bytes pixels) (primitive/cast (ptr u8) 0))
+    0))
 
 (defn renderer-draw! [(renderer (mut Renderer)) (scene ui/Scene)] (-> i64)
   (renderer-draw-damage!
