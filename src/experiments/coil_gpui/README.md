@@ -232,7 +232,9 @@ endorsed by Zed Industries. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
   visible. Callers receive exact header, row, and cell rectangles for custom
   content. The independent 980×700 data-explorer window renders a live
   three-column table over one million logical rows while scene work remains
-  proportional to the viewport. Wheel/trackpad scrolling, pointer selection,
+  proportional to the viewport. Visible rows paint real numeric IDs from ten
+  cached digit textures plus cached entity and status labels; no million-string
+  allocation or per-frame shaping is involved. Wheel/trackpad scrolling, pointer selection,
   sortable headers, draggable column dividers, and Arrow/Home/End/Page navigation
   are routed directly to its retained state.
 - A retained GPU tree accepts batched parent-before-child nodes, publishes
