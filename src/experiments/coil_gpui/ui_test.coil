@@ -30,6 +30,7 @@
 (import "experiments.coil_gpui.inspector" :as inspector)
 (import "experiments.coil_gpui.scheduler" :as scheduler)
 (import "experiments.coil_gpui.window" :as window)
+(import "experiments.coil_gpui.event-test" :as event-test)
 
 (extern MTLCreateSystemDefaultDevice :cc c [] (-> (ptr i8)))
 
@@ -43,6 +44,27 @@
 (defstruct SchedulerProbe [(calls i64) (result i64) (cancelled i64)])
 
 (defstruct SchedulerBatchProbe [(completed i64) (sum i64)])
+
+(defn build-replay-component-scene! [(scene (mut Scene))
+                                     (router input/Router)
+                                     (checked bool)] (-> i64)
+  (do
+    (button! (mut scene)
+             (rect 8.0 8.0 36.0 28.0)
+             (ButtonState
+               :hovered (= (load (field router hovered)) 10)
+               :pressed (= (load (field router pressed)) 10)
+               :focused (= (load (field router focused)) 10)
+               :disabled false)
+             10)
+    (checkbox! (mut scene)
+               (rect 60.0 10.0 24.0 24.0)
+               (CheckboxState
+                 :checked checked
+                 :hovered (= (load (field router hovered)) 11)
+                 :focused (= (load (field router focused)) 11)
+                 :disabled false)
+               11)))
 
 (defn scheduler-test-foreground [(raw (ptr i8))] (-> i64)
   (let [probe (primitive/cast (ptr SchedulerProbe) raw)]
@@ -2891,4 +2913,77 @@
                      (assert (and (> blue 110) (< blue 145)))
                      (assert (and (> red 110) (< red 145)))))
                  (metal/pixel-buffer-free! (mut pixels))))
+             (window/window-host-free! (mut host)))))
+
+(deftest deterministic-event-replay-drives-components-and-offscreen-frames
+         (let [app (msg (ptr i8) (class c"NSApplication") (sel c"sharedApplication") [])
+               options (window/window-options c"Event replay test" 96.0 48.0)
+               (mut host) (window/window-host-new options)
+               (mut script) (event-test/event-script-new)
+               (mut replay) (primitive/zeroed event-test/ReplayContext)
+               (mut checked) false
+               (mut button-activations) 0]
+           (do
+             ; Mouse-focus and activate the checkbox, then move focus in paint
+             ; order and activate the button from the keyboard.
+             (event-test/event-script-click! (mut script) 72.0 22.0 5000000)
+             (event-test/event-script-key! (mut script) 48 false 2000000)
+             (event-test/event-script-key! (mut script) 49 false 1000000)
+             (store! replay (event-test/replay-context-new script))
+             (build-replay-component-scene! (mut (field host scene))
+                                            (load (field replay router))
+                                            (load checked))
+             (let [full (DamageRegion :bounds (rect 0.0 0.0 96.0 48.0) :valid true)
+                   (mut before) (metal/renderer-render-offscreen!
+                                  (mut (field host renderer))
+                                  (load (field host scene)) full)
+                   scale (primitive/cast i64 (load (field host scale)))
+                   checkbox-x (* 72 scale)
+                   checkbox-y (* 22 scale)
+                   before-red (primitive/cast i64
+                                (metal/pixel-buffer-byte before checkbox-x checkbox-y 2))
+                   (mut last-time) (primitive/cast u64 0)]
+               (do
+                 (assert (metal/pixel-buffer-valid? before))
+                 (while (event-test/replay-has-next? (load replay))
+                   (let [frame (event-test/replay-step! (mut replay)
+                                                        (load (field host scene)))]
+                     (do
+                       (assert (load (field frame valid)))
+                       (assert (>= (load (field frame time-ns)) (load last-time)))
+                       (store! last-time (load (field frame time-ns)))
+                       (if (and (= (load (field frame action))
+                                   (primitive/cast i32 input/action-activate))
+                                (= (load (field frame action-target)) 11))
+                           (store! checked (not (load checked)))
+                           0)
+                       (if (and (= (load (field frame action))
+                                   (primitive/cast i32 input/action-activate))
+                                (= (load (field frame action-target)) 10))
+                           (store! button-activations (+ (load button-activations) 1))
+                           0)
+                       ; Rebuild after every event exactly as a production frame
+                       ; does; subsequent events hit-test the newly painted state.
+                       (scene-clear! (mut (field host scene)))
+                       (build-replay-component-scene! (mut (field host scene))
+                                                      (load (field replay router))
+                                                      (load checked)))))
+                 (let [(mut after) (metal/renderer-render-offscreen!
+                                     (mut (field host renderer))
+                                     (load (field host scene)) full)]
+                   (do
+                     (assert (load checked))
+                     (assert-eq (load button-activations) 1)
+                     (assert-eq (load (field (field replay router) focused)) 10)
+                     (assert (load (field (field replay router) keyboard)))
+                     (assert-eq (load last-time) (primitive/cast u64 8000000))
+                     ; The replayed checkbox action changes a real GPU frame from
+                     ; its dark track to the checked white inset.
+                     (assert (> (primitive/cast i64
+                                  (metal/pixel-buffer-byte after checkbox-x checkbox-y 2))
+                                (+ before-red 120)))
+                     (metal/pixel-buffer-free! (mut after))))
+                 (metal/pixel-buffer-free! (mut before))))
+             (event-test/replay-context-free! (mut replay))
+             (event-test/event-script-free! (mut script))
              (window/window-host-free! (mut host)))))

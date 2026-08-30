@@ -80,6 +80,12 @@ layer in the runtime path.
   verify solid paint, analytic rounded corners, nested clips, alpha composition,
   and preservation outside a partial-damage scissor without screenshots or a
   visible window.
+- Coil-native event scripts record pointer moves, presses, releases, clicks, and
+  key events on a monotonic logical nanosecond timeline. An owned replay context
+  advances without reading wall time, drives the production hit-test/router,
+  captures action and hover/press/focus snapshots after every event, and resets
+  for exact repetition. End-to-end tests rebuild component scenes between steps
+  and verify the resulting action state in offscreen Metal pixels.
 - Adaptive center-parameterized elliptical arcs with positive or negative sweeps,
   full-circle support, and the same caller-controlled geometric tolerance.
 - SVG endpoint-parameterized elliptical arcs with x-axis rotation, radii
@@ -216,7 +222,7 @@ layer in the runtime path.
   storage. The demo owns its background checksum through such a scope.
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
   batching, scheduler lifecycle, ABI, allocation-reuse, and deterministic Metal
-  pixel tests (96 total).
+  pixel/event replay tests (97 total).
 
 ## Architecture
 
@@ -391,7 +397,7 @@ application. GPUI parity still requires substantial systems, notably:
   traversal, and logical actions work);
 - typed future values, worker-pool priority lanes and work stealing,
   non-image/remote asset sources,
-  editable style inspection, and deterministic event UI tests;
+  editable style inspection;
 - deeper GPU/CPU profiling.
 
 These are explicit missing capabilities, not features claimed by the prototype.
@@ -423,6 +429,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI macOS Metal renderer](https://github.com/zed-industries/zed/blob/main/crates/gpui_macos/src/metal_renderer.rs)
 - [GPUI macOS Metal atlas](https://github.com/zed-industries/zed/blob/main/crates/gpui_macos/src/metal_atlas.rs)
 - [GPUI platform headless-renderer contract](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/platform.rs)
+- [GPUI test-context input simulation example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/view_example/example_tests.rs)
 - [GPUI text-input grapheme navigation example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/input.rs)
 - [Apple CAMetalLayer documentation](https://developer.apple.com/documentation/QuartzCore/CAMetalLayer)
 - [Apple MTLRenderCommandEncoder documentation](https://developer.apple.com/documentation/metal/mtlrendercommandencoder)
