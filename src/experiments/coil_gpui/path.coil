@@ -23,6 +23,7 @@
         path-quadratic-to!
         path-cubic-to!
         path-arc!
+        path-svg-arc-to!
         path-close!
         path-point-count
         path-length
@@ -51,6 +52,12 @@
 (extern cosf :cc c [f32] (-> f32))
 
 (extern atan2f :cc c [f32 f32] (-> f32))
+
+(extern acosf :cc c [f32] (-> f32))
+
+(extern ceilf :cc c [f32] (-> f32))
+
+(extern fabsf :cc c [f32] (-> f32))
 
 (defn ButtCap [] (-> i32)
   (primitive/cast i32 0))
@@ -293,6 +300,143 @@
                         end-point
                         curve-tolerance
                         0)))))
+
+(defn rotated-ellipse-point [(center-x f32)
+                             (center-y f32)
+                             (radius-x f32)
+                             (radius-y f32)
+                             (cos-rotation f32)
+                             (sin-rotation f32)
+                             (angle f32)] (-> PathPoint)
+  (let [ellipse-x (* radius-x (cosf angle))
+        ellipse-y (* radius-y (sinf angle))]
+    (PathPoint :x (+ center-x (- (* cos-rotation ellipse-x) (* sin-rotation ellipse-y)))
+      :y (+ center-y (+ (* sin-rotation ellipse-x) (* cos-rotation ellipse-y))))))
+
+;;; Append an SVG endpoint-parameterized elliptical arc (`A`/`a`). Radii are
+;;; corrected per the SVG implementation notes, x-axis rotation is in degrees,
+;;; and flattening derives a segment angle from a geometric error tolerance.
+(defn path-svg-arc-to! [(path (mut Path))
+                        (radius-x-input f32)
+                        (radius-y-input f32)
+                        (x-axis-rotation f32)
+                        (large-arc bool)
+                        (sweep bool)
+                        (x f32)
+                        (y f32)
+                        (tolerance f32)] (-> i64)
+  (let [points (load (field path points))
+        count (al/al-len [PathPoint] points)]
+    (if (or (load (field path closed)) (= count 0))
+        0
+        (let [start (al/al-get [PathPoint] points (- count 1))
+              start-x (load (field start x))
+              start-y (load (field start y))
+              dx (- start-x x)
+              dy (- start-y y)
+              radii-degenerate (or (<= (fabsf radius-x-input) 0.000001)
+                                    (<= (fabsf radius-y-input) 0.000001))]
+          (cond
+            (and (<= (fabsf dx) 0.000001) (<= (fabsf dy) 0.000001)) 0
+            radii-degenerate (path-line-to! (mut path) x y)
+            :else
+              (let [radians-per-degree (primitive/cast f32 0.017453292519943295)
+                    rotation (* x-axis-rotation radians-per-degree)
+                    cos-rotation (cosf rotation)
+                    sin-rotation (sinf rotation)
+                    half-dx (* dx 0.5)
+                    half-dy (* dy 0.5)
+                    prime-x (+ (* cos-rotation half-dx) (* sin-rotation half-dy))
+                    prime-y
+                      (+ (* (- (primitive/cast f32 0.0) sin-rotation) half-dx)
+                         (* cos-rotation half-dy))
+                    raw-radius-x (fabsf radius-x-input)
+                    raw-radius-y (fabsf radius-y-input)
+                    lambda (+ (/ (* prime-x prime-x) (* raw-radius-x raw-radius-x))
+                              (/ (* prime-y prime-y) (* raw-radius-y raw-radius-y)))
+                    radius-scale (if (> lambda 1.0) (sqrtf lambda) 1.0)
+                    radius-x (* raw-radius-x radius-scale)
+                    radius-y (* raw-radius-y radius-scale)
+                    radius-x-squared (* radius-x radius-x)
+                    radius-y-squared (* radius-y radius-y)
+                    prime-x-squared (* prime-x prime-x)
+                    prime-y-squared (* prime-y prime-y)
+                    numerator
+                      (- (- (* radius-x-squared radius-y-squared)
+                            (* radius-x-squared prime-y-squared))
+                         (* radius-y-squared prime-x-squared))
+                    denominator
+                      (+ (* radius-x-squared prime-y-squared)
+                         (* radius-y-squared prime-x-squared))
+                    coefficient-base
+                      (if (or (<= numerator 0.0) (<= denominator 0.000001))
+                          0.0
+                          (sqrtf (/ numerator denominator)))
+                    coefficient (if (= large-arc sweep)
+                                    (- (primitive/cast f32 0.0) coefficient-base)
+                                    coefficient-base)
+                    center-prime-x (* coefficient (/ (* radius-x prime-y) radius-y))
+                    center-prime-y
+                      (* coefficient
+                         (/ (* (- (primitive/cast f32 0.0) radius-y) prime-x) radius-x))
+                    midpoint-x (* (+ start-x x) 0.5)
+                    midpoint-y (* (+ start-y y) 0.5)
+                    center-x
+                      (+ midpoint-x
+                         (- (* cos-rotation center-prime-x)
+                            (* sin-rotation center-prime-y)))
+                    center-y
+                      (+ midpoint-y
+                         (+ (* sin-rotation center-prime-x)
+                            (* cos-rotation center-prime-y)))
+                    unit-start-x (/ (- prime-x center-prime-x) radius-x)
+                    unit-start-y (/ (- prime-y center-prime-y) radius-y)
+                    unit-end-x
+                      (/ (- (- (primitive/cast f32 0.0) prime-x) center-prime-x) radius-x)
+                    unit-end-y
+                      (/ (- (- (primitive/cast f32 0.0) prime-y) center-prime-y) radius-y)
+                    start-angle (atan2f unit-start-y unit-start-x)
+                    raw-sweep
+                      (atan2f (- (* unit-start-x unit-end-y)
+                                 (* unit-start-y unit-end-x))
+                              (+ (* unit-start-x unit-end-x)
+                                 (* unit-start-y unit-end-y)))
+                    two-pi (primitive/cast f32 6.283185307179586)
+                    sweep-angle
+                      (cond (and (not sweep) (> raw-sweep 0.0)) (- raw-sweep two-pi)
+                            (and sweep (< raw-sweep 0.0)) (+ raw-sweep two-pi)
+                            :else raw-sweep)
+                    curve-tolerance (if (> tolerance 0.0) tolerance 0.25)
+                    max-radius (if (> radius-x radius-y) radius-x radius-y)
+                    error-ratio (if (>= curve-tolerance max-radius)
+                                    0.0
+                                    (- (primitive/cast f32 1.0)
+                                       (/ curve-tolerance max-radius)))
+                    max-angle (* (primitive/cast f32 2.0) (acosf error-ratio))
+                    safe-angle (if (> max-angle 0.0001) max-angle 0.0001)
+                    segments
+                      (let [needed
+                              (primitive/cast i64
+                                              (ceilf (/ (fabsf sweep-angle) safe-angle)))]
+                        (if (< needed 1) 1 needed))]
+                (do
+                  (for [i 1 (+ segments 1)]
+                    (let [ratio (/ (primitive/cast f32 i) (primitive/cast f32 segments))
+                          angle (+ start-angle (* sweep-angle ratio))]
+                      (if (= i segments)
+                          (al/al-push! [PathPoint]
+                                       (mut (.points path))
+                                       (PathPoint :x x :y y))
+                          (al/al-push! [PathPoint]
+                                       (mut (.points path))
+                                       (rotated-ellipse-point center-x
+                                                              center-y
+                                                              radius-x
+                                                              radius-y
+                                                              cos-rotation
+                                                              sin-rotation
+                                                              angle)))))
+                  segments)))))))
 
 (defn path-close! [(path (mut Path))] (-> i64)
   (do (set! (.closed path) true) 0))

@@ -56,6 +56,9 @@ layer in the runtime path.
   awaits a persistent backing texture; rotating layer drawables are always fully drawn.
 - Adaptive center-parameterized elliptical arcs with positive or negative sweeps,
   full-circle support, and the same caller-controlled geometric tolerance.
+- SVG endpoint-parameterized elliptical arcs with x-axis rotation, radii
+  correction, large-arc and sweep flags, exact endpoints, and tolerance-derived
+  subdivision. Degenerate SVG radii correctly fall back to a straight segment.
 - Batched analytic rounded-rectangle shadows with GPU-computed soft falloff,
   configurable offset, blur sigma, spread, radius, color, and scene clipping.
 - Native Unicode line shaping through CoreText `CTLine`/`CTRun`, preserving shaped
@@ -330,8 +333,8 @@ application. GPUI parity still requires substantial systems, notably:
   UTF-8/CoreText cluster conversion, glyph-run extraction, subpixel glyph caching,
   bounded atlas allocation, and GPU mask composition work now);
 - intrinsic text/image measurement (flex and constrained grid layout work);
-- endpoint-parameterized SVG arcs, closed-path dash seam merging,
-  SVG parsing, and non-simple/multi-contour fill rules (adaptive quadratic/cubic
+- closed-path dash seam merging, SVG parsing, and non-simple/multi-contour fill
+  rules (adaptive quadratic/cubic
   curves and elliptical arcs, polygon
   fills, butt-cap/miter strokes, affine transforms, analytic shadows, linear
   gradients, general raster images, virtual scrolling, and nested rectangular
