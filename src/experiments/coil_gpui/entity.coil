@@ -1,0 +1,216 @@
+(module experiments.coil_gpui.entity)
+(import "coil.rc" :as rc)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+
+(export EntityId
+        EntityMap
+        Entity
+        WeakEntity
+        entity-map-new
+        entity-map-create!
+        entity-map-alive-count
+        entity-id
+        entity-read
+        entity-strong-count
+        entity-downgrade
+        weak-entity-upgrade
+        weak-entity-alive?)
+
+(defstruct EntityId [(type-id i64) (slot i64) (generation i64)])
+
+(defstruct EntitySlot [T]
+  [(value T)
+   (strong i64)
+   (generation i64)
+   (alive bool)])
+
+(defstruct EntityArena [T]
+  [(slots (al/ArrayList (EntitySlot T)))
+   (free-slots (al/ArrayList i64))
+   (alive-count i64)])
+
+;;; EntityMap is the application-side capability used to create entities. An
+;;; Entity clones the arena owner, so values can safely outlive the map itself.
+(defstruct EntityMap [T] [(arena (rc/Rc (EntityArena T)))])
+
+;;; A strong handle owns one per-slot strong count and one arena Rc. The slot
+;;; value is destroyed exactly when the final Entity<T> handle is dropped.
+(defstruct Entity [T]
+  [(arena (rc/Rc (EntityArena T)))
+   (id EntityId)])
+
+;;; Weak handles keep only the arena control block alive. They do not preserve
+;;; either the arena payload or the entity value.
+(defstruct WeakEntity [T]
+  [(arena (rc/WeakRc (EntityArena T)))
+   (id EntityId)])
+
+(defn new-arena [T] [] (-> (EntityArena T))
+  (EntityArena
+    :slots (al/al-new [(EntitySlot T)] (alloc/malloc-allocator))
+    :free-slots (al/al-new [i64] (alloc/malloc-allocator))
+    :alive-count 0))
+
+(impl [T] Drop (EntityArena T)
+  (drop [(self (mut (EntityArena T)))] (-> void)
+    (do
+      ;; Normally no slot remains alive when the arena loses its final Rc, but
+      ;; clean up defensively if a future owner type releases counts in bulk.
+      (let [slots (load (field self slots))]
+        (for [i 0 (al/al-len [(EntitySlot T)] slots)]
+          (let [slot (primitive/index (load (field slots data)) i)]
+            (if (load (field slot alive))
+                (let [value (take! [T] (field slot value))]
+                  (do (store! (field slot alive) false) 0))
+                0))))
+      (al/al-free! [(EntitySlot T)] (mut (.slots self)))
+      (al/al-free! [i64] (mut (.free-slots self))))))
+
+(defn entity-map-new [T] [] (-> (Option (EntityMap T)))
+  (match (rc/rc-new [(EntityArena T)] (new-arena [T]))
+    (None [] (None [(EntityMap T)]))
+    (Some [owner] (Some (EntityMap :arena owner)))))
+
+(defn make-id [T] [(slot i64) (generation i64)] (-> EntityId)
+  (EntityId
+    :type-id (alloc/type-id [T])
+    :slot slot
+    :generation generation))
+
+(defn arena-slot [T] [(arena (ptr (EntityArena T)))
+                      (id EntityId)] (-> (ptr (EntitySlot T)))
+  (let [slots (load (field arena slots))
+        index (load (field id slot))]
+    (if (or (!= (load (field id type-id)) (alloc/type-id [T]))
+            (or (< index 0) (>= index (al/al-len [(EntitySlot T)] slots))))
+        (primitive/cast (ptr (EntitySlot T)) 0)
+        (let [slot (primitive/index (load (field slots data)) index)]
+          (if (and (load (field slot alive))
+                   (= (load (field slot generation))
+                      (load (field id generation))))
+              slot
+              (primitive/cast (ptr (EntitySlot T)) 0))))))
+
+(defn reserve-slot! [T] [(arena (ptr (EntityArena T)))] (-> i64)
+  (let [free-count (al/al-len [i64] (load (field arena free-slots)))]
+    (if (> free-count 0)
+        (let [index (al/al-get [i64] (load (field arena free-slots)) (- free-count 1))]
+          (do
+            (set! (.len (.free-slots arena)) (- free-count 1))
+            index))
+        (let [slots (load (field arena slots))
+              index (al/al-len [(EntitySlot T)] slots)]
+          (do
+            (if (>= index (al/al-cap [(EntitySlot T)] slots))
+                (al/al-reserve! [(EntitySlot T)]
+                                (mut (.slots arena))
+                                (if (= index 0) 2 (* index 2)))
+                0)
+            ;; The slot is populated in place before publishing the new length,
+            ;; avoiding a fabricated zero T for resource-owning entity values.
+            (set! (.len (.slots arena)) (+ index 1))
+            index)))))
+
+(defn entity-map-create! [T] [(map (ref (EntityMap T)))
+                              (value T)] (-> (Entity T))
+  (let [arena (rc/rc-borrow [(EntityArena T)] (field map arena))
+        index (reserve-slot! [T] arena)
+        slots (load (field arena slots))
+        slot (primitive/index (load (field slots data)) index)
+        generation
+          (if (= (load (field slot generation)) 0)
+              1
+              (load (field slot generation)))
+        slot-value value]
+    (do
+      (store! (field slot value) slot-value)
+      (store! (field slot strong) 1)
+      (store! (field slot generation) generation)
+      (store! (field slot alive) true)
+      (store! (field arena alive-count) (+ (load (field arena alive-count)) 1))
+      (Entity
+        :arena (clone (field map arena))
+        :id (make-id [T] index generation)))))
+
+(defn entity-id [T] [(entity (ref (Entity T)))] (-> EntityId)
+  (load (field entity id)))
+
+(defn entity-read [T] [(entity (ref (Entity T)))] (-> (ptr T))
+  (let [arena (rc/rc-borrow [(EntityArena T)] (field entity arena))
+        slot (arena-slot [T] arena (load (field entity id)))]
+    (if (= (primitive/cast i64 slot) 0)
+        (primitive/cast (ptr T) 0)
+        (field slot value))))
+
+(defn entity-strong-count [T] [(entity (ref (Entity T)))] (-> i64)
+  (let [arena (rc/rc-borrow [(EntityArena T)] (field entity arena))
+        slot (arena-slot [T] arena (load (field entity id)))]
+    (if (= (primitive/cast i64 slot) 0) 0 (load (field slot strong)))))
+
+(defn entity-map-alive-count [T] [(map (ref (EntityMap T)))] (-> i64)
+  (load (field (rc/rc-borrow [(EntityArena T)] (field map arena)) alive-count)))
+
+(defn entity-downgrade [T] [(entity (ref (Entity T)))] (-> (WeakEntity T))
+  (WeakEntity
+    :arena (rc/rc-downgrade [(EntityArena T)] (field entity arena))
+    :id (load (field entity id))))
+
+(defn weak-entity-upgrade [T] [(weak (ref (WeakEntity T)))] (-> (Option (Entity T)))
+  (match (rc/weak-rc-upgrade [(EntityArena T)] (field weak arena))
+    (None [] (None [(Entity T)]))
+    (Some [owner]
+      (let [arena (rc/rc-borrow [(EntityArena T)] owner)
+            slot (arena-slot [T] arena (load (field weak id)))]
+        (if (= (primitive/cast i64 slot) 0)
+            (let [expired-owner owner] (None [(Entity T)]))
+            (do
+              (store! (field slot strong) (+ (load (field slot strong)) 1))
+              (Some (Entity :arena owner :id (load (field weak id))))))))))
+
+(defn weak-entity-alive? [T] [(weak (ref (WeakEntity T)))] (-> bool)
+  (match (weak-entity-upgrade [T] weak)
+    (None [] false)
+    (Some [entity] (let [released entity] true))))
+
+(impl [T] Clone (Entity T)
+  (clone [(self (ref (Entity T)))] (-> (Entity T))
+    (let [arena (rc/rc-borrow [(EntityArena T)] (field self arena))
+          slot (arena-slot [T] arena (load (field self id)))]
+      (do
+        (if (!= (primitive/cast i64 slot) 0)
+            (store! (field slot strong) (+ (load (field slot strong)) 1))
+            0)
+        (Entity
+          :arena (clone (field self arena))
+          :id (load (field self id)))))))
+
+(impl [T] Drop (Entity T)
+  (drop [(self (mut (Entity T)))] (-> void)
+    (let [arena (rc/rc-borrow [(EntityArena T)] (field self arena))
+          slot (arena-slot [T] arena (load (field self id)))]
+      (if (!= (primitive/cast i64 slot) 0)
+          (let [next (- (load (field slot strong)) 1)]
+            (do
+              (store! (field slot strong) next)
+              (if (= next 0)
+                  (let [value (take! [T] (field slot value))]
+                    (do
+                      (store! (field slot alive) false)
+                      (store! (field slot generation)
+                              (+ (load (field slot generation)) 1))
+                      (store! (field arena alive-count)
+                              (- (load (field arena alive-count)) 1))
+                      (al/al-push! [i64]
+                                   (mut (.free-slots arena))
+                                   (load (field (field self id) slot)))
+                      0))
+                  0)))
+          0))))
+
+(impl [T] Clone (WeakEntity T)
+  (clone [(self (ref (WeakEntity T)))] (-> (WeakEntity T))
+    (WeakEntity
+      :arena (clone (field self arena))
+      :id (load (field self id)))))

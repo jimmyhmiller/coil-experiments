@@ -84,6 +84,11 @@ layer in the runtime path.
   rejection, slot reuse, deterministic destruction of owned values, ordered
   observation queues, and generation-safe subscription cancellation. The demo's
   application state lives in a retained entity rather than a frame-local value.
+- GPUI-style thread-confined `Entity<T>` and `WeakEntity<T>` handles backed by an
+  allocator-aware reference-counted arena. Strong handles clone automatically,
+  values are destroyed exactly when their final strong handle drops, weak handles
+  do not extend value lifetime, upgrades validate the slot generation, and entity
+  handles can safely outlive the map that created them.
 - Uniform and variable-height virtual lists with retained pixel offsets, bounded
   overscan, exact visible ranges, viewport clipping, wheel input, and stable GPU
   scrollbars. Variable lists use a Fenwick prefix-sum index for logarithmic
@@ -211,7 +216,7 @@ translate directly into one draw for all adjacent labels on an atlas page.
 
 The release scene benchmark rebuilds 1,049 paint primitives, emits 99 retained
 paragraph glyph sprites, and advances a 100,000-row virtual list. On the development
-Apple Silicon machine it measured **6,429 ns/frame** across 5,000 frames. This measures
+Apple Silicon machine it measured **6,437 ns/frame** across 5,000 frames. This measures
 Coil scene construction, retained-text recording, and visible-range calculation—not
 GPU presentation or display latency. The benchmark is checked in as `bench.coil` so
 results remain reproducible and comparable.
@@ -266,8 +271,8 @@ application. GPUI parity still requires substantial systems, notably:
   ranges, and accessibility text actions
   (hierarchical capture/target/bubble listeners with stop-propagation, focus
   traversal, and logical actions work);
-- weak/strong retained handles, dependency-tracked observation, async executor
-  integration, non-image/remote asset sources, inspector support, deterministic UI
+- dependency-tracked observation, async executor integration, non-image/remote
+  asset sources, inspector support, deterministic UI
   tests, and multiple windows;
 - persistent partial-presentation backing, multi-page texture-atlas eviction,
   and deeper GPU/CPU profiling.

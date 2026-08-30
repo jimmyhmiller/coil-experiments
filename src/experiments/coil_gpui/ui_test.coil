@@ -20,6 +20,7 @@
 (import "experiments.coil_gpui.text" :as text)
 (import "experiments.coil_gpui.path" :as path)
 (import "experiments.coil_gpui.assets" :as assets)
+(import "experiments.coil_gpui.entity" :as entity)
 
 (extern MTLCreateSystemDefaultDevice :cc c [] (-> (ptr i8)))
 
@@ -48,6 +49,15 @@
         (-> void)
         (let [counter (load (field self counter))]
           (store! counter (+ (load counter) 1)))))
+
+(defn make-expired-entity-weak [(map (ref (entity/EntityMap RetainedDropProbe)))
+                                (drops (ptr i64))] (-> (entity/WeakEntity RetainedDropProbe))
+  (let [owner
+          (entity/entity-map-create! [RetainedDropProbe]
+                                     map
+                                     (RetainedDropProbe :counter drops :value 77))
+        weak (entity/entity-downgrade [RetainedDropProbe] owner)]
+    weak))
 
 (deftest metal-buffer-capacity-grows-by-powers-of-two
          (assert-eq (metal/next-buffer-capacity 0 1) 65536)
@@ -1500,6 +1510,65 @@
              (let [value (retained/entity-store-get [RetainedDropProbe] (mut store) second)]
                (assert-eq (load (field value value)) 22)))
            (retained/entity-store-free! [RetainedDropProbe] (mut store))
+           (assert-eq (load drops) 2)))
+
+(deftest typed-entities-clone-downgrade-upgrade-and-drop-exactly-once
+         (let [drops (primitive/alloc-stack i64)]
+           (store! drops 0)
+           (match (entity/entity-map-new [RetainedDropProbe])
+             (None [] (assert false))
+             (Some [map]
+               (let [owner
+                       (entity/entity-map-create! [RetainedDropProbe]
+                                                  map
+                                                  (RetainedDropProbe :counter drops
+                                                    :value 41))
+                     weak (entity/entity-downgrade [RetainedDropProbe] owner)]
+                 (do
+                   (assert-eq (entity/entity-map-alive-count [RetainedDropProbe] map) 1)
+                   (assert-eq (entity/entity-strong-count [RetainedDropProbe] owner) 1)
+                   (let [duplicate (clone owner)]
+                     (do
+                       (assert-eq (entity/entity-strong-count [RetainedDropProbe] owner) 2)
+                       (let [value (entity/entity-read [RetainedDropProbe] duplicate)]
+                         (assert-eq (load (field value value)) 41))))
+                   (assert-eq (entity/entity-strong-count [RetainedDropProbe] owner) 1)
+                   (match (entity/weak-entity-upgrade [RetainedDropProbe] weak)
+                     (None [] (assert false))
+                     (Some [upgraded]
+                       (assert-eq (entity/entity-strong-count [RetainedDropProbe] upgraded) 2)))
+                   (assert-eq (entity/entity-strong-count [RetainedDropProbe] owner) 1)
+                   (assert-eq (load drops) 0)))))
+           ;; The map, owner, upgraded clone, and weak handle are all out of
+           ;; scope; only the entity value contributes to this counter.
+           (assert-eq (load drops) 1)))
+
+(deftest weak-entities-expire-and-generation-check-reused-slots
+         (let [drops (primitive/alloc-stack i64)]
+           (store! drops 0)
+           (match (entity/entity-map-new [RetainedDropProbe])
+             (None [] (assert false))
+             (Some [map]
+               (let [expired (make-expired-entity-weak map drops)
+                     old-id (load (field expired id))]
+                 (do
+                   (assert-eq (load drops) 1)
+                   (assert (not (entity/weak-entity-alive? [RetainedDropProbe] expired)))
+                   (match (entity/weak-entity-upgrade [RetainedDropProbe] expired)
+                     (None [] (assert true))
+                     (Some [unexpected] (assert false)))
+                   (let [replacement
+                           (entity/entity-map-create! [RetainedDropProbe]
+                                                      map
+                                                      (RetainedDropProbe :counter drops
+                                                        :value 99))
+                         new-id (entity/entity-id [RetainedDropProbe] replacement)]
+                     (do
+                       (assert-eq (load (field old-id slot)) (load (field new-id slot)))
+                       (assert (!= (load (field old-id generation))
+                                   (load (field new-id generation))))
+                       (assert (not (entity/weak-entity-alive? [RetainedDropProbe] expired)))
+                       (assert-eq (entity/entity-map-alive-count [RetainedDropProbe] map) 1)))))))
            (assert-eq (load drops) 2)))
 
 (deftest retained-observers-queue-in-order-and-unsubscribe-by-generation
