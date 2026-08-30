@@ -4,11 +4,13 @@
 (import "coil.arraylist" :as al)
 (import "coil.primitive" :as primitive)
 
-(export Renderer renderer-new renderer-resize! renderer-draw! renderer-valid?)
+(export Renderer renderer-new renderer-resize! renderer-draw! renderer-valid? renderer-free! next-buffer-capacity)
 
 (extern MTLCreateSystemDefaultDevice :cc c [] (-> (ptr i8)))
 
 (extern printf :cc c [(ptr i8) ...] (-> i32))
+
+(extern memcpy :cc c [(ptr i8) (ptr i8) i64] (-> (ptr i8)))
 
 (defstruct CGSize [(w f64) (h f64)])
 
@@ -20,6 +22,11 @@
   [(device (ptr i8))
    (queue (ptr i8))
    (pipeline (ptr i8))
+   (text-pipeline (ptr i8))
+   (primitive-buffer-0 (ptr i8))
+   (primitive-buffer-1 (ptr i8))
+   (primitive-buffer-2 (ptr i8))
+   (primitive-capacity i64)
    (layer (ptr i8))
    (width f32)
    (height f32)
@@ -27,17 +34,59 @@
    (frames i64)
    (draw-calls i64)])
 
+(defn next-buffer-capacity [(current i64) (required i64)] (-> i64)
+  (let [(mut capacity) (if (< current 65536) 65536 current)]
+    (do
+      (while (< (load capacity) required)
+        (store! capacity (* (load capacity) 2)))
+      (load capacity))))
+
+(defn renderer-ensure-capacity! [(renderer (mut Renderer)) (required i64)] (-> i64)
+  (if (<= required (load (field renderer primitive-capacity)))
+      0
+      (let [capacity (next-buffer-capacity (load (field renderer primitive-capacity)) required)
+            device (load (field renderer device))
+            buffer-0 (msg (ptr i8) device (sel c"newBufferWithLength:options:") [i64 i64] capacity 0)
+            buffer-1 (msg (ptr i8) device (sel c"newBufferWithLength:options:") [i64 i64] capacity 0)
+            buffer-2 (msg (ptr i8) device (sel c"newBufferWithLength:options:") [i64 i64] capacity 0)]
+        (if (or (= (primitive/cast i64 buffer-0) 0)
+                (or (= (primitive/cast i64 buffer-1) 0)
+                    (= (primitive/cast i64 buffer-2) 0)))
+            -1
+            (do
+              (if (!= (primitive/cast i64 (load (field renderer primitive-buffer-0))) 0)
+                  (msg i64 (load (field renderer primitive-buffer-0)) (sel c"release") [])
+                  0)
+              (if (!= (primitive/cast i64 (load (field renderer primitive-buffer-1))) 0)
+                  (msg i64 (load (field renderer primitive-buffer-1)) (sel c"release") [])
+                  0)
+              (if (!= (primitive/cast i64 (load (field renderer primitive-buffer-2))) 0)
+                  (msg i64 (load (field renderer primitive-buffer-2)) (sel c"release") [])
+                  0)
+              (set! (.primitive-buffer-0 renderer) buffer-0)
+              (set! (.primitive-buffer-1 renderer) buffer-1)
+              (set! (.primitive-buffer-2 renderer) buffer-2)
+              (set! (.primitive-capacity renderer) capacity)
+              1)))))
+
+(defn renderer-frame-buffer [(renderer Renderer)] (-> (ptr i8))
+  (let [slot (% (load (field renderer frames)) 3)]
+    (cond (= slot 0) (load (field renderer primitive-buffer-0))
+          (= slot 1) (load (field renderer primitive-buffer-1))
+          :else (load (field renderer primitive-buffer-2)))))
+
 (defn nsstr [(s (ptr i8))] (-> (ptr i8))
   (msg (ptr i8) (class c"NSString") (sel c"stringWithUTF8String:") [(ptr i8)] s))
 
 ;;; One shader invocation expands one UI primitive. Rounded corners, borders,
 ;;; clipping, and alpha compositing stay on the GPU; the CPU emits no vertices.
 (defn shader-source [] (-> (ptr i8))
-  c"#include <metal_stdlib>\nusing namespace metal;\nstruct Rect { float x,y,w,h; };\nstruct Color { float r,g,b,a; };\nstruct Primitive { Rect bounds; Color color; float radius; float borderWidth; Color borderColor; Rect clip; int kind; int id; };\nstruct Frame { float2 viewport; float2 pad; };\nstruct VOut { float4 position [[position]]; float2 local; float2 size; float4 color; float radius; float borderWidth; float4 borderColor; };\nvertex VOut ui_vertex(uint vid [[vertex_id]], uint iid [[instance_id]], constant Primitive* ps [[buffer(0)]], constant Frame& frame [[buffer(1)]]) { constexpr float2 q[6] = {float2(0,0),float2(1,0),float2(0,1),float2(0,1),float2(1,0),float2(1,1)}; Primitive p=ps[iid]; float2 pixel=float2(p.bounds.x,p.bounds.y)+q[vid]*float2(p.bounds.w,p.bounds.h); VOut o; o.position=float4(pixel.x/frame.viewport.x*2.0-1.0,1.0-pixel.y/frame.viewport.y*2.0,0,1); o.local=q[vid]*float2(p.bounds.w,p.bounds.h); o.size=float2(p.bounds.w,p.bounds.h); o.color=float4(p.color.r,p.color.g,p.color.b,p.color.a); o.radius=p.radius; o.borderWidth=p.borderWidth; o.borderColor=float4(p.borderColor.r,p.borderColor.g,p.borderColor.b,p.borderColor.a); return o; }\nfragment float4 ui_fragment(VOut in [[stage_in]]) { float2 halfSize=in.size*0.5; float2 d=abs(in.local-halfSize)-(halfSize-in.radius); float sd=length(max(d,0.0))+min(max(d.x,d.y),0.0)-in.radius; float aa=max(fwidth(sd),0.75); float coverage=1.0-smoothstep(-aa,aa,sd); float border=smoothstep(-in.borderWidth-aa,-in.borderWidth+aa,sd); float4 color=mix(in.color,in.borderColor,border); return float4(color.rgb,color.a*coverage); }\n")
+  c"#include <metal_stdlib>\nusing namespace metal;\nstruct Rect { float x,y,w,h; };\nstruct Color { float r,g,b,a; };\nstruct Primitive { Rect bounds; Color color; float radius; float borderWidth; Color borderColor; Rect clip; int kind; int id; };\nstruct Sprite { Rect bounds; Color color; };\nstruct Frame { float2 viewport; float2 pad; };\nstruct VOut { float4 position [[position]]; float2 local; float2 size; float4 color; float radius; float borderWidth; float4 borderColor; };\nstruct SpriteOut { float4 position [[position]]; float2 uv; float4 color; };\nvertex VOut ui_vertex(uint vid [[vertex_id]], uint iid [[instance_id]], constant Primitive* ps [[buffer(0)]], constant Frame& frame [[buffer(1)]]) { constexpr float2 q[6] = {float2(0,0),float2(1,0),float2(0,1),float2(0,1),float2(1,0),float2(1,1)}; Primitive p=ps[iid]; float2 pixel=float2(p.bounds.x,p.bounds.y)+q[vid]*float2(p.bounds.w,p.bounds.h); VOut o; o.position=float4(pixel.x/frame.viewport.x*2.0-1.0,1.0-pixel.y/frame.viewport.y*2.0,0,1); o.local=q[vid]*float2(p.bounds.w,p.bounds.h); o.size=float2(p.bounds.w,p.bounds.h); o.color=float4(p.color.r,p.color.g,p.color.b,p.color.a); o.radius=p.radius; o.borderWidth=p.borderWidth; o.borderColor=float4(p.borderColor.r,p.borderColor.g,p.borderColor.b,p.borderColor.a); return o; }\nfragment float4 ui_fragment(VOut in [[stage_in]]) { float2 halfSize=in.size*0.5; float2 d=abs(in.local-halfSize)-(halfSize-in.radius); float sd=length(max(d,0.0))+min(max(d.x,d.y),0.0)-in.radius; float aa=max(fwidth(sd),0.75); float coverage=1.0-smoothstep(-aa,aa,sd); float border=smoothstep(-in.borderWidth-aa,-in.borderWidth+aa,sd); float4 color=mix(in.color,in.borderColor,border); return float4(color.rgb,color.a*coverage); }\nvertex SpriteOut text_vertex(uint vid [[vertex_id]], constant Sprite& sprite [[buffer(0)]], constant Frame& frame [[buffer(1)]]) { constexpr float2 q[6] = {float2(0,0),float2(1,0),float2(0,1),float2(0,1),float2(1,0),float2(1,1)}; float2 pixel=float2(sprite.bounds.x,sprite.bounds.y)+q[vid]*float2(sprite.bounds.w,sprite.bounds.h); SpriteOut o; o.position=float4(pixel.x/frame.viewport.x*2.0-1.0,1.0-pixel.y/frame.viewport.y*2.0,0,1); o.uv=q[vid]; o.color=float4(sprite.color.r,sprite.color.g,sprite.color.b,sprite.color.a); return o; }\nfragment float4 text_fragment(SpriteOut in [[stage_in]], texture2d<float> mask [[texture(0)]]) { constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear); float alpha=mask.sample(s,in.uv).a; return float4(in.color.rgb,in.color.a*alpha); }\n")
 
 (defn renderer-valid? [(renderer Renderer)] (-> bool)
   (and (!= (primitive/cast i64 (load (field renderer device))) 0)
-       (!= (primitive/cast i64 (load (field renderer pipeline))) 0)))
+       (!= (primitive/cast i64 (load (field renderer pipeline))) 0)
+       (!= (primitive/cast i64 (load (field renderer text-pipeline))) 0)))
 
 (defn configure-blending! [(attachment (ptr i8))] (-> i64)
   (do
@@ -64,6 +113,8 @@
                (primitive/cast (ptr (ptr i8)) 0))
         vertex (msg (ptr i8) library (sel c"newFunctionWithName:") [(ptr i8)] (nsstr c"ui_vertex"))
         fragment (msg (ptr i8) library (sel c"newFunctionWithName:") [(ptr i8)] (nsstr c"ui_fragment"))
+        text-vertex (msg (ptr i8) library (sel c"newFunctionWithName:") [(ptr i8)] (nsstr c"text_vertex"))
+        text-fragment (msg (ptr i8) library (sel c"newFunctionWithName:") [(ptr i8)] (nsstr c"text_fragment"))
         descriptor (msg (ptr i8) (class c"MTLRenderPipelineDescriptor") (sel c"new") [])
         attachments (msg (ptr i8) descriptor (sel c"colorAttachments") [])
         attachment (msg (ptr i8) attachments (sel c"objectAtIndexedSubscript:") [i64] 0)]
@@ -78,24 +129,36 @@
                    (sel c"newRenderPipelineStateWithDescriptor:error:")
                    [(ptr i8) (ptr (ptr i8))]
                    descriptor
-                   (primitive/cast (ptr (ptr i8)) 0))
-            layer (msg (ptr i8) (class c"CAMetalLayer") (sel c"layer") [])]
+                   (primitive/cast (ptr (ptr i8)) 0))]
         (do
-          (msg i64 layer (sel c"setDevice:") [(ptr i8)] device)
-          (msg i64 layer (sel c"setPixelFormat:") [i64] 80)
-          (msg i64 layer (sel c"setFramebufferOnly:") [i8] (primitive/cast i8 1))
-          (msg i64 layer (sel c"setMaximumDrawableCount:") [i64] 3)
-          (msg i64 layer (sel c"setDisplaySyncEnabled:") [i8] (primitive/cast i8 1))
-          (msg i64 view (sel c"setWantsLayer:") [i8] (primitive/cast i8 1))
-          (msg i64 view (sel c"setLayer:") [(ptr i8)] layer)
-          (let [(mut renderer) (primitive/zeroed Renderer)]
+          (msg i64 descriptor (sel c"setVertexFunction:") [(ptr i8)] text-vertex)
+          (msg i64 descriptor (sel c"setFragmentFunction:") [(ptr i8)] text-fragment)
+          (let [text-pipeline
+                  (msg (ptr i8)
+                       device
+                       (sel c"newRenderPipelineStateWithDescriptor:error:")
+                       [(ptr i8) (ptr (ptr i8))]
+                       descriptor
+                       (primitive/cast (ptr (ptr i8)) 0))
+                layer (msg (ptr i8) (class c"CAMetalLayer") (sel c"layer") [])]
             (do
-              (set! (.device renderer) device)
-              (set! (.queue renderer) queue)
-              (set! (.pipeline renderer) pipeline)
-              (set! (.layer renderer) layer)
-              (renderer-resize! (mut renderer) width height scale)
-              (load renderer))))))))
+              (msg i64 layer (sel c"setDevice:") [(ptr i8)] device)
+              (msg i64 layer (sel c"setPixelFormat:") [i64] 80)
+              (msg i64 layer (sel c"setFramebufferOnly:") [i8] (primitive/cast i8 1))
+              (msg i64 layer (sel c"setMaximumDrawableCount:") [i64] 3)
+              (msg i64 layer (sel c"setDisplaySyncEnabled:") [i8] (primitive/cast i8 1))
+              (msg i64 view (sel c"setWantsLayer:") [i8] (primitive/cast i8 1))
+              (msg i64 view (sel c"setLayer:") [(ptr i8)] layer)
+              (let [(mut renderer) (primitive/zeroed Renderer)]
+                (do
+                  (set! (.device renderer) device)
+                  (set! (.queue renderer) queue)
+                  (set! (.pipeline renderer) pipeline)
+                  (set! (.text-pipeline renderer) text-pipeline)
+                  (set! (.layer renderer) layer)
+                  (renderer-ensure-capacity! (mut renderer) 65536)
+                  (renderer-resize! (mut renderer) width height scale)
+                  (load renderer))))))))))
 
 (defn renderer-resize! [(renderer (mut Renderer)) (width f32) (height f32) (scale f32)] (-> i64)
   (do
@@ -120,63 +183,134 @@
 
 (defn renderer-draw! [(renderer (mut Renderer)) (scene ui/Scene)] (-> i64)
   (let [items (load (field scene items))
-        count (al/al-len [ui/Primitive] items)]
-    (if (or (= count 0) (not (renderer-valid? (load renderer))))
+        text-items (load (field scene text))
+        count (al/al-len [ui/Primitive] items)
+        text-count (al/al-len [ui/TextSprite] text-items)
+        primitive-bytes (* count (primitive/sizeof ui/Primitive))]
+    (if (or (and (= count 0) (= text-count 0)) (not (renderer-valid? (load renderer))))
         0
-        (let [drawable (msg (ptr i8) (load (field renderer layer)) (sel c"nextDrawable") [])]
-          (if (= (primitive/cast i64 drawable) 0)
-              0
-              (let [texture (msg (ptr i8) drawable (sel c"texture") [])
-                    pass (msg (ptr i8) (class c"MTLRenderPassDescriptor") (sel c"renderPassDescriptor") [])
-                    colors (msg (ptr i8) pass (sel c"colorAttachments") [])
-                    color0 (msg (ptr i8) colors (sel c"objectAtIndexedSubscript:") [i64] 0)
-                    command (msg (ptr i8) (load (field renderer queue)) (sel c"commandBuffer") [])]
-                (do
-                  (msg i64 color0 (sel c"setTexture:") [(ptr i8)] texture)
-                  (msg i64 color0 (sel c"setLoadAction:") [i64] 2)
-                  (msg i64 color0 (sel c"setStoreAction:") [i64] 1)
-                  (msg i64
-                       color0
-                       (sel c"setClearColor:")
-                       [MTLClearColor]
-                       (MTLClearColor
-                         :r 0.055
-                         :g 0.063
-                         :b 0.082
-                         :a 1.0))
-                  (let [encoder (msg (ptr i8) command (sel c"renderCommandEncoderWithDescriptor:") [(ptr i8)] pass)
-                        frame (primitive/alloc-stack (array f32 4))]
+        (if (< (renderer-ensure-capacity! (mut renderer) primitive-bytes) 0)
+            0
+            (let [drawable (msg (ptr i8) (load (field renderer layer)) (sel c"nextDrawable") [])]
+              (if (= (primitive/cast i64 drawable) 0)
+                  0
+                  (let [texture (msg (ptr i8) drawable (sel c"texture") [])
+                        pass (msg (ptr i8) (class c"MTLRenderPassDescriptor") (sel c"renderPassDescriptor") [])
+                        colors (msg (ptr i8) pass (sel c"colorAttachments") [])
+                        color0 (msg (ptr i8) colors (sel c"objectAtIndexedSubscript:") [i64] 0)
+                        command (msg (ptr i8) (load (field renderer queue)) (sel c"commandBuffer") [])]
                     (do
-                      (store! (primitive/index frame 0) (load (field renderer width)))
-                      (store! (primitive/index frame 1) (load (field renderer height)))
-                      (store! (primitive/index frame 2) 0.0)
-                      (store! (primitive/index frame 3) 0.0)
-                      (msg i64 encoder (sel c"setRenderPipelineState:") [(ptr i8)] (load (field renderer pipeline)))
+                      (msg i64 color0 (sel c"setTexture:") [(ptr i8)] texture)
+                      (msg i64 color0 (sel c"setLoadAction:") [i64] 2)
+                      (msg i64 color0 (sel c"setStoreAction:") [i64] 1)
                       (msg i64
-                           encoder
-                           (sel c"setVertexBytes:length:atIndex:")
-                           [(ptr i8) i64 i64]
-                           (primitive/cast (ptr i8) (load (field items data)))
-                           (* count (primitive/sizeof ui/Primitive))
-                           0)
-                      (msg i64
-                           encoder
-                           (sel c"setVertexBytes:length:atIndex:")
-                           [(ptr i8) i64 i64]
-                           (primitive/cast (ptr i8) frame)
-                           16
-                           1)
-                      (msg i64
-                           encoder
-                           (sel c"drawPrimitives:vertexStart:vertexCount:instanceCount:")
-                           [i64 i64 i64 i64]
-                           3
-                           0
-                           6
-                           count)
-                      (msg i64 encoder (sel c"endEncoding") [])
-                      (msg i64 command (sel c"presentDrawable:") [(ptr i8)] drawable)
-                      (msg i64 command (sel c"commit") [])
-                      (set! (.frames renderer) (+ (load (field renderer frames)) 1))
-                      (set! (.draw-calls renderer) (+ (load (field renderer draw-calls)) 1))
-                      1)))))))))
+                           color0
+                           (sel c"setClearColor:")
+                           [MTLClearColor]
+                           (MTLClearColor
+                             :r 0.055
+                             :g 0.063
+                             :b 0.082
+                             :a 1.0))
+                      (let [encoder (msg (ptr i8) command (sel c"renderCommandEncoderWithDescriptor:") [(ptr i8)] pass)
+                            frame (primitive/alloc-stack (array f32 4))
+                            primitive-buffer (renderer-frame-buffer (load renderer))]
+                        (do
+                          (store! (primitive/index frame 0) (load (field renderer width)))
+                          (store! (primitive/index frame 1) (load (field renderer height)))
+                          (store! (primitive/index frame 2) 0.0)
+                          (store! (primitive/index frame 3) 0.0)
+                          (msg i64
+                               encoder
+                               (sel c"setVertexBytes:length:atIndex:")
+                               [(ptr i8) i64 i64]
+                               (primitive/cast (ptr i8) frame)
+                               16
+                               1)
+                          (if (> count 0)
+                              (do
+                                (memcpy (msg (ptr i8) primitive-buffer (sel c"contents") [])
+                                        (primitive/cast (ptr i8) (load (field items data)))
+                                        primitive-bytes)
+                                (msg i64
+                                     encoder
+                                     (sel c"setRenderPipelineState:")
+                                     [(ptr i8)]
+                                     (load (field renderer pipeline)))
+                                (msg i64
+                                     encoder
+                                     (sel c"setVertexBuffer:offset:atIndex:")
+                                     [(ptr i8) i64 i64]
+                                     primitive-buffer
+                                     0
+                                     0)
+                                (msg i64
+                                     encoder
+                                     (sel c"drawPrimitives:vertexStart:vertexCount:instanceCount:")
+                                     [i64 i64 i64 i64]
+                                     3
+                                     0
+                                     6
+                                     count))
+                              0)
+                          (if (> text-count 0)
+                              (do
+                                (msg i64
+                                     encoder
+                                     (sel c"setRenderPipelineState:")
+                                     [(ptr i8)]
+                                     (load (field renderer text-pipeline)))
+                                (let [(mut i) 0]
+                                  (while (< (load i) text-count)
+                                    (let [sprite (primitive/index (load (field text-items data)) (load i))]
+                                      (do
+                                        (msg i64
+                                             encoder
+                                             (sel c"setVertexBytes:length:atIndex:")
+                                             [(ptr i8) i64 i64]
+                                             (primitive/cast (ptr i8) sprite)
+                                             (primitive/sizeof ui/TextSprite)
+                                             0)
+                                        (msg i64
+                                             encoder
+                                             (sel c"setFragmentTexture:atIndex:")
+                                             [(ptr i8) i64]
+                                             (load (field sprite texture))
+                                             0)
+                                        (msg i64
+                                             encoder
+                                             (sel c"drawPrimitives:vertexStart:vertexCount:")
+                                             [i64 i64 i64]
+                                             3
+                                             0
+                                             6)
+                                        (store! i (+ (load i) 1)))))))
+                              0)
+                          (msg i64 encoder (sel c"endEncoding") [])
+                          (msg i64 command (sel c"presentDrawable:") [(ptr i8)] drawable)
+                          (msg i64 command (sel c"commit") [])
+                          (set! (.frames renderer) (+ (load (field renderer frames)) 1))
+                          (set! (.draw-calls renderer)
+                                (+ (load (field renderer draw-calls)) (+ (if (> count 0) 1 0) text-count)))
+                          1))))))))))
+
+(defn release-object! [(object (ptr i8))] (-> i64)
+  (if (!= (primitive/cast i64 object) 0)
+      (do (msg i64 object (sel c"release") []) 1)
+      0))
+
+(defn renderer-free! [(renderer (mut Renderer))] (-> i64)
+  (do
+    (release-object! (load (field renderer primitive-buffer-0)))
+    (release-object! (load (field renderer primitive-buffer-1)))
+    (release-object! (load (field renderer primitive-buffer-2)))
+    (release-object! (load (field renderer pipeline)))
+    (release-object! (load (field renderer text-pipeline)))
+    (release-object! (load (field renderer queue)))
+    (set! (.primitive-buffer-0 renderer) (primitive/cast (ptr i8) 0))
+    (set! (.primitive-buffer-1 renderer) (primitive/cast (ptr i8) 0))
+    (set! (.primitive-buffer-2 renderer) (primitive/cast (ptr i8) 0))
+    (set! (.pipeline renderer) (primitive/cast (ptr i8) 0))
+    (set! (.text-pipeline renderer) (primitive/cast (ptr i8) 0))
+    (set! (.queue renderer) (primitive/cast (ptr i8) 0))
+    0))

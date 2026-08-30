@@ -10,11 +10,16 @@ layer in the runtime path.
 - Native resizable AppKit window with a triple-buffered `CAMetalLayer`.
 - Runtime-compiled Metal vertex and fragment shaders.
 - One instanced draw call per frame for every box primitive in the scene.
+- Triple-buffered, power-of-two-growing shared `MTLBuffer` uploads; large scenes
+  do not rely on Metal's small inline-byte path and are never truncated.
 - GPU-expanded quads, antialiased rounded rectangles, borders, and alpha blending.
+- Native Unicode shaping/rasterization through AppKit's CoreText-backed string
+  stack, cached as high-DPI alpha-mask textures and colored/composited by Metal.
 - Reusable scene allocation across frames.
 - Immediate element reconstruction over retained application/component state.
 - Reverse-order hit testing with stable component IDs.
 - Interactive buttons, checkbox, slider, progress, divider, and panel components.
+- GPU text labels integrated with the reusable scene and demo components.
 - Mouse hover, press, release, checkbox toggling, and slider dragging.
 - Headless geometry, scene ordering, component batching, ABI, and allocation-reuse tests.
 
@@ -30,10 +35,15 @@ component functions rebuild a transient Scene each frame
 flat, paint-ordered ArrayList<Primitive> (80-byte stable GPU ABI)
         |
         v
-one setVertexBytes upload + one instanced Metal draw
+triple-buffered shared MTLBuffer upload + one instanced Metal draw
         |
         v
 vertex shader expands quads; fragment shader performs SDF shape rasterization
+
+CoreText-backed shaping/rasterization -> cached high-DPI mask textures
+        |
+        v
+Metal texture pipeline applies per-scene color and alpha composition
 ```
 
 This follows GPUI's hybrid model: long-lived entities own state, while the root
@@ -68,23 +78,26 @@ Run the focused tests from the repository root:
 
 ## Performance contract
 
-The scene retains its allocation after `scene-clear!`, avoiding steady-state heap
-traffic. A primitive is 80 bytes and every primitive is rendered through a single
-instanced command. Component count does not increase draw-call count. The layer uses
-three drawables and display synchronization. Per-frame autoreleased Cocoa objects
-are drained every frame.
+The scene retains both shape and text-list allocations after `scene-clear!`, avoiding
+steady-state list allocation. A primitive is 80 bytes and every shape primitive is
+rendered through one instanced command. Primitive data streams through a three-slot
+shared-buffer ring; each slot starts at 64 KiB and doubles until the complete scene
+fits. The demo intentionally rebuilds 1,024 background instances per frame so the
+large-scene path remains exercised. The layer uses three drawables and display
+synchronization. Per-frame autoreleased Cocoa objects are drained every frame.
 
-The current backend uses `setVertexBytes`, which is excellent for small and medium
-UI scenes but has an API size ceiling. The next renderer tier should maintain a ring
-of shared `MTLBuffer`s, then split only scenes larger than a ring segment. That work
-must preserve paint order and never silently truncate a scene.
+Text rasterization is cached rather than repeated each frame. The current cache is
+application-owned and one texture is bound per label. The next text tier should pack
+individual shaped glyph masks into bounded, evicting atlas pages and batch labels by
+atlas page, while retaining CoreText fallback and cluster semantics.
 
 ## Capability roadmap
 
 The current milestone proves the complete Coil-to-Metal path and a real component
 application. GPUI parity still requires substantial systems, notably:
 
-- glyph shaping and an atlas-backed GPU text renderer;
+- glyph-run extraction, editable text measurement, and a bounded glyph atlas
+  (whole-label shaping and GPU mask composition work now);
 - flex/grid layout with intrinsic measurement;
 - scroll views, clipping stacks, transforms, shadows, images, SVG, and paths;
 - focus, keyboard dispatch, actions, keymaps, IME, drag/drop, and accessibility;
@@ -101,3 +114,4 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI element lifecycle](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/element.rs)
 - [Apple CAMetalLayer documentation](https://developer.apple.com/documentation/QuartzCore/CAMetalLayer)
 - [Apple MTLRenderCommandEncoder documentation](https://developer.apple.com/documentation/metal/mtlrendercommandencoder)
+- [Apple CTRun documentation](https://developer.apple.com/documentation/coretext/ctrun)
