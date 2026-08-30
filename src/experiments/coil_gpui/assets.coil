@@ -1,0 +1,268 @@
+(module experiments.coil_gpui.assets)
+(import "experiments.coil_gpui.image" :as image)
+(import "experiments.coil_gpui.ui" :as ui)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+
+(export AssetId
+        ImageAssetCache
+        image-asset-cache-new
+        image-asset-cache-begin-frame!
+        image-asset-cache-load!
+        image-asset-cache-valid?
+        image-asset-cache-paint!
+        image-asset-cache-invalidate!
+        image-asset-cache-resident-bytes
+        image-asset-cache-resident-count
+        image-asset-cache-free!)
+
+(extern strlen :cc c [(ptr i8)] (-> i64))
+(extern strcmp :cc c [(ptr i8) (ptr i8)] (-> i32))
+(extern malloc :cc c [i64] (-> (ptr i8)))
+(extern free :cc c [(ptr i8)] (-> void))
+(extern memcpy :cc c [(ptr i8) (ptr i8) i64] (-> (ptr i8)))
+
+;;; Asset IDs are stable across ArrayList relocation. A generation prevents a
+;;; stale ID from observing an entry after its slot is evicted and reused.
+(defstruct AssetId [(slot i64) (generation i64)])
+
+(defstruct ImageAssetEntry
+  [(path (ptr i8))
+   (texture image/ImageTexture)
+   (byte-size i64)
+   (last-used i64)
+   (generation i64)
+   (alive bool)
+   (pinned bool)])
+
+(defstruct ImageAssetCache
+  [(device (ptr i8))
+   (entries (al/ArrayList ImageAssetEntry))
+   (free-slots (al/ArrayList i64))
+   (budget-bytes i64)
+   (resident-bytes i64)
+   (clock i64)])
+
+(defn invalid-asset-id [] (-> AssetId)
+  (AssetId :slot -1 :generation 0))
+
+(defn copy-path [(path (ptr i8))] (-> (ptr i8))
+  (let [length (strlen path)
+        copy (malloc (+ length 1))]
+    (if (= (primitive/cast i64 copy) 0)
+        (primitive/cast (ptr i8) 0)
+        (do
+          (memcpy copy path (+ length 1))
+          copy))))
+
+(defn image-asset-cache-new [(device (ptr i8))
+                             (budget-bytes i64)] (-> ImageAssetCache)
+  (ImageAssetCache
+    :device device
+    :entries (al/al-new [ImageAssetEntry] (alloc/malloc-allocator))
+    :free-slots (al/al-new [i64] (alloc/malloc-allocator))
+    :budget-bytes (if (> budget-bytes 0) budget-bytes 1)
+    :resident-bytes 0
+    :clock 0))
+
+(defn entry-at [(cache (mut ImageAssetCache))
+                (index i64)] (-> (ptr ImageAssetEntry))
+  (let [entries (load (field cache entries))]
+    (if (or (< index 0) (>= index (al/al-len [ImageAssetEntry] entries)))
+        (primitive/cast (ptr ImageAssetEntry) 0)
+        (primitive/index (load (field entries data)) index))))
+
+(defn image-asset-cache-valid? [(cache ImageAssetCache)
+                                (id AssetId)] (-> bool)
+  (let [entries (load (field cache entries))
+        index (load (field id slot))]
+    (and (>= index 0)
+         (and (< index (al/al-len [ImageAssetEntry] entries))
+              (let [entry (primitive/index (load (field entries data)) index)]
+                (and (load (field entry alive))
+                     (= (load (field entry generation))
+                        (load (field id generation)))))))))
+
+(defn image-asset-cache-begin-frame! [(cache (mut ImageAssetCache))] (-> i64)
+  (let [entries (load (field cache entries))]
+    (do
+      (for [i 0 (al/al-len [ImageAssetEntry] entries)]
+        (let [entry (primitive/index (load (field entries data)) i)]
+          (if (load (field entry alive)) (store! (field entry pinned) false) 0)))
+      0)))
+
+(defn release-entry! [(cache (mut ImageAssetCache))
+                      (index i64)] (-> bool)
+  (let [entry (entry-at (mut cache) index)]
+    (if (or (= (primitive/cast i64 entry) 0)
+            (not (load (field entry alive))))
+        false
+        (let [released-bytes (load (field entry byte-size))]
+          (do
+            (image/image-free! (mut (field entry texture)))
+            (if (!= (primitive/cast i64 (load (field entry path))) 0)
+                (do (free (load (field entry path))) 0)
+                0)
+            (store! (field entry path) (primitive/cast (ptr i8) 0))
+            (store! (field entry byte-size) 0)
+            (store! (field entry alive) false)
+            (store! (field entry pinned) false)
+            (store! (field entry generation) (+ (load (field entry generation)) 1))
+            (set! (.resident-bytes cache)
+                  (- (load (field cache resident-bytes)) released-bytes))
+            (al/al-push! [i64] (mut (.free-slots cache)) index)
+            true)))))
+
+(defn least-recent-unpinned [(cache ImageAssetCache)] (-> i64)
+  (let [entries (load (field cache entries))
+        (mut candidate) -1
+        (mut oldest) 0]
+    (do
+      (for [i 0 (al/al-len [ImageAssetEntry] entries)]
+        (let [entry (primitive/index (load (field entries data)) i)]
+          (if (and (load (field entry alive)) (not (load (field entry pinned))))
+              (if (or (= (load candidate) -1)
+                      (< (load (field entry last-used)) (load oldest)))
+                  (do
+                    (store! candidate i)
+                    (store! oldest (load (field entry last-used))))
+                  0)
+              0)))
+      (load candidate))))
+
+(defn make-room! [(cache (mut ImageAssetCache))
+                  (required i64)] (-> bool)
+  (if (> required (load (field cache budget-bytes)))
+      false
+      (block :done
+        (while (> (+ (load (field cache resident-bytes)) required)
+                  (load (field cache budget-bytes)))
+          (let [candidate (least-recent-unpinned (load cache))]
+            (if (= candidate -1)
+                (return-from :done false)
+                (release-entry! (mut cache) candidate))))
+        true)))
+
+(defn find-path [(cache ImageAssetCache)
+                 (path (ptr i8))] (-> i64)
+  (let [entries (load (field cache entries))]
+    (block :found
+      (for [i 0 (al/al-len [ImageAssetEntry] entries)]
+        (let [entry (primitive/index (load (field entries data)) i)]
+          (if (and (load (field entry alive))
+                   (= (strcmp (load (field entry path)) path) 0))
+              (return-from :found i)
+              0)))
+      -1)))
+
+(defn reserve-entry! [(cache (mut ImageAssetCache))] (-> i64)
+  (let [free-count (al/al-len [i64] (load (field cache free-slots)))]
+    (if (> free-count 0)
+        (let [index (al/al-get [i64] (load (field cache free-slots)) (- free-count 1))]
+          (do
+            (set! (.len (.free-slots cache)) (- free-count 1))
+            index))
+        (let [(mut zero) (primitive/zeroed ImageAssetEntry)]
+          (do
+            (al/al-push! [ImageAssetEntry] (mut (.entries cache)) (load zero))
+            (- (al/al-len [ImageAssetEntry] (load (field cache entries))) 1))))))
+
+(defn image-asset-cache-load! [(cache (mut ImageAssetCache))
+                               (path (ptr i8))] (-> AssetId)
+  (let [existing (find-path (load cache) path)]
+    (if (>= existing 0)
+        (let [entry (entry-at (mut cache) existing)
+              next-clock (+ (load (field cache clock)) 1)]
+          (do
+            (set! (.clock cache) next-clock)
+            (store! (field entry last-used) next-clock)
+            (store! (field entry pinned) true)
+            (AssetId :slot existing :generation (load (field entry generation)))))
+        (let [(mut loaded) (image/image-load (load (field cache device)) path)
+              bytes (* (* (load (field loaded width)) (load (field loaded height))) 4)]
+          (if (or (not (image/image-valid? loaded))
+                  (not (make-room! (mut cache) bytes)))
+              (do
+                (image/image-free! (mut loaded))
+                (invalid-asset-id))
+              (let [owned-path (copy-path path)]
+                (if (= (primitive/cast i64 owned-path) 0)
+                    (do
+                      (image/image-free! (mut loaded))
+                      (invalid-asset-id))
+                    (let [index (reserve-entry! (mut cache))
+                          entry (entry-at (mut cache) index)
+                          next-clock (+ (load (field cache clock)) 1)
+                          generation
+                            (if (= (load (field entry generation)) 0)
+                                1
+                                (load (field entry generation)))]
+                      (do
+                        (set! (.clock cache) next-clock)
+                        (store! (field entry path) owned-path)
+                        (store! (field entry texture) loaded)
+                        (store! (field entry byte-size) bytes)
+                        (store! (field entry last-used) next-clock)
+                        (store! (field entry generation) generation)
+                        (store! (field entry alive) true)
+                        (store! (field entry pinned) true)
+                        (set! (.resident-bytes cache)
+                              (+ (load (field cache resident-bytes)) bytes))
+                        (AssetId :slot index :generation generation))))))))))
+
+(defn image-asset-cache-paint! [(cache (mut ImageAssetCache))
+                                (scene (mut ui/Scene))
+                                (id AssetId)
+                                (bounds ui/Rect)
+                                (tint ui/Color)
+                                (paint-id i32)] (-> i64)
+  (if (not (image-asset-cache-valid? (load cache) id))
+      0
+      (let [entry (entry-at (mut cache) (load (field id slot)))
+            next-clock (+ (load (field cache clock)) 1)]
+        (do
+          (set! (.clock cache) next-clock)
+          (store! (field entry last-used) next-clock)
+          (store! (field entry pinned) true)
+          (image/paint-image! (mut scene)
+                              (load (field entry texture))
+                              bounds
+                              tint
+                              paint-id)))))
+
+(defn image-asset-cache-invalidate! [(cache (mut ImageAssetCache))
+                                     (id AssetId)] (-> bool)
+  (if (image-asset-cache-valid? (load cache) id)
+      (let [entry (entry-at (mut cache) (load (field id slot)))]
+        ;; A recorded scene borrows the Metal texture until the frame boundary.
+        ;; Refuse eager invalidation while that texture is frame-pinned.
+        (if (load (field entry pinned))
+            false
+            (release-entry! (mut cache) (load (field id slot)))))
+      false))
+
+(defn image-asset-cache-resident-bytes [(cache ImageAssetCache)] (-> i64)
+  (load (field cache resident-bytes)))
+
+(defn image-asset-cache-resident-count [(cache ImageAssetCache)] (-> i64)
+  (let [entries (load (field cache entries))
+        (mut count) 0]
+    (do
+      (for [i 0 (al/al-len [ImageAssetEntry] entries)]
+        (let [entry (primitive/index (load (field entries data)) i)]
+          (if (load (field entry alive)) (store! count (+ (load count) 1)) 0)))
+      (load count))))
+
+(defn image-asset-cache-free! [(cache (mut ImageAssetCache))] (-> i64)
+  (do
+    (let [entries (load (field cache entries))]
+      (for [i 0 (al/al-len [ImageAssetEntry] entries)]
+        (let [entry (primitive/index (load (field entries data)) i)]
+          (if (load (field entry alive))
+              (do (release-entry! (mut cache) i) 0)
+              0))))
+    (al/al-free! [ImageAssetEntry] (mut (.entries cache)))
+    (al/al-free! [i64] (mut (.free-slots cache)))
+    (set! (.resident-bytes cache) 0)
+    0))

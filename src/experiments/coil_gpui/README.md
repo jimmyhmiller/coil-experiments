@@ -111,6 +111,10 @@ layer in the runtime path.
 - Owned UTF-8 clipboard items through `NSPasteboard`, with native Copy/Cut/Paste/
   Select-All responder commands. External text and file-URL drags enter through
   Coil-defined AppKit callbacks and update a reusable GPU-painted drop target.
+- A byte-budgeted GPU image asset cache with owned source paths, deduplicated
+  ImageIO loads, generation-checked stable IDs, explicit invalidation, frame pins,
+  and least-recently-used eviction. A texture referenced by the current frame
+  cannot be evicted; stale IDs are rejected when an evicted slot is reused.
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
   batching, ABI, and allocation-reuse tests.
 
@@ -207,7 +211,7 @@ translate directly into one draw for all adjacent labels on an atlas page.
 
 The release scene benchmark rebuilds 1,049 paint primitives, emits 99 retained
 paragraph glyph sprites, and advances a 100,000-row virtual list. On the development
-Apple Silicon machine it measured **6,656 ns/frame** across 5,000 frames. This measures
+Apple Silicon machine it measured **6,429 ns/frame** across 5,000 frames. This measures
 Coil scene construction, retained-text recording, and visible-range calculation—not
 GPU presentation or display latency. The benchmark is checked in as `bench.coil` so
 results remain reproducible and comparable.
@@ -235,6 +239,12 @@ AppKit ranges to the field's UTF-8 byte offsets, and handles marked-text updates
 commits, selection ranges, commands, and candidate-window positioning. Selection,
 marked-text decoration, and the caret are painted through the same GPU scene.
 
+Image assets enter through a Coil-owned cache rather than component-local texture
+ownership. `image-asset-cache-begin-frame!` releases the previous frame's pins;
+painting pins each referenced texture for the new frame. Loads with the same path
+reuse one Metal texture, while budget pressure evicts only unpinned least-recently-
+used entries. Asset generations make cached handles safe across slot recycling.
+
 ## Capability roadmap
 
 The current milestone proves the complete Coil-to-Metal path and a real component
@@ -257,7 +267,8 @@ application. GPUI parity still requires substantial systems, notably:
   (hierarchical capture/target/bubble listeners with stop-propagation, focus
   traversal, and logical actions work);
 - weak/strong retained handles, dependency-tracked observation, async executor
-  integration, assets, inspector support, deterministic UI tests, and multiple windows;
+  integration, non-image/remote asset sources, inspector support, deterministic UI
+  tests, and multiple windows;
 - persistent partial-presentation backing, multi-page texture-atlas eviction,
   and deeper GPU/CPU profiling.
 
