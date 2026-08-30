@@ -88,18 +88,23 @@ layer in the runtime path.
 - Batched analytic rounded-rectangle shadows with GPU-computed soft falloff,
   configurable offset, blur sigma, spread, radius, color, and scene clipping.
 - Native Unicode line shaping through CoreText `CTLine`/`CTRun`, preserving shaped
-  positions, advances, and source cluster indices. Individual glyph rasters are
-  cached by font, glyph ID, and 4x2 subpixel variant, then colored and composited
-  as ordered Metal atlas sprites.
+  positions, advances, and source cluster indices. Direct run-storage pointers
+  retrieve complete glyph/position/index/advance arrays once per run, avoiding
+  four FFI calls per glyph. CTFont supplies exact per-glyph raster bounds.
+  Individual glyph rasters are cached by font, glyph ID, and 4x2 subpixel variant,
+  then colored and composited as ordered Metal atlas sprites.
 - Width-dependent single-line end, start, and middle truncation copies complete
   shaped glyphs and inserts a cached Unicode ellipsis while preserving the
   requested portions of the line. Each result owns its glyph list and leaves the
   source shape immutable, so transient zero-width layout probes cannot make later
   wider renders permanently collapse to an ellipsis. Multi-line clamps ellipsize
   the final visible line and retain logical mapping through hidden paragraph text.
-- Bounded shared text-atlas pages with padded shelf allocation, normalized UV
-  regions, explicit overflow, borrowed label handles, and retained per-glyph cache
-  entries. Whole-label and shaped-glyph sprites share the same Metal batching path.
+- Bounded multi-page text atlases use padded shelf allocation, normalized UV
+  regions, page-level LRU, and a configurable hard page cap. Reusing a page
+  compacts stale glyph keys immediately. Whole-label and shaped-glyph handles
+  retain their Metal page independently, so eviction or even atlas destruction
+  cannot invalidate retained layouts; copied truncation results balance ownership.
+  Whole-label and shaped-glyph sprites share the same Metal batching path.
 - Native ImageIO decoding into owned BGRA Metal textures, with linear sampling,
   tint/opacity, scene clipping, and explicit GPU-resource teardown.
 - GPUI-style image object fitting: `fill` stretches to the destination, `contain`
@@ -355,7 +360,7 @@ The current milestone proves the complete Coil-to-Metal path and a real componen
 application. GPUI parity still requires substantial systems, notably:
 
 - grapheme-aware navigation and richer shaped-layout
-  caching, and atlas-page eviction (editable selection/caret measurement,
+  caching (editable selection/caret measurement,
   UTF-8/CoreText cluster conversion, glyph-run extraction, subpixel glyph caching,
   bounded atlas allocation, and GPU mask composition work now);
 - intrinsic text/image measurement (flex and constrained grid layout work);
@@ -374,7 +379,7 @@ application. GPUI parity still requires substantial systems, notably:
 - typed future values, worker-pool priority lanes and work stealing,
   non-image/remote asset sources,
   editable style inspection, and deterministic pixel/event UI tests;
-- multi-page texture-atlas eviction and deeper GPU/CPU profiling.
+- deeper GPU/CPU profiling.
 
 These are explicit missing capabilities, not features claimed by the prototype.
 
@@ -403,6 +408,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI multiple-window example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/window.rs)
 - [GPUI entity transfer between windows](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/move_entity_between_windows.rs)
 - [GPUI macOS Metal renderer](https://github.com/zed-industries/zed/blob/main/crates/gpui_macos/src/metal_renderer.rs)
+- [GPUI macOS Metal atlas](https://github.com/zed-industries/zed/blob/main/crates/gpui_macos/src/metal_atlas.rs)
 - [Apple CAMetalLayer documentation](https://developer.apple.com/documentation/QuartzCore/CAMetalLayer)
 - [Apple MTLRenderCommandEncoder documentation](https://developer.apple.com/documentation/metal/mtlrendercommandencoder)
 - [Apple CTRun documentation](https://developer.apple.com/documentation/coretext/ctrun)
