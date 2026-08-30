@@ -62,6 +62,10 @@ layer in the runtime path.
   positions, advances, and source cluster indices. Individual glyph rasters are
   cached by font, glyph ID, and 4x2 subpixel variant, then colored and composited
   as ordered Metal atlas sprites.
+- Width-dependent single-line end truncation copies complete shaped glyphs and
+  appends a cached Unicode ellipsis. Each result owns its glyph list and leaves
+  the source shape immutable, so transient zero-width layout probes cannot make
+  later wider renders permanently collapse to an ellipsis.
 - Bounded shared text-atlas pages with padded shelf allocation, normalized UV
   regions, explicit overflow, borrowed label handles, and retained per-glyph cache
   entries. Whole-label and shaped-glyph sprites share the same Metal batching path.
@@ -319,7 +323,8 @@ the queue and its synchronization objects.
 The current milestone proves the complete Coil-to-Metal path and a real component
 application. GPUI parity still requires substantial systems, notably:
 
-- grapheme-aware navigation, paragraph ellipsis/truncation, richer shaped-layout
+- grapheme-aware navigation, multi-line clamp/ellipsis, start and middle
+  truncation, richer shaped-layout
   caching, and atlas-page eviction (editable selection/caret measurement,
   UTF-8/CoreText cluster conversion, glyph-run extraction, subpixel glyph caching,
   bounded atlas allocation, and GPU mask composition work now);
@@ -357,6 +362,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI opacity example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/opacity.rs)
 - [GPUI foreground/background executor](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/executor.rs)
 - [GPUI text system](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/text_system.rs)
+- [GPUI text-overflow styling](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/styled.rs)
 - [Apple CoreText line API](https://developer.apple.com/documentation/coretext/ctline)
 - [GPUI window, focus, and hitbox model](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/window.rs)
 - [GPUI list example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/list_example.rs)
