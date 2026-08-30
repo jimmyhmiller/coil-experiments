@@ -16,6 +16,12 @@ layer in the runtime path.
   Bézier easing, and redirectable mass/stiffness/damping springs with bounded
   120 Hz integration substeps. The demo continuously rotates its retained SVG
   by changing only the composed GPU affine transform.
+- Reusable deferred scenes rebase and append primitive, vector, texture, and
+  hitbox storage after the ordinary tree, preserving top-layer paint and input
+  order without per-frame allocation. Anchored popovers flip across viewport
+  edges, clamp oversized content, support modal outside-click dismissal, wrap
+  keyboard selection, and accept pointer-selected menu rows. The demo attaches
+  a deferred GPU menu to its transformed SVG icon.
 - Runtime-compiled Metal vertex and fragment shaders.
 - Instanced draw runs for adjacent box primitives, interleaved with ordered
   vector-path draws without changing scene submission order.
@@ -386,6 +392,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI painting example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/painting.rs)
 - [GPUI SVG example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/svg/svg.rs)
 - [GPUI animation example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/animation.rs)
+- [GPUI popover and deferred-layer example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/popover.rs)
 - [Apple CAMetalLayer documentation](https://developer.apple.com/documentation/QuartzCore/CAMetalLayer)
 - [Apple MTLRenderCommandEncoder documentation](https://developer.apple.com/documentation/metal/mtlrendercommandencoder)
 - [Apple CTRun documentation](https://developer.apple.com/documentation/coretext/ctrun)
