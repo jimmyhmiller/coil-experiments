@@ -204,8 +204,14 @@ layer in the runtime path.
 - Mouse hover, press, release, checkbox toggling, slider dragging, plus keyboard
   activation and arrow-key slider adjustment.
 - Owned UTF-8 clipboard items through `NSPasteboard`, with native Copy/Cut/Paste/
-  Select-All responder commands. External text and file-URL drags enter through
-  Coil-defined AppKit callbacks and update a reusable GPU-painted drop target.
+  Select-All responder commands. Drag payloads own ordered mixtures of text and
+  file paths, round-trip as multiple native pasteboard items, preserve item kinds,
+  and retain first-item compatibility. External drags enter through Coil-defined
+  AppKit callbacks and update a reusable GPU-painted drop target.
+- Internal drags use direct `NSDraggingItem`/`NSDraggingSession` interop with the
+  Coil view itself implementing `NSDraggingSource`. Source activity, completion
+  operation, and revision are retained explicitly; the demo's GPU drop component
+  is both draggable and able to receive its two-item payload without native views.
 - A byte-budgeted GPU image asset cache with owned source paths, deduplicated
   ImageIO loads, generation-checked stable IDs, explicit invalidation, frame pins,
   and least-recently-used eviction. A texture referenced by the current frame
@@ -398,8 +404,7 @@ application. GPUI parity still requires substantial systems, notably:
   fills, butt-cap/miter strokes, affine transforms, analytic shadows, linear
   gradients, general raster images, virtual scrolling, and nested rectangular
   GPU clipping work);
-- keymap predicate expressions and source metadata, internal drag sources,
-  multi-item external drops, richer text-area accessibility
+- keymap predicate expressions and source metadata, richer text-area accessibility
   ranges, and accessibility text actions
   (hierarchical capture/target/bubble listeners with stop-propagation, focus
   traversal, and logical actions work);
@@ -433,6 +438,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI SVG example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/svg/svg.rs)
 - [GPUI animation example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/animation.rs)
 - [GPUI popover and deferred-layer example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/popover.rs)
+- [GPUI internal drag/drop example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/drag_drop.rs)
 - [GPUI multiple-window example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/window.rs)
 - [GPUI entity transfer between windows](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/move_entity_between_windows.rs)
 - [GPUI macOS Metal renderer](https://github.com/zed-industries/zed/blob/main/crates/gpui_macos/src/metal_renderer.rs)

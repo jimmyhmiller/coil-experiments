@@ -2,14 +2,22 @@
 (import "experiments.coil_gpui.objc" :use *)
 (import "experiments.coil_gpui.ui" :as ui)
 (import "coil.primitive" :as primitive)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
 
 (export ClipboardText
+        DropItem
+        DragPayload
+        DragFrame
         DropState
+        DropText
+        DropFile
         clipboard-text-new
         clipboard-text-bytes
         clipboard-text-free!
         pasteboard-new-unique
         pasteboard-write-text!
+        pasteboard-write-payload!
         pasteboard-read-text!
         clipboard-write-text!
         clipboard-read-text!
@@ -20,6 +28,18 @@
         drop-state-x
         drop-state-y
         drop-state-revision
+        drop-state-item-count
+        drop-state-item-kind
+        drop-state-item-bytes
+        drop-state-item-length
+        drag-payload-new
+        drag-payload-add-text!
+        drag-payload-add-file!
+        drag-payload-free!
+        drag-source-begin!
+        drag-source-active?
+        drag-source-operation
+        drag-source-revision
         drop-target!
         drop-state-accept-pasteboard!
         drop-state-attach!
@@ -49,6 +69,15 @@
 
 (defstruct ClipboardText [(bytes (ptr i8)) (length i64)])
 
+(const DropText i32 1)
+(const DropFile i32 2)
+
+(defstruct DropItem [(kind i32) (bytes (ptr i8)) (length i64)])
+
+(defstruct DragPayload [(items (al/ArrayList DropItem))])
+
+(defstruct DragFrame [(x f64) (y f64) (width f64) (height f64)])
+
 (defstruct DropState
   [(view (ptr i8))
    (bytes (ptr i8))
@@ -58,7 +87,11 @@
    (x f64)
    (y f64)
    (bounds ui/Rect)
-   (revision i64)])
+   (items (al/ArrayList DropItem))
+   (revision i64)
+   (source-active bool)
+   (source-operation u64)
+   (source-revision i64)])
 
 (defn nsstr [(bytes (ptr i8))] (-> (ptr i8))
   (msg (ptr i8)
@@ -87,6 +120,46 @@
     (store! (field text length) 0)
     0))
 
+(defn drop-item-new [(kind i32) (utf8 (ptr i8))] (-> DropItem)
+  (let [length (strlen utf8)
+        bytes (malloc (+ length 1))]
+    (do
+      (memcpy bytes utf8 (+ length 1))
+      (DropItem :kind kind :bytes bytes :length length))))
+
+(defn drop-item-free! [(item (mut DropItem))] (-> i64)
+  (do
+    (if (!= (primitive/cast i64 (load (field item bytes))) 0)
+        (do (free (load (field item bytes))) 0) 0)
+    (set! (.bytes item) (primitive/cast (ptr i8) 0))
+    (set! (.length item) 0)
+    0))
+
+(defn drop-items-clear! [(items (mut (al/ArrayList DropItem)))] (-> i64)
+  (do
+    (for [i 0 (al/al-len [DropItem] (load items))]
+      (let [(mut item) (al/al-get [DropItem] (load items) i)]
+        (drop-item-free! (mut item))))
+    (al/al-clear! [DropItem] (mut items))))
+
+(defn drag-payload-new [] (-> DragPayload)
+  (DragPayload :items (al/al-new [DropItem] (alloc/malloc-allocator))))
+
+(defn drag-payload-add! [(payload (mut DragPayload))
+                         (kind i32) (utf8 (ptr i8))] (-> i64)
+  (al/al-push! [DropItem] (mut (.items payload)) (drop-item-new kind utf8)))
+
+(defn drag-payload-add-text! [(payload (mut DragPayload)) (utf8 (ptr i8))] (-> i64)
+  (drag-payload-add! (mut payload) (primitive/cast i32 DropText) utf8))
+
+(defn drag-payload-add-file! [(payload (mut DragPayload)) (path (ptr i8))] (-> i64)
+  (drag-payload-add! (mut payload) (primitive/cast i32 DropFile) path))
+
+(defn drag-payload-free! [(payload (mut DragPayload))] (-> i64)
+  (do
+    (drop-items-clear! (mut (.items payload)))
+    (al/al-free! [DropItem] (mut (.items payload)))))
+
 (defn pasteboard-new-unique [] (-> (ptr i8))
   (msg (ptr i8) (class c"NSPasteboard") (sel c"pasteboardWithUniqueName") []))
 
@@ -102,6 +175,24 @@
       (msg i64 pasteboard (sel c"clearContents") [])
       (!= (msg i8 pasteboard (sel c"writeObjects:") [(ptr i8)] objects)
           (primitive/cast i8 0)))))
+
+(defn pasteboard-write-payload! [(pasteboard (ptr i8))
+                                 (payload DragPayload)] (-> bool)
+  (let [objects (msg (ptr i8) (class c"NSMutableArray") (sel c"new") [])
+        items (load (field payload items))]
+    (do
+      (for [i 0 (al/al-len [DropItem] items)]
+        (let [item (al/al-get [DropItem] items i)
+              object
+                (if (= (load (field item kind)) (primitive/cast i32 DropFile))
+                    (msg (ptr i8) (class c"NSURL") (sel c"fileURLWithPath:")
+                         [(ptr i8)] (nsstr (load (field item bytes))))
+                    (nsstr (load (field item bytes))))]
+          (msg i64 objects (sel c"addObject:") [(ptr i8)] object)))
+      (msg i64 pasteboard (sel c"clearContents") [])
+      (let [written (!= (msg i8 pasteboard (sel c"writeObjects:") [(ptr i8)] objects)
+                         (primitive/cast i8 0))]
+        (do (msg i64 objects (sel c"release") []) written)))))
 
 (defn pasteboard-string [(pasteboard (ptr i8))] (-> (ptr i8))
   (let [modern (msg (ptr i8) pasteboard (sel c"stringForType:") [(ptr i8)] (nsstr c"public.utf8-plain-text"))]
@@ -138,6 +229,7 @@
       (store! bytes (primitive/cast i8 0))
       (store! (field state bytes) bytes)
       (store! (field state capacity) 1)
+      (store! (field state items) (al/al-new [DropItem] (alloc/malloc-allocator)))
       (load state))))
 
 (defn drop-state-bytes [(state DropState)] (-> (ptr i8))
@@ -158,6 +250,27 @@
 (defn drop-state-revision [(state DropState)] (-> i64)
   (load (field state revision)))
 
+(defn drop-state-item-count [(state DropState)] (-> i64)
+  (al/al-len [DropItem] (load (field state items))))
+
+(defn drop-state-item-kind [(state DropState) (index i64)] (-> i32)
+  (if (or (< index 0) (>= index (drop-state-item-count state)))
+      (primitive/cast i32 0)
+      (let [item (al/al-get [DropItem] (load (field state items)) index)]
+        (load (field item kind)))))
+
+(defn drop-state-item-bytes [(state DropState) (index i64)] (-> (ptr i8))
+  (if (or (< index 0) (>= index (drop-state-item-count state)))
+      (primitive/cast (ptr i8) 0)
+      (let [item (al/al-get [DropItem] (load (field state items)) index)]
+        (load (field item bytes)))))
+
+(defn drop-state-item-length [(state DropState) (index i64)] (-> i64)
+  (if (or (< index 0) (>= index (drop-state-item-count state)))
+      0
+      (let [item (al/al-get [DropItem] (load (field state items)) index)]
+        (load (field item length)))))
+
 (defn drop-target! [(scene (mut ui/Scene))
                     (state (mut DropState))
                     (bounds ui/Rect)
@@ -175,6 +288,7 @@
     (do
       (store! (field state bounds) bounds)
       (ui/scene-rounded-rect! (mut scene) bounds fill 8.0 1.5 border id)
+      (ui/scene-hitbox! (mut scene) bounds id -1 false true)
       (if has-payload
           (ui/scene-rounded-rect! (mut scene)
                                   (ui/rect (+ (load (field bounds x)) 10.0)
@@ -207,7 +321,6 @@
       (ensure-capacity! (mut state) (+ length 1))
       (memcpy (load (field state bytes)) utf8 (+ length 1))
       (store! (field state length) length)
-      (set! (.revision state) (+ (load (field state revision)) 1))
       length)))
 
 (defn pasteboard-file-path [(pasteboard (ptr i8))] (-> (ptr i8))
@@ -237,17 +350,68 @@
               path (msg (ptr i8) url (sel c"path") [])]
           (msg (ptr i8) path (sel c"UTF8String") [])))))
 
+(defn pasteboard-item-file-path [(item (ptr i8))] (-> (ptr i8))
+  (let [value (msg (ptr i8) item (sel c"stringForType:")
+                   [(ptr i8)] (nsstr c"public.file-url"))]
+    (if (= (primitive/cast i64 value) 0)
+        (primitive/cast (ptr i8) 0)
+        (let [url (msg (ptr i8) (class c"NSURL") (sel c"URLWithString:")
+                       [(ptr i8)] value)
+              path (msg (ptr i8) url (sel c"path") [])]
+          (if (= (primitive/cast i64 path) 0)
+              (primitive/cast (ptr i8) 0)
+              (msg (ptr i8) path (sel c"UTF8String") []))))))
+
+(defn pasteboard-item-text [(item (ptr i8))] (-> (ptr i8))
+  (let [value (msg (ptr i8) item (sel c"stringForType:")
+                   [(ptr i8)] (nsstr c"public.utf8-plain-text"))]
+    (if (= (primitive/cast i64 value) 0)
+        (primitive/cast (ptr i8) 0)
+        (msg (ptr i8) value (sel c"UTF8String") []))))
+
 (defn drop-state-accept-pasteboard! [(state (mut DropState))
                                      (pasteboard (ptr i8))] (-> bool)
-  (let [file (pasteboard-file-path pasteboard)]
-    (if (!= (primitive/cast i64 file) 0)
-        (do (copy-payload! (mut state) file) true)
-        (let [string (pasteboard-string pasteboard)]
-          (if (= (primitive/cast i64 string) 0)
-              false
-              (do
-                (copy-payload! (mut state) (msg (ptr i8) string (sel c"UTF8String") []))
-                true))))))
+  (let [pasteboard-items (msg (ptr i8) pasteboard (sel c"pasteboardItems") [])
+        count (msg u64 pasteboard-items (sel c"count") [])]
+    (do
+      (drop-items-clear! (mut (.items state)))
+      (for [i 0 (primitive/cast i64 count)]
+        (let [item (msg (ptr i8) pasteboard-items (sel c"objectAtIndex:")
+                        [u64] (primitive/cast u64 i))
+              file (pasteboard-item-file-path item)]
+          (if (!= (primitive/cast i64 file) 0)
+              (al/al-push! [DropItem] (mut (.items state))
+                           (drop-item-new (primitive/cast i32 DropFile) file))
+              (let [text (pasteboard-item-text item)]
+                (if (!= (primitive/cast i64 text) 0)
+                    (al/al-push! [DropItem] (mut (.items state))
+                                 (drop-item-new (primitive/cast i32 DropText) text))
+                    0)))))
+      ; Some legacy pasteboards expose type-level data without pasteboardItems.
+      (if (= (drop-state-item-count (load state)) 0)
+          (let [file (pasteboard-file-path pasteboard)]
+            (if (!= (primitive/cast i64 file) 0)
+                (al/al-push! [DropItem] (mut (.items state))
+                             (drop-item-new (primitive/cast i32 DropFile) file))
+                (let [string (pasteboard-string pasteboard)]
+                  (if (!= (primitive/cast i64 string) 0)
+                      (al/al-push! [DropItem] (mut (.items state))
+                                   (drop-item-new
+                                     (primitive/cast i32 DropText)
+                                     (msg (ptr i8) string (sel c"UTF8String") [])))
+                      0))))
+          0)
+      (if (> (drop-state-item-count (load state)) 0)
+          (let [first (al/al-get [DropItem] (load (field state items)) 0)]
+            (do
+              (copy-payload! (mut state) (load (field first bytes)))
+              (set! (.revision state) (+ (load (field state revision)) 1))
+              true))
+          (do
+            (ensure-capacity! (mut state) 1)
+            (store! (load (field state bytes)) (primitive/cast i8 0))
+            (set! (.length state) 0)
+            false)))))
 
 (defn view-drop-state [(self (ptr i8))] (-> (ptr DropState))
   (let [ivar (class_getInstanceVariable (object_getClass self) c"_coilDropState")
@@ -325,6 +489,83 @@
 (defn state-pointer [(state (ptr DropState))] (-> (ptr DropState))
   state)
 
+(defn drag-source-active? [(state DropState)] (-> bool)
+  (load (field state source-active)))
+
+(defn drag-source-operation [(state DropState)] (-> u64)
+  (load (field state source-operation)))
+
+(defn drag-source-revision [(state DropState)] (-> i64)
+  (load (field state source-revision)))
+
+(defn dragging-source-operation-mask [(self (ptr i8))
+                                      (command (ptr i8))
+                                      (session (ptr i8))
+                                      (context i64)] (-> u64)
+  (primitive/cast u64 1))
+
+(defn dragging-source-ended [(self (ptr i8))
+                             (command (ptr i8))
+                             (session (ptr i8))
+                             (point NSPoint)
+                             (operation u64)] (-> void)
+  (let [state (view-drop-state self)]
+    (do
+      (if (!= (primitive/cast i64 state) 0)
+          (do
+            (store! (field state source-active) false)
+            (store! (field state source-operation) operation)
+            (set! (field state source-revision)
+                  (+ (load (field state source-revision)) 1))
+            0)
+          0)
+      0)))
+
+(defn drag-source-begin! [(state (mut DropState))
+                          (event (ptr i8))
+                          (payload DragPayload)
+                          (frame DragFrame)] (-> bool)
+  (if (or (load (field state source-active))
+          (or (= (primitive/cast i64 (load (field state view))) 0)
+              (or (= (primitive/cast i64 event) 0)
+                  (= (al/al-len [DropItem] (load (field payload items))) 0))))
+      false
+      (let [dragging-items (msg (ptr i8) (class c"NSMutableArray") (sel c"new") [])
+            items (load (field payload items))]
+        (do
+          (for [i 0 (al/al-len [DropItem] items)]
+            (let [item (al/al-get [DropItem] items i)
+                  writer
+                    (if (= (load (field item kind)) (primitive/cast i32 DropFile))
+                        (msg (ptr i8) (class c"NSURL") (sel c"fileURLWithPath:")
+                             [(ptr i8)] (nsstr (load (field item bytes))))
+                        (nsstr (load (field item bytes))))
+                  dragging-item
+                    (msg (ptr i8)
+                         (msg (ptr i8) (class c"NSDraggingItem") (sel c"alloc") [])
+                         (sel c"initWithPasteboardWriter:") [(ptr i8)] writer)]
+              (do
+                (msg i64 dragging-item (sel c"setDraggingFrame:contents:")
+                     [NSRect (ptr i8)]
+                     (NSRect :x (load (field frame x)) :y (load (field frame y))
+                             :w (load (field frame width)) :h (load (field frame height)))
+                     writer)
+                (msg i64 dragging-items (sel c"addObject:") [(ptr i8)] dragging-item)
+                (msg i64 dragging-item (sel c"release") []))))
+          (let [session
+                  (msg (ptr i8) (load (field state view))
+                       (sel c"beginDraggingSessionWithItems:event:source:")
+                       [(ptr i8) (ptr i8) (ptr i8)]
+                       dragging-items event (load (field state view)))]
+            (do
+              (msg i64 dragging-items (sel c"release") [])
+              (if (= (primitive/cast i64 session) 0)
+                  false
+                  (do
+                    (set! (.source-active state) true)
+                    (set! (.source-operation state) (primitive/cast u64 0))
+                    true))))))))
+
 (defn drop-state-attach! [(state (mut DropState)) (view (ptr i8))] (-> i64)
   (let [view-class (object_getClass view)
         ivar (class_getInstanceVariable view-class c"_coilDropState")
@@ -348,6 +589,14 @@
                    c"performDragOperation:"
                    (primitive/cast (ptr i8) (primitive/fnptr-of perform-drag-operation))
                    c"c@:@")
+      (add-method! view-class
+                   c"draggingSession:sourceOperationMaskForDraggingContext:"
+                   (primitive/cast (ptr i8) (primitive/fnptr-of dragging-source-operation-mask))
+                   c"Q@:@q")
+      (add-method! view-class
+                   c"draggingSession:endedAtPoint:operation:"
+                   (primitive/cast (ptr i8) (primitive/fnptr-of dragging-source-ended))
+                   c"v@:@{CGPoint=dd}Q")
       (msg i64 types (sel c"addObject:") [(ptr i8)] (nsstr c"public.file-url"))
       (msg i64 types (sel c"addObject:") [(ptr i8)] (nsstr c"public.utf8-plain-text"))
       (msg i64 view (sel c"registerForDraggedTypes:") [(ptr i8)] types)
@@ -367,5 +616,7 @@
             (store! slot (primitive/cast (ptr DropState) 0))))
         0)
     (free (load (field state bytes)))
+    (drop-items-clear! (mut (.items state)))
+    (al/al-free! [DropItem] (mut (.items state)))
     (store! (field state bytes) (primitive/cast (ptr i8) 0))
     0))
