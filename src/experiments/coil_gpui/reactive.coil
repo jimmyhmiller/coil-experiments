@@ -1,0 +1,299 @@
+(module experiments.coil_gpui.reactive)
+(import "experiments.coil_gpui.entity" :as entity)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+
+(export DependencyKey
+        ConsumerId
+        ReactiveGraph
+        dependency-key
+        entity-dependency-key
+        reactive-graph-new
+        reactive-register-consumer!
+        reactive-unregister-consumer!
+        reactive-begin!
+        reactive-observe!
+        reactive-observe-entity!
+        reactive-end!
+        reactive-notify!
+        reactive-notify-entity!
+        reactive-dirty-count
+        reactive-dirty-at
+        reactive-clear-dirty!
+        reactive-edge-count
+        reactive-graph-free!)
+
+(defstruct DependencyKey [(type-id i64) (slot i64) (generation i64)])
+(defstruct ConsumerId [(slot i64) (generation i64)])
+
+(defstruct ConsumerSlot
+  [(generation i64)
+   (capture-epoch i64)
+   (active bool)
+   (dirty bool)])
+
+(defstruct DependencyEdge
+  [(dependency DependencyKey)
+   (consumer ConsumerId)
+   (capture-epoch i64)])
+
+(defstruct ReactiveGraph
+  [(consumers (al/ArrayList ConsumerSlot))
+   (free-consumers (al/ArrayList i64))
+   (edges (al/ArrayList DependencyEdge))
+   (dirty (al/ArrayList ConsumerId))
+   (capturing ConsumerId)
+   (capture-active bool)])
+
+(defn dependency-key [(type-id i64)
+                      (slot i64)
+                      (generation i64)] (-> DependencyKey)
+  (DependencyKey :type-id type-id :slot slot :generation generation))
+
+(defn entity-dependency-key [(id entity/EntityId)] (-> DependencyKey)
+  (DependencyKey
+    :type-id (load (field id type-id))
+    :slot (load (field id slot))
+    :generation (load (field id generation))))
+
+(defn invalid-consumer [] (-> ConsumerId)
+  (ConsumerId :slot -1 :generation 0))
+
+(defn same-dependency? [(a (ref DependencyKey))
+                        (b (ref DependencyKey))] (-> bool)
+  (and (= (load (field a type-id)) (load (field b type-id)))
+       (and (= (load (field a slot)) (load (field b slot)))
+            (= (load (field a generation)) (load (field b generation))))))
+
+(defn same-consumer? [(a (ref ConsumerId))
+                      (b (ref ConsumerId))] (-> bool)
+  (and (= (load (field a slot)) (load (field b slot)))
+       (= (load (field a generation)) (load (field b generation)))))
+
+(defn reactive-graph-new [] (-> ReactiveGraph)
+  (ReactiveGraph
+    :consumers (al/al-new [ConsumerSlot] (alloc/malloc-allocator))
+    :free-consumers (al/al-new [i64] (alloc/malloc-allocator))
+    :edges (al/al-new [DependencyEdge] (alloc/malloc-allocator))
+    :dirty (al/al-new [ConsumerId] (alloc/malloc-allocator))
+    :capturing (invalid-consumer)
+    :capture-active false))
+
+(defn consumer-slot [(graph (mut ReactiveGraph))
+                     (id ConsumerId)] (-> (ptr ConsumerSlot))
+  (let [consumers (load (field graph consumers))
+        index (load (field id slot))]
+    (if (or (< index 0) (>= index (al/al-len [ConsumerSlot] consumers)))
+        (primitive/cast (ptr ConsumerSlot) 0)
+        (let [slot (primitive/index (load (field consumers data)) index)]
+          (if (and (load (field slot active))
+                   (= (load (field slot generation))
+                      (load (field id generation))))
+              slot
+              (primitive/cast (ptr ConsumerSlot) 0))))))
+
+(defn reactive-register-consumer! [(graph (mut ReactiveGraph))] (-> ConsumerId)
+  (let [free-count (al/al-len [i64] (load (field graph free-consumers)))
+        (mut index) 0]
+    (do
+      (if (> free-count 0)
+          (do
+            (store! index (al/al-get [i64] (load (field graph free-consumers)) (- free-count 1)))
+            (set! (.len (.free-consumers graph)) (- free-count 1)))
+          (let [(mut zero) (primitive/zeroed ConsumerSlot)]
+            (do
+              (al/al-push! [ConsumerSlot] (mut (.consumers graph)) (load zero))
+              (store! index (- (al/al-len [ConsumerSlot] (load (field graph consumers))) 1)))))
+      (let [consumers (load (field graph consumers))
+            slot (primitive/index (load (field consumers data)) (load index))
+            generation (if (= (load (field slot generation)) 0)
+                           1
+                           (load (field slot generation)))]
+        (do
+          (store! (field slot generation) generation)
+          (store! (field slot capture-epoch) 0)
+          (store! (field slot active) true)
+          (store! (field slot dirty) false)
+          (ConsumerId :slot (load index) :generation generation))))))
+
+(defn reactive-unregister-consumer! [(graph (mut ReactiveGraph))
+                                     (id ConsumerId)] (-> bool)
+  (let [slot (consumer-slot (mut graph) id)]
+    (if (= (primitive/cast i64 slot) 0)
+        false
+        (do
+          (store! (field slot active) false)
+          (store! (field slot dirty) false)
+          (store! (field slot generation) (+ (load (field slot generation)) 1))
+          (if (and (load (field graph capture-active))
+                   (same-consumer? (field graph capturing) id))
+              (do
+                (set! (.capture-active graph) false)
+                (set! (.capturing graph) (invalid-consumer)))
+              0)
+          (al/al-push! [i64] (mut (.free-consumers graph)) (load (field id slot)))
+          true))))
+
+(defn reactive-begin! [(graph (mut ReactiveGraph))
+                       (id ConsumerId)] (-> bool)
+  (let [slot (consumer-slot (mut graph) id)]
+    (if (or (= (primitive/cast i64 slot) 0)
+            (load (field graph capture-active)))
+        false
+        (do
+          (store! (field slot capture-epoch) (+ (load (field slot capture-epoch)) 1))
+          (set! (.capturing graph) id)
+          (set! (.capture-active graph) true)
+          true))))
+
+(defn current-edge? [(graph ReactiveGraph)
+                     (dependency (ref DependencyKey))
+                     (consumer (ref ConsumerId))
+                     (epoch i64)] (-> bool)
+  (let [edges (load (field graph edges))]
+    (block :found
+      (for [i 0 (al/al-len [DependencyEdge] edges)]
+        (let [edge (primitive/index (load (field edges data)) i)]
+          (if (and (= (load (field edge capture-epoch)) epoch)
+                   (and (same-consumer? (field edge consumer) consumer)
+                        (same-dependency? (field edge dependency) dependency)))
+              (return-from :found true)
+              0)))
+      false)))
+
+(defn reactive-observe! [(graph (mut ReactiveGraph))
+                         (dependency DependencyKey)] (-> bool)
+  (if (not (load (field graph capture-active)))
+      false
+      (let [consumer (load (field graph capturing))
+            slot (consumer-slot (mut graph) consumer)]
+        (if (= (primitive/cast i64 slot) 0)
+            false
+            (let [epoch (load (field slot capture-epoch))]
+              (if (current-edge? (load graph) dependency consumer epoch)
+                  false
+                  (let [(mut zero) (primitive/zeroed DependencyEdge)]
+                    (do
+                      (al/al-push! [DependencyEdge] (mut (.edges graph)) (load zero))
+                      (let [edges (load (field graph edges))
+                            edge
+                              (primitive/index (load (field edges data))
+                                               (- (al/al-len [DependencyEdge] edges) 1))]
+                        (do
+                          (store! (field edge dependency) dependency)
+                          (store! (field edge consumer) consumer)
+                          (store! (field edge capture-epoch) epoch)
+                          true))))))))))
+
+(defn reactive-observe-entity! [(graph (mut ReactiveGraph))
+                                (id entity/EntityId)] (-> bool)
+  (reactive-observe! (mut graph) (entity-dependency-key id)))
+
+(defn edge-live? [(graph (mut ReactiveGraph))
+                  (edge (ptr DependencyEdge))] (-> bool)
+  (let [slot (consumer-slot (mut graph) (load (field edge consumer)))]
+    (and (!= (primitive/cast i64 slot) 0)
+         (= (load (field edge capture-epoch))
+            (load (field slot capture-epoch))))))
+
+(defn compact-edges! [(graph (mut ReactiveGraph))] (-> i64)
+  (let [(mut read) 0
+        (mut write) 0]
+    (do
+      (while (< (load read) (al/al-len [DependencyEdge] (load (field graph edges))))
+        (let [edges (load (field graph edges))
+              source (primitive/index (load (field edges data)) (load read))]
+          (do
+            (if (edge-live? (mut graph) source)
+                (do
+                  (if (!= (load read) (load write))
+                      (let [current (load (field graph edges))
+                            destination
+                              (primitive/index (load (field current data)) (load write))]
+                        (store! destination (load source)))
+                      0)
+                  (store! write (+ (load write) 1)))
+                0)
+            (store! read (+ (load read) 1)))))
+      (set! (.len (.edges graph)) (load write))
+      (load write))))
+
+(defn reactive-end! [(graph (mut ReactiveGraph))
+                     (id ConsumerId)] (-> bool)
+  (if (and (load (field graph capture-active))
+           (same-consumer? (field graph capturing) id))
+      (do
+        (set! (.capture-active graph) false)
+        (set! (.capturing graph) (invalid-consumer))
+        (compact-edges! (mut graph))
+        true)
+      false))
+
+(defn push-dirty! [(graph (mut ReactiveGraph))
+                   (id ConsumerId)
+                   (slot (ptr ConsumerSlot))] (-> i64)
+  (if (load (field slot dirty))
+      0
+      (do
+        (store! (field slot dirty) true)
+        (al/al-push! [ConsumerId] (mut (.dirty graph)) id)
+        1)))
+
+(defn reactive-notify! [(graph (mut ReactiveGraph))
+                        (dependency DependencyKey)] (-> i64)
+  (let [edges (load (field graph edges))
+        (mut notified) 0]
+    (do
+      (for [i 0 (al/al-len [DependencyEdge] edges)]
+        (let [edge (primitive/index (load (field edges data)) i)]
+          (if (same-dependency? (field edge dependency) dependency)
+              (let [slot (consumer-slot (mut graph) (load (field edge consumer)))]
+                (if (and (!= (primitive/cast i64 slot) 0)
+                         (= (load (field edge capture-epoch))
+                            (load (field slot capture-epoch))))
+                    (store! notified
+                            (+ (load notified)
+                               (push-dirty! (mut graph)
+                                            (load (field edge consumer))
+                                            slot)))
+                    0))
+              0)))
+      (load notified))))
+
+(defn reactive-notify-entity! [(graph (mut ReactiveGraph))
+                               (id entity/EntityId)] (-> i64)
+  (reactive-notify! (mut graph) (entity-dependency-key id)))
+
+(defn reactive-dirty-count [(graph ReactiveGraph)] (-> i64)
+  (al/al-len [ConsumerId] (load (field graph dirty))))
+
+(defn reactive-dirty-at [(graph (mut ReactiveGraph))
+                         (index i64)] (-> (ptr ConsumerId))
+  (let [dirty (load (field graph dirty))]
+    (if (or (< index 0) (>= index (al/al-len [ConsumerId] dirty)))
+        (primitive/cast (ptr ConsumerId) 0)
+        (primitive/index (load (field dirty data)) index))))
+
+(defn reactive-clear-dirty! [(graph (mut ReactiveGraph))] (-> i64)
+  (let [dirty (load (field graph dirty))]
+    (do
+      (for [i 0 (al/al-len [ConsumerId] dirty)]
+        (let [id (primitive/index (load (field dirty data)) i)
+              slot (consumer-slot (mut graph) (load id))]
+          (if (!= (primitive/cast i64 slot) 0)
+              (store! (field slot dirty) false)
+              0)))
+      (set! (.len (.dirty graph)) 0)
+      0)))
+
+(defn reactive-edge-count [(graph ReactiveGraph)] (-> i64)
+  (al/al-len [DependencyEdge] (load (field graph edges))))
+
+(defn reactive-graph-free! [(graph (mut ReactiveGraph))] (-> i64)
+  (do
+    (al/al-free! [ConsumerSlot] (mut (.consumers graph)))
+    (al/al-free! [i64] (mut (.free-consumers graph)))
+    (al/al-free! [DependencyEdge] (mut (.edges graph)))
+    (al/al-free! [ConsumerId] (mut (.dirty graph)))
+    0))
