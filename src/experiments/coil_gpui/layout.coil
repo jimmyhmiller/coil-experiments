@@ -1,0 +1,158 @@
+(module experiments.coil_gpui.layout)
+(import "experiments.coil_gpui.ui" :as ui)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+
+(export FlexItem FlexLayout flex-new flex-clear! flex-free! flex-push! flex-compute!)
+
+;;; Per-child flex inputs. `basis` is the preferred main-axis size, `cross` is
+;;; the preferred cross-axis size (zero means stretch), and min/max are hard
+;;; clamps. A zero max means unbounded. Grow distributes positive free space;
+;;; shrink distributes overflow weighted by basis, matching CSS flex behavior.
+(defstruct FlexItem
+  [(basis f32)
+   (cross f32)
+   (grow f32)
+   (shrink f32)
+   (min-main f32)
+   (max-main f32)
+   (min-cross f32)
+   (max-cross f32)])
+
+(defstruct FlexLayout
+  [(items (al/ArrayList FlexItem))
+   (rects (al/ArrayList ui/Rect))])
+
+(defn flex-new [] (-> FlexLayout)
+  (let [allocator (alloc/malloc-allocator)]
+    (FlexLayout :items (al/al-new [FlexItem] allocator)
+      :rects (al/al-new [ui/Rect] allocator))))
+
+(defn flex-clear! [(layout (mut FlexLayout))] (-> i64)
+  (do
+    (al/al-clear! [FlexItem] (mut (.items layout)))
+    (al/al-clear! [ui/Rect] (mut (.rects layout)))))
+
+(defn flex-free! [(layout (mut FlexLayout))] (-> i64)
+  (do
+    (al/al-free! [FlexItem] (mut (.items layout)))
+    (al/al-free! [ui/Rect] (mut (.rects layout)))))
+
+(defn flex-push! [(layout (mut FlexLayout))
+                  (basis f32)
+                  (cross f32)
+                  (grow f32)
+                  (shrink f32)] (-> i64)
+  (al/al-push! [FlexItem]
+               (mut (.items layout))
+               (FlexItem
+                 :basis basis
+                 :cross cross
+                 :grow grow
+                 :shrink shrink
+                 :min-main 0.0
+                 :max-main 0.0
+                 :min-cross 0.0
+                 :max-cross 0.0)))
+
+(defn clamp-dimension [(value f32) (minimum f32) (maximum f32)] (-> f32)
+  (let [lowered (if (< value minimum) minimum value)]
+    (if (and (> maximum 0.0) (> lowered maximum)) maximum lowered)))
+
+(defn item-main [(item FlexItem)] (-> f32)
+  (clamp-dimension (load (field item basis))
+                   (load (field item min-main))
+                   (load (field item max-main))))
+
+(defn compute-totals [(layout FlexLayout) (gap f32)] (-> ui/Rect)
+  (let [items (load (field layout items))
+        count (al/al-len [FlexItem] items)
+        (mut basis) (primitive/cast f32 0.0)
+        (mut grow) (primitive/cast f32 0.0)
+        (mut shrink-weight) (primitive/cast f32 0.0)]
+    (do
+      (for [i 0 count]
+        (let [item (al/al-get [FlexItem] items i)
+              main (item-main item)]
+          (do
+            (store! basis (+ (load basis) main))
+            (store! grow (+ (load grow) (load (field item grow))))
+            (store! shrink-weight
+                    (+ (load shrink-weight) (* (load (field item shrink)) main))))))
+      (ui/rect (+ (load basis) (* gap (primitive/cast f32 (if (> count 0) (- count 1) 0))))
+               (load grow)
+               (load shrink-weight)
+               (primitive/cast f32 count)))))
+
+(defn flex-compute! [(layout (mut FlexLayout))
+                     (bounds ui/Rect)
+                     (axis ui/Axis)
+                     (gap f32)
+                     (padding ui/EdgeInsets)
+                     (align ui/Align)
+                     (justify ui/Justify)] (-> i64)
+  (let [inner (ui/inset bounds padding)
+        horizontal (match axis (ui/Horizontal [] true) (ui/Vertical [] false))
+        main-size (if horizontal (load (field inner w)) (load (field inner h)))
+        cross-size (if horizontal (load (field inner h)) (load (field inner w)))
+        main-origin (if horizontal (load (field inner x)) (load (field inner y)))
+        cross-origin (if horizontal (load (field inner y)) (load (field inner x)))
+        totals (compute-totals (load layout) gap)
+        basis-total (load (field totals x))
+        grow-total (load (field totals y))
+        shrink-total (load (field totals w))
+        count (al/al-len [FlexItem] (load (field layout items)))
+        free (- main-size basis-total)
+        leftover (if (> free 0.0) (if (> grow-total 0.0) 0.0 free) 0.0)
+        justify-offset
+          (match justify
+            (ui/Leading [] 0.0)
+            (ui/Middle [] (/ leftover 2.0))
+            (ui/Trailing [] leftover)
+            (ui/SpaceBetween [] 0.0))
+        distributed-gap
+          (match justify
+            (ui/SpaceBetween []
+                             (if (> count 1) (+ gap (/ leftover (primitive/cast f32 (- count 1)))) gap))
+            (_ gap))
+        (mut cursor) (+ main-origin justify-offset)]
+    (do
+      (al/al-clear! [ui/Rect] (mut (.rects layout)))
+      (for [i 0 count]
+        (let [item (al/al-get [FlexItem] (load (field layout items)) i)
+              base (item-main item)
+              grown
+                (if (and (> free 0.0) (> grow-total 0.0))
+                    (+ base (* free (/ (load (field item grow)) grow-total)))
+                    base)
+              shrunk
+                (if (and (< free 0.0) (> shrink-total 0.0))
+                    (+ grown (* free (/ (* (load (field item shrink)) base) shrink-total)))
+                    grown)
+              main
+                (clamp-dimension shrunk
+                                 (load (field item min-main))
+                                 (load (field item max-main)))
+              requested-cross (load (field item cross))
+              stretched
+                (or (match align (ui/Stretch [] true) (_ false))
+                    (<= requested-cross 0.0))
+              child-cross
+                (clamp-dimension (if stretched cross-size requested-cross)
+                                 (load (field item min-cross))
+                                 (load (field item max-cross)))
+              cross-offset
+                (match align
+                  (ui/Start [] 0.0)
+                  (ui/Center [] (/ (- cross-size child-cross) 2.0))
+                  (ui/End [] (- cross-size child-cross))
+                  (ui/Stretch [] 0.0))
+              child
+                (if horizontal
+                    (ui/rect (load cursor) (+ cross-origin cross-offset) main child-cross)
+                    (ui/rect (+ cross-origin cross-offset) (load cursor) child-cross main))]
+          (do
+            (al/al-push! [ui/Rect] (mut (.rects layout)) child)
+            (store! cursor (+ (load cursor) (+ main distributed-gap))))))
+      count)))
