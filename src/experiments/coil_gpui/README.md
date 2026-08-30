@@ -208,6 +208,12 @@ layer in the runtime path.
   measurement updates and pixel-offset lookup, with scroll-anchor preservation.
 - The demo's scroll view has 100,000 heterogeneously sized logical rows but
   measures and constructs only visible rows plus three-row overscan each frame.
+- A reusable GPU data table composes uniform virtualization with sortable headers,
+  bounded column resizing, horizontal and vertical scrolling, zebra and selected
+  row paint, stable header/row hitboxes, and keyboard selection that keeps its row
+  visible. Callers receive exact header, row, and cell rectangles for custom
+  content. The independent demo window renders a live three-column table over one
+  million logical rows while scene work remains proportional to the viewport.
 - Interactive buttons, checkbox, slider, progress, divider, panel, single-line text
   field, and retained multiline text-area components. The editors own NUL-terminated
   UTF-8 buffers and support insertion, selection replacement, code-point-safe
@@ -288,7 +294,7 @@ layer in the runtime path.
   storage. The demo owns its background checksum through such a scope.
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
   batching, scheduler lifecycle and telemetry, frame profiling, ABI,
-  allocation-reuse, and deterministic Metal pixel/event replay tests (110 total).
+  allocation-reuse, and deterministic Metal pixel/event replay tests (111 total).
 
 ## Architecture
 
@@ -483,6 +489,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [Apple CoreText line API](https://developer.apple.com/documentation/coretext/ctline)
 - [GPUI window, focus, and hitbox model](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/window.rs)
 - [GPUI list example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/list_example.rs)
+- [GPUI data-table example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/data_table.rs)
 - [GPUI responsive grid example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/grid_layout.rs)
 - [GPUI painting example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/painting.rs)
 - [GPUI SVG example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/svg/svg.rs)
