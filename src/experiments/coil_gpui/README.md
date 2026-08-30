@@ -206,6 +206,12 @@ variant is rasterized once into an application-owned, explicitly bounded atlas p
 Repeated shaping reuses those entries, and compatible glyph and label sprites remain
 one instanced Metal run. Whole-label caching remains available for static labels.
 
+Editable text is integrated with AppKit without a native wrapper. Coil dynamically
+registers an `NSView` subclass implementing `NSTextInputClient`, translates UTF-16
+AppKit ranges to the field's UTF-8 byte offsets, and handles marked-text updates,
+commits, selection ranges, commands, and candidate-window positioning. Selection,
+marked-text decoration, and the caret are painted through the same GPU scene.
+
 ## Capability roadmap
 
 The current milestone proves the complete Coil-to-Metal path and a real component
@@ -222,7 +228,7 @@ application. GPUI parity still requires substantial systems, notably:
   fills, butt-cap/miter strokes, affine transforms, analytic shadows, linear
   gradients, general raster images, virtual scrolling, and nested rectangular
   GPU clipping work);
-- keymap predicate expressions and source metadata, NSTextInputClient/IME composition,
+- keymap predicate expressions and source metadata, richer multiline IME geometry,
   drag/drop, and accessibility
   (hierarchical capture/target/bubble listeners with stop-propagation, focus
   traversal, and logical actions work);
