@@ -23,6 +23,9 @@ layer in the runtime path.
   concave tessellation in either winding. Triangle lists are uploaded through the
   shared frame ring and filled by a clipped, affine Metal pipeline; invalid,
   degenerate, open, and self-intersecting paths fail atomically.
+- Adaptive quadratic and cubic Bézier flattening with caller-controlled geometric
+  tolerance, plus open/closed stroke tessellation with butt caps and bounded miter
+  joins. Stroke meshes reuse the ordered transformed/clipped Metal path pipeline.
 - Batched analytic rounded-rectangle shadows with GPU-computed soft falloff,
   configurable offset, blur sigma, spread, radius, color, and scene clipping.
 - Native Unicode shaping/rasterization through AppKit's CoreText-backed string
@@ -176,8 +179,9 @@ application. GPUI parity still requires substantial systems, notably:
 - glyph-run extraction, editable text measurement, and atlas-page eviction
   (whole-label shaping, bounded atlas allocation, and GPU mask composition work now);
 - intrinsic text/image measurement (flex and constrained grid layout work);
-- Bézier curves, arcs, strokes, SVG parsing, and non-simple/multi-contour fills
-  (validated concave polygon fills, affine transforms, analytic shadows, linear
+- arcs, round/square caps, bevel/round joins, dashes, SVG parsing, and
+  non-simple/multi-contour fill rules (adaptive quadratic/cubic curves, polygon
+  fills, butt-cap/miter strokes, affine transforms, analytic shadows, linear
   gradients, general raster images, virtual scrolling, and nested rectangular
   GPU clipping work);
 - hierarchical capture/bubble listeners, configurable keymaps, IME, drag/drop,

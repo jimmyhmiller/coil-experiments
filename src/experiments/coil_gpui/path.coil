@@ -11,12 +11,17 @@
         path-free!
         path-move-to!
         path-line-to!
+        path-quadratic-to!
+        path-cubic-to!
         path-close!
         path-point-count
         path-signed-area
         path-simple?
         path-tessellate
+        path-stroke-tessellate
         tessellation-free!)
+
+(extern sqrtf :cc c [f32] (-> f32))
 
 (defstruct PathPoint [(x f32) (y f32)])
 
@@ -25,6 +30,8 @@
 ;;; Vertices are emitted as a triangle list. Invalid input returns an empty,
 ;;; owned list with `valid = false`, so callers never render partial geometry.
 (defstruct Tessellation [(vertices (al/ArrayList PathPoint)) (valid bool)])
+
+(defstruct StrokePair [(left PathPoint) (right PathPoint) (valid bool)])
 
 (defn path-new [] (-> Path)
   (Path :points (al/al-new [PathPoint] (alloc/malloc-allocator)) :closed false))
@@ -47,6 +54,100 @@
   (if (load (field path closed))
       0
       (al/al-push! [PathPoint] (mut (.points path)) (PathPoint :x x :y y))))
+
+(defn midpoint [(a PathPoint) (b PathPoint)] (-> PathPoint)
+  (PathPoint :x (* (+ (load (field a x)) (load (field b x))) 0.5)
+    :y (* (+ (load (field a y)) (load (field b y))) 0.5)))
+
+(defn point-line-flat? [(p PathPoint) (a PathPoint) (b PathPoint) (tolerance f32)] (-> bool)
+  (let [dx (- (load (field b x)) (load (field a x)))
+        dy (- (load (field b y)) (load (field a y)))
+        length-squared (+ (* dx dx) (* dy dy))
+        area
+          (- (* dx (- (load (field p y)) (load (field a y))))
+             (* dy (- (load (field p x)) (load (field a x)))))
+        px (- (load (field p x)) (load (field a x)))
+        py (- (load (field p y)) (load (field a y)))
+        projection (+ (* px dx) (* py dy))
+        tolerance-squared (* tolerance tolerance)]
+    (if (> length-squared 0.000001)
+        (and (>= projection 0.0)
+             (and (<= projection length-squared)
+                  (<= (* area area) (* tolerance-squared length-squared))))
+        (<= (+ (* px px) (* py py)) tolerance-squared))))
+
+(defn flatten-quadratic! [(path (mut Path))
+                          (a PathPoint)
+                          (control PathPoint)
+                          (b PathPoint)
+                          (tolerance f32)
+                          (depth i32)] (-> i64)
+  (if (or (>= depth 16) (point-line-flat? control a b tolerance))
+      (al/al-push! [PathPoint] (mut (.points path)) b)
+      (let [ac (midpoint a control)
+            cb (midpoint control b)
+            center (midpoint ac cb)]
+        (do
+          (flatten-quadratic! (mut path) a ac center tolerance (+ depth 1))
+          (flatten-quadratic! (mut path) center cb b tolerance (+ depth 1))))))
+
+(defn path-quadratic-to! [(path (mut Path))
+                          (control-x f32)
+                          (control-y f32)
+                          (x f32)
+                          (y f32)
+                          (tolerance f32)] (-> i64)
+  (let [points (load (field path points))
+        count (al/al-len [PathPoint] points)]
+    (if (or (load (field path closed)) (= count 0))
+        0
+        (flatten-quadratic! (mut path)
+                            (al/al-get [PathPoint] points (- count 1))
+                            (PathPoint :x control-x :y control-y)
+                            (PathPoint :x x :y y)
+                            (if (> tolerance 0.0) tolerance 0.25)
+                            0))))
+
+(defn flatten-cubic! [(path (mut Path))
+                      (a PathPoint)
+                      (control-a PathPoint)
+                      (control-b PathPoint)
+                      (b PathPoint)
+                      (tolerance f32)
+                      (depth i32)] (-> i64)
+  (if (or (>= depth 16)
+          (and (point-line-flat? control-a a b tolerance)
+               (point-line-flat? control-b a b tolerance)))
+      (al/al-push! [PathPoint] (mut (.points path)) b)
+      (let [ab (midpoint a control-a)
+            bc (midpoint control-a control-b)
+            cd (midpoint control-b b)
+            abc (midpoint ab bc)
+            bcd (midpoint bc cd)
+            center (midpoint abc bcd)]
+        (do
+          (flatten-cubic! (mut path) a ab abc center tolerance (+ depth 1))
+          (flatten-cubic! (mut path) center bcd cd b tolerance (+ depth 1))))))
+
+(defn path-cubic-to! [(path (mut Path))
+                      (control-a-x f32)
+                      (control-a-y f32)
+                      (control-b-x f32)
+                      (control-b-y f32)
+                      (x f32)
+                      (y f32)
+                      (tolerance f32)] (-> i64)
+  (let [points (load (field path points))
+        count (al/al-len [PathPoint] points)]
+    (if (or (load (field path closed)) (= count 0))
+        0
+        (flatten-cubic! (mut path)
+                        (al/al-get [PathPoint] points (- count 1))
+                        (PathPoint :x control-a-x :y control-a-y)
+                        (PathPoint :x control-b-x :y control-b-y)
+                        (PathPoint :x x :y y)
+                        (if (> tolerance 0.0) tolerance 0.25)
+                        0))))
 
 (defn path-close! [(path (mut Path))] (-> i64)
   (do (set! (.closed path) true) 0))
@@ -212,6 +313,99 @@
               (al/al-clear! [PathPoint] (mut vertices)))
           (al/al-free! [i64] (mut indices))
           (Tessellation :vertices (load vertices) :valid (not (load failed)))))))
+
+(defn unit-normal [(a PathPoint) (b PathPoint)] (-> StrokePair)
+  (let [dx (- (load (field b x)) (load (field a x)))
+        dy (- (load (field b y)) (load (field a y)))
+        length (sqrtf (+ (* dx dx) (* dy dy)))]
+    (if (<= length 0.00001)
+        (StrokePair
+          :left (PathPoint :x 0.0 :y 0.0)
+          :right (PathPoint :x 0.0 :y 0.0)
+          :valid false)
+        (let [nx (/ (- (primitive/cast f32 0.0) dy) length)
+              ny (/ dx length)]
+          (StrokePair
+            :left (PathPoint :x nx :y ny)
+            :right
+              (PathPoint :x (- (primitive/cast f32 0.0) nx)
+                :y (- (primitive/cast f32 0.0) ny))
+            :valid true)))))
+
+(defn stroke-pair [(points (al/ArrayList PathPoint))
+                   (index i64)
+                   (count i64)
+                   (closed bool)
+                   (half-width f32)
+                   (miter-limit f32)] (-> StrokePair)
+  (let [point (al/al-get [PathPoint] points index)
+        has-prev (or closed (> index 0))
+        has-next (or closed (< index (- count 1)))
+        prev-index (if (> index 0) (- index 1) (- count 1))
+        next-index (if (< index (- count 1)) (+ index 1) 0)
+        prev-normal
+          (if has-prev
+              (unit-normal (al/al-get [PathPoint] points prev-index) point)
+              (unit-normal point (al/al-get [PathPoint] points next-index)))
+        next-normal
+          (if has-next
+              (unit-normal point (al/al-get [PathPoint] points next-index))
+              (load prev-normal))]
+    (if (or (not (load (field prev-normal valid))) (not (load (field next-normal valid))))
+        (StrokePair
+          :left point
+          :right point
+          :valid false)
+        (let [prev (load (field prev-normal left))
+              next (load (field next-normal left))
+              sum-x (+ (load (field prev x)) (load (field next x)))
+              sum-y (+ (load (field prev y)) (load (field next y)))
+              sum-length (sqrtf (+ (* sum-x sum-x) (* sum-y sum-y)))
+              join-x (if (> sum-length 0.00001) (/ sum-x sum-length) (load (field next x)))
+              join-y (if (> sum-length 0.00001) (/ sum-y sum-length) (load (field next y)))
+              denominator (+ (* join-x (load (field next x))) (* join-y (load (field next y))))
+              raw-distance (if (> denominator 0.00001) (/ half-width denominator) half-width)
+              limit (* half-width (if (> miter-limit 1.0) miter-limit 1.0))
+              distance (if (> raw-distance limit) limit raw-distance)
+              offset-x (* join-x distance)
+              offset-y (* join-y distance)]
+          (StrokePair
+            :left
+              (PathPoint :x (+ (load (field point x)) offset-x)
+                :y (+ (load (field point y)) offset-y))
+            :right
+              (PathPoint :x (- (load (field point x)) offset-x)
+                :y (- (load (field point y)) offset-y))
+            :valid true)))))
+
+;;; Tessellate a polyline into a triangle list with butt caps and miter joins.
+;;; The miter length is bounded, preventing spikes at nearly reversing corners.
+(defn path-stroke-tessellate [(path Path) (width f32) (miter-limit f32)] (-> Tessellation)
+  (let [points (load (field path points))
+        count (al/al-len [PathPoint] points)
+        closed (load (field path closed))]
+    (if (or (< count 2) (<= width 0.0))
+        (invalid-tessellation)
+        (let [(mut vertices) (al/al-new [PathPoint] (alloc/malloc-allocator))
+              segment-count (if closed count (- count 1))
+              half-width (* width 0.5)
+              (mut valid) true]
+          (do
+            (for [i 0 segment-count]
+              (let [next (% (+ i 1) count)
+                    a (stroke-pair points i count closed half-width miter-limit)
+                    b (stroke-pair points next count closed half-width miter-limit)]
+                (if (and (load (field a valid)) (load (field b valid)))
+                    (do
+                      (al/al-push! [PathPoint] (mut vertices) (load (field a left)))
+                      (al/al-push! [PathPoint] (mut vertices) (load (field a right)))
+                      (al/al-push! [PathPoint] (mut vertices) (load (field b left)))
+                      (al/al-push! [PathPoint] (mut vertices) (load (field b left)))
+                      (al/al-push! [PathPoint] (mut vertices) (load (field a right)))
+                      (al/al-push! [PathPoint] (mut vertices) (load (field b right))))
+                    (store! valid false))))
+            (if (not (load valid)) (al/al-clear! [PathPoint] (mut vertices)) 0)
+            (Tessellation :vertices (load vertices) :valid (load valid)))))))
 
 (defn tessellation-free! [(tessellation (mut Tessellation))] (-> i64)
   (al/al-free! [PathPoint] (mut (.vertices tessellation))))
