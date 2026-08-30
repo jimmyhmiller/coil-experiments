@@ -90,10 +90,17 @@ layer in the runtime path.
   measurement updates and pixel-offset lookup, with scroll-anchor preservation.
 - The demo's scroll view has 100,000 heterogeneously sized logical rows but
   measures and constructs only visible rows plus three-row overscan each frame.
-- Interactive buttons, checkbox, slider, progress, divider, panel, and single-line
-  text-field components. The text field owns a NUL-terminated UTF-8 buffer, supports
-  insertion, selection replacement, code-point-safe deletion/navigation, shaped
-  pointer hit-testing, and GPU-rendered selection and caret geometry.
+- Interactive buttons, checkbox, slider, progress, divider, panel, single-line text
+  field, and retained multiline text-area components. The editors own NUL-terminated
+  UTF-8 buffers and support insertion, selection replacement, code-point-safe
+  deletion/navigation, shaped pointer hit-testing, and GPU-rendered selection and
+  caret geometry. The text area adds width-constrained wrapping, explicit newlines,
+  preferred-column vertical movement, selection across line breaks, and reshaping
+  only when text or available width changes.
+- Native `NSTextInputClient` composition routes insertion, marked ranges, newline,
+  horizontal and vertical selection movement into the Coil editors. Candidate
+  rectangles are converted to Cocoa screen coordinates, and screen-point character
+  queries map back through retained multiline layout with UTF-8/UTF-16 conversion.
 - Retained accessibility nodes backed by Coil-defined `NSAccessibilityElement`
   subclasses. Components expose native roles, labels, stable identifiers, values,
   ranges, enabled/focused state, screen-space bounds, change notifications, and
@@ -200,7 +207,7 @@ translate directly into one draw for all adjacent labels on an atlas page.
 
 The release scene benchmark rebuilds 1,049 paint primitives, emits 99 retained
 paragraph glyph sprites, and advances a 100,000-row virtual list. On the development
-Apple Silicon machine it measured **6,564 ns/frame** across 5,000 frames. This measures
+Apple Silicon machine it measured **6,656 ns/frame** across 5,000 frames. This measures
 Coil scene construction, retained-text recording, and visible-range calculation—not
 GPU presentation or display latency. The benchmark is checked in as `bench.coil` so
 results remain reproducible and comparable.
@@ -244,8 +251,8 @@ application. GPUI parity still requires substantial systems, notably:
   fills, butt-cap/miter strokes, affine transforms, analytic shadows, linear
   gradients, general raster images, virtual scrolling, and nested rectangular
   GPU clipping work);
-- keymap predicate expressions and source metadata, richer multiline IME geometry,
-  internal drag sources, multi-item external drops, richer text-field accessibility
+- keymap predicate expressions and source metadata, internal drag sources,
+  multi-item external drops, richer text-area accessibility
   ranges, and accessibility text actions
   (hierarchical capture/target/bubble listeners with stop-propagation, focus
   traversal, and logical actions work);
