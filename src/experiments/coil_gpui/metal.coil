@@ -4,7 +4,14 @@
 (import "coil.arraylist" :as al)
 (import "coil.primitive" :as primitive)
 
-(export Renderer renderer-new renderer-resize! renderer-draw! renderer-valid? renderer-free! next-buffer-capacity)
+(export Renderer
+        renderer-new
+        renderer-resize!
+        renderer-draw!
+        renderer-valid?
+        renderer-free!
+        next-buffer-capacity
+        sprite-run-end)
 
 (extern MTLCreateSystemDefaultDevice :cc c [] (-> (ptr i8)))
 
@@ -42,6 +49,26 @@
       (while (< (load capacity) required)
         (store! capacity (* (load capacity) 2)))
       (load capacity))))
+
+;;; Return the exclusive end of an adjacent sprite run that can share one
+;;; pipeline and texture binding without changing paint order.
+(defn sprite-run-end [(sprites (al/ArrayList ui/TextSprite))
+                      (start i64)
+                      (count i64)] (-> i64)
+  (if (or (< start 0) (>= start count))
+      start
+      (let [first (primitive/index (load (field sprites data)) start)
+            texture (primitive/cast i64 (load (field first texture)))
+            mode (load (field first mode))
+            (mut end) (+ start 1)]
+        (do
+          (while (< (load end) count)
+            (let [candidate (primitive/index (load (field sprites data)) (load end))]
+              (if (and (= (primitive/cast i64 (load (field candidate texture))) texture)
+                       (= (load (field candidate mode)) mode))
+                  (store! end (+ (load end) 1))
+                  (break 0))))
+          (load end)))))
 
 (defn renderer-ensure-capacity! [(renderer (mut Renderer)) (required i64)] (-> i64)
   (if (<= required (load (field renderer primitive-capacity)))
@@ -100,6 +127,9 @@
 (defn texture-shader-source [] (-> (ptr i8))
   c"#include <metal_stdlib>\nusing namespace metal;\nstruct Rect { float x,y,w,h; };\nstruct Color { float r,g,b,a; };\nstruct Affine { float m11,m12,m21,m22,tx,ty; };\nstruct Sprite { Rect bounds; Color color; Rect clip; Affine transform; };\nstruct Frame { float2 viewport; float2 pad; };\nstruct SpriteOut { float4 position [[position]]; float2 pixel; float2 uv; float4 clip; float4 color; };\nfloat2 apply_affine(Affine t,float2 p) { return float2(t.m11*p.x+t.m21*p.y+t.tx,t.m12*p.x+t.m22*p.y+t.ty); }\nvertex SpriteOut texture_vertex(uint vid [[vertex_id]], constant Sprite& sprite [[buffer(0)]], constant Frame& frame [[buffer(1)]]) { constexpr float2 q[6] = {float2(0,0),float2(1,0),float2(0,1),float2(0,1),float2(1,0),float2(1,1)}; float2 localPoint=float2(sprite.bounds.x,sprite.bounds.y)+q[vid]*float2(sprite.bounds.w,sprite.bounds.h); float2 pixel=apply_affine(sprite.transform,localPoint); SpriteOut o; o.position=float4(pixel.x/frame.viewport.x*2.0-1.0,1.0-pixel.y/frame.viewport.y*2.0,0,1); o.pixel=pixel; o.uv=q[vid]; o.clip=float4(sprite.clip.x,sprite.clip.y,sprite.clip.w,sprite.clip.h); o.color=float4(sprite.color.r,sprite.color.g,sprite.color.b,sprite.color.a); return o; }\nfragment float4 text_fragment(SpriteOut in [[stage_in]], texture2d<float> mask [[texture(0)]]) { if (in.pixel.x<in.clip.x || in.pixel.y<in.clip.y || in.pixel.x>=in.clip.x+in.clip.z || in.pixel.y>=in.clip.y+in.clip.w) discard_fragment(); constexpr sampler s(coord::normalized,address::clamp_to_edge,filter::linear); float alpha=mask.sample(s,in.uv).a; return float4(in.color.rgb,in.color.a*alpha); }\nfragment float4 image_fragment(SpriteOut in [[stage_in]], texture2d<float> image [[texture(0)]]) { if (in.pixel.x<in.clip.x || in.pixel.y<in.clip.y || in.pixel.x>=in.clip.x+in.clip.z || in.pixel.y>=in.clip.y+in.clip.w) discard_fragment(); constexpr sampler s(coord::normalized,address::clamp_to_edge,filter::linear); return image.sample(s,in.uv)*in.color; }\n")
 
+(defn batched-texture-shader-source [] (-> (ptr i8))
+  c"#include <metal_stdlib>\nusing namespace metal;\nstruct Rect { float x,y,w,h; };\nstruct Color { float r,g,b,a; };\nstruct Affine { float m11,m12,m21,m22,tx,ty; };\nstruct Sprite { Rect bounds; Color color; Rect clip; Affine transform; ulong texture; int id; int mode; };\nstruct Frame { float2 viewport; float2 pad; };\nstruct SpriteOut { float4 position [[position]]; float2 pixel; float2 uv; float4 clip; float4 color; };\nfloat2 apply_affine(Affine t,float2 p) { return float2(t.m11*p.x+t.m21*p.y+t.tx,t.m12*p.x+t.m22*p.y+t.ty); }\nvertex SpriteOut texture_vertex(uint vid [[vertex_id]],uint iid [[instance_id]],constant Sprite* sprites [[buffer(0)]],constant Frame& frame [[buffer(1)]]) { constexpr float2 q[6]={float2(0,0),float2(1,0),float2(0,1),float2(0,1),float2(1,0),float2(1,1)}; Sprite sprite=sprites[iid]; float2 localPoint=float2(sprite.bounds.x,sprite.bounds.y)+q[vid]*float2(sprite.bounds.w,sprite.bounds.h); float2 pixel=apply_affine(sprite.transform,localPoint); SpriteOut o; o.position=float4(pixel.x/frame.viewport.x*2.0-1.0,1.0-pixel.y/frame.viewport.y*2.0,0,1); o.pixel=pixel; o.uv=q[vid]; o.clip=float4(sprite.clip.x,sprite.clip.y,sprite.clip.w,sprite.clip.h); o.color=float4(sprite.color.r,sprite.color.g,sprite.color.b,sprite.color.a); return o; }\nfragment float4 text_fragment(SpriteOut in [[stage_in]],texture2d<float> mask [[texture(0)]]) { if(in.pixel.x<in.clip.x||in.pixel.y<in.clip.y||in.pixel.x>=in.clip.x+in.clip.z||in.pixel.y>=in.clip.y+in.clip.w) discard_fragment(); constexpr sampler s(coord::normalized,address::clamp_to_edge,filter::linear); float alpha=mask.sample(s,in.uv).a; return float4(in.color.rgb,in.color.a*alpha); }\nfragment float4 image_fragment(SpriteOut in [[stage_in]],texture2d<float> image [[texture(0)]]) { if(in.pixel.x<in.clip.x||in.pixel.y<in.clip.y||in.pixel.x>=in.clip.x+in.clip.z||in.pixel.y>=in.clip.y+in.clip.w) discard_fragment(); constexpr sampler s(coord::normalized,address::clamp_to_edge,filter::linear); return image.sample(s,in.uv)*in.color; }\n")
+
 (defn renderer-valid? [(renderer Renderer)] (-> bool)
   (and (!= (primitive/cast i64 (load (field renderer device))) 0)
        (!= (primitive/cast i64 (load (field renderer pipeline))) 0)
@@ -121,7 +151,7 @@
 (defn renderer-new [(view (ptr i8)) (width f32) (height f32) (scale f32)] (-> Renderer)
   (let [device (MTLCreateSystemDefaultDevice)
         queue (msg (ptr i8) device (sel c"newCommandQueue") [])
-        source (nsstr (texture-shader-source))
+        source (nsstr (batched-texture-shader-source))
         library
           (msg (ptr i8)
                device
@@ -248,7 +278,9 @@
         text-count (al/al-len [ui/TextSprite] text-items)
         shadow-bytes (* shadow-count (primitive/sizeof ui/Primitive))
         primitive-bytes (* count (primitive/sizeof ui/Primitive))
-        total-bytes (+ shadow-bytes primitive-bytes)]
+        sprite-offset (+ shadow-bytes primitive-bytes)
+        sprite-bytes (* text-count (primitive/sizeof ui/TextSprite))
+        total-bytes (+ sprite-offset sprite-bytes)]
     (if (or (and (= count 0) (and (= shadow-count 0) (= text-count 0)))
             (not (renderer-valid? (load renderer))))
         0
@@ -277,7 +309,8 @@
                              :a 1.0))
                       (let [encoder (msg (ptr i8) command (sel c"renderCommandEncoderWithDescriptor:") [(ptr i8)] pass)
                             frame (primitive/alloc-stack (array f32 4))
-                            primitive-buffer (renderer-frame-buffer (load renderer))]
+                            primitive-buffer (renderer-frame-buffer (load renderer))
+                            (mut texture-runs) 0]
                         (do
                           (store! (primitive/index frame 0) (load (field renderer width)))
                           (store! (primitive/index frame 1) (load (field renderer height)))
@@ -349,38 +382,54 @@
                                      count))
                               0)
                           (if (> text-count 0)
-                              (let [(mut i) 0]
-                                (while (< (load i) text-count)
-                                  (let [sprite (primitive/index (load (field text-items data)) (load i))]
-                                    (do
-                                      (msg i64
-                                           encoder
-                                           (sel c"setRenderPipelineState:")
-                                           [(ptr i8)]
-                                           (if (= (load (field sprite mode)) 1)
-                                               (load (field renderer image-pipeline))
-                                               (load (field renderer text-pipeline))))
-                                      (msg i64
-                                           encoder
-                                           (sel c"setVertexBytes:length:atIndex:")
-                                           [(ptr i8) i64 i64]
-                                           (primitive/cast (ptr i8) sprite)
-                                           (primitive/sizeof ui/TextSprite)
-                                           0)
-                                      (msg i64
-                                           encoder
-                                           (sel c"setFragmentTexture:atIndex:")
-                                           [(ptr i8) i64]
-                                           (load (field sprite texture))
-                                           0)
-                                      (msg i64
-                                           encoder
-                                           (sel c"drawPrimitives:vertexStart:vertexCount:")
-                                           [i64 i64 i64]
-                                           3
-                                           0
-                                           6)
-                                      (store! i (+ (load i) 1))))))
+                              (do
+                                (memcpy (primitive/cast (ptr i8)
+                                                        (+ (primitive/cast i64
+                                                                           (msg (ptr i8)
+                                                                                primitive-buffer
+                                                                                (sel c"contents")
+                                                                                []))
+                                                           sprite-offset))
+                                        (primitive/cast (ptr i8) (load (field text-items data)))
+                                        sprite-bytes)
+                                (let [(mut i) 0]
+                                  (while (< (load i) text-count)
+                                    (let [sprite (primitive/index (load (field text-items data)) (load i))
+                                          run-end (sprite-run-end text-items (load i) text-count)
+                                          run-count (- run-end (load i))]
+                                      (do
+                                        (msg i64
+                                             encoder
+                                             (sel c"setRenderPipelineState:")
+                                             [(ptr i8)]
+                                             (if (= (load (field sprite mode)) 1)
+                                                 (load (field renderer image-pipeline))
+                                                 (load (field renderer text-pipeline))))
+                                        (msg i64
+                                             encoder
+                                             (sel c"setVertexBuffer:offset:atIndex:")
+                                             [(ptr i8) i64 i64]
+                                             primitive-buffer
+                                             (+ sprite-offset
+                                                (* (load i) (primitive/sizeof ui/TextSprite)))
+                                             0)
+                                        (msg i64
+                                             encoder
+                                             (sel c"setFragmentTexture:atIndex:")
+                                             [(ptr i8) i64]
+                                             (load (field sprite texture))
+                                             0)
+                                        (msg i64
+                                             encoder
+                                             (sel c"drawPrimitives:vertexStart:vertexCount:instanceCount:")
+                                             [i64 i64 i64 i64]
+                                             3
+                                             0
+                                             6
+                                             run-count)
+                                        (store! texture-runs (+ (load texture-runs) 1))
+                                        (store! i run-end)))))
+                                0)
                               0)
                           (msg i64 encoder (sel c"endEncoding") [])
                           (msg i64 command (sel c"presentDrawable:") [(ptr i8)] drawable)
@@ -389,7 +438,7 @@
                           (set! (.draw-calls renderer)
                                 (+ (load (field renderer draw-calls))
                                    (+ (+ (if (> shadow-count 0) 1 0) (if (> count 0) 1 0))
-                                      text-count)))
+                                      (load texture-runs))))
                           1))))))))))
 
 (defn release-object! [(object (ptr i8))] (-> i64)

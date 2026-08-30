@@ -24,6 +24,8 @@ layer in the runtime path.
   stack, cached as high-DPI alpha-mask textures and colored/composited by Metal.
 - Native ImageIO decoding into owned BGRA Metal textures, with linear sampling,
   tint/opacity, scene clipping, and explicit GPU-resource teardown.
+- Buffered, instanced texture sprites: adjacent text/image records sharing a
+  texture and pipeline collapse into one draw without changing paint order.
 - Reusable scene allocation across frames.
 - Immediate element reconstruction over retained application/component state.
 - Reusable flex row/column solving with basis, grow, weighted shrink, gaps,
@@ -58,7 +60,7 @@ flex layout -> component functions rebuild a transient Scene each frame
 paint list + clipped inverse-transform hitbox/focus list + texture-sprite list
         |
         v
-triple-buffered shared MTLBuffer upload + batched shadow/shape Metal draws
+triple-buffered shared MTLBuffer upload + instanced shape/texture runs
         |
         v
 affine vertex shaders expand/transform quads; fragments perform SDF paint
@@ -131,6 +133,12 @@ at 64 KiB and doubles until the complete scene fits. The demo intentionally rebu
 layer uses three drawables and display synchronization. Per-frame autoreleased Cocoa
 objects are drained every frame.
 
+Texture sprites use the same growable triple-buffered frame storage as shapes;
+there is no per-label `setVertexBytes` path or fixed inline upload ceiling. The
+renderer scans the ordered sprite list into maximal adjacent runs by pipeline and
+texture, issuing one instanced draw per run. This makes a future shared glyph atlas
+translate directly into one draw for all adjacent labels on an atlas page.
+
 The release scene benchmark rebuilds 1,049 paint primitives while advancing a
 100,000-row virtual list. On the development Apple Silicon machine it measured
 **4,136 ns/frame with per-primitive affine transforms**, versus 1,840 ns/frame before
@@ -144,9 +152,10 @@ lookup across one million rows. It measured **164 ns per update-plus-lookup** ac
 steady-state work performed as rows are measured during scrolling.
 
 Text rasterization is cached rather than repeated each frame. The current cache is
-application-owned and one texture is bound per label. The next text tier should pack
-individual shaped glyph masks into bounded, evicting atlas pages and batch labels by
-atlas page, while retaining CoreText fallback and cluster semantics.
+application-owned and one texture is bound per label; compatible sprites are already
+buffered and instanced. The next text tier should pack individual shaped glyph masks
+into bounded, evicting atlas pages so multiple labels share each texture run, while
+retaining CoreText fallback and cluster semantics.
 
 ## Capability roadmap
 
