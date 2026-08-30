@@ -22,6 +22,9 @@ layer in the runtime path.
   configurable offset, blur sigma, spread, radius, color, and scene clipping.
 - Native Unicode shaping/rasterization through AppKit's CoreText-backed string
   stack, cached as high-DPI alpha-mask textures and colored/composited by Metal.
+- Bounded shared text-atlas pages with padded shelf allocation, normalized UV
+  regions, explicit overflow, and borrowed label handles; the demo's six labels
+  share one texture and one instanced draw.
 - Native ImageIO decoding into owned BGRA Metal textures, with linear sampling,
   tint/opacity, scene clipping, and explicit GPU-resource teardown.
 - Buffered, instanced texture sprites: adjacent text/image records sharing a
@@ -65,7 +68,7 @@ triple-buffered shared MTLBuffer upload + instanced shape/texture runs
         v
 affine vertex shaders expand/transform quads; fragments perform SDF paint
 
-CoreText-backed shaping/rasterization -> cached high-DPI mask textures
+CoreText-backed shaping/rasterization -> bounded high-DPI atlas regions
 ImageIO decode -> cached BGRA textures
         |
         v
@@ -151,19 +154,19 @@ lookup across one million rows. It measured **164 ns per update-plus-lookup** ac
 100,000 operations. Initial tree construction is excluded; the timed path covers the
 steady-state work performed as rows are measured during scrolling.
 
-Text rasterization is cached rather than repeated each frame. The current cache is
-application-owned and one texture is bound per label; compatible sprites are already
-buffered and instanced. The next text tier should pack individual shaped glyph masks
-into bounded, evicting atlas pages so multiple labels share each texture run, while
-retaining CoreText fallback and cluster semantics.
+Text rasterization is cached rather than repeated each frame. Labels borrow normalized
+regions from an application-owned, explicitly bounded atlas page; compatible labels
+are buffered and rendered as one instanced run. The next text tier should extract and
+cache individual shaped glyph runs rather than whole labels, add page eviction, and
+retain CoreText fallback and cluster semantics.
 
 ## Capability roadmap
 
 The current milestone proves the complete Coil-to-Metal path and a real component
 application. GPUI parity still requires substantial systems, notably:
 
-- glyph-run extraction, editable text measurement, and a bounded glyph atlas
-  (whole-label shaping and GPU mask composition work now);
+- glyph-run extraction, editable text measurement, and atlas-page eviction
+  (whole-label shaping, bounded atlas allocation, and GPU mask composition work now);
 - grid and intrinsic text/image measurement (flex layout works);
 - SVG and arbitrary paths (affine transforms, analytic shadows, linear gradients,
   general raster images, uniform and variable-height virtual scrolling, and nested
@@ -172,7 +175,7 @@ application. GPUI parity still requires substantial systems, notably:
   and accessibility (focus traversal and logical actions work);
 - retained entities, subscriptions, observation, async executor integration, assets,
   inspector support, deterministic UI tests, and multiple windows;
-- damage tracking, frame pacing, occlusion handling, buffer rings, texture atlases,
+- damage tracking, frame pacing, occlusion handling, multi-page texture-atlas eviction,
   and GPU/CPU profiling.
 
 These are explicit missing capabilities, not features claimed by the prototype.

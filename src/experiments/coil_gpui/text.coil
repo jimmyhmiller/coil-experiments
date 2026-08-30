@@ -3,7 +3,18 @@
 (import "experiments.coil_gpui.ui" :as ui)
 (import "coil.primitive" :as primitive)
 
-(export TextTexture text-texture-new text-texture-valid? text-texture-free! paint-text!)
+(export TextTexture
+        TextAtlas
+        AtlasRegion
+        text-texture-new
+        text-texture-valid?
+        text-texture-free!
+        paint-text!
+        text-atlas-new
+        text-atlas-valid?
+        text-atlas-reserve!
+        text-atlas-add!
+        text-atlas-free!)
 
 (extern malloc :cc c [i64] (-> (ptr i8)))
 
@@ -34,13 +45,262 @@
 ;;; A persistent Metal alpha-mask texture. AppKit/CoreText performs Unicode
 ;;; shaping and glyph rasterization once; each frame Metal applies color and
 ;;; composites the cached mask. The texture is owned and explicitly released.
-(defstruct TextTexture [(texture (ptr i8)) (width i64) (height i64) (scale f32)])
+(defstruct TextTexture
+  [(texture (ptr i8)) (width i64) (height i64) (scale f32) (uv ui/Rect) (owned bool)])
+
+(defstruct TextAtlas
+  [(texture (ptr i8))
+   (width i64)
+   (height i64)
+   (cursor-x i64)
+   (cursor-y i64)
+   (row-height i64)
+   (padding i64)
+   (scale f32)])
+
+(defstruct AtlasRegion [(x i64) (y i64) (w i64) (h i64) (valid bool)])
 
 (defn nsstr [(value (ptr i8))] (-> (ptr i8))
   (msg (ptr i8) (class c"NSString") (sel c"stringWithUTF8String:") [(ptr i8)] value))
 
 (defn text-texture-valid? [(text TextTexture)] (-> bool)
   (!= (primitive/cast i64 (load (field text texture))) 0))
+
+(defn text-atlas-valid? [(atlas TextAtlas)] (-> bool)
+  (!= (primitive/cast i64 (load (field atlas texture))) 0))
+
+(defn empty-atlas [(scale f32)] (-> TextAtlas)
+  (TextAtlas
+    :texture (primitive/cast (ptr i8) 0)
+    :width 0
+    :height 0
+    :cursor-x 0
+    :cursor-y 0
+    :row-height 0
+    :padding 0
+    :scale scale))
+
+(defn text-atlas-new [(device (ptr i8))
+                      (width i64)
+                      (height i64)
+                      (padding i64)
+                      (scale f32)] (-> TextAtlas)
+  (if (or (<= width 0) (<= height 0))
+      (empty-atlas scale)
+      (let [descriptor
+              (msg (ptr i8)
+                   (class c"MTLTextureDescriptor")
+                   (sel c"texture2DDescriptorWithPixelFormat:width:height:mipmapped:")
+                   [i64 i64 i64 i8]
+                   80
+                   width
+                   height
+                   (primitive/cast i8 0))
+            texture (msg (ptr i8) device (sel c"newTextureWithDescriptor:") [(ptr i8)] descriptor)
+            row-bytes (* width 4)
+            byte-count (* row-bytes height)
+            pixels (malloc byte-count)]
+        (if (or (= (primitive/cast i64 texture) 0) (= (primitive/cast i64 pixels) 0))
+            (do
+              (if (!= (primitive/cast i64 texture) 0)
+                  (msg i64 texture (sel c"release") [])
+                  0)
+              (if (!= (primitive/cast i64 pixels) 0) (do (free pixels) 0) 0)
+              (empty-atlas scale))
+            (do
+              (memset pixels 0 byte-count)
+              (msg i64
+                   texture
+                   (sel c"replaceRegion:mipmapLevel:withBytes:bytesPerRow:")
+                   [MTLRegion i64 (ptr i8) i64]
+                   (MTLRegion
+                     :origin
+                       (MTLOrigin
+                         :x 0
+                         :y 0
+                         :z 0)
+                     :size
+                       (MTLSize
+                         :w (primitive/cast u64 width)
+                         :h (primitive/cast u64 height)
+                         :d 1))
+                   0
+                   pixels
+                   row-bytes)
+              (free pixels)
+              (let [gap (if (< padding 1) 1 padding)]
+                (TextAtlas
+                  :texture texture
+                  :width width
+                  :height height
+                  :cursor-x gap
+                  :cursor-y gap
+                  :row-height 0
+                  :padding gap
+                  :scale scale)))))))
+
+(defn invalid-region [] (-> AtlasRegion)
+  (AtlasRegion
+    :x 0
+    :y 0
+    :w 0
+    :h 0
+    :valid false))
+
+;;; Bounded shelf allocation. Failure is explicit and leaves allocator state
+;;; unchanged, allowing the caller to create/evict an atlas page deliberately.
+(defn text-atlas-reserve! [(atlas (mut TextAtlas)) (width i64) (height i64)] (-> AtlasRegion)
+  (if (or (<= width 0)
+          (<= height 0)
+          (> (+ width (* (load (field atlas padding)) 2)) (load (field atlas width)))
+          (> (+ height (* (load (field atlas padding)) 2)) (load (field atlas height))))
+      (invalid-region)
+      (let [gap (load (field atlas padding))
+            current-x (load (field atlas cursor-x))
+            needs-row (> (+ (+ current-x width) gap) (load (field atlas width)))
+            x (if needs-row gap current-x)
+            y
+              (if needs-row
+                  (+ (+ (load (field atlas cursor-y)) (load (field atlas row-height))) gap)
+                  (load (field atlas cursor-y)))
+            prior-row-height (if needs-row 0 (load (field atlas row-height)))]
+        (if (> (+ (+ y height) gap) (load (field atlas height)))
+            (invalid-region)
+            (do
+              (set! (.cursor-x atlas) (+ (+ x width) gap))
+              (set! (.cursor-y atlas) y)
+              (set! (.row-height atlas) (if (> height prior-row-height) height prior-row-height))
+              (AtlasRegion
+                :x x
+                :y y
+                :w width
+                :h height
+                :valid true))))))
+
+(defn empty-text-texture [(scale f32)] (-> TextTexture)
+  (TextTexture
+    :texture (primitive/cast (ptr i8) 0)
+    :width 0
+    :height 0
+    :scale scale
+    :uv (ui/rect 0.0 0.0 1.0 1.0)
+    :owned false))
+
+(defn text-atlas-add! [(atlas (mut TextAtlas))
+                       (utf8 (ptr i8))
+                       (width i64)
+                       (height i64)
+                       (font-size f64)] (-> TextTexture)
+  (let [scale (load (field atlas scale))
+        pixel-width (primitive/cast i64 (* (primitive/cast f32 width) scale))
+        pixel-height (primitive/cast i64 (* (primitive/cast f32 height) scale))
+        prior-x (load (field atlas cursor-x))
+        prior-y (load (field atlas cursor-y))
+        prior-row-height (load (field atlas row-height))
+        region
+          (if (text-atlas-valid? (load atlas))
+              (text-atlas-reserve! (mut atlas) pixel-width pixel-height)
+              (invalid-region))]
+    (if (or (not (text-atlas-valid? (load atlas))) (not (load (field region valid))))
+        (empty-text-texture scale)
+        (let [row-bytes (* pixel-width 4)
+              byte-count (* row-bytes pixel-height)
+              pixels (malloc byte-count)
+              colorspace (CGColorSpaceCreateDeviceRGB)
+              context (CGBitmapContextCreate pixels pixel-width pixel-height 8 row-bytes colorspace 8194)]
+          (if (or (= (primitive/cast i64 pixels) 0)
+                  (= (primitive/cast i64 colorspace) 0)
+                  (= (primitive/cast i64 context) 0))
+              (do
+                (set! (.cursor-x atlas) prior-x)
+                (set! (.cursor-y atlas) prior-y)
+                (set! (.row-height atlas) prior-row-height)
+                (if (!= (primitive/cast i64 context) 0) (do (CGContextRelease context) 0) 0)
+                (if (!= (primitive/cast i64 colorspace) 0) (do (CGColorSpaceRelease colorspace) 0) 0)
+                (if (!= (primitive/cast i64 pixels) 0) (do (free pixels) 0) 0)
+                (empty-text-texture scale))
+              (do
+                (memset pixels 0 byte-count)
+                (let [graphics
+                        (msg (ptr i8)
+                             (class c"NSGraphicsContext")
+                             (sel c"graphicsContextWithCGContext:flipped:")
+                             [(ptr i8) i8]
+                             context
+                             (primitive/cast i8 1))
+                      font
+                        (msg (ptr i8)
+                             (class c"NSFont")
+                             (sel c"systemFontOfSize:weight:")
+                             [f64 f64]
+                             (* font-size (primitive/cast f64 scale))
+                             0.0)
+                      attributes
+                        (msg (ptr i8)
+                             (class c"NSDictionary")
+                             (sel c"dictionaryWithObject:forKey:")
+                             [(ptr i8) (ptr i8)]
+                             font
+                             (nsstr c"NSFont"))
+                      string (nsstr utf8)]
+                  (do
+                    (msg i64 (class c"NSGraphicsContext") (sel c"saveGraphicsState") [])
+                    (msg i64 (class c"NSGraphicsContext") (sel c"setCurrentContext:") [(ptr i8)] graphics)
+                    (msg i64
+                         string
+                         (sel c"drawInRect:withAttributes:")
+                         [CGRect (ptr i8)]
+                         (CGRect
+                           :x 0.0
+                           :y 0.0
+                           :w (primitive/cast f64 pixel-width)
+                           :h (primitive/cast f64 pixel-height))
+                         attributes)
+                    (msg i64 (class c"NSGraphicsContext") (sel c"restoreGraphicsState") [])
+                    (msg i64
+                         (load (field atlas texture))
+                         (sel c"replaceRegion:mipmapLevel:withBytes:bytesPerRow:")
+                         [MTLRegion i64 (ptr i8) i64]
+                         (MTLRegion
+                           :origin
+                             (MTLOrigin
+                               :x (primitive/cast u64 (load (field region x)))
+                               :y (primitive/cast u64 (load (field region y)))
+                               :z 0)
+                           :size
+                             (MTLSize
+                               :w (primitive/cast u64 pixel-width)
+                               :h (primitive/cast u64 pixel-height)
+                               :d 1))
+                         0
+                         pixels
+                         row-bytes)
+                    (CGContextRelease context)
+                    (CGColorSpaceRelease colorspace)
+                    (free pixels)
+                    (TextTexture
+                      :texture (load (field atlas texture))
+                      :width width
+                      :height height
+                      :scale scale
+                      :uv
+                        (ui/rect (/ (primitive/cast f32 (load (field region x)))
+                                    (primitive/cast f32 (load (field atlas width))))
+                                 (/ (primitive/cast f32 (load (field region y)))
+                                    (primitive/cast f32 (load (field atlas height))))
+                                 (/ (primitive/cast f32 pixel-width)
+                                    (primitive/cast f32 (load (field atlas width))))
+                                 (/ (primitive/cast f32 pixel-height)
+                                    (primitive/cast f32 (load (field atlas height)))))
+                      :owned false)))))))))
+
+(defn text-atlas-free! [(atlas (mut TextAtlas))] (-> i64)
+  (do
+    (if (text-atlas-valid? (load atlas))
+        (msg i64 (load (field atlas texture)) (sel c"release") [])
+        0)
+    (set! (.texture atlas) (primitive/cast (ptr i8) 0))
+    0))
 
 (defn text-texture-new [(device (ptr i8))
                         (utf8 (ptr i8))
@@ -64,7 +324,9 @@
             :texture (primitive/cast (ptr i8) 0)
             :width 0
             :height 0
-            :scale scale))
+            :scale scale
+            :uv (ui/rect 0.0 0.0 1.0 1.0)
+            :owned false))
         (do
           (memset pixels 0 byte-count)
           (let [graphics
@@ -141,14 +403,18 @@
                     :texture texture
                     :width width
                     :height height
-                    :scale scale)))))))))
+                    :scale scale
+                    :uv (ui/rect 0.0 0.0 1.0 1.0)
+                    :owned true)))))))))
 
 (defn text-texture-free! [(text (mut TextTexture))] (-> i64)
   (do
-    (if (!= (primitive/cast i64 (load (field text texture))) 0)
+    (if (and (load (field text owned))
+             (!= (primitive/cast i64 (load (field text texture))) 0))
         (msg i64 (load (field text texture)) (sel c"release") [])
         0)
     (set! (.texture text) (primitive/cast (ptr i8) 0))
+    (set! (.owned text) false)
     0))
 
 (defn paint-text! [(scene (mut ui/Scene))
@@ -158,12 +424,13 @@
                    (color ui/Color)
                    (id i32)] (-> i64)
   (if (text-texture-valid? text)
-      (ui/scene-texture! (mut scene)
-                         (ui/rect x
-                                  y
-                                  (primitive/cast f32 (load (field text width)))
-                                  (primitive/cast f32 (load (field text height))))
-                         color
-                         (load (field text texture))
-                         id)
+      (ui/scene-texture-region! (mut scene)
+                                (ui/rect x
+                                         y
+                                         (primitive/cast f32 (load (field text width)))
+                                         (primitive/cast f32 (load (field text height))))
+                                color
+                                (load (field text uv))
+                                (load (field text texture))
+                                id)
       0))
