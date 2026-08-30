@@ -17,6 +17,9 @@ layer in the runtime path.
 - Triple-buffered, power-of-two-growing shared `MTLBuffer` uploads; large scenes
   do not rely on Metal's small inline-byte path and are never truncated.
 - GPU-expanded quads, antialiased rounded rectangles, borders, and alpha blending.
+- Nested GPUI-style opacity groups multiply and restore scene state. One scalar is
+  recorded per primitive, path, glyph, or image and applied in its Metal fragment
+  shader, preserving source colors and avoiding per-channel CPU rewrites.
 - Composable translate/scale/rotate affine transforms applied on the GPU to solid,
   gradient, shadow, text, and image geometry; pointer hit testing uses the exact
   inverse transform and rejects singular transforms.
@@ -242,8 +245,8 @@ cd src/experiments/coil_gpui
 ## Performance contract
 
 The scene retains shape, path, command, shadow, and texture-list allocations after `scene-clear!`,
-avoiding steady-state list allocation. A paint primitive is 104 bytes, including its
-six-float affine transform. Ordinary shapes and
+avoiding steady-state list allocation. A paint primitive is 112 bytes, including its
+six-float affine transform and GPU opacity scalar. Ordinary shapes and
 analytic shadows use instanced commands. Ordinary shapes form maximal adjacent
 instanced runs around ordered path commands. All geometry shares a three-slot buffer ring; each slot starts
 at 64 KiB and doubles until the complete scene fits. The demo intentionally rebuilds
@@ -259,8 +262,10 @@ translate directly into one draw for all adjacent labels on an atlas page.
 
 The release scene benchmark rebuilds 1,049 paint primitives, emits 99 retained
 paragraph glyph sprites, and advances a 100,000-row virtual list. On the development
-Apple Silicon machine it measured **6,674 ns/frame** across 5,000 frames (median of
-three consecutive runs). This measures
+Apple Silicon machine it measured **6,964 ns/frame** across 5,000 frames (median of
+three consecutive runs). A same-session checkout immediately before nested opacity
+measured 6,611 ns/frame, making the cost of the additional GPU record state explicit.
+This measures
 Coil scene construction, retained-text recording, and visible-range calculation—not
 GPU presentation or display latency. The benchmark is checked in as `bench.coil` so
 results remain reproducible and comparable.
@@ -349,6 +354,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI subscriptions](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/subscription.rs)
 - [GPUI image element](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/elements/img.rs)
 - [GPUI pattern example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/pattern.rs)
+- [GPUI opacity example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/opacity.rs)
 - [GPUI foreground/background executor](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/executor.rs)
 - [GPUI text system](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/text_system.rs)
 - [Apple CoreText line API](https://developer.apple.com/documentation/coretext/ctline)
