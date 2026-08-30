@@ -323,7 +323,7 @@ endorsed by Zed Industries. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
   batching, scheduler lifecycle and telemetry, frame profiling, ABI,
   allocation-reuse, upright CoreText glyph orientation, and deterministic Metal
-  pixel/event replay tests (115 total).
+  pixel/event replay tests (116 total).
 
 ## Architecture
 
