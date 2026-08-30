@@ -134,8 +134,10 @@ layer in the runtime path.
   owner-thread foreground and monotonic timer queues, and pthread-backed background
   work. Background control blocks are heap-stable, cross-thread state is atomic,
   workers receive cooperative cancellation, and every worker is joined before its
-  completion callback or storage release. The demo computes a checksum off-thread
-  and paints its owner-thread completion as a GPU status badge.
+  completion callback or storage release. Completion publication signals the frame
+  semaphore, waking both active display pacing and the occluded fallback without
+  exposing UI state across threads. The demo computes a checksum off-thread and
+  paints its owner-thread completion as a GPU status badge.
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
   batching, scheduler lifecycle, ABI, and allocation-reuse tests (74 total).
 
