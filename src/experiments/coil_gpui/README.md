@@ -48,11 +48,13 @@ layer in the runtime path.
   full-circle support, and the same caller-controlled geometric tolerance.
 - Batched analytic rounded-rectangle shadows with GPU-computed soft falloff,
   configurable offset, blur sigma, spread, radius, color, and scene clipping.
-- Native Unicode shaping/rasterization through AppKit's CoreText-backed string
-  stack, cached as high-DPI alpha-mask textures and colored/composited by Metal.
+- Native Unicode line shaping through CoreText `CTLine`/`CTRun`, preserving shaped
+  positions, advances, and source cluster indices. Individual glyph rasters are
+  cached by font, glyph ID, and 4x2 subpixel variant, then colored and composited
+  as ordered Metal atlas sprites.
 - Bounded shared text-atlas pages with padded shelf allocation, normalized UV
-  regions, explicit overflow, and borrowed label handles; the demo's six labels
-  share one texture and one instanced draw.
+  regions, explicit overflow, borrowed label handles, and retained per-glyph cache
+  entries. Whole-label and shaped-glyph sprites share the same Metal batching path.
 - Native ImageIO decoding into owned BGRA Metal textures, with linear sampling,
   tint/opacity, scene clipping, and explicit GPU-resource teardown.
 - Buffered, instanced texture sprites: adjacent text/image records sharing a
@@ -195,19 +197,20 @@ lookup across one million rows. It measured **164 ns per update-plus-lookup** ac
 100,000 operations. Initial tree construction is excluded; the timed path covers the
 steady-state work performed as rows are measured during scrolling.
 
-Text rasterization is cached rather than repeated each frame. Labels borrow normalized
-regions from an application-owned, explicitly bounded atlas page; compatible labels
-are buffered and rendered as one instanced run. The next text tier should extract and
-cache individual shaped glyph runs rather than whole labels, add page eviction, and
-retain CoreText fallback and cluster semantics.
+Text rasterization is cached rather than repeated each frame. CoreText produces glyph
+runs with positions, advances, and source cluster indices; each font/glyph/subpixel
+variant is rasterized once into an application-owned, explicitly bounded atlas page.
+Repeated shaping reuses those entries, and compatible glyph and label sprites remain
+one instanced Metal run. Whole-label caching remains available for static labels.
 
 ## Capability roadmap
 
 The current milestone proves the complete Coil-to-Metal path and a real component
 application. GPUI parity still requires substantial systems, notably:
 
-- glyph-run extraction, editable text measurement, and atlas-page eviction
-  (whole-label shaping, bounded atlas allocation, and GPU mask composition work now);
+- editable text selection/caret measurement, shaped-line caching, fallback-font cache
+  key hardening, and atlas-page eviction (glyph-run extraction, cluster indices,
+  subpixel glyph caching, bounded atlas allocation, and GPU mask composition work now);
 - intrinsic text/image measurement (flex and constrained grid layout work);
 - endpoint-parameterized SVG arcs, closed-path dash seam merging,
   SVG parsing, and non-simple/multi-contour fill rules (adaptive quadratic/cubic
@@ -233,6 +236,8 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI keymap precedence and matching](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/keymap.rs)
 - [GPUI retained entity map](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/app/entity_map.rs)
 - [GPUI subscriptions](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/subscription.rs)
+- [GPUI text system](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/text_system.rs)
+- [Apple CoreText line API](https://developer.apple.com/documentation/coretext/ctline)
 - [GPUI window, focus, and hitbox model](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/window.rs)
 - [GPUI list example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/list_example.rs)
 - [GPUI responsive grid example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/grid_layout.rs)

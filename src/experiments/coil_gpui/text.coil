@@ -2,10 +2,15 @@
 (import "experiments.coil_gpui.objc" :use *)
 (import "experiments.coil_gpui.ui" :as ui)
 (import "coil.primitive" :as primitive)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
 
 (export TextTexture
         TextAtlas
         AtlasRegion
+        GlyphEntry
+        ShapedGlyph
+        ShapedLine
         text-texture-new
         text-texture-valid?
         text-texture-free!
@@ -14,6 +19,10 @@
         text-atlas-valid?
         text-atlas-reserve!
         text-atlas-add!
+        text-shape-line!
+        shaped-line-free!
+        paint-shaped-line!
+        text-atlas-glyph-count
         text-atlas-free!)
 
 (extern malloc :cc c [i64] (-> (ptr i8)))
@@ -34,7 +43,49 @@
 
 (extern CGContextRelease :cc c [(ptr i8)] (-> void))
 
+(extern CGContextTranslateCTM :cc c [(ptr i8) f64 f64] (-> void))
+
+(extern CFRelease :cc c [(ptr i8)] (-> void))
+
+(extern CFArrayGetCount :cc c [(ptr i8)] (-> i64))
+
+(extern CFArrayGetValueAtIndex :cc c [(ptr i8) i64] (-> (ptr i8)))
+
+(extern CFDictionaryGetValue :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+(extern CTLineCreateWithAttributedString :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern CTLineGetGlyphRuns :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern CTLineGetTypographicBounds
+        :cc
+        c
+        [(ptr i8) (ptr f64) (ptr f64) (ptr f64)]
+        (-> f64))
+
+(extern CTRunGetGlyphCount :cc c [(ptr i8)] (-> i64))
+
+(extern CTRunGetGlyphs :cc c [(ptr i8) CFRange (ptr u16)] (-> void))
+
+(extern CTRunGetPositions :cc c [(ptr i8) CFRange (ptr CGPoint)] (-> void))
+
+(extern CTRunGetStringIndices :cc c [(ptr i8) CFRange (ptr i64)] (-> void))
+
+(extern CTRunGetAdvances :cc c [(ptr i8) CFRange (ptr CGSize)] (-> f64))
+
+(extern CTRunGetImageBounds :cc c [(ptr i8) (ptr i8) CFRange] (-> CGRect))
+
+(extern CTRunGetAttributes :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern CTRunDraw :cc c [(ptr i8) (ptr i8) CFRange] (-> void))
+
 (defstruct CGRect [(x f64) (y f64) (w f64) (h f64)])
+
+(defstruct CGPoint [(x f64) (y f64)])
+
+(defstruct CGSize [(w f64) (h f64)])
+
+(defstruct CFRange [(location i64) (length i64)])
 
 (defstruct MTLOrigin [(x u64) (y u64) (z u64)])
 
@@ -56,7 +107,35 @@
    (cursor-y i64)
    (row-height i64)
    (padding i64)
-   (scale f32)])
+   (scale f32)
+   (glyphs (al/ArrayList GlyphEntry))])
+
+(defstruct GlyphEntry
+  [(font (ptr i8))
+   (glyph u16)
+   (subpixel-x i32)
+   (subpixel-y i32)
+   (pixel-width i64)
+   (pixel-height i64)
+   (bearing-x f32)
+   (bearing-top f32)
+   (advance f32)
+   (uv ui/Rect)])
+
+(defstruct ShapedGlyph
+  [(texture TextTexture)
+   (x f32)
+   (y f32)
+   (advance f32)
+   (string-index i64)
+   (glyph u16)])
+
+(defstruct ShapedLine
+  [(glyphs (al/ArrayList ShapedGlyph))
+   (width f32)
+   (ascent f32)
+   (descent f32)
+   (valid bool)])
 
 (defstruct AtlasRegion [(x i64) (y i64) (w i64) (h i64) (valid bool)])
 
@@ -78,7 +157,8 @@
     :cursor-y 0
     :row-height 0
     :padding 0
-    :scale scale))
+    :scale scale
+    :glyphs (al/al-new [GlyphEntry] (alloc/malloc-allocator))))
 
 (defn text-atlas-new [(device (ptr i8))
                       (width i64)
@@ -137,7 +217,8 @@
                   :cursor-y gap
                   :row-height 0
                   :padding gap
-                  :scale scale)))))))
+                  :scale scale
+                  :glyphs (al/al-new [GlyphEntry] (alloc/malloc-allocator)))))))))
 
 (defn invalid-region [] (-> AtlasRegion)
   (AtlasRegion
@@ -294,8 +375,353 @@
                                     (primitive/cast f32 (load (field atlas height)))))
                       :owned false)))))))))
 
+(defn glyph-subpixel [(value f64) (variants i32)] (-> i32)
+  (let [whole (primitive/cast i64 value)
+        fraction (- value (primitive/cast f64 whole))
+        normalized (if (< fraction 0.0) (+ fraction 1.0) fraction)
+        variant (primitive/cast i32 (* normalized (primitive/cast f64 variants)))]
+    (cond (< variant 0) 0
+          (>= variant variants) (- variants 1)
+          :else variant)))
+
+(defn find-glyph [(atlas (mut TextAtlas))
+                  (font (ptr i8))
+                  (glyph u16)
+                  (subpixel-x i32)
+                  (subpixel-y i32)] (-> (ptr GlyphEntry))
+  (let [glyphs (load (field atlas glyphs))]
+    (block :found
+           (for [i 0 (al/al-len [GlyphEntry] glyphs)]
+             (let [entry (primitive/index (load (field glyphs data)) i)]
+               (if (and (= (primitive/cast i64 (load (field entry font)))
+                           (primitive/cast i64 font))
+                        (and (= (load (field entry glyph)) glyph)
+                             (and (= (load (field entry subpixel-x)) subpixel-x)
+                                  (= (load (field entry subpixel-y)) subpixel-y))))
+                   (return-from :found entry)
+                   0)))
+           (primitive/cast (ptr GlyphEntry) 0))))
+
+(defn push-glyph-entry! [(atlas (mut TextAtlas))
+                         (font (ptr i8))
+                         (glyph u16)
+                         (subpixel-x i32)
+                         (subpixel-y i32)
+                         (pixel-width i64)
+                         (pixel-height i64)
+                         (bearing-x f32)
+                         (bearing-top f32)
+                         (advance f32)
+                         (uv ui/Rect)] (-> (ptr GlyphEntry))
+  (let [(mut zero) (primitive/zeroed GlyphEntry)]
+    (do
+      (al/al-push! [GlyphEntry] (mut (.glyphs atlas)) (load zero))
+      (let [glyphs (load (field atlas glyphs))
+            entry
+              (primitive/index (load (field glyphs data))
+                               (- (al/al-len [GlyphEntry] glyphs) 1))]
+        (do
+          (store! (field entry font) font)
+          (store! (field entry glyph) glyph)
+          (store! (field entry subpixel-x) subpixel-x)
+          (store! (field entry subpixel-y) subpixel-y)
+          (store! (field entry pixel-width) pixel-width)
+          (store! (field entry pixel-height) pixel-height)
+          (store! (field entry bearing-x) bearing-x)
+          (store! (field entry bearing-top) bearing-top)
+          (store! (field entry advance) advance)
+          (store! (field entry uv) uv)
+          (if (!= (primitive/cast i64 font) 0) (msg i64 font (sel c"retain") []) 0)
+          entry)))))
+
+(defn cache-run-glyph! [(atlas (mut TextAtlas))
+                        (run (ptr i8))
+                        (font (ptr i8))
+                        (glyph u16)
+                        (position CGPoint)
+                        (range CFRange)
+                        (advance f64)] (-> (ptr GlyphEntry))
+  (let [subpixel-x (glyph-subpixel (load (field position x)) 4)
+        subpixel-y (glyph-subpixel (load (field position y)) 2)
+        cached (find-glyph (mut atlas) font glyph subpixel-x subpixel-y)]
+    (if (!= (primitive/cast i64 cached) 0)
+        cached
+        (let [bounds (CTRunGetImageBounds run (primitive/cast (ptr i8) 0) range)
+              scale (load (field atlas scale))
+              image-width (load (field bounds w))
+              image-height (load (field bounds h))]
+          (if (or (<= image-width 0.0) (<= image-height 0.0))
+              (push-glyph-entry! (mut atlas)
+                                 font
+                                 glyph
+                                 subpixel-x
+                                 subpixel-y
+                                 0
+                                 0
+                                 0.0
+                                 0.0
+                                 (primitive/cast f32 (/ advance (primitive/cast f64 scale)))
+                                 (ui/rect 0.0 0.0 0.0 0.0))
+              (let [pixel-width (+ (primitive/cast i64 image-width) 3)
+                    pixel-height (+ (primitive/cast i64 image-height) 3)
+                    prior-x (load (field atlas cursor-x))
+                    prior-y (load (field atlas cursor-y))
+                    prior-row-height (load (field atlas row-height))
+                    region (text-atlas-reserve! (mut atlas) pixel-width pixel-height)]
+                (if (not (load (field region valid)))
+                    (primitive/cast (ptr GlyphEntry) 0)
+                    (let [row-bytes (* pixel-width 4)
+                          byte-count (* row-bytes pixel-height)
+                          pixels (malloc byte-count)
+                          colorspace (CGColorSpaceCreateDeviceRGB)
+                          context
+                            (CGBitmapContextCreate pixels
+                                                   pixel-width
+                                                   pixel-height
+                                                   8
+                                                   row-bytes
+                                                   colorspace
+                                                   8194)]
+                      (if (or (= (primitive/cast i64 pixels) 0)
+                              (or (= (primitive/cast i64 colorspace) 0)
+                                  (= (primitive/cast i64 context) 0)))
+                          (do
+                            (set! (.cursor-x atlas) prior-x)
+                            (set! (.cursor-y atlas) prior-y)
+                            (set! (.row-height atlas) prior-row-height)
+                            (if (!= (primitive/cast i64 context) 0)
+                                (do (CGContextRelease context) 0)
+                                0)
+                            (if (!= (primitive/cast i64 colorspace) 0)
+                                (do (CGColorSpaceRelease colorspace) 0)
+                                0)
+                            (if (!= (primitive/cast i64 pixels) 0) (do (free pixels) 0) 0)
+                            (primitive/cast (ptr GlyphEntry) 0))
+                          (do
+                            (memset pixels 0 byte-count)
+                            (CGContextTranslateCTM context
+                                                   (- 1.0 (load (field bounds x)))
+                                                   (- 1.0 (load (field bounds y))))
+                            (CTRunDraw run context range)
+                            (msg i64
+                                 (load (field atlas texture))
+                                 (sel c"replaceRegion:mipmapLevel:withBytes:bytesPerRow:")
+                                 [MTLRegion i64 (ptr i8) i64]
+                                 (MTLRegion
+                                   :origin
+                                     (MTLOrigin
+                                       :x (primitive/cast u64 (load (field region x)))
+                                       :y (primitive/cast u64 (load (field region y)))
+                                       :z 0)
+                                   :size
+                                     (MTLSize
+                                       :w (primitive/cast u64 pixel-width)
+                                       :h (primitive/cast u64 pixel-height)
+                                       :d 1))
+                                 0
+                                 pixels
+                                 row-bytes)
+                            (CGContextRelease context)
+                            (CGColorSpaceRelease colorspace)
+                            (free pixels)
+                            (push-glyph-entry! (mut atlas)
+                                               font
+                                               glyph
+                                               subpixel-x
+                                               subpixel-y
+                                               pixel-width
+                                               pixel-height
+                                               (primitive/cast f32
+                                                               (/ (- (- (load (field bounds x))
+                                                                        (load (field position x)))
+                                                                     1.0)
+                                                                  (primitive/cast f64 scale)))
+                                               (primitive/cast f32
+                                                               (/ (- (- 0.0
+                                                                        (+ (load (field bounds y))
+                                                                           (load (field bounds h))))
+                                                                     1.0)
+                                                                  (primitive/cast f64 scale)))
+                                               (primitive/cast f32 (/ advance (primitive/cast f64 scale)))
+                                               (ui/rect (/ (primitive/cast f32 (load (field region x)))
+                                                           (primitive/cast f32 (load (field atlas width))))
+                                                        (/ (primitive/cast f32 (load (field region y)))
+                                                           (primitive/cast f32 (load (field atlas height))))
+                                                        (/ (primitive/cast f32 pixel-width)
+                                                           (primitive/cast f32 (load (field atlas width))))
+                                                        (/ (primitive/cast f32 pixel-height)
+                                                           (primitive/cast f32 (load (field atlas height))))))))))))))))
+
+(defn push-shaped-glyph! [(line (mut ShapedLine))
+                          (atlas (mut TextAtlas))
+                          (entry (ptr GlyphEntry))
+                          (position CGPoint)
+                          (string-index i64)
+                          (glyph u16)] (-> i64)
+  (let [(mut zero) (primitive/zeroed ShapedGlyph)]
+    (do
+      (al/al-push! [ShapedGlyph] (mut (.glyphs line)) (load zero))
+      (let [glyphs (load (field line glyphs))
+            item
+              (primitive/index (load (field glyphs data))
+                               (- (al/al-len [ShapedGlyph] glyphs) 1))
+            texture (field item texture)
+            scale (load (field atlas scale))]
+        (do
+          (store! (field texture texture) (load (field atlas texture)))
+          (store! (field texture width)
+                  (primitive/cast i64
+                                  (/ (primitive/cast f32 (load (field entry pixel-width))) scale)))
+          (store! (field texture height)
+                  (primitive/cast i64
+                                  (/ (primitive/cast f32 (load (field entry pixel-height))) scale)))
+          (store! (field texture scale) scale)
+          (store! (field texture uv) (load (field entry uv)))
+          (store! (field texture owned) false)
+          (store! (field item x)
+                  (+ (primitive/cast f32
+                                     (/ (load (field position x)) (primitive/cast f64 scale)))
+                     (load (field entry bearing-x))))
+          (store! (field item y) (+ (load (field line ascent)) (load (field entry bearing-top))))
+          (store! (field item advance) (load (field entry advance)))
+          (store! (field item string-index) string-index)
+          (store! (field item glyph) glyph)
+          (al/al-len [ShapedGlyph] glyphs))))))
+
+(defn invalid-shaped-line [] (-> ShapedLine)
+  (let [(mut line) (primitive/zeroed ShapedLine)]
+    (do
+      (store! (field line glyphs) (al/al-new [ShapedGlyph] (alloc/malloc-allocator)))
+      (store! (field line valid) false)
+      (load line))))
+
+(defn text-shape-line! [(atlas (mut TextAtlas))
+                        (utf8 (ptr i8))
+                        (font-size f64)] (-> ShapedLine)
+  (if (or (not (text-atlas-valid? (load atlas))) (<= font-size 0.0))
+      (invalid-shaped-line)
+      (let [scale (load (field atlas scale))
+            font
+              (msg (ptr i8)
+                   (class c"NSFont")
+                   (sel c"systemFontOfSize:weight:")
+                   [f64 f64]
+                   (* font-size (primitive/cast f64 scale))
+                   0.0)
+            attributes
+              (msg (ptr i8)
+                   (class c"NSDictionary")
+                   (sel c"dictionaryWithObject:forKey:")
+                   [(ptr i8) (ptr i8)]
+                   font
+                   (nsstr c"NSFont"))
+            attributed
+              (msg (ptr i8)
+                   (msg (ptr i8) (class c"NSAttributedString") (sel c"alloc") [])
+                   (sel c"initWithString:attributes:")
+                   [(ptr i8) (ptr i8)]
+                   (nsstr utf8)
+                   attributes)
+            ct-line (CTLineCreateWithAttributedString attributed)]
+        (if (= (primitive/cast i64 ct-line) 0)
+            (do
+              (if (!= (primitive/cast i64 attributed) 0)
+                  (msg i64 attributed (sel c"release") [])
+                  0)
+              (invalid-shaped-line))
+            (let [(mut shaped) (invalid-shaped-line)
+                  ascent (primitive/alloc-stack f64)
+                  descent (primitive/alloc-stack f64)
+                  leading (primitive/alloc-stack f64)]
+              (do
+                (store! ascent 0.0)
+                (store! descent 0.0)
+                (store! leading 0.0)
+                (let [width (CTLineGetTypographicBounds ct-line ascent descent leading)
+                      runs (CTLineGetGlyphRuns ct-line)]
+                  (do
+                    (set! (.width shaped)
+                          (primitive/cast f32 (/ width (primitive/cast f64 scale))))
+                    (set! (.ascent shaped)
+                          (primitive/cast f32 (/ (load ascent) (primitive/cast f64 scale))))
+                    (set! (.descent shaped)
+                          (primitive/cast f32 (/ (load descent) (primitive/cast f64 scale))))
+                    (set! (.valid shaped) true)
+                    (for [run-index 0 (CFArrayGetCount runs)]
+                      (let [run (CFArrayGetValueAtIndex runs run-index)
+                            run-attributes (CTRunGetAttributes run)
+                            run-font (CFDictionaryGetValue run-attributes (nsstr c"NSFont"))
+                            effective-font (if (= (primitive/cast i64 run-font) 0) font run-font)]
+                        (for [glyph-index 0 (CTRunGetGlyphCount run)]
+                          (let [range (CFRange :location glyph-index :length 1)
+                                glyph (primitive/alloc-stack u16)
+                                position (primitive/alloc-stack CGPoint)
+                                string-index (primitive/alloc-stack i64)
+                                advance-size (primitive/alloc-stack CGSize)]
+                            (do
+                              (CTRunGetGlyphs run range glyph)
+                              (CTRunGetPositions run range position)
+                              (CTRunGetStringIndices run range string-index)
+                              (let [advance (CTRunGetAdvances run range advance-size)
+                                    entry
+                                      (cache-run-glyph! (mut atlas)
+                                                        run
+                                                        effective-font
+                                                        (load glyph)
+                                                        (load position)
+                                                        range
+                                                        advance)]
+                                (if (!= (primitive/cast i64 entry) 0)
+                                    (push-shaped-glyph! (mut shaped)
+                                                        (mut atlas)
+                                                        entry
+                                                        (load position)
+                                                        (load string-index)
+                                                        (load glyph))
+                                    0))))))))
+                  (CFRelease ct-line)
+                  (msg i64 attributed (sel c"release") [])
+                  (load shaped))))))))
+
+(defn shaped-line-free! [(line (mut ShapedLine))] (-> i64)
+  (al/al-free! [ShapedGlyph] (mut (.glyphs line))))
+
+(defn paint-shaped-line! [(scene (mut ui/Scene))
+                          (line ShapedLine)
+                          (x f32)
+                          (y f32)
+                          (color ui/Color)
+                          (id i32)] (-> i64)
+  (let [glyphs (load (field line glyphs))]
+    (do
+      (for [i 0 (al/al-len [ShapedGlyph] glyphs)]
+        (let [glyph (primitive/index (load (field glyphs data)) i)
+              texture (field glyph texture)]
+          (if (and (> (load (field texture width)) 0) (> (load (field texture height)) 0))
+              (ui/scene-texture-region! (mut scene)
+                                        (ui/rect (+ x (load (field glyph x)))
+                                                 (+ y (load (field glyph y)))
+                                                 (primitive/cast f32 (load (field texture width)))
+                                                 (primitive/cast f32 (load (field texture height))))
+                                        color
+                                        (load (field texture uv))
+                                        (load (field texture texture))
+                                        (primitive/cast i32 (+ (primitive/cast i64 id) i)))
+              0)))
+      (al/al-len [ShapedGlyph] glyphs))))
+
+(defn text-atlas-glyph-count [(atlas TextAtlas)] (-> i64)
+  (al/al-len [GlyphEntry] (load (field atlas glyphs))))
+
 (defn text-atlas-free! [(atlas (mut TextAtlas))] (-> i64)
   (do
+    (let [glyphs (load (field atlas glyphs))]
+      (for [i 0 (al/al-len [GlyphEntry] glyphs)]
+        (let [entry (primitive/index (load (field glyphs data)) i)]
+          (if (!= (primitive/cast i64 (load (field entry font))) 0)
+              (msg i64 (load (field entry font)) (sel c"release") [])
+              0))))
+    (al/al-free! [GlyphEntry] (mut (.glyphs atlas)))
     (if (text-atlas-valid? (load atlas))
         (msg i64 (load (field atlas texture)) (sel c"release") [])
         0)
