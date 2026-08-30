@@ -71,7 +71,7 @@ layer in the runtime path.
   Tab/Shift-Tab traversal, and logical activate/decrement/increment actions.
 - Hierarchical event paths with capture, target, and bubble phases; listener
   registration order is stable and an owned dispatch cursor supports immediate
-  stop-propagation before later listeners or phases run.
+  stop-propagation and default-action prevention as independent controls.
 - Uniform and variable-height virtual lists with retained pixel offsets, bounded
   overscan, exact visible ranges, viewport clipping, wheel input, and stable GPU
   scrollbars. Variable lists use a Fenwick prefix-sum index for logarithmic
@@ -208,7 +208,7 @@ application. GPUI parity still requires substantial systems, notably:
   fills, butt-cap/miter strokes, affine transforms, analytic shadows, linear
   gradients, general raster images, virtual scrolling, and nested rectangular
   GPU clipping work);
-- configurable keymaps, IME, drag/drop, default-action prevention, and accessibility
+- configurable keymaps, IME, drag/drop, and accessibility
   (hierarchical capture/target/bubble listeners with stop-propagation, focus
   traversal, and logical actions work);
 - retained entities, subscriptions, observation, async executor integration, assets,
