@@ -27,6 +27,12 @@ layer in the runtime path.
   edges, clamp oversized content, support modal outside-click dismissal, wrap
   keyboard selection, and accept pointer-selected menu rows. The demo attaches
   a deferred GPU menu to its transformed SVG icon.
+- Delayed GPU tooltips use deterministic nanosecond state transitions, restart
+  their delay when the pointer crosses targets, remain painted during a bounded
+  close grace period, and treat their own stable hitbox as part of the hover
+  chain so interactive content does not flicker. Shared anchored placement flips
+  and clamps the shadowed surface and arrow; callers paint arbitrary content into
+  a separate deferred scene. The demo attaches one to its primary button.
 - Runtime-compiled Metal vertex and fragment shaders.
 - Instanced draw runs for adjacent box primitives, interleaved with ordered
   vector-path draws without changing scene submission order.
@@ -294,7 +300,7 @@ layer in the runtime path.
   storage. The demo owns its background checksum through such a scope.
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
   batching, scheduler lifecycle and telemetry, frame profiling, ABI,
-  allocation-reuse, and deterministic Metal pixel/event replay tests (111 total).
+  allocation-reuse, and deterministic Metal pixel/event replay tests (112 total).
 
 ## Architecture
 

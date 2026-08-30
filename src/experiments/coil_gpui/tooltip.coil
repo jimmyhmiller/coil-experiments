@@ -1,0 +1,182 @@
+(module experiments.coil_gpui.tooltip)
+(import "coil.primitive" :as primitive)
+(import "experiments.coil_gpui.ui" :as ui)
+(import "experiments.coil_gpui.overlay" :as overlay)
+
+(export TooltipState
+        TooltipIdle
+        TooltipPending
+        TooltipOpen
+        TooltipClosing
+        tooltip-new
+        tooltip-hover-target!
+        tooltip-hover-content!
+        tooltip-tick!
+        tooltip-open?
+        tooltip-active-target
+        tooltip-bounds
+        tooltip-paint!)
+
+(defn TooltipIdle [] (-> i32) (primitive/cast i32 0))
+(defn TooltipPending [] (-> i32) (primitive/cast i32 1))
+(defn TooltipOpen [] (-> i32) (primitive/cast i32 2))
+(defn TooltipClosing [] (-> i32) (primitive/cast i32 3))
+
+(defstruct TooltipState
+  [(status i32)
+   (target i32)
+   (anchor ui/Rect)
+   (placement overlay/Placement)
+   (show-delay-ns i64)
+   (hide-delay-ns i64)
+   (transition-ns i64)
+   (content-hovered bool)])
+
+(defn tooltip-new [(show-delay-ns i64) (hide-delay-ns i64)] (-> TooltipState)
+  (TooltipState
+    :status (TooltipIdle)
+    :target -1
+    :anchor (ui/rect 0.0 0.0 0.0 0.0)
+    :placement (overlay/Placement
+                 :bounds (ui/rect 0.0 0.0 0.0 0.0)
+                 :side (overlay/SideBelow)
+                 :arrow-offset 0.0)
+    :show-delay-ns (if (> show-delay-ns 0) show-delay-ns 0)
+    :hide-delay-ns (if (> hide-delay-ns 0) hide-delay-ns 0)
+    :transition-ns 0
+    :content-hovered false))
+
+;;; Start or continue hovering an anchor. Changing targets always restarts the
+;;; show delay, preventing a stale tooltip from appearing under a fast pointer.
+(defn tooltip-hover-target! [(state (mut TooltipState))
+                             (target i32)
+                             (anchor ui/Rect)
+                             (now-ns i64)] (-> i32)
+  (if (< target 0)
+      (do
+        (cond (= (load (field state status)) (TooltipPending))
+                (do (set! (.status state) (TooltipIdle))
+                    (set! (.target state) -1))
+              (= (load (field state status)) (TooltipOpen))
+                (when (not (load (field state content-hovered)))
+                  (do (set! (.status state) (TooltipClosing))
+                      (set! (.transition-ns state) now-ns)))
+              :else 0)
+        (load (field state status)))
+      (if (= target (load (field state target)))
+          (do
+            (set! (.anchor state) anchor)
+            (set! (.content-hovered state) false)
+            (when (= (load (field state status)) (TooltipClosing))
+              (set! (.status state) (TooltipOpen)))
+            (load (field state status)))
+          (do
+            (set! (.target state) target)
+            (set! (.anchor state) anchor)
+            (set! (.status state) (TooltipPending))
+            (set! (.transition-ns state) now-ns)
+            (set! (.content-hovered state) false)
+            (TooltipPending)))))
+
+;;; Tooltip content participates in the hover chain. Entering it during the
+;;; close grace period reopens immediately; leaving starts a fresh grace period.
+(defn tooltip-hover-content! [(state (mut TooltipState))
+                              (hovered bool)
+                              (now-ns i64)] (-> i32)
+  (do
+    (set! (.content-hovered state) hovered)
+    (if hovered
+        (when (= (load (field state status)) (TooltipClosing))
+          (set! (.status state) (TooltipOpen)))
+        (when (= (load (field state status)) (TooltipOpen))
+          (do
+            (set! (.status state) (TooltipClosing))
+            (set! (.transition-ns state) now-ns))))
+    (load (field state status))))
+
+(defn tooltip-tick! [(state (mut TooltipState)) (now-ns i64)] (-> bool)
+  (do
+    (cond (= (load (field state status)) (TooltipPending))
+            (when (>= (- now-ns (load (field state transition-ns)))
+                      (load (field state show-delay-ns)))
+              (set! (.status state) (TooltipOpen)))
+          (= (load (field state status)) (TooltipClosing))
+            (when (and (not (load (field state content-hovered)))
+                       (>= (- now-ns (load (field state transition-ns)))
+                           (load (field state hide-delay-ns))))
+              (do
+                (set! (.status state) (TooltipIdle))
+                (set! (.target state) -1)))
+          :else 0)
+    (tooltip-open? (load state))))
+
+(defn tooltip-open? [(state TooltipState)] (-> bool)
+  (or (= (load (field state status)) (TooltipOpen))
+      (= (load (field state status)) (TooltipClosing))))
+
+(defn tooltip-active-target [(state TooltipState)] (-> i32)
+  (load (field state target)))
+
+(defn tooltip-bounds [(state TooltipState)] (-> ui/Rect)
+  (load (field (field state placement) bounds)))
+
+(defn tooltip-arrow-bounds [(placement overlay/Placement)] (-> ui/Rect)
+  (let [bounds (load (field placement bounds))
+        offset (load (field placement arrow-offset))
+        size (primitive/cast f32 8.0)]
+    (cond (= (load (field placement side)) (overlay/SideBelow))
+            (ui/rect (+ (load (field bounds x)) (- offset 4.0))
+                     (- (load (field bounds y)) 4.0) size size)
+          (= (load (field placement side)) (overlay/SideAbove))
+            (ui/rect (+ (load (field bounds x)) (- offset 4.0))
+                     (- (+ (load (field bounds y)) (load (field bounds h))) 4.0) size size)
+          (= (load (field placement side)) (overlay/SideRight))
+            (ui/rect (- (load (field bounds x)) 4.0)
+                     (+ (load (field bounds y)) (- offset 4.0)) size size)
+          :else
+            (ui/rect (- (+ (load (field bounds x)) (load (field bounds w))) 4.0)
+                     (+ (load (field bounds y)) (- offset 4.0)) size size))))
+
+;;; Paint a tooltip into its own deferred scene. Content is intentionally a
+;;; caller-painted layer inside the returned bounds; this function owns the
+;;; shadow, arrow, surface, and hover hitbox but imposes no text representation.
+(defn tooltip-paint! [(deferred (mut ui/Scene))
+                      (state (mut TooltipState))
+                      (viewport ui/Rect)
+                      (content-width f32)
+                      (content-height f32)
+                      (preferred-side i32)
+                      (id i32)] (-> ui/Rect)
+  (do
+    (ui/scene-clear! (mut deferred))
+    (if (not (tooltip-open? (load state)))
+        (ui/rect 0.0 0.0 0.0 0.0)
+        (let [placement
+                (overlay/anchored-place (load (field state anchor))
+                                        content-width content-height viewport
+                                        8.0 8.0 preferred-side)
+              bounds (load (field placement bounds))
+              arrow (tooltip-arrow-bounds placement)]
+          (do
+            (set! (.placement state) placement)
+            (ui/scene-shadow! (mut deferred) bounds 0.0 5.0 10.0 1.0 8.0
+                              (ui/rgba 0.0 0.0 0.0 0.45) (+ id 1))
+            (let [center-x (+ (load (field arrow x)) 4.0)
+                  center-y (+ (load (field arrow y)) 4.0)
+                  prior
+                    (ui/scene-push-transform!
+                      (mut deferred)
+                      (ui/affine-multiply
+                        (ui/affine-translate center-x center-y)
+                        (ui/affine-multiply (ui/affine-rotate 45.0)
+                                            (ui/affine-translate
+                                              (- (primitive/cast f32 0.0) center-x)
+                                              (- (primitive/cast f32 0.0) center-y)))))]
+              (do
+                (ui/scene-rect! (mut deferred) arrow (ui/rgba 0.075 0.085 0.12 0.99) (+ id 2))
+                (ui/scene-pop-transform! (mut deferred) prior)))
+            (ui/scene-rounded-rect! (mut deferred) bounds
+                                    (ui/rgba 0.075 0.085 0.12 0.99)
+                                    8.0 1.0 (ui/rgba 0.38 0.45 0.62 0.88) (+ id 3))
+            (ui/scene-hitbox! (mut deferred) bounds id -1 false true)
+            bounds)))))
