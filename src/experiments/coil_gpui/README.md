@@ -307,7 +307,8 @@ layer in the runtime path.
   storage. The demo owns its background checksum through such a scope.
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
   batching, scheduler lifecycle and telemetry, frame profiling, ABI,
-  allocation-reuse, and deterministic Metal pixel/event replay tests (113 total).
+  allocation-reuse, upright CoreText glyph orientation, and deterministic Metal
+  pixel/event replay tests (114 total).
 
 ## Architecture
 
