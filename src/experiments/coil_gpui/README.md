@@ -7,7 +7,12 @@ layer in the runtime path.
 
 ## What works
 
-- Native resizable AppKit window with a triple-buffered `CAMetalLayer`.
+- Reusable multi-window hosts own independent AppKit windows, views, retained
+  scenes, triple-buffered `CAMetalLayer` renderers, display clocks, scale/resize
+  state, visibility, and deterministic teardown. Specialized views can be
+  injected for IME and accessibility. The demo presents an independently
+  animated second GPU window, and lifecycle tests prove scene/render-target
+  isolation and safe destruction in either order.
 - CoreVideo display-link pacing with coalesced refresh ticks, bounded recovery
   from display reconfiguration, and occlusion-aware suspension of scene rebuilds
   and Metal submission.
@@ -364,8 +369,7 @@ application. GPUI parity still requires substantial systems, notably:
   traversal, and logical actions work);
 - typed future values, worker-pool priority lanes and work stealing,
   non-image/remote asset sources,
-  editable style inspection, deterministic UI
-  tests, and multiple windows;
+  editable style inspection, and deterministic pixel/event UI tests;
 - persistent partial-presentation backing, multi-page texture-atlas eviction,
   and deeper GPU/CPU profiling.
 
@@ -393,6 +397,8 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI SVG example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/svg/svg.rs)
 - [GPUI animation example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/animation.rs)
 - [GPUI popover and deferred-layer example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/popover.rs)
+- [GPUI multiple-window example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/window.rs)
+- [GPUI entity transfer between windows](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/move_entity_between_windows.rs)
 - [Apple CAMetalLayer documentation](https://developer.apple.com/documentation/QuartzCore/CAMetalLayer)
 - [Apple MTLRenderCommandEncoder documentation](https://developer.apple.com/documentation/metal/mtlrendercommandencoder)
 - [Apple CTRun documentation](https://developer.apple.com/documentation/coretext/ctrun)

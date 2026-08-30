@@ -1,0 +1,162 @@
+(module experiments.coil_gpui.window)
+(import "coil.primitive" :as primitive)
+(import "experiments.coil_gpui.objc" :use *)
+(import "experiments.coil_gpui.ui" :as ui)
+(import "experiments.coil_gpui.metal" :as metal)
+(import "experiments.coil_gpui.frame_clock" :as clock)
+
+(export WindowOptions
+        WindowHost
+        window-options
+        window-host-new
+        window-host-new-with-view
+        window-host-valid?
+        window-host-visible?
+        window-host-set-visible!
+        window-host-sync!
+        window-host-draw!
+        window-host-close!
+        window-host-free!)
+
+(defstruct CGRect [(x f64) (y f64) (w f64) (h f64)])
+(defstruct CGSize [(w f64) (h f64)])
+
+(defstruct WindowOptions
+  [(x f64) (y f64) (width f32) (height f32)
+   (min-width f32) (min-height f32)
+   (title (ptr i8)) (style i64) (show bool)])
+
+;;; A window is an independent retained render target. AppKit owns the content
+;;; view while this host owns its NSWindow, GPU renderer, scene, and display
+;;; clock. `owns-view` balances views allocated by the ordinary constructor;
+;;; callers can inject a specialized view (IME, drag/drop, accessibility) and
+;;; retain its lifecycle themselves.
+(defstruct WindowHost
+  [(window (ptr i8)) (view (ptr i8)) (owns-view bool)
+   (renderer metal/Renderer) (scene ui/Scene) (frame-clock clock/FrameClock)
+   (width f32) (height f32) (scale f32) (closed bool)])
+
+(defn nsstr [(s (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8) (class c"NSString") (sel c"stringWithUTF8String:") [(ptr i8)] s))
+
+(defn window-options [(title (ptr i8)) (width f32) (height f32)] (-> WindowOptions)
+  (WindowOptions :x 180.0 :y 140.0 :width width :height height
+                 :min-width 240.0 :min-height 160.0
+                 :title title :style 15 :show false))
+
+(defn native-view-new [(width f32) (height f32)] (-> (ptr i8))
+  (msg (ptr i8)
+       (msg (ptr i8) (class c"NSView") (sel c"alloc") [])
+       (sel c"initWithFrame:")
+       [CGRect]
+       (CGRect :x 0.0 :y 0.0
+               :w (primitive/cast f64 width)
+               :h (primitive/cast f64 height))))
+
+(defn window-host-new-with-view [(options WindowOptions)
+                                 (view (ptr i8))
+                                 (owns-view bool)] (-> WindowHost)
+  (let [window (msg (ptr i8) (class c"NSWindow") (sel c"alloc") [])
+        width (load (field options width))
+        height (load (field options height))]
+    (do
+      (msg (ptr i8) window (sel c"initWithContentRect:styleMask:backing:defer:")
+           [CGRect i64 i64 i8]
+           (CGRect :x (load (field options x)) :y (load (field options y))
+                   :w (primitive/cast f64 width) :h (primitive/cast f64 height))
+           (load (field options style)) 2 (primitive/cast i8 0))
+      (msg i64 window (sel c"setTitle:") [(ptr i8)] (nsstr (load (field options title))))
+      (msg i64 window (sel c"setMinSize:") [CGSize]
+           (CGSize :w (primitive/cast f64 (load (field options min-width)))
+                   :h (primitive/cast f64 (load (field options min-height)))) )
+      (msg i64 window (sel c"setContentView:") [(ptr i8)] view)
+      (let [scale (primitive/cast f32 (msg f64 window (sel c"backingScaleFactor") []))
+            renderer (metal/renderer-new view width height scale)
+            scene (ui/scene-new)
+            frame-clock (clock/frame-clock-new)
+            (mut host) (primitive/zeroed WindowHost)]
+        (do
+          (set! (.window host) window)
+          (set! (.view host) view)
+          (set! (.owns-view host) owns-view)
+          (set! (.renderer host) renderer)
+          (set! (.scene host) scene)
+          (set! (.frame-clock host) frame-clock)
+          (set! (.width host) width)
+          (set! (.height host) height)
+          (set! (.scale host) scale)
+          (if (load (field options show))
+              (msg i64 window (sel c"makeKeyAndOrderFront:") [(ptr i8)] (primitive/cast (ptr i8) 0))
+              0)
+          (load host))))))
+
+(defn window-host-new [(options WindowOptions)] (-> WindowHost)
+  (window-host-new-with-view options
+                             (native-view-new (load (field options width))
+                                              (load (field options height)))
+                             true))
+
+(defn window-host-valid? [(host WindowHost)] (-> bool)
+  (and (not (load (field host closed)))
+       (!= (primitive/cast i64 (load (field host window))) 0)
+       (metal/renderer-valid? (load (field host renderer)))))
+
+(defn window-host-visible? [(host WindowHost)] (-> bool)
+  (and (window-host-valid? host)
+       (!= (msg i64 (load (field host window)) (sel c"isVisible") []) 0)))
+
+(defn window-host-set-visible! [(host (mut WindowHost)) (visible bool)] (-> bool)
+  (do
+    (if visible
+        (msg i64 (load (field host window)) (sel c"orderFront:") [(ptr i8)] (primitive/cast (ptr i8) 0))
+        (msg i64 (load (field host window)) (sel c"orderOut:") [(ptr i8)] (primitive/cast (ptr i8) 0)))
+    (clock/frame-clock-set-active! (mut (field host frame-clock)) visible)
+    visible))
+
+(defn window-host-sync! [(host (mut WindowHost))] (-> bool)
+  (if (load (field host closed))
+      false
+      (let [bounds (msg CGRect (load (field host view)) (sel c"bounds") [])
+            width (primitive/cast f32 (load (field bounds w)))
+            height (primitive/cast f32 (load (field bounds h)))
+            scale (primitive/cast f32
+                    (msg f64 (load (field host window)) (sel c"backingScaleFactor") []))
+            visible (!= (& (msg u64 (load (field host window)) (sel c"occlusionState") [])
+                            (primitive/cast u64 2))
+                         (primitive/cast u64 0))]
+        (do
+          (set! (.width host) width)
+          (set! (.height host) height)
+          (set! (.scale host) scale)
+          (metal/renderer-resize! (mut (field host renderer)) width height scale)
+          (clock/frame-clock-set-active! (mut (field host frame-clock)) visible)
+          visible))))
+
+(defn window-host-draw! [(host (mut WindowHost))] (-> i64)
+  (if (window-host-sync! (mut host))
+      (metal/renderer-draw! (mut (field host renderer)) (load (field host scene)))
+      0))
+
+(defn window-host-close! [(host (mut WindowHost))] (-> i64)
+  (if (load (field host closed)) 0
+      (do
+        (clock/frame-clock-set-active! (mut (field host frame-clock)) false)
+        (msg i64 (load (field host window)) (sel c"orderOut:") [(ptr i8)] (primitive/cast (ptr i8) 0))
+        (set! (.closed host) true)
+        1)))
+
+(defn window-host-free! [(host (mut WindowHost))] (-> i64)
+  (do
+    (window-host-close! (mut host))
+    (clock/frame-clock-free! (mut (field host frame-clock)))
+    (ui/scene-free! (mut (field host scene)))
+    (metal/renderer-free! (mut (field host renderer)))
+    (msg i64 (load (field host window)) (sel c"setContentView:") [(ptr i8)] (primitive/cast (ptr i8) 0))
+    (if (load (field host owns-view))
+        (msg i64 (load (field host view)) (sel c"release") [])
+        0)
+    (msg i64 (load (field host window)) (sel c"close") [])
+    (msg i64 (load (field host window)) (sel c"release") [])
+    (set! (.window host) (primitive/cast (ptr i8) 0))
+    (set! (.view host) (primitive/cast (ptr i8) 0))
+    0))
