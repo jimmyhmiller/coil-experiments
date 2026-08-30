@@ -16,6 +16,7 @@
         entity-store-free!
         observation-hub-new
         observation-subscribe!
+        observation-subscribe-callback!
         observation-unsubscribe!
         observation-notify!
         observation-count
@@ -35,7 +36,19 @@
 (defstruct Subscription [(index i64) (generation i64)])
 
 (defstruct ObserverSlot
-  [(subject EntityId) (token i32) (generation i64) (active bool)])
+  [(subject EntityId)
+   (token i32)
+   (callback (fnptr c [(ptr i8) i64 i64 i64 i32] i64))
+   (context (ptr i8))
+   (callback-enabled bool)
+   (generation i64)
+   (active bool)])
+
+(defstruct PendingCallback
+  [(subject EntityId)
+   (token i32)
+   (callback (fnptr c [(ptr i8) i64 i64 i64 i32] i64))
+   (context (ptr i8))])
 
 (defstruct Notification [(subject EntityId) (token i32)])
 
@@ -151,9 +164,12 @@
       (store! (field hub notifications) (al/al-new [Notification] (alloc/malloc-allocator)))
       (load hub))))
 
-(defn observation-subscribe! [(hub (mut ObservationHub))
-                              (subject EntityId)
-                              (token i32)] (-> Subscription)
+(defn observation-subscribe-raw! [(hub (mut ObservationHub))
+                                  (subject EntityId)
+                                  (token i32)
+                                  (callback (fnptr c [(ptr i8) i64 i64 i64 i32] i64))
+                                  (context (ptr i8))
+                                  (callback-enabled bool)] (-> Subscription)
   (let [free-count (al/al-len [i64] (load (field hub free-observers)))
         (mut index) 0]
     (do
@@ -170,6 +186,9 @@
         (do
           (store! (field slot subject) subject)
           (store! (field slot token) token)
+          (store! (field slot callback) callback)
+          (store! (field slot context) context)
+          (store! (field slot callback-enabled) callback-enabled)
           (if (= (load (field slot generation)) 0) (store! (field slot generation) 1) 0)
           (store! (field slot active) true)
           (let [(mut subscription) (primitive/zeroed Subscription)]
@@ -177,6 +196,25 @@
               (store! (field subscription index) (load index))
               (store! (field subscription generation) (load (field slot generation)))
               (load subscription))))))))
+
+(defn observation-subscribe! [(hub (mut ObservationHub))
+                              (subject EntityId)
+                              (token i32)] (-> Subscription)
+  (let [(mut zero) (primitive/zeroed ObserverSlot)]
+    (observation-subscribe-raw! (mut hub)
+                                subject
+                                token
+                                (load (field zero callback))
+                                (primitive/cast (ptr i8) 0)
+                                false)))
+
+(defn observation-subscribe-callback!
+  [(hub (mut ObservationHub))
+   (subject EntityId)
+   (token i32)
+   (callback (fnptr c [(ptr i8) i64 i64 i64 i32] i64))
+   (context (ptr i8))] (-> Subscription)
+  (observation-subscribe-raw! (mut hub) subject token callback context true))
 
 (defn observation-unsubscribe! [(hub (mut ObservationHub))
                                 (subscription Subscription)] (-> bool)
@@ -190,6 +228,7 @@
               false
               (do
                 (store! (field slot active) false)
+                (store! (field slot callback-enabled) false)
                 (store! (field slot generation) (+ (load (field slot generation)) 1))
                 (al/al-push! [i64] (mut (.free-observers hub)) index)
                 true))))))
@@ -211,14 +250,37 @@
 
 (defn observation-notify! [(hub (mut ObservationHub))
                            (subject EntityId)] (-> i64)
-  (let [observers (load (field hub observers))]
+  (let [observers (load (field hub observers))
+        (mut callbacks) (al/al-new [PendingCallback] (alloc/malloc-allocator))]
     (do
       (for [i 0 (al/al-len [ObserverSlot] observers)]
         (let [slot (primitive/index (load (field observers data)) i)]
           (if (and (load (field slot active))
                    (same-entity? (field slot subject) subject))
-              (push-notification! (mut hub) subject (load (field slot token)))
+              (do
+                (push-notification! (mut hub) subject (load (field slot token)))
+                (when (load (field slot callback-enabled))
+                  (al/al-push! [PendingCallback]
+                               (mut callbacks)
+                               (PendingCallback
+                                 :subject subject
+                                 :token (load (field slot token))
+                                 :callback (load (field slot callback))
+                                 :context (load (field slot context)))))
+                0)
               0)))
+      ;; Invoke from a snapshot so callbacks may subscribe, unsubscribe, notify,
+      ;; or grow the hub without invalidating the observer scan.
+      (for [i 0 (al/al-len [PendingCallback] callbacks)]
+        (let [pending (al/al-elem [PendingCallback] (mut callbacks) i)
+              id (field pending subject)]
+          (primitive/call-ptr (load (field pending callback))
+                              (load (field pending context))
+                              (load (field id type-id))
+                              (load (field id slot))
+                              (load (field id generation))
+                              (load (field pending token)))))
+      (al/al-free! [PendingCallback] (mut callbacks))
       (al/al-len [Notification] (load (field hub notifications))))))
 
 (defn observation-count [(hub ObservationHub)] (-> i64)

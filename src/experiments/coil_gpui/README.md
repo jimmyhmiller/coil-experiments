@@ -82,7 +82,10 @@ layer in the runtime path.
   precedence, explicit disabled bindings, versioning, and failed-prefix retry.
 - Typed retained entity stores with type/slot/generation identities, stale-handle
   rejection, slot reuse, deterministic destruction of owned values, ordered
-  observation queues, and generation-safe subscription cancellation. The demo's
+  observation queues, generation-safe subscription cancellation, and optional
+  direct callbacks. Notification dispatch snapshots callbacks in registration-slot
+  order, so callbacks may safely subscribe, unsubscribe, or grow the hub without
+  invalidating the active scan. The demo's
   application state lives in a retained entity rather than a frame-local value.
 - GPUI-style thread-confined `Entity<T>` and `WeakEntity<T>` handles backed by an
   allocator-aware reference-counted arena. Strong handles clone automatically,
@@ -145,7 +148,7 @@ layer in the runtime path.
   closure, and cooperatively cancel all remaining jobs before releasing their own
   storage. The demo owns its background checksum through such a scope.
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
-  batching, scheduler lifecycle, ABI, and allocation-reuse tests (77 total).
+  batching, scheduler lifecycle, ABI, and allocation-reuse tests (78 total).
 
 ## Architecture
 
@@ -307,8 +310,8 @@ application. GPUI parity still requires substantial systems, notably:
   ranges, and accessibility text actions
   (hierarchical capture/target/bubble listeners with stop-propagation, focus
   traversal, and logical actions work);
-- callback-driven entity subscriptions, typed future values, worker-pool
-  priority lanes and work stealing, non-image/remote asset sources,
+- typed future values, worker-pool priority lanes and work stealing,
+  non-image/remote asset sources,
   editable style inspection, deterministic UI
   tests, and multiple windows;
 - persistent partial-presentation backing, multi-page texture-atlas eviction,
