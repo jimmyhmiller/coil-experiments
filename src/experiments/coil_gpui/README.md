@@ -13,6 +13,8 @@ layer in the runtime path.
 - Triple-buffered, power-of-two-growing shared `MTLBuffer` uploads; large scenes
   do not rely on Metal's small inline-byte path and are never truncated.
 - GPU-expanded quads, antialiased rounded rectangles, borders, and alpha blending.
+- Rounded two-stop linear gradients at arbitrary CSS-compatible angles, mixed
+  with solid primitives in exact scene order inside the same instanced draw.
 - Batched analytic rounded-rectangle shadows with GPU-computed soft falloff,
   configurable offset, blur sigma, spread, radius, color, and scene clipping.
 - Native Unicode shaping/rasterization through AppKit's CoreText-backed string
@@ -56,7 +58,7 @@ paint list + clipped hitbox/focus dispatch list + texture-sprite list
 triple-buffered shared MTLBuffer upload + batched shadow/shape Metal draws
         |
         v
-vertex shader expands quads; fragment shaders perform SDF shape/shadow rasterization
+vertex shader expands quads; fragment shaders perform SDF shape/gradient/shadow rasterization
 
 CoreText-backed shaping/rasterization -> cached high-DPI mask textures
 ImageIO decode -> cached BGRA textures
@@ -127,8 +129,8 @@ objects are drained every frame.
 
 The release scene benchmark rebuilds 1,049 paint primitives while advancing a
 100,000-row virtual list. On the development Apple Silicon machine it measured
-**1,862–1,930 ns/frame across prior 5,000-frame runs; 1,886 ns/frame after adding the
-shadow batch**. This measures Coil scene construction and
+**1,840 ns/frame after adding mixed solid/gradient painting**, with earlier milestones
+measuring 1,862–1,930 ns/frame. This measures Coil scene construction and
 visible-range calculation, not GPU presentation or display latency; the benchmark
 is checked in as `bench.coil` so results remain reproducible and comparable.
 
@@ -150,8 +152,9 @@ application. GPUI parity still requires substantial systems, notably:
 - glyph-run extraction, editable text measurement, and a bounded glyph atlas
   (whole-label shaping and GPU mask composition work now);
 - grid and intrinsic text/image measurement (flex layout works);
-- transforms, SVG, and paths (analytic shadows, general raster images, uniform and
-  variable-height virtual scrolling, and nested rectangular GPU clipping work);
+- transforms, SVG, and paths (analytic shadows, linear gradients, general raster
+  images, uniform and variable-height virtual scrolling, and nested rectangular
+  GPU clipping work);
 - hierarchical capture/bubble listeners, configurable keymaps, IME, drag/drop,
   and accessibility (focus traversal and logical actions work);
 - retained entities, subscriptions, observation, async executor integration, assets,
