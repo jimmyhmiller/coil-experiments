@@ -97,9 +97,11 @@ layer in the runtime path.
   validates and tessellates all filled contours once into one retained mesh,
   with SVG-default nonzero winding and explicit even-odd fill support. A
   Coil-native scanline tessellator preserves nested holes, islands, disjoint
-  contours, and orientation-sensitive winding while painting aspect-preserving
-  instances through the ordered Metal path pipeline. The demo uses this
-  component for its cyan lightning icon.
+  contours, orientation-sensitive winding, overlapping subpaths, and
+  self-intersections. It splits horizontal bands at every proper segment
+  crossing before emitting GPU triangles, while collinear overlapping edges
+  reject atomically. Aspect-preserving instances paint through the ordered Metal
+  path pipeline. The demo uses this component for its cyan lightning icon.
 - Coil-native retained SVG document loading for XML prologs/comments, nested
   `<svg>`/`<g>`/`<path>` structure, root `viewBox`, inherited presentation
   attributes and inline `style` declarations, `fill-opacity`, nonzero/even-odd
@@ -428,8 +430,7 @@ application. GPUI parity still requires substantial systems, notably:
   UTF-8/CoreText cluster conversion, glyph-run extraction, subpixel glyph caching,
   bounded atlas allocation, and GPU mask composition work now);
 - closed-path dash seam merging, additional SVG elements/strokes/paint servers,
-  CSS stylesheets and intersecting/self-intersecting contour fill rules
-  (path-data parsing,
+  CSS stylesheets and collinear-overlap normalization (path-data parsing,
   retained compound vector components, adaptive quadratic/cubic
   curves and elliptical arcs, polygon
   fills, butt-cap/miter strokes, affine transforms, analytic shadows, linear
