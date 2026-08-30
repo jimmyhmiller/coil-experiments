@@ -9,6 +9,7 @@
 (import "experiments.coil_gpui.scroll" :as scroll)
 (import "experiments.coil_gpui.variable_scroll" :as variable)
 (import "experiments.coil_gpui.text" :as text)
+(import "experiments.coil_gpui.path" :as path)
 
 (deftest metal-buffer-capacity-grows-by-powers-of-two
          (assert-eq (metal/next-buffer-capacity 0 1) 65536)
@@ -23,6 +24,43 @@
 (deftest metal-text-sprite-abi-is-stable
          ;; bounds + color + clip + UV + affine + retained texture pointer + id/mode.
          (assert-eq (primitive/sizeof TextSprite) 104))
+
+(deftest metal-path-abis-are-stable
+         (assert-eq (primitive/sizeof path/PathPoint) 8)
+         (assert-eq (primitive/sizeof PathDraw) 80)
+         (assert-eq (primitive/sizeof PaintCommand) 8))
+
+(deftest paths-preserve-paint-order-and-scene-ownership
+         (let [(mut polygon) (path/path-new)
+               (mut scene) (scene-new)]
+           (path/path-move-to! (mut polygon) 0.0 0.0)
+           (path/path-line-to! (mut polygon) 40.0 0.0)
+           (path/path-line-to! (mut polygon) 20.0 30.0)
+           (path/path-close! (mut polygon))
+           (let [(mut tessellation) (path/path-tessellate polygon)]
+             (scene-rect! (mut scene) (rect 0.0 0.0 10.0 10.0) (rgb 1.0 0.0 0.0) 1)
+             (scene-path-fill! (mut scene) tessellation (rgb 0.0 1.0 0.0) 2)
+             (scene-linear-gradient! (mut scene)
+                                     (rect 0.0 0.0 10.0 10.0)
+                                     (rgb 0.0 0.0 0.0)
+                                     (rgb 1.0 1.0 1.0)
+                                     90.0
+                                     0.0
+                                     3)
+             (assert-eq (al/al-len [path/PathPoint] (load (field scene path-vertices))) 3)
+             (assert-eq (al/al-len [PathDraw] (load (field scene path-draws))) 1)
+             (let [commands (load (field scene paint-commands))]
+               (assert-eq (al/al-len [PaintCommand] commands) 3)
+               (let [first (al/al-get [PaintCommand] commands 0)
+                     second (al/al-get [PaintCommand] commands 1)
+                     third (al/al-get [PaintCommand] commands 2)]
+                 (assert-eq (load (field first kind)) 0)
+                 (assert-eq (load (field second kind)) 1)
+                 (assert-eq (load (field third kind)) 0))
+               (assert-eq (metal/paint-run-end commands 0 3) 1))
+             (path/tessellation-free! (mut tessellation)))
+           (path/path-free! (mut polygon))
+           (scene-free! (mut scene))))
 
 (deftest text-atlas-shelf-allocation-wraps-and-fails-atomically
          (let [(mut atlas) (primitive/zeroed text/TextAtlas)]
@@ -341,6 +379,59 @@
                                    :left 0.0))
              (assert-eq (al/al-cap [Rect] (load (field layout rects))) capacity))
            (grid/grid-free! (mut layout))))
+
+(deftest concave-paths-tessellate-in-both-windings
+         (let [(mut clockwise) (primitive/zeroed path/Path)
+               (mut counterclockwise) (primitive/zeroed path/Path)]
+           (store! clockwise (path/path-new))
+           (path/path-move-to! (mut clockwise) 0.0 0.0)
+           (path/path-line-to! (mut clockwise) 40.0 0.0)
+           (path/path-line-to! (mut clockwise) 20.0 18.0)
+           (path/path-line-to! (mut clockwise) 40.0 40.0)
+           (path/path-line-to! (mut clockwise) 0.0 40.0)
+           (path/path-close! (mut clockwise))
+           (store! counterclockwise (path/path-new))
+           (path/path-move-to! (mut counterclockwise) 0.0 40.0)
+           (path/path-line-to! (mut counterclockwise) 40.0 40.0)
+           (path/path-line-to! (mut counterclockwise) 20.0 18.0)
+           (path/path-line-to! (mut counterclockwise) 40.0 0.0)
+           (path/path-line-to! (mut counterclockwise) 0.0 0.0)
+           (path/path-close! (mut counterclockwise))
+           (let [(mut a) (path/path-tessellate (load clockwise))
+                 (mut b) (path/path-tessellate (load counterclockwise))]
+             (assert (load (field a valid)))
+             (assert (load (field b valid)))
+             (assert-eq (al/al-len [path/PathPoint] (load (field a vertices))) 9)
+             (assert-eq (al/al-len [path/PathPoint] (load (field b vertices))) 9)
+             (path/tessellation-free! (mut a))
+             (path/tessellation-free! (mut b)))
+           (path/path-free! (mut clockwise))
+           (path/path-free! (mut counterclockwise))))
+
+(deftest path-tessellation-rejects-open-degenerate-and-self-intersecting-input
+         (let [(mut candidate) (primitive/zeroed path/Path)]
+           (store! candidate (path/path-new))
+           (path/path-move-to! (mut candidate) 0.0 0.0)
+           (path/path-line-to! (mut candidate) 40.0 40.0)
+           (path/path-line-to! (mut candidate) 0.0 40.0)
+           (path/path-line-to! (mut candidate) 40.0 0.0)
+           (let [(mut open-result) (path/path-tessellate (load candidate))]
+             (assert (not (load (field open-result valid))))
+             (path/tessellation-free! (mut open-result)))
+           (path/path-close! (mut candidate))
+           (let [(mut crossed-result) (path/path-tessellate (load candidate))]
+             (assert (not (load (field crossed-result valid))))
+             (assert-eq (al/al-len [path/PathPoint] (load (field crossed-result vertices))) 0)
+             (path/tessellation-free! (mut crossed-result)))
+           (path/path-clear! (mut candidate))
+           (path/path-move-to! (mut candidate) 0.0 0.0)
+           (path/path-line-to! (mut candidate) 10.0 0.0)
+           (path/path-line-to! (mut candidate) 20.0 0.0)
+           (path/path-close! (mut candidate))
+           (let [(mut degenerate) (path/path-tessellate (load candidate))]
+             (assert (not (load (field degenerate valid))))
+             (path/tessellation-free! (mut degenerate)))
+           (path/path-free! (mut candidate))))
 
 (deftest focus-and-actions-survive-transient-scenes
          (let [(mut scene) (scene-new)

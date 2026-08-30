@@ -9,7 +9,8 @@ layer in the runtime path.
 
 - Native resizable AppKit window with a triple-buffered `CAMetalLayer`.
 - Runtime-compiled Metal vertex and fragment shaders.
-- One instanced draw call per frame for every box primitive in the scene.
+- Instanced draw runs for adjacent box primitives, interleaved with ordered
+  vector-path draws without changing scene submission order.
 - Triple-buffered, power-of-two-growing shared `MTLBuffer` uploads; large scenes
   do not rely on Metal's small inline-byte path and are never truncated.
 - GPU-expanded quads, antialiased rounded rectangles, borders, and alpha blending.
@@ -18,6 +19,10 @@ layer in the runtime path.
   inverse transform and rejects singular transforms.
 - Rounded two-stop linear gradients at arbitrary CSS-compatible angles, mixed
   with solid primitives in exact scene order inside the same instanced draw.
+- Coil-native closed-polygon paths with simple-polygon validation and ear-clipped
+  concave tessellation in either winding. Triangle lists are uploaded through the
+  shared frame ring and filled by a clipped, affine Metal pipeline; invalid,
+  degenerate, open, and self-intersecting paths fail atomically.
 - Batched analytic rounded-rectangle shadows with GPU-computed soft falloff,
   configurable offset, blur sigma, spread, radius, color, and scene clipping.
 - Native Unicode shaping/rasterization through AppKit's CoreText-backed string
@@ -63,10 +68,10 @@ retained application state
 flex/grid layout -> component functions rebuild a transient Scene each frame
         |
         v
-paint list + clipped inverse-transform hitbox/focus list + texture-sprite list
+ordered box/path commands + clipped hitbox/focus list + texture-sprite list
         |
         v
-triple-buffered shared MTLBuffer upload + instanced shape/texture runs
+triple-buffered shared MTLBuffer upload + instanced shape/texture runs + path triangles
         |
         v
 affine vertex shaders expand/transform quads; fragments perform SDF paint
@@ -129,11 +134,11 @@ cd src/experiments/coil_gpui
 
 ## Performance contract
 
-The scene retains shape, shadow, and texture-list allocations after `scene-clear!`,
+The scene retains shape, path, command, shadow, and texture-list allocations after `scene-clear!`,
 avoiding steady-state list allocation. A paint primitive is 104 bytes, including its
 six-float affine transform. Ordinary shapes and
-analytic shadows are each rendered through one instanced command, independent of
-their counts. Both contiguous batches share a three-slot buffer ring; each slot starts
+analytic shadows use instanced commands. Ordinary shapes form maximal adjacent
+instanced runs around ordered path commands. All geometry shares a three-slot buffer ring; each slot starts
 at 64 KiB and doubles until the complete scene fits. The demo intentionally rebuilds
 1,024 background instances per frame so the large-scene path remains exercised. The
 layer uses three drawables and display synchronization. Per-frame autoreleased Cocoa
@@ -147,8 +152,8 @@ translate directly into one draw for all adjacent labels on an atlas page.
 
 The release scene benchmark rebuilds 1,049 paint primitives while advancing a
 100,000-row virtual list. On the development Apple Silicon machine it measured
-**4,136 ns/frame with per-primitive affine transforms**, versus 1,840 ns/frame before
-the transform payload. This measures Coil scene construction and
+**5,790 ns/frame with affine payloads and ordered paint-command recording**, versus
+1,840 ns/frame before transforms and ordering. This measures Coil scene construction and
 visible-range calculation, not GPU presentation or display latency; the benchmark
 is checked in as `bench.coil` so results remain reproducible and comparable.
 
@@ -171,9 +176,10 @@ application. GPUI parity still requires substantial systems, notably:
 - glyph-run extraction, editable text measurement, and atlas-page eviction
   (whole-label shaping, bounded atlas allocation, and GPU mask composition work now);
 - intrinsic text/image measurement (flex and constrained grid layout work);
-- SVG and arbitrary paths (affine transforms, analytic shadows, linear gradients,
-  general raster images, uniform and variable-height virtual scrolling, and nested
-  rectangular GPU clipping work);
+- Bézier curves, arcs, strokes, SVG parsing, and non-simple/multi-contour fills
+  (validated concave polygon fills, affine transforms, analytic shadows, linear
+  gradients, general raster images, virtual scrolling, and nested rectangular
+  GPU clipping work);
 - hierarchical capture/bubble listeners, configurable keymaps, IME, drag/drop,
   and accessibility (focus traversal and logical actions work);
 - retained entities, subscriptions, observation, async executor integration, assets,
@@ -191,6 +197,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI window, focus, and hitbox model](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/window.rs)
 - [GPUI list example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/list_example.rs)
 - [GPUI responsive grid example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/grid_layout.rs)
+- [GPUI painting example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/painting.rs)
 - [Apple CAMetalLayer documentation](https://developer.apple.com/documentation/QuartzCore/CAMetalLayer)
 - [Apple MTLRenderCommandEncoder documentation](https://developer.apple.com/documentation/metal/mtlrendercommandencoder)
 - [Apple CTRun documentation](https://developer.apple.com/documentation/coretext/ctrun)

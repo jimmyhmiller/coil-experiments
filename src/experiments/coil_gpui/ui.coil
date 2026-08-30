@@ -2,6 +2,7 @@
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :as al)
 (import "coil.primitive" :as primitive)
+(import "experiments.coil_gpui.path" :as path)
 
 (extern sinf :cc c [f32] (-> f32))
 
@@ -14,6 +15,8 @@
         EdgeInsets
         Primitive
         TextSprite
+        PathDraw
+        PaintCommand
         Hitbox
         Scene
         scene-new
@@ -38,6 +41,7 @@
         scene-rounded-rect!
         scene-shadow!
         scene-linear-gradient!
+        scene-path-fill!
         scene-texture!
         scene-texture-region!
         scene-image!
@@ -111,6 +115,19 @@
    (id i32)
    (mode i32)])
 
+(defstruct PathDraw
+  [(vertex-start i64)
+   (vertex-count i64)
+   (color Color)
+   (clip Rect)
+   (transform Affine)
+   (id i32)
+   (padding i32)])
+
+;;; Paint commands retain submission order while allowing adjacent box runs
+;;; to remain instanced. Kind 0 indexes `items`; kind 1 indexes `path-draws`.
+(defstruct PaintCommand [(kind i32) (index i32)])
+
 (defstruct Hitbox
   [(bounds Rect)
    (clip Rect)
@@ -125,6 +142,9 @@
   [(items (al/ArrayList Primitive))
    (shadows (al/ArrayList Primitive))
    (text (al/ArrayList TextSprite))
+   (path-vertices (al/ArrayList path/PathPoint))
+   (path-draws (al/ArrayList PathDraw))
+   (paint-commands (al/ArrayList PaintCommand))
    (hitboxes (al/ArrayList Hitbox))
    (current-clip Rect)
    (current-transform Affine)])
@@ -335,6 +355,9 @@
       :items (al/al-new [Primitive] allocator)
       :shadows (al/al-new [Primitive] allocator)
       :text (al/al-new [TextSprite] allocator)
+      :path-vertices (al/al-new [path/PathPoint] allocator)
+      :path-draws (al/al-new [PathDraw] allocator)
+      :paint-commands (al/al-new [PaintCommand] allocator)
       :hitboxes (al/al-new [Hitbox] allocator)
       :current-clip (rect -100000.0 -100000.0 200000.0 200000.0)
       :current-transform (affine-identity))))
@@ -344,6 +367,9 @@
     (al/al-clear! [Primitive] (mut (.items scene)))
     (al/al-clear! [Primitive] (mut (.shadows scene)))
     (al/al-clear! [TextSprite] (mut (.text scene)))
+    (al/al-clear! [path/PathPoint] (mut (.path-vertices scene)))
+    (al/al-clear! [PathDraw] (mut (.path-draws scene)))
+    (al/al-clear! [PaintCommand] (mut (.paint-commands scene)))
     (al/al-clear! [Hitbox] (mut (.hitboxes scene)))
     (set! (.current-clip scene) (rect -100000.0 -100000.0 200000.0 200000.0))
     (set! (.current-transform scene) (affine-identity))
@@ -354,6 +380,9 @@
     (al/al-free! [Primitive] (mut (.items scene)))
     (al/al-free! [Primitive] (mut (.shadows scene)))
     (al/al-free! [TextSprite] (mut (.text scene)))
+    (al/al-free! [path/PathPoint] (mut (.path-vertices scene)))
+    (al/al-free! [PathDraw] (mut (.path-draws scene)))
+    (al/al-free! [PaintCommand] (mut (.paint-commands scene)))
     (al/al-free! [Hitbox] (mut (.hitboxes scene)))))
 
 (defn scene-rect! [(scene (mut Scene)) (bounds Rect) (color Color) (id i32)] (-> i64)
@@ -366,18 +395,23 @@
                            (border-width f32)
                            (border-color Color)
                            (id i32)] (-> i64)
-  (al/al-push! [Primitive]
-               (mut (.items scene))
-               (Primitive
-                 :bounds bounds
-                 :color color
-                 :radius radius
-                 :border-width border-width
-                 :border-color border-color
-                 :clip (load (field scene current-clip))
-                 :transform (load (field scene current-transform))
-                 :kind 0
-                 :id id)))
+  (let [index (al/al-len [Primitive] (load (field scene items)))]
+    (do
+      (al/al-push! [Primitive]
+                   (mut (.items scene))
+                   (Primitive
+                     :bounds bounds
+                     :color color
+                     :radius radius
+                     :border-width border-width
+                     :border-color border-color
+                     :clip (load (field scene current-clip))
+                     :transform (load (field scene current-transform))
+                     :kind 0
+                     :id id))
+      (al/al-push! [PaintCommand]
+                   (mut (.paint-commands scene))
+                   (PaintCommand :kind 0 :index (primitive/cast i32 index))))))
 
 ;;; Queue one analytically blurred rounded-rectangle shadow. `blur` is the
 ;;; Gaussian sigma in logical pixels; the quad extends to three sigma, where
@@ -431,18 +465,52 @@
                               (angle-degrees f32)
                               (radius f32)
                               (id i32)] (-> i64)
-  (al/al-push! [Primitive]
-               (mut (.items scene))
-               (Primitive
-                 :bounds bounds
-                 :color start-color
-                 :radius radius
-                 :border-width angle-degrees
-                 :border-color end-color
-                 :clip (load (field scene current-clip))
-                 :transform (load (field scene current-transform))
-                 :kind 2
-                 :id id)))
+  (let [index (al/al-len [Primitive] (load (field scene items)))]
+    (do
+      (al/al-push! [Primitive]
+                   (mut (.items scene))
+                   (Primitive
+                     :bounds bounds
+                     :color start-color
+                     :radius radius
+                     :border-width angle-degrees
+                     :border-color end-color
+                     :clip (load (field scene current-clip))
+                     :transform (load (field scene current-transform))
+                     :kind 2
+                     :id id))
+      (al/al-push! [PaintCommand]
+                   (mut (.paint-commands scene))
+                   (PaintCommand :kind 0 :index (primitive/cast i32 index))))))
+
+(defn scene-path-fill! [(scene (mut Scene))
+                        (tessellation path/Tessellation)
+                        (color Color)
+                        (id i32)] (-> i64)
+  (let [vertices (load (field tessellation vertices))
+        count (al/al-len [path/PathPoint] vertices)]
+    (if (or (not (load (field tessellation valid))) (= count 0))
+        0
+        (let [start (al/al-len [path/PathPoint] (load (field scene path-vertices)))
+              draw-index (al/al-len [PathDraw] (load (field scene path-draws)))]
+          (do
+            (for [i 0 count]
+              (al/al-push! [path/PathPoint]
+                           (mut (.path-vertices scene))
+                           (al/al-get [path/PathPoint] vertices i)))
+            (al/al-push! [PathDraw]
+                         (mut (.path-draws scene))
+                         (PathDraw
+                           :vertex-start start
+                           :vertex-count count
+                           :color color
+                           :clip (load (field scene current-clip))
+                           :transform (load (field scene current-transform))
+                           :id id
+                           :padding 0))
+            (al/al-push! [PaintCommand]
+                         (mut (.paint-commands scene))
+                         (PaintCommand :kind 1 :index (primitive/cast i32 draw-index))))))))
 
 ;;; Queue a cached alpha-mask texture for GPU compositing. Texture ownership
 ;;; remains with the renderer/text cache; the transient scene only borrows it.

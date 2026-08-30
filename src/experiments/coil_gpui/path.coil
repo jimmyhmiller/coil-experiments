@@ -1,0 +1,217 @@
+(module experiments.coil_gpui.path)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+
+(export PathPoint
+        Path
+        Tessellation
+        path-new
+        path-clear!
+        path-free!
+        path-move-to!
+        path-line-to!
+        path-close!
+        path-point-count
+        path-signed-area
+        path-simple?
+        path-tessellate
+        tessellation-free!)
+
+(defstruct PathPoint [(x f32) (y f32)])
+
+(defstruct Path [(points (al/ArrayList PathPoint)) (closed bool)])
+
+;;; Vertices are emitted as a triangle list. Invalid input returns an empty,
+;;; owned list with `valid = false`, so callers never render partial geometry.
+(defstruct Tessellation [(vertices (al/ArrayList PathPoint)) (valid bool)])
+
+(defn path-new [] (-> Path)
+  (Path :points (al/al-new [PathPoint] (alloc/malloc-allocator)) :closed false))
+
+(defn path-clear! [(path (mut Path))] (-> i64)
+  (do
+    (al/al-clear! [PathPoint] (mut (.points path)))
+    (set! (.closed path) false)
+    0))
+
+(defn path-free! [(path (mut Path))] (-> i64)
+  (al/al-free! [PathPoint] (mut (.points path))))
+
+(defn path-move-to! [(path (mut Path)) (x f32) (y f32)] (-> i64)
+  (do
+    (path-clear! (mut path))
+    (al/al-push! [PathPoint] (mut (.points path)) (PathPoint :x x :y y))))
+
+(defn path-line-to! [(path (mut Path)) (x f32) (y f32)] (-> i64)
+  (if (load (field path closed))
+      0
+      (al/al-push! [PathPoint] (mut (.points path)) (PathPoint :x x :y y))))
+
+(defn path-close! [(path (mut Path))] (-> i64)
+  (do (set! (.closed path) true) 0))
+
+(defn path-point-count [(path Path)] (-> i64)
+  (al/al-len [PathPoint] (load (field path points))))
+
+(defn cross [(a PathPoint) (b PathPoint) (c PathPoint)] (-> f32)
+  (- (* (- (load (field b x)) (load (field a x)))
+        (- (load (field c y)) (load (field a y))))
+     (* (- (load (field b y)) (load (field a y)))
+        (- (load (field c x)) (load (field a x))))))
+
+(defn path-signed-area [(path Path)] (-> f32)
+  (let [points (load (field path points))
+        count (al/al-len [PathPoint] points)
+        (mut twice-area) (primitive/cast f32 0.0)]
+    (do
+      (for [i 0 count]
+        (let [a (al/al-get [PathPoint] points i)
+              b (al/al-get [PathPoint] points (% (+ i 1) count))]
+          (store! twice-area
+                  (+ (load twice-area)
+                     (- (* (load (field a x)) (load (field b y)))
+                        (* (load (field b x)) (load (field a y))))))))
+      (/ (load twice-area) 2.0))))
+
+(defn orientation [(a PathPoint) (b PathPoint) (c PathPoint)] (-> i32)
+  (let [value (cross a b c)]
+    (cond (> value 0.00001) 1 (< value -0.00001) -1 :else 0)))
+
+(defn on-segment? [(a PathPoint) (b PathPoint) (p PathPoint)] (-> bool)
+  (and (<= (if (< (load (field a x)) (load (field b x)))
+               (load (field a x))
+               (load (field b x)))
+           (load (field p x)))
+       (and (<= (load (field p x))
+                (if (> (load (field a x)) (load (field b x)))
+                    (load (field a x))
+                    (load (field b x))))
+            (and (<= (if (< (load (field a y)) (load (field b y)))
+                         (load (field a y))
+                         (load (field b y)))
+                     (load (field p y)))
+                 (<= (load (field p y))
+                     (if (> (load (field a y)) (load (field b y)))
+                         (load (field a y))
+                         (load (field b y))))))))
+
+(defn segments-intersect? [(a PathPoint) (b PathPoint) (c PathPoint) (d PathPoint)] (-> bool)
+  (let [o1 (orientation a b c)
+        o2 (orientation a b d)
+        o3 (orientation c d a)
+        o4 (orientation c d b)]
+    (or (and (!= o1 o2) (!= o3 o4))
+        (or (and (= o1 0) (on-segment? a b c))
+            (or (and (= o2 0) (on-segment? a b d))
+                (or (and (= o3 0) (on-segment? c d a))
+                    (and (= o4 0) (on-segment? c d b))))))))
+
+(defn edges-adjacent? [(a i64) (b i64) (count i64)] (-> bool)
+  (or (= a b) (or (= (% (+ a 1) count) b) (= (% (+ b 1) count) a))))
+
+(defn path-simple? [(path Path)] (-> bool)
+  (let [points (load (field path points))
+        count (al/al-len [PathPoint] points)]
+    (if (or (not (load (field path closed))) (< count 3))
+        false
+        (block :result
+               (for [i 0 count]
+                 (let [a (al/al-get [PathPoint] points i)
+                       b (al/al-get [PathPoint] points (% (+ i 1) count))]
+                   (for [j (+ i 1) count]
+                     (if (not (edges-adjacent? i j count))
+                         (let [c (al/al-get [PathPoint] points j)
+                               d (al/al-get [PathPoint] points (% (+ j 1) count))]
+                           (if (segments-intersect? a b c d)
+                               (return-from :result false)
+                               0))
+                         0))))
+               (let [area (path-signed-area path)]
+                 (or (> area 0.0001) (< area -0.0001)))))))
+
+(defn point-in-triangle? [(p PathPoint)
+                          (a PathPoint)
+                          (b PathPoint)
+                          (c PathPoint)
+                          (winding f32)] (-> bool)
+  (and (>= (* (cross a b p) winding) -0.00001)
+       (and (>= (* (cross b c p) winding) -0.00001)
+            (>= (* (cross c a p) winding) -0.00001))))
+
+(defn index-remove! [(indices (mut (al/ArrayList i64))) (index i64)] (-> i64)
+  (let [count (al/al-len [i64] (load indices))]
+    (do
+      (for [i index (- count 1)]
+        (al/al-set! [i64] (mut indices) i (al/al-get [i64] (load indices) (+ i 1))))
+      (al/al-pop! [i64] (mut indices))
+      0)))
+
+(defn invalid-tessellation [] (-> Tessellation)
+  (Tessellation :vertices (al/al-new [PathPoint] (alloc/malloc-allocator)) :valid false))
+
+(defn path-tessellate [(path Path)] (-> Tessellation)
+  (if (not (path-simple? path))
+      (invalid-tessellation)
+      (let [allocator (alloc/malloc-allocator)
+            (mut vertices) (al/al-new [PathPoint] allocator)
+            (mut indices) (al/al-new [i64] allocator)
+            points (load (field path points))
+            count (al/al-len [PathPoint] points)
+            winding
+              (if (> (path-signed-area path) 0.0)
+                  (primitive/cast f32 1.0)
+                  (primitive/cast f32 -1.0))
+            (mut failed) false]
+        (do
+          (for [i 0 count] (al/al-push! [i64] (mut indices) i))
+          (while (and (> (al/al-len [i64] (load indices)) 3) (not (load failed)))
+            (let [remaining (al/al-len [i64] (load indices))
+                  (mut found-ear) false]
+              (do
+                (block :ear
+                       (for [slot 0 remaining]
+                         (let [prev-slot (% (+ slot (- remaining 1)) remaining)
+                               next-slot (% (+ slot 1) remaining)
+                               ia (al/al-get [i64] (load indices) prev-slot)
+                               ib (al/al-get [i64] (load indices) slot)
+                               ic (al/al-get [i64] (load indices) next-slot)
+                               a (al/al-get [PathPoint] points ia)
+                               b (al/al-get [PathPoint] points ib)
+                               c (al/al-get [PathPoint] points ic)]
+                           (if (> (* (cross a b c) winding) 0.00001)
+                               (let [(mut contains-point) false]
+                                 (do
+                                   (for [other-slot 0 remaining]
+                                     (let [other (al/al-get [i64] (load indices) other-slot)]
+                                       (if (and (!= other ia) (and (!= other ib) (!= other ic)))
+                                           (let [p (al/al-get [PathPoint] points other)]
+                                             (if (point-in-triangle? p a b c winding)
+                                                 (store! contains-point true)
+                                                 0))
+                                           0)))
+                                   (if (not (load contains-point))
+                                       (do
+                                         (al/al-push! [PathPoint] (mut vertices) a)
+                                         (al/al-push! [PathPoint] (mut vertices) b)
+                                         (al/al-push! [PathPoint] (mut vertices) c)
+                                         (index-remove! (mut indices) slot)
+                                         (store! found-ear true)
+                                         (return-from :ear 0))
+                                       0)))
+                               0)))
+                       (if (not (load found-ear)) (store! failed true) 0)))))
+          (if (not (load failed))
+              (let [a (al/al-get [PathPoint] points (al/al-get [i64] (load indices) 0))
+                    b (al/al-get [PathPoint] points (al/al-get [i64] (load indices) 1))
+                    c (al/al-get [PathPoint] points (al/al-get [i64] (load indices) 2))]
+                (do
+                  (al/al-push! [PathPoint] (mut vertices) a)
+                  (al/al-push! [PathPoint] (mut vertices) b)
+                  (al/al-push! [PathPoint] (mut vertices) c)))
+              (al/al-clear! [PathPoint] (mut vertices)))
+          (al/al-free! [i64] (mut indices))
+          (Tessellation :vertices (load vertices) :valid (not (load failed)))))))
+
+(defn tessellation-free! [(tessellation (mut Tessellation))] (-> i64)
+  (al/al-free! [PathPoint] (mut (.vertices tessellation))))

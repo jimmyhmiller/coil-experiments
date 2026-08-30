@@ -1,6 +1,7 @@
 (module experiments.coil_gpui.metal)
 (import "experiments.coil_gpui.objc" :use *)
 (import "experiments.coil_gpui.ui" :as ui)
+(import "experiments.coil_gpui.path" :as path)
 (import "coil.arraylist" :as al)
 (import "coil.primitive" :as primitive)
 
@@ -11,7 +12,8 @@
         renderer-valid?
         renderer-free!
         next-buffer-capacity
-        sprite-run-end)
+        sprite-run-end
+        paint-run-end)
 
 (extern MTLCreateSystemDefaultDevice :cc c [] (-> (ptr i8)))
 
@@ -30,6 +32,7 @@
    (queue (ptr i8))
    (pipeline (ptr i8))
    (shadow-pipeline (ptr i8))
+   (path-pipeline (ptr i8))
    (text-pipeline (ptr i8))
    (image-pipeline (ptr i8))
    (primitive-buffer-0 (ptr i8))
@@ -42,6 +45,8 @@
    (scale f32)
    (frames i64)
    (draw-calls i64)])
+
+(defstruct PathUniform [(color ui/Color) (clip ui/Rect) (transform ui/Affine)])
 
 (defn next-buffer-capacity [(current i64) (required i64)] (-> i64)
   (let [(mut capacity) (if (< current 65536) 65536 current)]
@@ -69,6 +74,28 @@
                   (store! end (+ (load end) 1))
                   (break 0))))
           (load end)))))
+
+;;; Find an adjacent run of ordinary primitive commands. A path command ends
+;;; the run, as does a non-consecutive primitive index.
+(defn paint-run-end [(commands (al/ArrayList ui/PaintCommand))
+                     (start i64)
+                     (count i64)] (-> i64)
+  (if (or (< start 0) (>= start count))
+      start
+      (let [first (al/al-get [ui/PaintCommand] commands start)
+            (mut end) (+ start 1)]
+        (if (!= (load (field first kind)) (primitive/cast i32 0))
+            (load end)
+            (do
+              (while (< (load end) count)
+                (let [candidate (al/al-get [ui/PaintCommand] commands (load end))]
+                  (if (and (= (load (field candidate kind)) 0)
+                           (= (load (field candidate index))
+                              (+ (load (field first index))
+                                 (primitive/cast i32 (- (load end) start)))))
+                      (store! end (+ (load end) 1))
+                      (break 0))))
+              (load end))))))
 
 (defn renderer-ensure-capacity! [(renderer (mut Renderer)) (required i64)] (-> i64)
   (if (<= required (load (field renderer primitive-capacity)))
@@ -133,10 +160,14 @@
 (defn atlas-texture-shader-source [] (-> (ptr i8))
   c"#include <metal_stdlib>\nusing namespace metal;\nstruct Rect { float x,y,w,h; };\nstruct Color { float r,g,b,a; };\nstruct Affine { float m11,m12,m21,m22,tx,ty; };\nstruct Sprite { Rect bounds; Color color; Rect clip; Rect uv; Affine transform; ulong texture; int id; int mode; };\nstruct Frame { float2 viewport; float2 pad; };\nstruct SpriteOut { float4 position [[position]]; float2 pixel; float2 uv; float4 clip; float4 color; };\nfloat2 apply_affine(Affine t,float2 p) { return float2(t.m11*p.x+t.m21*p.y+t.tx,t.m12*p.x+t.m22*p.y+t.ty); }\nvertex SpriteOut texture_vertex(uint vid [[vertex_id]],uint iid [[instance_id]],constant Sprite* sprites [[buffer(0)]],constant Frame& frame [[buffer(1)]]) { constexpr float2 q[6]={float2(0,0),float2(1,0),float2(0,1),float2(0,1),float2(1,0),float2(1,1)}; Sprite sprite=sprites[iid]; float2 localPoint=float2(sprite.bounds.x,sprite.bounds.y)+q[vid]*float2(sprite.bounds.w,sprite.bounds.h); float2 pixel=apply_affine(sprite.transform,localPoint); SpriteOut o; o.position=float4(pixel.x/frame.viewport.x*2.0-1.0,1.0-pixel.y/frame.viewport.y*2.0,0,1); o.pixel=pixel; o.uv=float2(sprite.uv.x,sprite.uv.y)+q[vid]*float2(sprite.uv.w,sprite.uv.h); o.clip=float4(sprite.clip.x,sprite.clip.y,sprite.clip.w,sprite.clip.h); o.color=float4(sprite.color.r,sprite.color.g,sprite.color.b,sprite.color.a); return o; }\nfragment float4 text_fragment(SpriteOut in [[stage_in]],texture2d<float> mask [[texture(0)]]) { if(in.pixel.x<in.clip.x||in.pixel.y<in.clip.y||in.pixel.x>=in.clip.x+in.clip.z||in.pixel.y>=in.clip.y+in.clip.w) discard_fragment(); constexpr sampler s(coord::normalized,address::clamp_to_edge,filter::linear); float alpha=mask.sample(s,in.uv).a; return float4(in.color.rgb,in.color.a*alpha); }\nfragment float4 image_fragment(SpriteOut in [[stage_in]],texture2d<float> image [[texture(0)]]) { if(in.pixel.x<in.clip.x||in.pixel.y<in.clip.y||in.pixel.x>=in.clip.x+in.clip.z||in.pixel.y>=in.clip.y+in.clip.w) discard_fragment(); constexpr sampler s(coord::normalized,address::clamp_to_edge,filter::linear); return image.sample(s,in.uv)*in.color; }\n")
 
+(defn path-shader-source [] (-> (ptr i8))
+  c"#include <metal_stdlib>\nusing namespace metal;\nstruct Point { float x,y; };\nstruct Color { float r,g,b,a; };\nstruct Rect { float x,y,w,h; };\nstruct Affine { float m11,m12,m21,m22,tx,ty; };\nstruct Frame { float2 viewport; float2 pad; };\nstruct Uniform { Color color; Rect clip; Affine transform; };\nstruct Out { float4 position [[position]]; float2 pixel; float4 color; float4 clip; };\nvertex Out path_vertex(uint vid [[vertex_id]],constant Point* points [[buffer(0)]],constant Frame& frame [[buffer(1)]],constant Uniform& u [[buffer(2)]]) { Point p=points[vid]; float2 pixel=float2(u.transform.m11*p.x+u.transform.m21*p.y+u.transform.tx,u.transform.m12*p.x+u.transform.m22*p.y+u.transform.ty); Out o; o.position=float4(pixel.x/frame.viewport.x*2.0-1.0,1.0-pixel.y/frame.viewport.y*2.0,0,1); o.pixel=pixel; o.color=float4(u.color.r,u.color.g,u.color.b,u.color.a); o.clip=float4(u.clip.x,u.clip.y,u.clip.w,u.clip.h); return o; }\nfragment float4 path_fragment(Out in [[stage_in]]) { if(in.pixel.x<in.clip.x||in.pixel.y<in.clip.y||in.pixel.x>=in.clip.x+in.clip.z||in.pixel.y>=in.clip.y+in.clip.w) discard_fragment(); return in.color; }\n")
+
 (defn renderer-valid? [(renderer Renderer)] (-> bool)
   (and (!= (primitive/cast i64 (load (field renderer device))) 0)
        (!= (primitive/cast i64 (load (field renderer pipeline))) 0)
        (!= (primitive/cast i64 (load (field renderer shadow-pipeline))) 0)
+       (!= (primitive/cast i64 (load (field renderer path-pipeline))) 0)
        (!= (primitive/cast i64 (load (field renderer text-pipeline))) 0)
        (!= (primitive/cast i64 (load (field renderer image-pipeline))) 0)))
 
@@ -179,6 +210,14 @@
                (nsstr (shadow-shader-source))
                (primitive/cast (ptr i8) 0)
                (primitive/cast (ptr (ptr i8)) 0))
+        path-library
+          (msg (ptr i8)
+               device
+               (sel c"newLibraryWithSource:options:error:")
+               [(ptr i8) (ptr i8) (ptr (ptr i8))]
+               (nsstr (path-shader-source))
+               (primitive/cast (ptr i8) 0)
+               (primitive/cast (ptr (ptr i8)) 0))
         vertex (msg (ptr i8) paint-library (sel c"newFunctionWithName:") [(ptr i8)] (nsstr c"paint_vertex"))
         fragment (msg (ptr i8) paint-library (sel c"newFunctionWithName:") [(ptr i8)] (nsstr c"paint_fragment"))
         text-vertex (msg (ptr i8) library (sel c"newFunctionWithName:") [(ptr i8)] (nsstr c"texture_vertex"))
@@ -186,6 +225,8 @@
         image-fragment (msg (ptr i8) library (sel c"newFunctionWithName:") [(ptr i8)] (nsstr c"image_fragment"))
         shadow-fragment
           (msg (ptr i8) shadow-library (sel c"newFunctionWithName:") [(ptr i8)] (nsstr c"shadow_fragment"))
+        path-vertex (msg (ptr i8) path-library (sel c"newFunctionWithName:") [(ptr i8)] (nsstr c"path_vertex"))
+        path-fragment (msg (ptr i8) path-library (sel c"newFunctionWithName:") [(ptr i8)] (nsstr c"path_fragment"))
         descriptor (msg (ptr i8) (class c"MTLRenderPipelineDescriptor") (sel c"new") [])
         attachments (msg (ptr i8) descriptor (sel c"colorAttachments") [])
         attachment (msg (ptr i8) attachments (sel c"objectAtIndexedSubscript:") [i64] 0)]
@@ -229,6 +270,16 @@
                              [(ptr i8) (ptr (ptr i8))]
                              descriptor
                              (primitive/cast (ptr (ptr i8)) 0)))
+                    path-pipeline
+                      (do
+                        (msg i64 descriptor (sel c"setVertexFunction:") [(ptr i8)] path-vertex)
+                        (msg i64 descriptor (sel c"setFragmentFunction:") [(ptr i8)] path-fragment)
+                        (msg (ptr i8)
+                             device
+                             (sel c"newRenderPipelineStateWithDescriptor:error:")
+                             [(ptr i8) (ptr (ptr i8))]
+                             descriptor
+                             (primitive/cast (ptr (ptr i8)) 0)))
                     layer (msg (ptr i8) (class c"CAMetalLayer") (sel c"layer") [])]
                 (do
                   (msg i64 layer (sel c"setDevice:") [(ptr i8)] device)
@@ -246,6 +297,7 @@
                       (set! (.shadow-pipeline renderer) shadow-pipeline)
                       (set! (.text-pipeline renderer) text-pipeline)
                       (set! (.image-pipeline renderer) image-pipeline)
+                      (set! (.path-pipeline renderer) path-pipeline)
                       (set! (.layer renderer) layer)
                       (renderer-ensure-capacity! (mut renderer) 65536)
                       (renderer-resize! (mut renderer) width height scale)
@@ -276,15 +328,23 @@
   (let [items (load (field scene items))
         shadows (load (field scene shadows))
         text-items (load (field scene text))
+        path-vertices (load (field scene path-vertices))
+        path-draws (load (field scene path-draws))
+        paint-commands (load (field scene paint-commands))
         count (al/al-len [ui/Primitive] items)
         shadow-count (al/al-len [ui/Primitive] shadows)
         text-count (al/al-len [ui/TextSprite] text-items)
+        path-vertex-count (al/al-len [path/PathPoint] path-vertices)
+        path-draw-count (al/al-len [ui/PathDraw] path-draws)
+        command-count (al/al-len [ui/PaintCommand] paint-commands)
         shadow-bytes (* shadow-count (primitive/sizeof ui/Primitive))
         primitive-bytes (* count (primitive/sizeof ui/Primitive))
         sprite-offset (+ shadow-bytes primitive-bytes)
         sprite-bytes (* text-count (primitive/sizeof ui/TextSprite))
-        total-bytes (+ sprite-offset sprite-bytes)]
-    (if (or (and (= count 0) (and (= shadow-count 0) (= text-count 0)))
+        path-offset (+ sprite-offset sprite-bytes)
+        path-bytes (* path-vertex-count (primitive/sizeof path/PathPoint))
+        total-bytes (+ path-offset path-bytes)]
+    (if (or (and (= count 0) (and (= path-draw-count 0) (and (= shadow-count 0) (= text-count 0))))
             (not (renderer-valid? (load renderer))))
         0
         (if (< (renderer-ensure-capacity! (mut renderer) total-bytes) 0)
@@ -313,7 +373,8 @@
                       (let [encoder (msg (ptr i8) command (sel c"renderCommandEncoderWithDescriptor:") [(ptr i8)] pass)
                             frame (primitive/alloc-stack (array f32 4))
                             primitive-buffer (renderer-frame-buffer (load renderer))
-                            (mut texture-runs) 0]
+                            (mut texture-runs) 0
+                            (mut paint-runs) 0]
                         (do
                           (store! (primitive/index frame 0) (load (field renderer width)))
                           (store! (primitive/index frame 1) (load (field renderer height)))
@@ -363,27 +424,91 @@
                                                            shadow-bytes))
                                         (primitive/cast (ptr i8) (load (field items data)))
                                         primitive-bytes)
-                                (msg i64
-                                     encoder
-                                     (sel c"setRenderPipelineState:")
-                                     [(ptr i8)]
-                                     (load (field renderer pipeline)))
-                                (msg i64
-                                     encoder
-                                     (sel c"setVertexBuffer:offset:atIndex:")
-                                     [(ptr i8) i64 i64]
-                                     primitive-buffer
-                                     shadow-bytes
-                                     0)
-                                (msg i64
-                                     encoder
-                                     (sel c"drawPrimitives:vertexStart:vertexCount:instanceCount:")
-                                     [i64 i64 i64 i64]
-                                     3
-                                     0
-                                     6
-                                     count))
+                                0)
                               0)
+                          (if (> path-vertex-count 0)
+                              (memcpy (primitive/cast (ptr i8)
+                                                      (+ (primitive/cast i64
+                                                                         (msg (ptr i8)
+                                                                              primitive-buffer
+                                                                              (sel c"contents")
+                                                                              []))
+                                                         path-offset))
+                                      (primitive/cast (ptr i8) (load (field path-vertices data)))
+                                      path-bytes)
+                              (primitive/cast (ptr i8) 0))
+                          (let [(mut command-index) 0]
+                            (while (< (load command-index) command-count)
+                              (let [paint-command (al/al-get [ui/PaintCommand] paint-commands (load command-index))]
+                                (if (= (load (field paint-command kind)) 0)
+                                    (let [run-end (paint-run-end paint-commands (load command-index) command-count)
+                                          run-count (- run-end (load command-index))]
+                                      (do
+                                        (msg i64
+                                             encoder
+                                             (sel c"setRenderPipelineState:")
+                                             [(ptr i8)]
+                                             (load (field renderer pipeline)))
+                                        (msg i64
+                                             encoder
+                                             (sel c"setVertexBuffer:offset:atIndex:")
+                                             [(ptr i8) i64 i64]
+                                             primitive-buffer
+                                             (+ shadow-bytes
+                                                (* (primitive/cast i64 (load (field paint-command index)))
+                                                   (primitive/sizeof ui/Primitive)))
+                                             0)
+                                        (msg i64
+                                             encoder
+                                             (sel c"drawPrimitives:vertexStart:vertexCount:instanceCount:")
+                                             [i64 i64 i64 i64]
+                                             3
+                                             0
+                                             6
+                                             run-count)
+                                        (store! paint-runs (+ (load paint-runs) 1))
+                                        (store! command-index run-end)))
+                                    (let [draw
+                                            (al/al-get [ui/PathDraw]
+                                                       path-draws
+                                                       (primitive/cast i64 (load (field paint-command index))))
+                                          uniform (primitive/alloc-stack PathUniform)]
+                                      (do
+                                        (store! uniform
+                                                (PathUniform
+                                                  :color (load (field draw color))
+                                                  :clip (load (field draw clip))
+                                                  :transform (load (field draw transform))))
+                                        (msg i64
+                                             encoder
+                                             (sel c"setRenderPipelineState:")
+                                             [(ptr i8)]
+                                             (load (field renderer path-pipeline)))
+                                        (msg i64
+                                             encoder
+                                             (sel c"setVertexBuffer:offset:atIndex:")
+                                             [(ptr i8) i64 i64]
+                                             primitive-buffer
+                                             (+ path-offset
+                                                (* (load (field draw vertex-start))
+                                                   (primitive/sizeof path/PathPoint)))
+                                             0)
+                                        (msg i64
+                                             encoder
+                                             (sel c"setVertexBytes:length:atIndex:")
+                                             [(ptr i8) i64 i64]
+                                             (primitive/cast (ptr i8) uniform)
+                                             (primitive/sizeof PathUniform)
+                                             2)
+                                        (msg i64
+                                             encoder
+                                             (sel c"drawPrimitives:vertexStart:vertexCount:")
+                                             [i64 i64 i64]
+                                             3
+                                             0
+                                             (load (field draw vertex-count)))
+                                        (store! paint-runs (+ (load paint-runs) 1))
+                                        (store! command-index (+ (load command-index) 1))))))))
                           (if (> text-count 0)
                               (do
                                 (memcpy (primitive/cast (ptr i8)
@@ -440,7 +565,7 @@
                           (set! (.frames renderer) (+ (load (field renderer frames)) 1))
                           (set! (.draw-calls renderer)
                                 (+ (load (field renderer draw-calls))
-                                   (+ (+ (if (> shadow-count 0) 1 0) (if (> count 0) 1 0))
+                                   (+ (+ (if (> shadow-count 0) 1 0) (load paint-runs))
                                       (load texture-runs))))
                           1))))))))))
 
@@ -456,6 +581,7 @@
     (release-object! (load (field renderer primitive-buffer-2)))
     (release-object! (load (field renderer pipeline)))
     (release-object! (load (field renderer shadow-pipeline)))
+    (release-object! (load (field renderer path-pipeline)))
     (release-object! (load (field renderer text-pipeline)))
     (release-object! (load (field renderer image-pipeline)))
     (release-object! (load (field renderer queue)))
@@ -464,6 +590,7 @@
     (set! (.primitive-buffer-2 renderer) (primitive/cast (ptr i8) 0))
     (set! (.pipeline renderer) (primitive/cast (ptr i8) 0))
     (set! (.shadow-pipeline renderer) (primitive/cast (ptr i8) 0))
+    (set! (.path-pipeline renderer) (primitive/cast (ptr i8) 0))
     (set! (.text-pipeline renderer) (primitive/cast (ptr i8) 0))
     (set! (.image-pipeline renderer) (primitive/cast (ptr i8) 0))
     (set! (.queue renderer) (primitive/cast (ptr i8) 0))
