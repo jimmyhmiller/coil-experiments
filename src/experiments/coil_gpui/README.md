@@ -11,6 +11,11 @@ layer in the runtime path.
 - CoreVideo display-link pacing with coalesced refresh ticks, bounded recovery
   from display reconfiguration, and occlusion-aware suspension of scene rebuilds
   and Metal submission.
+- Coil-native animations sampled from monotonic `CACurrentMediaTime`: delayed and
+  finite/infinite timelines, repeat/autoreverse cycles, arbitrary CSS cubic
+  Bézier easing, and redirectable mass/stiffness/damping springs with bounded
+  120 Hz integration substeps. The demo continuously rotates its retained SVG
+  by changing only the composed GPU affine transform.
 - Runtime-compiled Metal vertex and fragment shaders.
 - Instanced draw runs for adjacent box primitives, interleaved with ordered
   vector-path draws without changing scene submission order.
@@ -380,6 +385,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI responsive grid example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/grid_layout.rs)
 - [GPUI painting example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/painting.rs)
 - [GPUI SVG example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/svg/svg.rs)
+- [GPUI animation example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/animation.rs)
 - [Apple CAMetalLayer documentation](https://developer.apple.com/documentation/QuartzCore/CAMetalLayer)
 - [Apple MTLRenderCommandEncoder documentation](https://developer.apple.com/documentation/metal/mtlrendercommandencoder)
 - [Apple CTRun documentation](https://developer.apple.com/documentation/coretext/ctrun)
