@@ -60,6 +60,11 @@ layer in the runtime path.
   entries. Whole-label and shaped-glyph sprites share the same Metal batching path.
 - Native ImageIO decoding into owned BGRA Metal textures, with linear sampling,
   tint/opacity, scene clipping, and explicit GPU-resource teardown.
+- GPUI-style image object fitting: `fill` stretches to the destination, `contain`
+  centers aspect-preserving geometry, and `cover` retains the destination quad
+  while cropping normalized source UVs. An optional dedicated Metal fragment
+  pipeline converts sampled color to luminance on the GPU; grayscale images remain
+  batchable by texture and mode with no CPU pixel rewrite.
 - Buffered, instanced texture sprites: adjacent text/image records sharing a
   texture and pipeline collapse into one draw without changing paint order.
 - Reusable scene allocation across frames.
@@ -148,7 +153,7 @@ layer in the runtime path.
   closure, and cooperatively cancel all remaining jobs before releasing their own
   storage. The demo owns its background checksum through such a scope.
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
-  batching, scheduler lifecycle, ABI, and allocation-reuse tests (78 total).
+  batching, scheduler lifecycle, ABI, and allocation-reuse tests (80 total).
 
 ## Architecture
 
@@ -263,6 +268,12 @@ variant is rasterized once into an application-owned, explicitly bounded atlas p
 Repeated shaping reuses those entries, and compatible glyph and label sprites remain
 one instanced Metal run. Whole-label caching remains available for static labels.
 
+Image fitting is resolved before recording the sprite. `contain` changes quad bounds;
+`cover` keeps the component bounds and records the centered visible UV fraction. This
+avoids oversized quads and redundant clip pushes. Color and grayscale use separate
+Metal pipelines, while the existing run builder keeps adjacent records batched only
+when texture and mode are compatible.
+
 Retained paragraphs use CoreText's Unicode line breaker with explicit wrap width,
 line height, and optional line clamp. Each visual line owns byte-accurate UTF-8 source
 ranges and a shaped GPU line, enabling point-to-index and index-to-position mapping
@@ -327,6 +338,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI keymap precedence and matching](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/keymap.rs)
 - [GPUI retained entity map](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/app/entity_map.rs)
 - [GPUI subscriptions](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/subscription.rs)
+- [GPUI image element](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/elements/img.rs)
 - [GPUI foreground/background executor](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/executor.rs)
 - [GPUI text system](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/text_system.rs)
 - [Apple CoreText line API](https://developer.apple.com/documentation/coretext/ctline)
