@@ -1,0 +1,600 @@
+(module experiments.coil_gpui.svg-document)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+(import "experiments.coil_gpui.path" :as path)
+(import "experiments.coil_gpui.svg" :as svg)
+(import "experiments.coil_gpui.ui" :as ui)
+
+(export SvgDocument
+        svg-document-new
+        svg-document-valid?
+        svg-document-shape-count
+        svg-document-paint!
+        svg-document-free!)
+
+(extern strlen :cc c [(ptr i8)] (-> i64))
+(extern strtod :cc c [(ptr i8) (ptr (ptr i8))] (-> f64))
+(extern malloc :cc c [i64] (-> (ptr i8)))
+(extern free :cc c [(ptr i8)] (-> void))
+(extern memcpy :cc c [(ptr i8) (ptr i8) i64] (-> (ptr i8)))
+
+(defstruct XmlReader [(cursor (ptr u8)) (valid bool)])
+(defstruct XmlSlice [(start (ptr u8)) (length i64)])
+(defstruct SvgStyle
+  [(fill ui/Color) (fill-opacity f32) (fill-rule i32) (fill-enabled bool) (transform ui/Affine)])
+(defstruct SvgDocumentShape
+  [(vector svg/SvgVector) (fill ui/Color) (transform ui/Affine)])
+(defstruct SvgDocument
+  [(shapes (al/ArrayList SvgDocumentShape))
+   (bounds path/PathBounds)
+   (valid bool)])
+
+(defn byte-at [(pointer (ptr u8)) (index i64)] (-> u8)
+  (load (primitive/index pointer index)))
+
+(defn reader-byte [(reader XmlReader)] (-> u8)
+  (if (= (primitive/cast i64 (load (field reader cursor))) 0)
+      (primitive/cast u8 0)
+      (load (load (field reader cursor)))))
+
+(defn reader-advance! [(reader (mut XmlReader))] (-> i64)
+  (do
+    (set! (.cursor reader)
+          (primitive/cast (ptr u8)
+                          (+ (primitive/cast i64 (load (field reader cursor))) 1)))
+    0))
+
+(defn xml-space? [(byte u8)] (-> bool)
+  (or (= byte (primitive/cast u8 32))
+      (or (= byte (primitive/cast u8 9))
+          (or (= byte (primitive/cast u8 10)) (= byte (primitive/cast u8 13))))))
+
+(defn skip-space! [(reader (mut XmlReader))] (-> i64)
+  (do
+    (while (xml-space? (reader-byte (load reader))) (reader-advance! (mut reader)))
+    0))
+
+(defn name-byte? [(byte u8)] (-> bool)
+  (or (and (>= byte (primitive/cast u8 65)) (<= byte (primitive/cast u8 90)))
+      (or (and (>= byte (primitive/cast u8 97)) (<= byte (primitive/cast u8 122)))
+          (or (and (>= byte (primitive/cast u8 48)) (<= byte (primitive/cast u8 57)))
+              (or (= byte (primitive/cast u8 45))
+                  (or (= byte (primitive/cast u8 95)) (= byte (primitive/cast u8 58))))))))
+
+(defn read-name! [(reader (mut XmlReader))] (-> XmlSlice)
+  (let [start (load (field reader cursor)) (mut length) (primitive/cast i64 0)]
+    (do
+      (while (name-byte? (reader-byte (load reader)))
+        (do (reader-advance! (mut reader)) (store! length (+ (load length) 1))))
+      (if (= (load length) 0) (set! (.valid reader) false) 0)
+      (XmlSlice :start start :length (load length)))))
+
+(defn slice-equals? [(slice XmlSlice) (literal (ptr i8))] (-> bool)
+  (let [length (strlen literal)]
+    (if (!= (load (field slice length)) length)
+        false
+        (block :result
+          (for [i 0 length]
+            (if (!= (byte-at (load (field slice start)) i)
+                    (byte-at (primitive/cast (ptr u8) literal) i))
+                (return-from :result false)
+                0))
+          true))))
+
+(defn slice-copy [(slice XmlSlice)] (-> (ptr i8))
+  (let [length (load (field slice length)) copy (malloc (+ length 1))]
+    (if (= (primitive/cast i64 copy) 0)
+        (primitive/cast (ptr i8) 0)
+        (do
+          (memcpy copy (primitive/cast (ptr i8) (load (field slice start))) length)
+          (store! (primitive/index (primitive/cast (ptr u8) copy) length) (primitive/cast u8 0))
+          copy))))
+
+(defn read-value! [(reader (mut XmlReader))] (-> XmlSlice)
+  (do
+    (skip-space! (mut reader))
+    (if (!= (reader-byte (load reader)) (primitive/cast u8 61))
+        (do
+          (set! (.valid reader) false)
+          (XmlSlice :start (load (field reader cursor)) :length 0))
+        (do
+          (reader-advance! (mut reader))
+          (skip-space! (mut reader))
+          (let [quote (reader-byte (load reader))]
+            (if (not (or (= quote (primitive/cast u8 34)) (= quote (primitive/cast u8 39))))
+                (do
+                  (set! (.valid reader) false)
+                  (XmlSlice :start (load (field reader cursor)) :length 0))
+                (do
+                  (reader-advance! (mut reader))
+                  (let [start (load (field reader cursor)) (mut length) (primitive/cast i64 0)]
+                    (do
+                      (while (and (!= (reader-byte (load reader)) quote)
+                                  (!= (reader-byte (load reader)) (primitive/cast u8 0)))
+                        (do
+                          (reader-advance! (mut reader))
+                          (store! length (+ (load length) 1))))
+                      (if (= (reader-byte (load reader)) quote)
+                          (reader-advance! (mut reader))
+                          (set! (.valid reader) false))
+                      (XmlSlice :start start :length (load length)))))))))))
+
+(defn hex-digit [(byte u8)] (-> i32)
+  (cond
+    (and (>= byte (primitive/cast u8 48)) (<= byte (primitive/cast u8 57)))
+      (primitive/cast i32 (- byte (primitive/cast u8 48)))
+    (and (>= byte (primitive/cast u8 65)) (<= byte (primitive/cast u8 70)))
+      (+ (primitive/cast i32 (- byte (primitive/cast u8 65))) 10)
+    (and (>= byte (primitive/cast u8 97)) (<= byte (primitive/cast u8 102)))
+      (+ (primitive/cast i32 (- byte (primitive/cast u8 97))) 10)
+    :else -1))
+
+(defn byte-color [(value i32)] (-> f32)
+  (/ (primitive/cast f32 value) 255.0))
+
+(defn parse-color! [(style (mut SvgStyle)) (value XmlSlice)] (-> i64)
+  (let [length (load (field value length)) start (load (field value start))]
+    (cond
+      (slice-equals? value c"none") (set! (.fill-enabled style) false)
+      (slice-equals? value c"black")
+        (do (set! (.fill style) (ui/rgb 0.0 0.0 0.0)) (set! (.fill-enabled style) true))
+      (slice-equals? value c"white")
+        (do (set! (.fill style) (ui/rgb 1.0 1.0 1.0)) (set! (.fill-enabled style) true))
+      (and (= length 7) (= (byte-at start 0) (primitive/cast u8 35)))
+        (let [r0 (hex-digit (byte-at start 1)) r1 (hex-digit (byte-at start 2))
+              g0 (hex-digit (byte-at start 3)) g1 (hex-digit (byte-at start 4))
+              b0 (hex-digit (byte-at start 5)) b1 (hex-digit (byte-at start 6))]
+          (if (or (< r0 0) (or (< r1 0) (or (< g0 0) (or (< g1 0) (or (< b0 0) (< b1 0))))))
+              -1
+              (do
+                (set! (.fill style)
+                      (ui/rgb (byte-color (+ (* r0 16) r1))
+                              (byte-color (+ (* g0 16) g1))
+                              (byte-color (+ (* b0 16) b1))))
+                (set! (.fill-enabled style) true))))
+      :else -1)))
+
+(defn numeric-separator? [(byte u8)] (-> bool)
+  (or (xml-space? byte) (= byte (primitive/cast u8 44))))
+
+(defn number-skip! [(cursor (mut (ptr u8)))] (-> i64)
+  (do
+    (while (numeric-separator? (load (load cursor)))
+      (store! cursor (primitive/index (load cursor) 1)))
+    0))
+
+(defn number-read! [(cursor (mut (ptr u8))) (valid (mut bool))] (-> f32)
+  (do
+    (number-skip! (mut cursor))
+    (let [end (primitive/alloc-stack (ptr i8)) start (load cursor)]
+      (do
+        (store! end (primitive/cast (ptr i8) 0))
+        (let [value (strtod (primitive/cast (ptr i8) start) end)
+              finish (primitive/cast (ptr u8) (load end))]
+          (if (= (primitive/cast i64 finish) (primitive/cast i64 start))
+              (do (store! valid false) 0.0)
+              (do (store! cursor finish) (primitive/cast f32 value))))))))
+
+(defn prefix-at? [(cursor (ptr u8)) (literal (ptr i8))] (-> bool)
+  (let [length (strlen literal)]
+    (block :result
+      (for [i 0 length]
+        (if (!= (byte-at cursor i) (byte-at (primitive/cast (ptr u8) literal) i))
+            (return-from :result false)
+            0))
+      true)))
+
+(defn skip-processing-instruction! [(reader (mut XmlReader))] (-> i64)
+  (do
+    (reader-advance! (mut reader))
+    (reader-advance! (mut reader))
+    (while (and (!= (reader-byte (load reader)) (primitive/cast u8 0))
+                (not (and (= (reader-byte (load reader)) (primitive/cast u8 63))
+                          (= (byte-at (load (field reader cursor)) 1)
+                             (primitive/cast u8 62)))))
+      (reader-advance! (mut reader)))
+    (if (= (reader-byte (load reader)) (primitive/cast u8 0))
+        (set! (.valid reader) false)
+        (do (reader-advance! (mut reader)) (reader-advance! (mut reader)) 0))))
+
+(defn skip-declaration! [(reader (mut XmlReader))] (-> i64)
+  (do
+    (reader-advance! (mut reader))
+    (reader-advance! (mut reader))
+    (while (and (!= (reader-byte (load reader)) (primitive/cast u8 0))
+                (!= (reader-byte (load reader)) (primitive/cast u8 62)))
+      (reader-advance! (mut reader)))
+    (if (= (reader-byte (load reader)) (primitive/cast u8 0))
+        (set! (.valid reader) false)
+        (reader-advance! (mut reader)))))
+
+(defn parse-transform [(value XmlSlice)] (-> ui/Affine)
+  (let [copy (slice-copy value)
+        (mut cursor) (primitive/cast (ptr u8) copy)
+        (mut valid) (!= (primitive/cast i64 copy) 0)
+        (mut result) (ui/affine-identity)]
+    (do
+      (while (and (load valid) (!= (load (load cursor)) (primitive/cast u8 0)))
+        (do
+          (number-skip! (mut cursor))
+          (let [(mut operation) (ui/affine-identity)]
+            (cond
+              (prefix-at? (load cursor) c"translate(")
+                (do
+                  (store! cursor (primitive/index (load cursor) 10))
+                  (let [x (number-read! (mut cursor) (mut valid))]
+                    (do
+                      (number-skip! (mut cursor))
+                      (let [y (if (= (load (load cursor)) (primitive/cast u8 41))
+                                  0.0
+                                  (number-read! (mut cursor) (mut valid)))]
+                        (store! operation (ui/affine-translate x y))))))
+              (prefix-at? (load cursor) c"scale(")
+                (do
+                  (store! cursor (primitive/index (load cursor) 6))
+                  (let [x (number-read! (mut cursor) (mut valid))]
+                    (do
+                      (number-skip! (mut cursor))
+                      (let [y (if (= (load (load cursor)) (primitive/cast u8 41))
+                                  x
+                                  (number-read! (mut cursor) (mut valid)))]
+                        (store! operation (ui/affine-scale x y))))))
+              (prefix-at? (load cursor) c"rotate(")
+                (do
+                  (store! cursor (primitive/index (load cursor) 7))
+                  (store! operation
+                          (ui/affine-rotate (number-read! (mut cursor) (mut valid)))))
+              (prefix-at? (load cursor) c"matrix(")
+                (do
+                  (store! cursor (primitive/index (load cursor) 7))
+                  (let [a (number-read! (mut cursor) (mut valid))
+                        b (number-read! (mut cursor) (mut valid))
+                        c (number-read! (mut cursor) (mut valid))
+                        d (number-read! (mut cursor) (mut valid))
+                        e (number-read! (mut cursor) (mut valid))
+                        f (number-read! (mut cursor) (mut valid))]
+                    (store! operation (ui/Affine :m11 a :m12 b :m21 c :m22 d :tx e :ty f))))
+              :else (store! valid false))
+            (number-skip! (mut cursor))
+            (if (= (load (load cursor)) (primitive/cast u8 41))
+                (store! cursor (primitive/index (load cursor) 1))
+                (store! valid false))
+            (store! result (ui/affine-multiply (load result) (load operation))))))
+      (if (!= (primitive/cast i64 copy) 0) (do (free copy) 0) 0)
+      (if (load valid) (load result) (ui/Affine :m11 0.0 :m12 0.0 :m21 0.0 :m22 0.0 :tx 0.0 :ty 0.0)))))
+
+(defn default-style [] (-> SvgStyle)
+  (SvgStyle :fill (ui/rgb 0.0 0.0 0.0)
+            :fill-opacity 1.0
+            :fill-rule (svg/FillRuleNonzero)
+            :fill-enabled true
+            :transform (ui/affine-identity)))
+
+(defn parse-unit-number [(value XmlSlice)] (-> f32)
+  (let [copy (slice-copy value)
+        (mut cursor) (primitive/cast (ptr u8) copy)
+        (mut valid) (!= (primitive/cast i64 copy) 0)
+        number (number-read! (mut cursor) (mut valid))]
+    (do
+      (number-skip! (mut cursor))
+      (if (not (= (load (load cursor)) (primitive/cast u8 0))) (store! valid false) 0)
+      (if (!= (primitive/cast i64 copy) 0) (do (free copy) 0) 0)
+      (if (and (load valid) (>= number 0.0))
+          (if (> number 1.0) 1.0 number)
+          -1.0))))
+
+(defn trim-slice [(value XmlSlice)] (-> XmlSlice)
+  (let [(mut start) (load (field value start))
+        (mut length) (load (field value length))]
+    (do
+      (while (and (> (load length) 0) (xml-space? (load (load start))))
+        (do (store! start (primitive/index (load start) 1))
+            (store! length (- (load length) 1))))
+      (while (and (> (load length) 0)
+                  (xml-space? (byte-at (load start) (- (load length) 1))))
+        (store! length (- (load length) 1)))
+      (XmlSlice :start (load start) :length (load length)))))
+
+(defn apply-attribute! [(style (mut SvgStyle)) (name XmlSlice) (value XmlSlice)] (-> bool)
+  (cond
+    (slice-equals? name c"fill") (>= (parse-color! (mut style) value) 0)
+    (slice-equals? name c"fill-rule")
+      (cond
+        (slice-equals? value c"nonzero") (do (set! (.fill-rule style) (svg/FillRuleNonzero)) true)
+        (slice-equals? value c"evenodd") (do (set! (.fill-rule style) (svg/FillRuleEvenodd)) true)
+        :else false)
+    (slice-equals? name c"fill-opacity")
+      (let [opacity (parse-unit-number value)]
+        (if (< opacity 0.0) false (do (set! (.fill-opacity style) opacity) true)))
+    (slice-equals? name c"transform")
+      (let [transform (parse-transform value)]
+        (if (ui/affine-invertible? transform)
+            (do
+              (set! (.transform style)
+                    (ui/affine-multiply (load (field style transform)) transform))
+              true)
+            false))
+    (slice-equals? name c"style")
+      (let [(mut offset) (primitive/cast i64 0)
+            length (load (field value length))
+            start (load (field value start))
+            (mut valid) true]
+        (do
+          (while (and (load valid) (< (load offset) length))
+            (let [declaration-start (load offset) (mut colon) (primitive/cast i64 -1)]
+              (do
+                (while (and (< (load offset) length)
+                            (!= (byte-at start (load offset)) (primitive/cast u8 59)))
+                  (do
+                    (if (= (byte-at start (load offset)) (primitive/cast u8 58))
+                        (if (= (load colon) -1) (store! colon (load offset)) 0)
+                        0)
+                    (store! offset (+ (load offset) 1))))
+                (if (> (load offset) declaration-start)
+                    (if (> (load colon) declaration-start)
+                        (let [property (trim-slice
+                                         (XmlSlice :start (primitive/index start declaration-start)
+                                                   :length (- (load colon) declaration-start)))
+                              property-value (trim-slice
+                                               (XmlSlice
+                                                 :start (primitive/index start (+ (load colon) 1))
+                                                 :length (- (load offset) (+ (load colon) 1))))]
+                          (if (or (slice-equals? property c"fill")
+                                  (or (slice-equals? property c"fill-rule")
+                                      (slice-equals? property c"fill-opacity")))
+                              (if (not (apply-attribute! (mut style) property property-value))
+                                  (store! valid false)
+                                  0)
+                              0))
+                        (store! valid false))
+                    0)
+                (if (< (load offset) length) (store! offset (+ (load offset) 1)) 0))))
+          (load valid)))
+    :else true))
+
+(defn parse-view-box [(value XmlSlice)] (-> path/PathBounds)
+  (let [copy (slice-copy value)
+        (mut cursor) (primitive/cast (ptr u8) copy)
+        (mut valid) (!= (primitive/cast i64 copy) 0)
+        x (number-read! (mut cursor) (mut valid))
+        y (number-read! (mut cursor) (mut valid))
+        width (number-read! (mut cursor) (mut valid))
+        height (number-read! (mut cursor) (mut valid))]
+    (do
+      (number-skip! (mut cursor))
+      (if (!= (primitive/cast i64 copy) 0) (do (free copy) 0) 0)
+      (path/PathBounds :x x :y y :w width :h height
+                       :valid (and (load valid) (and (> width 0.0) (> height 0.0)))))))
+
+(defn svg-document-empty [] (-> SvgDocument)
+  (SvgDocument :shapes (al/al-new [SvgDocumentShape] (alloc/malloc-allocator))
+               :bounds (path/PathBounds :x 0.0 :y 0.0 :w 0.0 :h 0.0 :valid false)
+               :valid false))
+
+(defn svg-document-valid? [(document SvgDocument)] (-> bool)
+  (load (field document valid)))
+
+(defn svg-document-shape-count [(document SvgDocument)] (-> i64)
+  (al/al-len [SvgDocumentShape] (load (field document shapes))))
+
+(defn extend-document-bounds! [(document (mut SvgDocument))
+                               (bounds path/PathBounds)
+                               (transform ui/Affine)] (-> i64)
+  (let [rect (ui/affine-transform-bounds
+               transform
+               (ui/rect (load (field bounds x)) (load (field bounds y))
+                        (load (field bounds w)) (load (field bounds h))))]
+    (if (load (field (field document bounds) valid))
+        (let [old (load (field document bounds))
+              x0 (if (< (load (field rect x)) (load (field old x)))
+                     (load (field rect x)) (load (field old x)))
+              y0 (if (< (load (field rect y)) (load (field old y)))
+                     (load (field rect y)) (load (field old y)))
+              x1 (if (> (+ (load (field rect x)) (load (field rect w)))
+                         (+ (load (field old x)) (load (field old w))))
+                     (+ (load (field rect x)) (load (field rect w)))
+                     (+ (load (field old x)) (load (field old w))))
+              y1 (if (> (+ (load (field rect y)) (load (field rect h)))
+                         (+ (load (field old y)) (load (field old h))))
+                     (+ (load (field rect y)) (load (field rect h)))
+                     (+ (load (field old y)) (load (field old h))))]
+          (set! (.bounds document)
+                (path/PathBounds :x x0 :y y0 :w (- x1 x0) :h (- y1 y0) :valid true)))
+        (set! (.bounds document)
+              (path/PathBounds :x (load (field rect x)) :y (load (field rect y))
+                               :w (load (field rect w)) :h (load (field rect h))
+                               :valid true)))))
+
+(defn svg-document-free! [(document (mut SvgDocument))] (-> i64)
+  (do
+    (let [shapes (load (field document shapes))]
+      (for [i 0 (al/al-len [SvgDocumentShape] shapes)]
+        (svg/svg-vector-free! (mut (field (primitive/index (load (field shapes data)) i) vector)))))
+    (al/al-free! [SvgDocumentShape] (mut (.shapes document)))
+    (set! (.valid document) false)
+    0))
+
+;;; Parse the structural SVG subset used by UI assets: nested svg/g containers
+;;; and path elements with inherited fill, fill-rule, and affine transforms.
+(defn svg-document-new [(source (ptr i8)) (tolerance f32)] (-> SvgDocument)
+  (let [(mut document) (svg-document-empty)
+        (mut reader) (primitive/zeroed XmlReader)
+        (mut styles) (al/al-new [SvgStyle] (alloc/malloc-allocator))
+        (mut tags) (al/al-new [i32] (alloc/malloc-allocator))
+        (mut declared-bounds) (primitive/zeroed path/PathBounds)]
+    (do
+      (store! reader (XmlReader :cursor (primitive/cast (ptr u8) source) :valid true))
+      (al/al-push! [SvgStyle] (mut styles) (default-style))
+      (while (and (load (field reader valid))
+                  (!= (reader-byte (load reader)) (primitive/cast u8 0)))
+        (cond
+          (prefix-at? (load (field reader cursor)) c"<?")
+            (skip-processing-instruction! (mut reader))
+          (prefix-at? (load (field reader cursor)) c"<!")
+            (skip-declaration! (mut reader))
+          (!= (reader-byte (load reader)) (primitive/cast u8 60))
+            (reader-advance! (mut reader))
+          :else
+            (do
+              (reader-advance! (mut reader))
+              (if (= (reader-byte (load reader)) (primitive/cast u8 47))
+                  (do
+                    (reader-advance! (mut reader))
+                    (let [name (read-name! (mut reader))]
+                      (do
+                        (skip-space! (mut reader))
+                        (if (!= (reader-byte (load reader)) (primitive/cast u8 62))
+                            (set! (.valid reader) false)
+                            (reader-advance! (mut reader)))
+                        (if (> (al/al-len [i32] (load tags)) 0)
+                            (let [expected (al/al-get [i32] (load tags)
+                                                      (- (al/al-len [i32] (load tags)) 1))
+                                  actual (if (slice-equals? name c"svg")
+                                             (primitive/cast i32 1)
+                                             (if (slice-equals? name c"g")
+                                                 (primitive/cast i32 2)
+                                                 (if (slice-equals? name c"path")
+                                                     (primitive/cast i32 3)
+                                                     (primitive/cast i32 0))))]
+                              (if (= expected actual)
+                                  (do
+                                    (al/al-pop! [i32] (mut tags))
+                                    (al/al-pop! [SvgStyle] (mut styles))
+                                    0)
+                                  (set! (.valid reader) false)))
+                            (set! (.valid reader) false)))))
+                  (let [name (read-name! (mut reader))
+                        kind (if (slice-equals? name c"svg") (primitive/cast i32 1)
+                                 (if (slice-equals? name c"g") (primitive/cast i32 2)
+                                     (if (slice-equals? name c"path")
+                                         (primitive/cast i32 3)
+                                         (primitive/cast i32 0))))
+                        parent (al/al-get [SvgStyle] (load styles)
+                                          (- (al/al-len [SvgStyle] (load styles)) 1))
+                        (mut style) (primitive/zeroed SvgStyle)
+                        (mut path-data) (primitive/cast (ptr i8) 0)
+                        (mut self-closing) false]
+                    (do
+                      (store! style parent)
+                      (if (= kind 0) (set! (.valid reader) false) 0)
+                      (while (and (load (field reader valid))
+                                  (not (or (= (reader-byte (load reader)) (primitive/cast u8 62))
+                                           (= (reader-byte (load reader)) (primitive/cast u8 47)))))
+                        (do
+                          (skip-space! (mut reader))
+                          (if (or (= (reader-byte (load reader)) (primitive/cast u8 62))
+                                  (= (reader-byte (load reader)) (primitive/cast u8 47)))
+                              0
+                              (let [attribute-name (read-name! (mut reader))
+                                    attribute-value (read-value! (mut reader))]
+                                (if (and (= kind 3) (slice-equals? attribute-name c"d"))
+                                    (store! path-data (slice-copy attribute-value))
+                                    (if (and (= kind (primitive/cast i32 1))
+                                             (slice-equals? attribute-name c"viewBox"))
+                                        (do
+                                          (store! declared-bounds (parse-view-box attribute-value))
+                                          (if (not (load (field declared-bounds valid)))
+                                              (set! (.valid reader) false)
+                                              0))
+                                        (if (not (apply-attribute! (mut style)
+                                                                   attribute-name
+                                                                   attribute-value))
+                                            (set! (.valid reader) false)
+                                            0)))))))
+                      (skip-space! (mut reader))
+                      (if (= (reader-byte (load reader)) (primitive/cast u8 47))
+                          (do (store! self-closing true) (reader-advance! (mut reader))) 0)
+                      (if (= (reader-byte (load reader)) (primitive/cast u8 62))
+                          (reader-advance! (mut reader))
+                          (set! (.valid reader) false))
+                      (if (= kind (primitive/cast i32 3))
+                          (if (and (load (field reader valid))
+                                   (!= (primitive/cast i64 (load path-data)) 0)
+                                   (load (field style fill-enabled)))
+                              (let [(mut vector)
+                                      (svg/svg-vector-new-with-fill-rule
+                                        (load path-data) tolerance (load (field style fill-rule)))]
+                                (if (svg/svg-vector-valid? vector)
+                                    (do
+                                      (al/al-push! [SvgDocumentShape]
+                                                   (mut (.shapes document))
+                                                   (SvgDocumentShape
+                                                     :vector (load vector)
+                                                     :fill
+                                                       (ui/rgba
+                                                         (load (field (field style fill) r))
+                                                         (load (field (field style fill) g))
+                                                         (load (field (field style fill) b))
+                                                         (* (load (field (field style fill) a))
+                                                            (load (field style fill-opacity))))
+                                                     :transform (load (field style transform))))
+                                      (extend-document-bounds! (mut document)
+                                                               (load (field vector bounds))
+                                                               (load (field style transform))))
+                                    (do
+                                      (svg/svg-vector-free! (mut vector))
+                                      (set! (.valid reader) false))))
+                              (if (and (!= (primitive/cast i64 (load path-data)) 0)
+                                       (not (load (field style fill-enabled))))
+                                  0
+                                  (set! (.valid reader) false)))
+                          0)
+                      (if (not (load self-closing))
+                          (do
+                            (al/al-push! [SvgStyle] (mut styles) (load style))
+                            (al/al-push! [i32] (mut tags) kind))
+                          0)
+                      (if (!= (primitive/cast i64 (load path-data)) 0)
+                          (do (free (load path-data)) 0)
+                          0)))))))
+      (if (or (not (load (field reader valid)))
+              (or (!= (al/al-len [i32] (load tags)) 0)
+                  (= (svg-document-shape-count (load document)) 0)))
+          (svg-document-free! (mut document))
+          (do
+            (if (load (field declared-bounds valid))
+                (set! (.bounds document) (load declared-bounds))
+                0)
+            (set! (.valid document) true)))
+      (al/al-free! [i32] (mut tags))
+      (al/al-free! [SvgStyle] (mut styles))
+      (load document))))
+
+(defn svg-document-paint! [(scene (mut ui/Scene))
+                           (document SvgDocument)
+                           (bounds ui/Rect)
+                           (id i32)] (-> i64)
+  (if (or (not (load (field document valid)))
+          (or (<= (load (field bounds w)) 0.0) (<= (load (field bounds h)) 0.0)))
+      0
+      (let [source (load (field document bounds))
+            scale-x (/ (load (field bounds w)) (load (field source w)))
+            scale-y (/ (load (field bounds h)) (load (field source h)))
+            scale (if (< scale-x scale-y) scale-x scale-y)
+            width (* (load (field source w)) scale)
+            height (* (load (field source h)) scale)
+            fit (ui/Affine
+                  :m11 scale :m12 0.0 :m21 0.0 :m22 scale
+                  :tx (- (+ (load (field bounds x)) (* (- (load (field bounds w)) width) 0.5))
+                         (* (load (field source x)) scale))
+                  :ty (- (+ (load (field bounds y)) (* (- (load (field bounds h)) height) 0.5))
+                         (* (load (field source y)) scale)))
+            fit-prior (ui/scene-push-transform! (mut scene) fit)
+            shapes (load (field document shapes))
+            (mut draws) (primitive/cast i64 0)]
+        (do
+          (for [i 0 (al/al-len [SvgDocumentShape] shapes)]
+            (let [shape (al/al-get [SvgDocumentShape] shapes i)
+                  prior (ui/scene-push-transform! (mut scene) (load (field shape transform)))]
+              (do
+                (store! draws
+                        (+ (load draws)
+                           (svg/svg-vector-paint-local! (mut scene)
+                                                       (load (field shape vector))
+                                                       (load (field shape fill))
+                                                       (primitive/cast i32
+                                                         (+ (primitive/cast i64 id) i)))))
+                (ui/scene-pop-transform! (mut scene) prior))))
+          (ui/scene-pop-transform! (mut scene) fit-prior)
+          (load draws)))))
