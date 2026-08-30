@@ -30,6 +30,9 @@ layer in the runtime path.
 - Explicit miter, bevel, and adaptively rounded joins. Segment quads remain
   independent and join wedges close the outer turn; over-limit miters fall back
   to bevel geometry instead of producing spikes or narrowed corners.
+- Arbitrary alternating dash arrays with SVG-style odd-pattern repetition,
+  positive or negative phase offsets, exact distance interpolation across
+  polyline corners, and per-run configurable caps and joins.
 - Adaptive center-parameterized elliptical arcs with positive or negative sweeps,
   full-circle support, and the same caller-controlled geometric tolerance.
 - Batched analytic rounded-rectangle shadows with GPU-computed soft falloff,
@@ -185,7 +188,7 @@ application. GPUI parity still requires substantial systems, notably:
 - glyph-run extraction, editable text measurement, and atlas-page eviction
   (whole-label shaping, bounded atlas allocation, and GPU mask composition work now);
 - intrinsic text/image measurement (flex and constrained grid layout work);
-- endpoint-parameterized SVG arcs, dashes,
+- endpoint-parameterized SVG arcs, closed-path dash seam merging,
   SVG parsing, and non-simple/multi-contour fill rules (adaptive quadratic/cubic
   curves and elliptical arcs, polygon
   fills, butt-cap/miter strokes, affine transforms, analytic shadows, linear
