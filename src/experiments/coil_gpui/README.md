@@ -125,6 +125,11 @@ layer in the runtime path.
   ImageIO loads, generation-checked stable IDs, explicit invalidation, frame pins,
   and least-recently-used eviction. A texture referenced by the current frame
   cannot be evicted; stale IDs are rejected when an evicted slot is reused.
+- A GPU-painted scene inspector toggled with Command-I. It uses the same inverse
+  affine and clip semantics as event dispatch, picks the topmost hitbox under the
+  pointer, cycles through occluded candidates with the scroll wheel, reports
+  hierarchy depth and scene counts, and overlays selected and parent bounds without
+  introducing native inspection views.
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
   batching, ABI, and allocation-reuse tests.
 
@@ -221,7 +226,7 @@ translate directly into one draw for all adjacent labels on an atlas page.
 
 The release scene benchmark rebuilds 1,049 paint primitives, emits 99 retained
 paragraph glyph sprites, and advances a 100,000-row virtual list. On the development
-Apple Silicon machine it measured **6,742 ns/frame** across 5,000 frames. This measures
+Apple Silicon machine it measured **6,481 ns/frame** across 5,000 frames. This measures
 Coil scene construction, retained-text recording, and visible-range calculation—not
 GPU presentation or display latency. The benchmark is checked in as `bench.coil` so
 results remain reproducible and comparable.
@@ -277,7 +282,7 @@ application. GPUI parity still requires substantial systems, notably:
   (hierarchical capture/target/bubble listeners with stop-propagation, focus
   traversal, and logical actions work);
 - callback-driven entity subscriptions, async executor integration, non-image/
-  remote asset sources, inspector support, deterministic UI
+  remote asset sources, editable style inspection, deterministic UI
   tests, and multiple windows;
 - persistent partial-presentation backing, multi-page texture-atlas eviction,
   and deeper GPU/CPU profiling.
