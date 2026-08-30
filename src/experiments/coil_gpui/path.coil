@@ -6,6 +6,9 @@
 (export PathPoint
         Path
         Tessellation
+        ButtCap
+        SquareCap
+        RoundCap
         path-new
         path-clear!
         path-free!
@@ -20,6 +23,7 @@
         path-simple?
         path-tessellate
         path-stroke-tessellate
+        path-stroke-tessellate-cap
         tessellation-free!)
 
 (extern sqrtf :cc c [f32] (-> f32))
@@ -27,6 +31,17 @@
 (extern sinf :cc c [f32] (-> f32))
 
 (extern cosf :cc c [f32] (-> f32))
+
+(extern atan2f :cc c [f32 f32] (-> f32))
+
+(defn ButtCap [] (-> i32)
+  (primitive/cast i32 0))
+
+(defn SquareCap [] (-> i32)
+  (primitive/cast i32 1))
+
+(defn RoundCap [] (-> i32)
+  (primitive/cast i32 2))
 
 (defstruct PathPoint [(x f32) (y f32)])
 
@@ -475,9 +490,61 @@
                 :y (- (load (field point y)) offset-y))
             :valid true)))))
 
-;;; Tessellate a polyline into a triangle list with butt caps and miter joins.
-;;; The miter length is bounded, preventing spikes at nearly reversing corners.
-(defn path-stroke-tessellate [(path Path) (width f32) (miter-limit f32)] (-> Tessellation)
+(defn translate-pair [(pair StrokePair) (x f32) (y f32)] (-> StrokePair)
+  (let [left (load (field pair left))
+        right (load (field pair right))]
+    (StrokePair
+      :left (PathPoint :x (+ (load (field left x)) x) :y (+ (load (field left y)) y))
+      :right (PathPoint :x (+ (load (field right x)) x) :y (+ (load (field right y)) y))
+      :valid (load (field pair valid)))))
+
+(defn append-round-fan! [(vertices (mut (al/ArrayList PathPoint)))
+                         (center PathPoint)
+                         (radius f32)
+                         (start-angle f32)
+                         (end-angle f32)
+                         (start-point PathPoint)
+                         (end-point PathPoint)
+                         (tolerance f32)
+                         (depth i32)] (-> i64)
+  (let [middle-angle (* (+ start-angle end-angle) 0.5)
+        middle-point
+          (ellipse-point (load (field center x))
+                         (load (field center y))
+                         radius
+                         radius
+                         middle-angle)]
+    (if (or (>= depth 16) (point-line-flat? middle-point start-point end-point tolerance))
+        (do
+          (al/al-push! [PathPoint] (mut vertices) center)
+          (al/al-push! [PathPoint] (mut vertices) start-point)
+          (al/al-push! [PathPoint] (mut vertices) end-point))
+        (do
+          (append-round-fan! (mut vertices)
+                             center
+                             radius
+                             start-angle
+                             middle-angle
+                             start-point
+                             middle-point
+                             tolerance
+                             (+ depth 1))
+          (append-round-fan! (mut vertices)
+                             center
+                             radius
+                             middle-angle
+                             end-angle
+                             middle-point
+                             end-point
+                             tolerance
+                             (+ depth 1))))))
+
+;;; Tessellate a polyline with bounded miter joins and configurable end caps.
+(defn path-stroke-tessellate-cap [(path Path)
+                                  (width f32)
+                                  (miter-limit f32)
+                                  (cap i32)
+                                  (tolerance f32)] (-> Tessellation)
   (let [points (load (field path points))
         count (al/al-len [PathPoint] points)
         closed (load (field path closed))]
@@ -490,8 +557,25 @@
           (do
             (for [i 0 segment-count]
               (let [next (% (+ i 1) count)
-                    a (stroke-pair points i count closed half-width miter-limit)
-                    b (stroke-pair points next count closed half-width miter-limit)]
+                    raw-a (stroke-pair points i count closed half-width miter-limit)
+                    raw-b (stroke-pair points next count closed half-width miter-limit)
+                    segment-a (al/al-get [PathPoint] points i)
+                    segment-b (al/al-get [PathPoint] points next)
+                    dx (- (load (field segment-b x)) (load (field segment-a x)))
+                    dy (- (load (field segment-b y)) (load (field segment-a y)))
+                    length (sqrtf (+ (* dx dx) (* dy dy)))
+                    extend-a (and (not closed) (and (= cap (SquareCap)) (= i 0)))
+                    extend-b (and (not closed) (and (= cap (SquareCap)) (= next (- count 1))))
+                    a
+                      (if extend-a
+                          (translate-pair raw-a
+                                          (* (/ dx length) (- (primitive/cast f32 0.0) half-width))
+                                          (* (/ dy length) (- (primitive/cast f32 0.0) half-width)))
+                          (load raw-a))
+                    b
+                      (if extend-b
+                          (translate-pair raw-b (* (/ dx length) half-width) (* (/ dy length) half-width))
+                          (load raw-b))]
                 (if (and (load (field a valid)) (load (field b valid)))
                     (do
                       (al/al-push! [PathPoint] (mut vertices) (load (field a left)))
@@ -501,8 +585,69 @@
                       (al/al-push! [PathPoint] (mut vertices) (load (field a right)))
                       (al/al-push! [PathPoint] (mut vertices) (load (field b right))))
                     (store! valid false))))
+            (if (and (load valid) (and (not closed) (= cap (RoundCap))))
+                (let [first (al/al-get [PathPoint] points 0)
+                      second (al/al-get [PathPoint] points 1)
+                      before-last (al/al-get [PathPoint] points (- count 2))
+                      last (al/al-get [PathPoint] points (- count 1))
+                      start-angle
+                        (atan2f (- (load (field second y)) (load (field first y)))
+                                (- (load (field second x)) (load (field first x))))
+                      end-angle
+                        (atan2f (- (load (field last y)) (load (field before-last y)))
+                                (- (load (field last x)) (load (field before-last x))))
+                      half-pi (primitive/cast f32 1.5707963267948966)
+                      pi (primitive/cast f32 3.141592653589793)
+                      cap-tolerance (if (> tolerance 0.0) tolerance 0.25)
+                      start-left
+                        (ellipse-point (load (field first x))
+                                       (load (field first y))
+                                       half-width
+                                       half-width
+                                       (+ start-angle half-pi))
+                      start-right
+                        (ellipse-point (load (field first x))
+                                       (load (field first y))
+                                       half-width
+                                       half-width
+                                       (+ (+ start-angle half-pi) pi))
+                      end-right
+                        (ellipse-point (load (field last x))
+                                       (load (field last y))
+                                       half-width
+                                       half-width
+                                       (- end-angle half-pi))
+                      end-left
+                        (ellipse-point (load (field last x))
+                                       (load (field last y))
+                                       half-width
+                                       half-width
+                                       (+ end-angle half-pi))]
+                  (do
+                    (append-round-fan! (mut vertices)
+                                       first
+                                       half-width
+                                       (+ start-angle half-pi)
+                                       (+ (+ start-angle half-pi) pi)
+                                       start-left
+                                       start-right
+                                       cap-tolerance
+                                       0)
+                    (append-round-fan! (mut vertices)
+                                       last
+                                       half-width
+                                       (- end-angle half-pi)
+                                       (+ end-angle half-pi)
+                                       end-right
+                                       end-left
+                                       cap-tolerance
+                                       0)))
+                0)
             (if (not (load valid)) (al/al-clear! [PathPoint] (mut vertices)) 0)
             (Tessellation :vertices (load vertices) :valid (load valid)))))))
+
+(defn path-stroke-tessellate [(path Path) (width f32) (miter-limit f32)] (-> Tessellation)
+  (path-stroke-tessellate-cap path width miter-limit (ButtCap) 0.25))
 
 (defn tessellation-free! [(tessellation (mut Tessellation))] (-> i64)
   (al/al-free! [PathPoint] (mut (.vertices tessellation))))

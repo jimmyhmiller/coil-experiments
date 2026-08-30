@@ -24,8 +24,9 @@ layer in the runtime path.
   shared frame ring and filled by a clipped, affine Metal pipeline; invalid,
   degenerate, open, and self-intersecting paths fail atomically.
 - Adaptive quadratic and cubic Bézier flattening with caller-controlled geometric
-  tolerance, plus open/closed stroke tessellation with butt caps and bounded miter
-  joins. Stroke meshes reuse the ordered transformed/clipped Metal path pipeline.
+  tolerance, plus open/closed stroke tessellation with butt, square, or adaptively
+  rounded caps and bounded miter joins. Stroke meshes reuse the ordered
+  transformed/clipped Metal path pipeline.
 - Adaptive center-parameterized elliptical arcs with positive or negative sweeps,
   full-circle support, and the same caller-controlled geometric tolerance.
 - Batched analytic rounded-rectangle shadows with GPU-computed soft falloff,
@@ -181,7 +182,7 @@ application. GPUI parity still requires substantial systems, notably:
 - glyph-run extraction, editable text measurement, and atlas-page eviction
   (whole-label shaping, bounded atlas allocation, and GPU mask composition work now);
 - intrinsic text/image measurement (flex and constrained grid layout work);
-- endpoint-parameterized SVG arcs, round/square caps, bevel/round joins, dashes,
+- endpoint-parameterized SVG arcs, bevel/round joins, dashes,
   SVG parsing, and non-simple/multi-contour fill rules (adaptive quadratic/cubic
   curves and elliptical arcs, polygon
   fills, butt-cap/miter strokes, affine transforms, analytic shadows, linear
