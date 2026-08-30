@@ -33,6 +33,9 @@ layer in the runtime path.
 - Arbitrary alternating dash arrays with SVG-style odd-pattern repetition,
   positive or negative phase offsets, exact distance interpolation across
   polyline corners, and per-run configurable caps and joins.
+- Exact tessellated path bounds retained in scene records; the renderer applies
+  affine transforms and intersects nested clips plus the viewport before encoding,
+  skipping fully invisible path draw calls without disturbing paint order.
 - Adaptive center-parameterized elliptical arcs with positive or negative sweeps,
   full-circle support, and the same caller-controlled geometric tolerance.
 - Batched analytic rounded-rectangle shadows with GPU-computed soft falloff,
@@ -198,7 +201,7 @@ application. GPUI parity still requires substantial systems, notably:
   and accessibility (focus traversal and logical actions work);
 - retained entities, subscriptions, observation, async executor integration, assets,
   inspector support, deterministic UI tests, and multiple windows;
-- damage tracking, frame pacing, occlusion handling, multi-page texture-atlas eviction,
+- box/texture culling, damage tracking, frame pacing, occlusion handling, multi-page texture-atlas eviction,
   and GPU/CPU profiling.
 
 These are explicit missing capabilities, not features claimed by the prototype.
