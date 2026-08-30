@@ -1,0 +1,199 @@
+(module experiments.coil_gpui.profiler)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+(import "experiments.coil_gpui.ui" :as ui)
+
+(export FrameSample
+        FrameSummary
+        FrameProfiler
+        profiler-now-ns
+        frame-profiler-new
+        frame-profiler-record!
+        frame-profiler-count
+        frame-profiler-summary
+        frame-profiler-paint!
+        frame-profiler-free!)
+
+(defstruct Timespec [(sec i64) (nsec i64)])
+(extern clock_gettime :cc c [i32 (ptr Timespec)] (-> i32))
+
+(defstruct FrameSample
+  [(build-ns i64)
+   (render-ns i64)
+   (total-ns i64)
+   (primitives i64)
+   (path-draws i64)
+   (text-sprites i64)])
+
+(defstruct FrameSummary
+  [(count i64)
+   (latest-ns i64)
+   (average-ns i64)
+   (p50-ns i64)
+   (p95-ns i64)
+   (p99-ns i64)
+   (maximum-ns i64)
+   (average-build-ns i64)
+   (average-render-ns i64)])
+
+(defstruct FrameProfiler
+  [(samples (al/ArrayList FrameSample))
+   (scratch (al/ArrayList i64))
+   (capacity i64)
+   (cursor i64)
+   (count i64)])
+
+(defn profiler-now-ns [] (-> i64)
+  (let [value (primitive/alloc-stack Timespec)]
+    (if (= (clock_gettime (primitive/cast i32 6) value) 0)
+        (+ (* (load (field value sec)) 1000000000) (load (field value nsec)))
+        0)))
+
+(defn frame-profiler-new [(capacity i64)] (-> FrameProfiler)
+  (FrameProfiler
+    :samples (al/al-new [FrameSample] (alloc/malloc-allocator))
+    :scratch (al/al-new [i64] (alloc/malloc-allocator))
+    :capacity (if (> capacity 0) capacity 1)
+    :cursor 0
+    :count 0))
+
+(defn frame-profiler-record! [(profiler (mut FrameProfiler))
+                              (build-ns i64)
+                              (render-ns i64)
+                              (primitives i64)
+                              (path-draws i64)
+                              (text-sprites i64)] (-> i64)
+  (let [build (if (> build-ns 0) build-ns 0)
+        render (if (> render-ns 0) render-ns 0)
+        sample (FrameSample
+                 :build-ns build
+                 :render-ns render
+                 :total-ns (+ build render)
+                 :primitives primitives
+                 :path-draws path-draws
+                 :text-sprites text-sprites)
+        count (load (field profiler count))
+        capacity (load (field profiler capacity))]
+    (do
+      (if (< count capacity)
+          (do
+            (al/al-push! [FrameSample] (mut (.samples profiler)) sample)
+            (set! (.count profiler) (+ count 1)))
+          (do
+            (al/al-set! [FrameSample]
+                        (mut (.samples profiler))
+                        (load (field profiler cursor))
+                        sample)
+            (set! (.cursor profiler) (% (+ (load (field profiler cursor)) 1) capacity))))
+      (load (field profiler count)))))
+
+(defn frame-profiler-count [(profiler FrameProfiler)] (-> i64)
+  (load (field profiler count)))
+
+(defn sample-chronological [(profiler FrameProfiler) (index i64)] (-> FrameSample)
+  (let [count (load (field profiler count)) capacity (load (field profiler capacity))]
+    (if (< count capacity)
+        (al/al-get [FrameSample] (load (field profiler samples)) index)
+        (al/al-get [FrameSample]
+                   (load (field profiler samples))
+                   (% (+ (load (field profiler cursor)) index) capacity)))))
+
+(defn sort-i64! [(values (mut (al/ArrayList i64)))] (-> i64)
+  (do
+    (for [i 1 (al/al-len [i64] (load values))]
+      (let [value (al/al-get [i64] (load values) i) (mut slot) i]
+        (do
+          (while (and (> (load slot) 0)
+                      (> (al/al-get [i64] (load values) (- (load slot) 1)) value))
+            (do
+              (al/al-set! [i64] (mut values) (load slot)
+                          (al/al-get [i64] (load values) (- (load slot) 1)))
+              (store! slot (- (load slot) 1))))
+          (al/al-set! [i64] (mut values) (load slot) value))))
+    0))
+
+(defn percentile-index [(count i64) (numerator i64)] (-> i64)
+  (if (<= count 1) 0 (/ (* (- count 1) numerator) 100)))
+
+(defn frame-profiler-summary [(profiler (mut FrameProfiler))] (-> FrameSummary)
+  (let [count (load (field profiler count))
+        (mut total) (primitive/cast i64 0)
+        (mut build) (primitive/cast i64 0)
+        (mut render) (primitive/cast i64 0)
+        (mut maximum) (primitive/cast i64 0)]
+    (do
+      (al/al-clear! [i64] (mut (.scratch profiler)))
+      (for [i 0 count]
+        (let [sample (sample-chronological (load profiler) i)
+              elapsed (load (field sample total-ns))]
+          (do
+            (al/al-push! [i64] (mut (.scratch profiler)) elapsed)
+            (store! total (+ (load total) elapsed))
+            (store! build (+ (load build) (load (field sample build-ns))))
+            (store! render (+ (load render) (load (field sample render-ns))))
+            (if (> elapsed (load maximum)) (store! maximum elapsed) 0))))
+      (sort-i64! (mut (.scratch profiler)))
+      (if (= count 0)
+          (primitive/zeroed FrameSummary)
+          (let [latest (sample-chronological (load profiler) (- count 1))]
+            (FrameSummary
+              :count count
+              :latest-ns (load (field latest total-ns))
+              :average-ns (/ (load total) count)
+              :p50-ns (al/al-get [i64] (load (field profiler scratch))
+                                  (percentile-index count 50))
+              :p95-ns (al/al-get [i64] (load (field profiler scratch))
+                                  (percentile-index count 95))
+              :p99-ns (al/al-get [i64] (load (field profiler scratch))
+                                  (percentile-index count 99))
+              :maximum-ns (load maximum)
+              :average-build-ns (/ (load build) count)
+              :average-render-ns (/ (load render) count)))))))
+
+(defn clamp01 [(value f32)] (-> f32)
+  (if (< value 0.0) 0.0 (if (> value 1.0) 1.0 value)))
+
+;;; A compact GPU graph: cyan is scene build time, violet is renderer encoding,
+;;; and the horizontal budget marker is one 60 Hz frame (16.67 ms).
+(defn frame-profiler-paint! [(scene (mut ui/Scene))
+                            (profiler FrameProfiler)
+                            (bounds ui/Rect)
+                            (id i32)] (-> i64)
+  (let [count (load (field profiler count))]
+    (if (or (= count 0) (or (<= (load (field bounds w)) 0.0) (<= (load (field bounds h)) 0.0)))
+        0
+        (let [bar-width (/ (load (field bounds w)) (primitive/cast f32 count))
+              budget (primitive/cast f32 16666667.0)]
+          (do
+            (ui/scene-rounded-rect! (mut scene) bounds (ui/rgba 0.02 0.03 0.08 0.88)
+                                    4.0 0.0 (ui/rgba 0.0 0.0 0.0 0.0) id)
+            (for [i 0 count]
+              (let [sample (sample-chronological profiler i)
+                    total-ratio (clamp01 (/ (primitive/cast f32 (load (field sample total-ns))) budget))
+                    build-ratio (clamp01 (/ (primitive/cast f32 (load (field sample build-ns))) budget))
+                    total-height (* (load (field bounds h)) total-ratio)
+                    build-height (* (load (field bounds h)) build-ratio)
+                    render-height (- total-height build-height)
+                    x (+ (load (field bounds x)) (* (primitive/cast f32 i) bar-width))
+                    bottom (+ (load (field bounds y)) (load (field bounds h)))]
+                (do
+                  (ui/scene-rect! (mut scene)
+                                  (ui/rect x (- bottom build-height) bar-width build-height)
+                                  (ui/rgba 0.20 0.82 1.0 0.9)
+                                  (+ id 1))
+                  (ui/scene-rect! (mut scene)
+                                  (ui/rect x
+                                           (- (- bottom build-height) render-height)
+                                           bar-width
+                                           render-height)
+                                  (ui/rgba 0.72 0.42 1.0 0.9)
+                                  (+ id 2)))))
+            count)))))
+
+(defn frame-profiler-free! [(profiler (mut FrameProfiler))] (-> i64)
+  (do
+    (al/al-free! [i64] (mut (.scratch profiler)))
+    (al/al-free! [FrameSample] (mut (.samples profiler)))
+    (set! (.count profiler) 0)
+    0))

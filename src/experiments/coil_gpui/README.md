@@ -262,6 +262,14 @@ layer in the runtime path.
   semaphore, waking both active display pacing and the occluded fallback without
   exposing UI state across threads. The demo computes a checksum off-thread and
   paints its owner-thread completion as a GPU status badge.
+- Thread-safe scheduler telemetry snapshots expose worker activity, per-priority
+  queue depths, total queued work, queue high-water mark, running jobs, and
+  completed jobs without exposing mutable scheduler internals.
+- A bounded Coil-native rolling frame profiler records scene-build and CPU-side
+  Metal encoding/submission times at nanosecond resolution alongside primitive,
+  path, and text-sprite counts. It reports latest, mean, p50, p95, p99, and maximum
+  frame times, and the demo paints a live GPU-rendered history graph without
+  adding native views. GPU execution timestamps remain separate roadmap work.
 - Affine typed `Future<T>` handles retain reference-counted completion cores.
   Workers publish owned result pointers, owner-thread polling exposes readiness,
   `future-take!` transfers exact T ownership, and required destructors reclaim
@@ -273,8 +281,8 @@ layer in the runtime path.
   closure, and cooperatively cancel all remaining jobs before releasing their own
   storage. The demo owns its background checksum through such a scope.
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
-  batching, scheduler lifecycle, ABI, allocation-reuse, and deterministic Metal
-  pixel/event replay tests (100 total).
+  batching, scheduler lifecycle and telemetry, frame profiling, ABI,
+  allocation-reuse, and deterministic Metal pixel/event replay tests (110 total).
 
 ## Architecture
 
@@ -444,7 +452,7 @@ application. GPUI parity still requires substantial systems, notably:
 - worker-pool work stealing,
   non-image/remote asset sources,
   editable style inspection;
-- deeper GPU/CPU profiling.
+- Metal command-buffer GPU timestamps/counter sampling and exportable trace events.
 
 These are explicit missing capabilities, not features claimed by the prototype.
 

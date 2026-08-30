@@ -8,11 +8,13 @@
 (import "coil.time" :as time)
 
 (export Scheduler
+        SchedulerStats
         JobHandle
         TaskScope
         scheduler-new
         scheduler-new-with-workers
         scheduler-worker-count
+        scheduler-stats
         scheduler-set-wake!
         scheduler-dispatch!
         scheduler-at!
@@ -51,6 +53,16 @@
 
 (defstruct TaskScope [(handles (al/ArrayList JobHandle)) (closed bool)])
 
+(defstruct SchedulerStats
+  [(workers i64)
+   (active i64)
+   (queued-high i64)
+   (queued-medium i64)
+   (queued-low i64)
+   (queued-high-water i64)
+   (running i64)
+   (completed i64)])
+
 (const priority-high i64 0)
 
 (const priority-medium i64 1)
@@ -80,6 +92,12 @@
    (medium-tail (ptr BackgroundWork))
    (low-head (ptr BackgroundWork))
    (low-tail (ptr BackgroundWork))
+   (queued-high i64)
+   (queued-medium i64)
+   (queued-low i64)
+   (queued-high-water i64)
+   (running i64)
+   (completed i64)
    (service-ticket i64)
    (shutdown bool)
    (initialized bool)])
@@ -129,16 +147,19 @@
           (do
             (cond (= priority priority-high)
                     (do
+                      (store! (field pool queued-high) (- (load (field pool queued-high)) 1))
                       (store! (field pool high-head) next)
                       (when (= (primitive/cast i64 next) 0)
                         (store! (field pool high-tail) (null-work))))
                   (= priority priority-low)
                     (do
+                      (store! (field pool queued-low) (- (load (field pool queued-low)) 1))
                       (store! (field pool low-head) next)
                       (when (= (primitive/cast i64 next) 0)
                         (store! (field pool low-tail) (null-work))))
                   :else
                     (do
+                      (store! (field pool queued-medium) (- (load (field pool queued-medium)) 1))
                       (store! (field pool medium-head) next)
                       (when (= (primitive/cast i64 next) 0)
                         (store! (field pool medium-tail) (null-work)))))
@@ -199,10 +220,14 @@
                      (if (= (primitive/cast i64 work) 0)
                          (return-from :stopped (null-context))
                          (let [result
-                                 (primitive/call-ptr (load (field work worker))
-                                                     (load (field work worker-context))
-                                                     (field work cancel-requested))]
+                                 (do
+                                   (atomic/atomic-add (field pool running) 1)
+                                   (primitive/call-ptr (load (field work worker))
+                                                       (load (field work worker-context))
+                                                       (field work cancel-requested)))]
                            (do
+                             (atomic/atomic-sub (field pool running) 1)
+                             (atomic/atomic-add (field pool completed) 1)
                              (atomic/atomic-store (field work result) result)
                              (when (load (field work wake-enabled))
                                (primitive/call-ptr (load (field work wake))
@@ -220,22 +245,30 @@
               (let [priority (load (field work priority))]
                 (cond (= priority priority-high)
                         (do
+                          (set! (field pool queued-high) (+ (load (field pool queued-high)) 1))
                           (if (= (primitive/cast i64 (load (field pool high-tail))) 0)
                               (store! (field pool high-head) work)
                               (store! (field (load (field pool high-tail)) next) work))
                           (store! (field pool high-tail) work))
                       (= priority priority-low)
                         (do
+                          (set! (field pool queued-low) (+ (load (field pool queued-low)) 1))
                           (if (= (primitive/cast i64 (load (field pool low-tail))) 0)
                               (store! (field pool low-head) work)
                               (store! (field (load (field pool low-tail)) next) work))
                           (store! (field pool low-tail) work))
                       :else
                         (do
+                          (set! (field pool queued-medium) (+ (load (field pool queued-medium)) 1))
                           (if (= (primitive/cast i64 (load (field pool medium-tail))) 0)
                               (store! (field pool medium-head) work)
                               (store! (field (load (field pool medium-tail)) next) work))
                           (store! (field pool medium-tail) work))))
+              (let [queued (+ (load (field pool queued-high))
+                              (+ (load (field pool queued-medium))
+                                 (load (field pool queued-low))))]
+                (when (> queued (load (field pool queued-high-water)))
+                  (store! (field pool queued-high-water) queued)))
               (sync/condition-notify-one! (field pool available))
               (sync/mutex-unlock! (field pool mutex))
               true)))))
@@ -281,6 +314,31 @@
 
 (defn scheduler-worker-count [(scheduler Scheduler)] (-> i64)
   (al/al-len [thread/Thread] (load (field scheduler workers))))
+
+(defn scheduler-stats [(scheduler (mut Scheduler))] (-> SchedulerStats)
+  (let [pool (load (field scheduler pool))
+        (mut result) (primitive/zeroed SchedulerStats)]
+    (do
+      (store! result
+              (SchedulerStats
+                :workers (scheduler-worker-count (load scheduler))
+                :active (load (field scheduler active))
+                :queued-high 0 :queued-medium 0 :queued-low 0
+                :queued-high-water 0 :running 0 :completed 0))
+      (when (!= (primitive/cast i64 pool) 0)
+        (match (sync/mutex-lock! (field pool mutex))
+          (Err [_] 0)
+          (Ok [_]
+              (do
+                (set! (.queued-high result) (load (field pool queued-high)))
+                (set! (.queued-medium result) (load (field pool queued-medium)))
+                (set! (.queued-low result) (load (field pool queued-low)))
+                (set! (.queued-high-water result) (load (field pool queued-high-water)))
+                (sync/mutex-unlock! (field pool mutex))
+                0)))
+        (set! (.running result) (atomic/atomic-load (field pool running)))
+        (set! (.completed result) (atomic/atomic-load (field pool completed))))
+      (load result))))
 
 ;; The wake callback must be thread-safe: background workers call it only after
 ;; atomically publishing completion. A dispatch semaphore signal is an ideal UI
