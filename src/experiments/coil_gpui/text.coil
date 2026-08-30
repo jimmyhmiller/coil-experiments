@@ -24,6 +24,8 @@
         text-atlas-add!
         text-shape-line!
         text-truncate-line-end!
+        text-truncate-line-start!
+        text-truncate-line-middle!
         text-shape-paragraph!
         shaped-line-free!
         shaped-paragraph-free!
@@ -759,10 +761,11 @@
 ;;; and appending a cached ellipsis when the requested width is exceeded. The
 ;;; source line remains untouched so width-dependent layout probes cannot poison
 ;;; retained shaping state.
-(defn text-truncate-line-end! [(atlas (mut TextAtlas))
+(defn truncate-line-end-impl! [(atlas (mut TextAtlas))
                                (line ShapedLine)
                                (font-size f64)
-                               (max-width f32)] (-> ShapedLine)
+                               (max-width f32)
+                               (force-ellipsis bool)] (-> ShapedLine)
   (let [(mut result) (invalid-shaped-line)
         limit (if (< max-width 0.0) 0.0 max-width)
         source-glyphs (load (field line glyphs))]
@@ -772,7 +775,7 @@
       (set! (.length result) (load (field line length)))
       (set! (.valid result) (load (field line valid)))
       (if (or (not (load (field line valid)))
-              (<= (load (field line width)) limit))
+              (and (not force-ellipsis) (<= (load (field line width)) limit)))
           (do
             (for [i 0 (al/al-len [ShapedGlyph] source-glyphs)]
               (al/al-push! [ShapedGlyph]
@@ -815,6 +818,169 @@
                   (set! (.descent result) (load (field suffix descent)))
                   0)
               (shaped-line-free! (mut suffix)))))
+      (load result))))
+
+(defn text-truncate-line-end! [(atlas (mut TextAtlas))
+                               (line ShapedLine)
+                               (font-size f64)
+                               (max-width f32)] (-> ShapedLine)
+  (truncate-line-end-impl! (mut atlas) line font-size max-width false))
+
+;;; Preserve the end of an overflowing shaped line, placing the ellipsis at x=0.
+;;; This is useful for paths and identifiers whose distinguishing suffix matters.
+(defn text-truncate-line-start! [(atlas (mut TextAtlas))
+                                 (line ShapedLine)
+                                 (font-size f64)
+                                 (max-width f32)] (-> ShapedLine)
+  (let [(mut result) (invalid-shaped-line)
+        limit (if (< max-width 0.0) 0.0 max-width)
+        source-glyphs (load (field line glyphs))]
+    (do
+      (set! (.ascent result) (load (field line ascent)))
+      (set! (.descent result) (load (field line descent)))
+      (set! (.length result) (load (field line length)))
+      (set! (.valid result) (load (field line valid)))
+      (if (or (not (load (field line valid)))
+              (<= (load (field line width)) limit))
+          (do
+            (for [i 0 (al/al-len [ShapedGlyph] source-glyphs)]
+              (al/al-push! [ShapedGlyph]
+                           (mut (.glyphs result))
+                           (load (primitive/index (load (field source-glyphs data)) i))))
+            (set! (.width result) (load (field line width))))
+          (let [(mut ellipsis) (text-shape-line! (mut atlas) c"…" font-size)
+                ellipsis-width (load (field ellipsis width))
+                available (if (> limit ellipsis-width) (- limit ellipsis-width) 0.0)
+                count (al/al-len [ShapedGlyph] source-glyphs)
+                (mut first) count
+                (mut tail-width) (primitive/cast f32 0.0)]
+            (do
+              (for [offset 0 count]
+                (let [index (- (- count 1) offset)
+                      glyph (primitive/index (load (field source-glyphs data)) index)
+                      candidate (- (load (field line width)) (load (field glyph pen-x)))]
+                  (if (<= candidate available)
+                      (do (store! first index) (store! tail-width candidate))
+                      0)))
+              (if (and (load (field ellipsis valid)) (<= ellipsis-width limit))
+                  (let [ellipsis-glyphs (load (field ellipsis glyphs))]
+                    (for [i 0 (al/al-len [ShapedGlyph] ellipsis-glyphs)]
+                      (let [(mut glyph)
+                              (load (primitive/index (load (field ellipsis-glyphs data)) i))]
+                        (do
+                          (set! (.string-index glyph) 0)
+                          (al/al-push! [ShapedGlyph] (mut (.glyphs result)) (load glyph))))))
+                  0)
+              (if (< (load first) count)
+                  (let [origin
+                          (load (field (primitive/index (load (field source-glyphs data))
+                                                        (load first))
+                                       pen-x))]
+                    (for [i (load first) count]
+                      (let [(mut glyph)
+                              (load (primitive/index (load (field source-glyphs data)) i))]
+                        (do
+                          (set! (.x glyph) (+ ellipsis-width (- (load (field glyph x)) origin)))
+                          (set! (.pen-x glyph)
+                                (+ ellipsis-width (- (load (field glyph pen-x)) origin)))
+                          (al/al-push! [ShapedGlyph] (mut (.glyphs result)) (load glyph))))))
+                  0)
+              (set! (.width result)
+                    (if (and (load (field ellipsis valid)) (<= ellipsis-width limit))
+                        (+ ellipsis-width (load tail-width))
+                        0.0))
+              (shaped-line-free! (mut ellipsis)))))
+      (load result))))
+
+;;; Preserve both ends of an overflowing line. Space after the ellipsis is
+;;; offered to the suffix after reserving half of the available content width
+;;; for the prefix; selections always contain whole CoreText-shaped glyphs.
+(defn text-truncate-line-middle! [(atlas (mut TextAtlas))
+                                  (line ShapedLine)
+                                  (font-size f64)
+                                  (max-width f32)] (-> ShapedLine)
+  (let [(mut result) (invalid-shaped-line)
+        limit (if (< max-width 0.0) 0.0 max-width)
+        source-glyphs (load (field line glyphs))]
+    (do
+      (set! (.ascent result) (load (field line ascent)))
+      (set! (.descent result) (load (field line descent)))
+      (set! (.length result) (load (field line length)))
+      (set! (.valid result) (load (field line valid)))
+      (if (or (not (load (field line valid)))
+              (<= (load (field line width)) limit))
+          (do
+            (for [i 0 (al/al-len [ShapedGlyph] source-glyphs)]
+              (al/al-push! [ShapedGlyph]
+                           (mut (.glyphs result))
+                           (load (primitive/index (load (field source-glyphs data)) i))))
+            (set! (.width result) (load (field line width))))
+          (let [(mut ellipsis) (text-shape-line! (mut atlas) c"…" font-size)
+                ellipsis-width (load (field ellipsis width))
+                available (if (> limit ellipsis-width) (- limit ellipsis-width) 0.0)
+                prefix-limit (* available (primitive/cast f32 0.5))
+                count (al/al-len [ShapedGlyph] source-glyphs)
+                (mut prefix-count) 0
+                (mut prefix-width) (primitive/cast f32 0.0)
+                (mut suffix-first) count
+                (mut suffix-width) (primitive/cast f32 0.0)]
+            (do
+              (for [i 0 count]
+                (let [glyph (primitive/index (load (field source-glyphs data)) i)
+                      edge (+ (load (field glyph pen-x)) (load (field glyph advance)))]
+                  (if (<= edge prefix-limit)
+                      (do (store! prefix-count (+ i 1)) (store! prefix-width edge))
+                      0)))
+              (for [offset 0 count]
+                (let [index (- (- count 1) offset)
+                      glyph (primitive/index (load (field source-glyphs data)) index)
+                      candidate (- (load (field line width)) (load (field glyph pen-x)))]
+                  (if (and (>= index (load prefix-count))
+                           (<= candidate (- available (load prefix-width))))
+                      (do (store! suffix-first index) (store! suffix-width candidate))
+                      0)))
+              (for [i 0 (load prefix-count)]
+                (al/al-push! [ShapedGlyph]
+                             (mut (.glyphs result))
+                             (load (primitive/index (load (field source-glyphs data)) i))))
+              (if (and (load (field ellipsis valid)) (<= ellipsis-width limit))
+                  (let [ellipsis-glyphs (load (field ellipsis glyphs))]
+                    (for [i 0 (al/al-len [ShapedGlyph] ellipsis-glyphs)]
+                      (let [(mut glyph)
+                              (load (primitive/index (load (field ellipsis-glyphs data)) i))]
+                        (do
+                          (set! (.x glyph) (+ (load prefix-width) (load (field glyph x))))
+                          (set! (.pen-x glyph)
+                                (+ (load prefix-width) (load (field glyph pen-x))))
+                          (set! (.string-index glyph)
+                                (if (< (load prefix-count) count)
+                                    (load (field (primitive/index
+                                                  (load (field source-glyphs data))
+                                                  (load prefix-count))
+                                                 string-index))
+                                    (load (field line length))))
+                          (al/al-push! [ShapedGlyph] (mut (.glyphs result)) (load glyph))))))
+                  0)
+              (if (< (load suffix-first) count)
+                  (let [origin
+                          (load (field (primitive/index (load (field source-glyphs data))
+                                                        (load suffix-first))
+                                       pen-x))
+                        destination (+ (load prefix-width) ellipsis-width)]
+                    (for [i (load suffix-first) count]
+                      (let [(mut glyph)
+                              (load (primitive/index (load (field source-glyphs data)) i))]
+                        (do
+                          (set! (.x glyph) (+ destination (- (load (field glyph x)) origin)))
+                          (set! (.pen-x glyph)
+                                (+ destination (- (load (field glyph pen-x)) origin)))
+                          (al/al-push! [ShapedGlyph] (mut (.glyphs result)) (load glyph))))))
+                  0)
+              (set! (.width result)
+                    (if (and (load (field ellipsis valid)) (<= ellipsis-width limit))
+                        (+ (+ (load prefix-width) ellipsis-width) (load suffix-width))
+                        0.0))
+              (shaped-line-free! (mut ellipsis)))))
       (load result))))
 
 (defn push-paragraph-line! [(paragraph (mut ShapedParagraph))
@@ -945,6 +1111,28 @@
                                                     byte-content-end
                                                     byte-end))
                             (store! start end))))))
+              ;; A positive line clamp represents hidden remaining content with
+              ;; an ellipsis on the final visible line. Replacing the owned line
+              ;; avoids mutating either CoreText state or a reusable source shape.
+              (if (and (> max-lines 0)
+                       (< (load start) utf16-length)
+                       (> (al/al-len [ParagraphLine] (load (field paragraph lines))) 0))
+                  (let [lines (load (field paragraph lines))
+                        last
+                          (primitive/index
+                            (load (field lines data))
+                            (- (al/al-len [ParagraphLine] lines) 1))
+                        (mut replacement)
+                          (truncate-line-end-impl! (mut atlas)
+                                                   (load (field last line))
+                                                   font-size
+                                                   width
+                                                   true)]
+                    (do
+                      (shaped-line-free! (mut (field last line)))
+                      (store! (field last line) (load replacement))
+                      (store! (field last byte-end) (load (field paragraph length)))))
+                  0)
               (store! (field paragraph height)
                       (* effective-line-height
                          (primitive/cast f32

@@ -62,10 +62,12 @@ layer in the runtime path.
   positions, advances, and source cluster indices. Individual glyph rasters are
   cached by font, glyph ID, and 4x2 subpixel variant, then colored and composited
   as ordered Metal atlas sprites.
-- Width-dependent single-line end truncation copies complete shaped glyphs and
-  appends a cached Unicode ellipsis. Each result owns its glyph list and leaves
-  the source shape immutable, so transient zero-width layout probes cannot make
-  later wider renders permanently collapse to an ellipsis.
+- Width-dependent single-line end, start, and middle truncation copies complete
+  shaped glyphs and inserts a cached Unicode ellipsis while preserving the
+  requested portions of the line. Each result owns its glyph list and leaves the
+  source shape immutable, so transient zero-width layout probes cannot make later
+  wider renders permanently collapse to an ellipsis. Multi-line clamps ellipsize
+  the final visible line and retain logical mapping through hidden paragraph text.
 - Bounded shared text-atlas pages with padded shelf allocation, normalized UV
   regions, explicit overflow, borrowed label handles, and retained per-glyph cache
   entries. Whole-label and shaped-glyph sprites share the same Metal batching path.
@@ -323,8 +325,7 @@ the queue and its synchronization objects.
 The current milestone proves the complete Coil-to-Metal path and a real component
 application. GPUI parity still requires substantial systems, notably:
 
-- grapheme-aware navigation, multi-line clamp/ellipsis, start and middle
-  truncation, richer shaped-layout
+- grapheme-aware navigation and richer shaped-layout
   caching, and atlas-page eviction (editable selection/caret measurement,
   UTF-8/CoreText cluster conversion, glyph-run extraction, subpixel glyph caching,
   bounded atlas allocation, and GPU mask composition work now);
