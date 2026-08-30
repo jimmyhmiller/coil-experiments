@@ -7,10 +7,25 @@
 (import "experiments.coil_gpui.layout" :as layout)
 (import "experiments.coil_gpui.grid" :as grid)
 (import "experiments.coil_gpui.input" :as input)
+(import "experiments.coil_gpui.keymap" :as keymap)
 (import "experiments.coil_gpui.scroll" :as scroll)
 (import "experiments.coil_gpui.variable_scroll" :as variable)
 (import "experiments.coil_gpui.text" :as text)
 (import "experiments.coil_gpui.path" :as path)
+
+(defn test-keystroke-push! [(strokes (mut (al/ArrayList keymap/KeyStroke)))
+                            (key i64)
+                            (modifiers i32)] (-> i64)
+  (let [(mut zero) (primitive/zeroed keymap/KeyStroke)]
+    (do
+      (al/al-push! [keymap/KeyStroke] (mut strokes) (load zero))
+      (let [item
+              (primitive/index (load (field strokes data))
+                               (- (al/al-len [keymap/KeyStroke] (load strokes)) 1))]
+        (do
+          (store! (field item key) key)
+          (store! (field item modifiers) modifiers)
+          (al/al-len [keymap/KeyStroke] (load strokes)))))))
 
 (deftest metal-buffer-capacity-grows-by-powers-of-two
          (assert-eq (metal/next-buffer-capacity 0 1) 65536)
@@ -901,6 +916,133 @@
              (input/dispatch-plan-free! (mut plan)))
            (input/listener-registry-free! (mut registry))
            (scene-free! (mut scene))))
+
+(deftest keymap-prefers-deepest-context-then-latest-binding
+         (let [(mut map) (keymap/keymap-new)
+               (mut contexts) (al/al-new [i32] (alloc/malloc-allocator))]
+           (keymap/keymap-bind! (mut map) 15 8 -1 100)
+           (keymap/keymap-bind! (mut map) 15 8 10 200)
+           (keymap/keymap-bind! (mut map) 15 8 20 300)
+           (keymap/keymap-bind! (mut map) 15 8 20 301)
+           (al/al-push! [i32] (mut contexts) 10)
+           (al/al-push! [i32] (mut contexts) 20)
+           (let [(mut input-strokes) (al/al-new [keymap/KeyStroke] (alloc/malloc-allocator))]
+             (test-keystroke-push! (mut input-strokes) 15 8)
+             (let [resolution
+                     (keymap/keymap-resolve map
+                                            (load (field input-strokes data))
+                                            1
+                                            (load (field contexts data))
+                                            2)]
+               (assert (load (field resolution matched)))
+               (assert-eq (load (field resolution action)) 301)
+               (assert-eq (load (field resolution depth)) 2)
+               (assert (not (load (field resolution pending)))))
+             (al/al-free! [keymap/KeyStroke] (mut input-strokes)))
+           (assert-eq (keymap/keymap-version map) 4)
+           (al/al-free! [i32] (mut contexts))
+           (keymap/keymap-free! (mut map))))
+
+(deftest keymap-disabled-binding-shadows-weaker-context
+         (let [(mut map) (keymap/keymap-new)
+               (mut contexts) (al/al-new [i32] (alloc/malloc-allocator))
+               (mut input-strokes) (al/al-new [keymap/KeyStroke] (alloc/malloc-allocator))]
+           (keymap/keymap-bind! (mut map) 48 0 -1 100)
+           (keymap/keymap-disable! (mut map) 48 0 20)
+           (al/al-push! [i32] (mut contexts) 10)
+           (al/al-push! [i32] (mut contexts) 20)
+           (test-keystroke-push! (mut input-strokes) 48 0)
+           (let [resolution
+                   (keymap/keymap-resolve map
+                                          (load (field input-strokes data))
+                                          1
+                                          (load (field contexts data))
+                                          2)]
+             (assert (not (load (field resolution matched))))
+             (assert-eq (load (field resolution depth)) 2)
+             (assert-eq (load (field resolution binding-index)) 1))
+           (al/al-free! [keymap/KeyStroke] (mut input-strokes))
+           (al/al-free! [i32] (mut contexts))
+           (keymap/keymap-free! (mut map))))
+
+(deftest keymap-multi-stroke-prefix-reports-pending-then-matches
+         (let [(mut map) (keymap/keymap-new)
+               (mut sequence) (al/al-new [keymap/KeyStroke] (alloc/malloc-allocator))]
+           (test-keystroke-push! (mut sequence) 7 8)
+           (test-keystroke-push! (mut sequence) 13 0)
+           (keymap/keymap-bind-sequence! (mut map)
+                                         (load (field sequence data))
+                                         2
+                                         -1
+                                         700)
+           (let [prefix
+                   (keymap/keymap-resolve map
+                                          (load (field sequence data))
+                                          1
+                                          (primitive/cast (ptr i32) 0)
+                                          0)
+                 exact
+                   (keymap/keymap-resolve map
+                                          (load (field sequence data))
+                                          2
+                                          (primitive/cast (ptr i32) 0)
+                                          0)]
+             (assert (not (load (field prefix matched))))
+             (assert (load (field prefix pending)))
+             (assert (load (field exact matched)))
+             (assert-eq (load (field exact action)) 700)
+             (assert (not (load (field exact pending)))))
+           (al/al-free! [keymap/KeyStroke] (mut sequence))
+           (keymap/keymap-free! (mut map))))
+
+(deftest key-dispatcher-retains-chords-and-retries-failed-final-keys
+         (let [(mut map) (keymap/keymap-new)
+               (mut dispatcher) (keymap/key-dispatcher-new)
+               (mut sequence) (al/al-new [keymap/KeyStroke] (alloc/malloc-allocator))]
+           (test-keystroke-push! (mut sequence) 7 (primitive/cast i32 keymap/modifier-command))
+           (test-keystroke-push! (mut sequence) 13 0)
+           (keymap/keymap-bind-sequence! (mut map)
+                                         (load (field sequence data))
+                                         2
+                                         -1
+                                         700)
+           (keymap/keymap-bind! (mut map) 14 0 -1 800)
+           (let [prefix
+                   (keymap/key-dispatcher-push! (mut dispatcher)
+                                                map
+                                                7
+                                                (primitive/cast i32 keymap/modifier-command)
+                                                (primitive/cast (ptr i32) 0)
+                                                0)]
+             (assert (load (field prefix pending)))
+             (assert (not (load (field prefix matched)))))
+           (let [exact
+                   (keymap/key-dispatcher-push! (mut dispatcher)
+                                                map
+                                                13
+                                                0
+                                                (primitive/cast (ptr i32) 0)
+                                                0)]
+             (assert (load (field exact matched)))
+             (assert-eq (load (field exact action)) 700))
+           (keymap/key-dispatcher-push! (mut dispatcher)
+                                        map
+                                        7
+                                        (primitive/cast i32 keymap/modifier-command)
+                                        (primitive/cast (ptr i32) 0)
+                                        0)
+           (let [retried
+                   (keymap/key-dispatcher-push! (mut dispatcher)
+                                                map
+                                                14
+                                                0
+                                                (primitive/cast (ptr i32) 0)
+                                                0)]
+             (assert (load (field retried matched)))
+             (assert-eq (load (field retried action)) 800))
+           (al/al-free! [keymap/KeyStroke] (mut sequence))
+           (keymap/key-dispatcher-free! (mut dispatcher))
+           (keymap/keymap-free! (mut map))))
 
 (deftest focus-and-actions-survive-transient-scenes
          (let [(mut scene) (scene-new)

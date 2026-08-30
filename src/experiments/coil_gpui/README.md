@@ -72,6 +72,9 @@ layer in the runtime path.
 - Hierarchical event paths with capture, target, and bubble phases; listener
   registration order is stable and an owned dispatch cursor supports immediate
   stop-propagation and default-action prevention as independent controls.
+- Configurable keymaps with platform-independent modifiers, multi-stroke chords,
+  global and stacked component contexts, deepest-context and latest-binding
+  precedence, explicit disabled bindings, versioning, and failed-prefix retry.
 - Uniform and variable-height virtual lists with retained pixel offsets, bounded
   overscan, exact visible ranges, viewport clipping, wheel input, and stable GPU
   scrollbars. Variable lists use a Fenwick prefix-sum index for logarithmic
@@ -208,7 +211,7 @@ application. GPUI parity still requires substantial systems, notably:
   fills, butt-cap/miter strokes, affine transforms, analytic shadows, linear
   gradients, general raster images, virtual scrolling, and nested rectangular
   GPU clipping work);
-- configurable keymaps, IME, drag/drop, and accessibility
+- keymap predicate expressions and source metadata, IME, drag/drop, and accessibility
   (hierarchical capture/target/bubble listeners with stop-propagation, focus
   traversal, and logical actions work);
 - retained entities, subscriptions, observation, async executor integration, assets,
@@ -223,6 +226,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI README](https://github.com/zed-industries/zed/blob/main/crates/gpui/README.md)
 - [GPUI element lifecycle](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/element.rs)
 - [GPUI key dispatch](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/key_dispatch.rs)
+- [GPUI keymap precedence and matching](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/keymap.rs)
 - [GPUI window, focus, and hitbox model](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/window.rs)
 - [GPUI list example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/list_example.rs)
 - [GPUI responsive grid example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/grid_layout.rs)
