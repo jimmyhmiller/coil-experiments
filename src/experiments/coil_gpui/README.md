@@ -269,7 +269,13 @@ layer in the runtime path.
   Metal encoding/submission times at nanosecond resolution alongside primitive,
   path, and text-sprite counts. It reports latest, mean, p50, p95, p99, and maximum
   frame times, and the demo paints a live GPU-rendered history graph without
-  adding native views. GPU execution timestamps remain separate roadmap work.
+  adding native views.
+- Non-blocking Metal command-buffer telemetry retains at most four in-flight
+  buffers, polls completion on the owner thread, and harvests `GPUStartTime` and
+  `GPUEndTime` without stalling presentation. It reports completed and pending
+  buffers, timestamp samples, dropped samples, command errors, and latest/mean/max
+  GPU execution duration. The live graph overlays GPU duration in green because
+  it can execute concurrently with CPU scene construction and command encoding.
 - Affine typed `Future<T>` handles retain reference-counted completion cores.
   Workers publish owned result pointers, owner-thread polling exposes readiness,
   `future-take!` transfers exact T ownership, and required destructors reclaim
@@ -452,7 +458,7 @@ application. GPUI parity still requires substantial systems, notably:
 - worker-pool work stealing,
   non-image/remote asset sources,
   editable style inspection;
-- Metal command-buffer GPU timestamps/counter sampling and exportable trace events.
+- Metal counter-sample buffers and exportable trace events.
 
 These are explicit missing capabilities, not features claimed by the prototype.
 
@@ -462,7 +468,6 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI element lifecycle](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/element.rs)
 - [GPUI image intrinsic render sizing](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/assets.rs)
 - [GPUI key dispatch](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/key_dispatch.rs)
-- [GPUI keymap precedence and matching](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/keymap.rs)
 - [GPUI key-context predicate language](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/keymap/context.rs)
 - [GPUI binding metadata indirection](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/keymap/binding.rs)
 - [GPUI typed tasks and priority spawning](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/executor.rs)
@@ -495,5 +500,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [Apple accessible text range geometry](https://developer.apple.com/documentation/appkit/nsaccessibilitynavigablestatictext/accessibilityframe(for:))
 - [Apple MTLRenderCommandEncoder documentation](https://developer.apple.com/documentation/metal/mtlrendercommandencoder)
 - [Apple MTLBlitCommandEncoder documentation](https://developer.apple.com/documentation/metal/mtlblitcommandencoder)
+- [Apple MTLCommandBuffer GPU start time](https://developer.apple.com/documentation/metal/mtlcommandbuffer/gpustarttime)
+- [Apple MTLCommandBuffer GPU end time](https://developer.apple.com/documentation/metal/mtlcommandbuffer/gpuendtime)
 - [Apple CTRun documentation](https://developer.apple.com/documentation/coretext/ctrun)
 - [Apple ImageIO documentation](https://developer.apple.com/documentation/imageio)

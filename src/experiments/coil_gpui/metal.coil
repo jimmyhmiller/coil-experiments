@@ -6,12 +6,15 @@
 (import "coil.primitive" :as primitive)
 
 (export Renderer
+        GpuTiming
         PixelBuffer
         renderer-new
         renderer-resize!
         renderer-draw!
         renderer-draw-damage!
         renderer-render-offscreen!
+        renderer-poll-gpu-timing!
+        renderer-gpu-timing
         pixel-buffer-valid?
         pixel-buffer-byte
         pixel-buffer-free!
@@ -48,6 +51,16 @@
   [(buffer (ptr i8)) (bytes (ptr u8))
    (width i64) (height i64) (row-bytes i64)])
 
+(defstruct GpuTiming
+  [(completed i64)
+   (samples i64)
+   (pending i64)
+   (dropped i64)
+   (errors i64)
+   (latest-ns i64)
+   (average-ns i64)
+   (maximum-ns i64)])
+
 (defstruct Renderer
   [(device (ptr i8))
    (queue (ptr i8))
@@ -71,7 +84,18 @@
    (height f32)
    (scale f32)
    (frames i64)
-   (draw-calls i64)])
+   (draw-calls i64)
+   (gpu-command-0 (ptr i8))
+   (gpu-command-1 (ptr i8))
+   (gpu-command-2 (ptr i8))
+   (gpu-command-3 (ptr i8))
+   (gpu-completed i64)
+   (gpu-samples i64)
+   (gpu-total-ns i64)
+   (gpu-latest-ns i64)
+   (gpu-maximum-ns i64)
+   (gpu-dropped i64)
+   (gpu-errors i64)])
 
 (defstruct PathUniform
   [(color ui/Color) (clip ui/Rect) (transform ui/Affine) (opacity f32) (padding i32)])
@@ -502,6 +526,84 @@
                               (primitive/cast i64 (* height scale)))
     0))
 
+;;; Metal timestamps become valid only after a command buffer completes. Keep a
+;;; small retained in-flight set and poll it from the owner thread so normal
+;;; presentation never waits for the GPU merely to collect diagnostics.
+(defn renderer-harvest-gpu-command! [(renderer (mut Renderer))
+                                     (command (ptr i8))] (-> bool)
+  (if (= (primitive/cast i64 command) 0)
+      false
+      (let [status (msg i64 command (sel c"status") [])]
+        (if (< status 4)
+            false
+            (let [start (msg f64 command (sel c"GPUStartTime") [])
+                  finish (msg f64 command (sel c"GPUEndTime") [])]
+              (do
+                (set! (.gpu-completed renderer) (+ (load (field renderer gpu-completed)) 1))
+                (when (= status 5)
+                  (set! (.gpu-errors renderer) (+ (load (field renderer gpu-errors)) 1)))
+                (when (> finish start)
+                  (let [elapsed (primitive/cast i64 (* (- finish start) 1000000000.0))]
+                    (do
+                      (set! (.gpu-samples renderer) (+ (load (field renderer gpu-samples)) 1))
+                      (set! (.gpu-total-ns renderer) (+ (load (field renderer gpu-total-ns)) elapsed))
+                      (set! (.gpu-latest-ns renderer) elapsed)
+                      (when (> elapsed (load (field renderer gpu-maximum-ns)))
+                        (set! (.gpu-maximum-ns renderer) elapsed)))))
+                (release-object! command)
+                true))))))
+
+(defn renderer-poll-gpu-timing! [(renderer (mut Renderer))] (-> i64)
+  (let [(mut harvested) 0]
+    (do
+      (when (renderer-harvest-gpu-command! (mut renderer) (load (field renderer gpu-command-0)))
+        (do (set! (.gpu-command-0 renderer) (primitive/cast (ptr i8) 0))
+            (store! harvested (+ (load harvested) 1))))
+      (when (renderer-harvest-gpu-command! (mut renderer) (load (field renderer gpu-command-1)))
+        (do (set! (.gpu-command-1 renderer) (primitive/cast (ptr i8) 0))
+            (store! harvested (+ (load harvested) 1))))
+      (when (renderer-harvest-gpu-command! (mut renderer) (load (field renderer gpu-command-2)))
+        (do (set! (.gpu-command-2 renderer) (primitive/cast (ptr i8) 0))
+            (store! harvested (+ (load harvested) 1))))
+      (when (renderer-harvest-gpu-command! (mut renderer) (load (field renderer gpu-command-3)))
+        (do (set! (.gpu-command-3 renderer) (primitive/cast (ptr i8) 0))
+            (store! harvested (+ (load harvested) 1))))
+      (load harvested))))
+
+(defn renderer-track-gpu-command! [(renderer (mut Renderer)) (command (ptr i8))] (-> bool)
+  (do
+    (renderer-poll-gpu-timing! (mut renderer))
+    (let [retained (msg (ptr i8) command (sel c"retain") [])]
+      (cond (= (primitive/cast i64 (load (field renderer gpu-command-0))) 0)
+              (do (set! (.gpu-command-0 renderer) retained) true)
+            (= (primitive/cast i64 (load (field renderer gpu-command-1))) 0)
+              (do (set! (.gpu-command-1 renderer) retained) true)
+            (= (primitive/cast i64 (load (field renderer gpu-command-2))) 0)
+              (do (set! (.gpu-command-2 renderer) retained) true)
+            (= (primitive/cast i64 (load (field renderer gpu-command-3))) 0)
+              (do (set! (.gpu-command-3 renderer) retained) true)
+            :else
+              (do
+                (release-object! retained)
+                (set! (.gpu-dropped renderer) (+ (load (field renderer gpu-dropped)) 1))
+                false)))))
+
+(defn renderer-gpu-timing [(renderer Renderer)] (-> GpuTiming)
+  (let [samples (load (field renderer gpu-samples))
+        pending (+ (if (!= (primitive/cast i64 (load (field renderer gpu-command-0))) 0) 1 0)
+                   (+ (if (!= (primitive/cast i64 (load (field renderer gpu-command-1))) 0) 1 0)
+                      (+ (if (!= (primitive/cast i64 (load (field renderer gpu-command-2))) 0) 1 0)
+                         (if (!= (primitive/cast i64 (load (field renderer gpu-command-3))) 0) 1 0))))]
+    (GpuTiming
+      :completed (load (field renderer gpu-completed))
+      :samples samples
+      :pending pending
+      :dropped (load (field renderer gpu-dropped))
+      :errors (load (field renderer gpu-errors))
+      :latest-ns (load (field renderer gpu-latest-ns))
+      :average-ns (if (> samples 0) (/ (load (field renderer gpu-total-ns)) samples) 0)
+      :maximum-ns (load (field renderer gpu-maximum-ns)))))
+
 (defn renderer-draw-damage-internal! [(renderer (mut Renderer))
                                       (scene ui/Scene)
                                       (damage ui/DamageRegion)
@@ -879,6 +981,7 @@
                               (msg i64 command (sel c"presentDrawable:") [(ptr i8)] drawable)
                               0)
                           (msg i64 command (sel c"commit") [])
+                          (renderer-track-gpu-command! (mut renderer) command)
                           (set! (.frames renderer) (+ (load (field renderer frames)) 1))
                           (set! (.backing-valid renderer) true)
                           (set! (.draw-calls renderer)
@@ -929,6 +1032,7 @@
                 (msg i64 blit (sel c"endEncoding") [])
                 (msg i64 command (sel c"commit") [])
                 (msg i64 command (sel c"waitUntilCompleted") [])
+                (renderer-poll-gpu-timing! (mut renderer))
                 (set! (.buffer result) buffer)
                 (set! (.bytes result) (primitive/cast (ptr u8)
                                       (msg (ptr i8) buffer (sel c"contents") [])))
@@ -971,6 +1075,10 @@
 
 (defn renderer-free! [(renderer (mut Renderer))] (-> i64)
   (do
+    (release-object! (load (field renderer gpu-command-0)))
+    (release-object! (load (field renderer gpu-command-1)))
+    (release-object! (load (field renderer gpu-command-2)))
+    (release-object! (load (field renderer gpu-command-3)))
     (release-object! (load (field renderer primitive-buffer-0)))
     (release-object! (load (field renderer primitive-buffer-1)))
     (release-object! (load (field renderer primitive-buffer-2)))
@@ -996,4 +1104,8 @@
     (set! (.grayscale-image-pipeline renderer) (primitive/cast (ptr i8) 0))
     (set! (.presentation-pipeline renderer) (primitive/cast (ptr i8) 0))
     (set! (.queue renderer) (primitive/cast (ptr i8) 0))
+    (set! (.gpu-command-0 renderer) (primitive/cast (ptr i8) 0))
+    (set! (.gpu-command-1 renderer) (primitive/cast (ptr i8) 0))
+    (set! (.gpu-command-2 renderer) (primitive/cast (ptr i8) 0))
+    (set! (.gpu-command-3 renderer) (primitive/cast (ptr i8) 0))
     0))
