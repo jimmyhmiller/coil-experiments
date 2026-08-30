@@ -15,6 +15,8 @@ layer in the runtime path.
 - GPU-expanded quads, antialiased rounded rectangles, borders, and alpha blending.
 - Native Unicode shaping/rasterization through AppKit's CoreText-backed string
   stack, cached as high-DPI alpha-mask textures and colored/composited by Metal.
+- Native ImageIO decoding into owned BGRA Metal textures, with linear sampling,
+  tint/opacity, scene clipping, and explicit GPU-resource teardown.
 - Reusable scene allocation across frames.
 - Immediate element reconstruction over retained application/component state.
 - Reusable flex row/column solving with basis, grow, weighted shrink, gaps,
@@ -44,7 +46,7 @@ retained application state
 flex layout -> component functions rebuild a transient Scene each frame
         |
         v
-paint list + clipped hitbox/focus dispatch list + text-sprite list
+paint list + clipped hitbox/focus dispatch list + texture-sprite list
         |
         v
 triple-buffered shared MTLBuffer upload + one instanced Metal draw
@@ -53,9 +55,10 @@ triple-buffered shared MTLBuffer upload + one instanced Metal draw
 vertex shader expands quads; fragment shader performs SDF shape rasterization
 
 CoreText-backed shaping/rasterization -> cached high-DPI mask textures
+ImageIO decode -> cached BGRA textures
         |
         v
-Metal texture pipeline applies per-scene color and alpha composition
+Metal text/image pipelines apply per-scene tint, clipping, and alpha composition
 ```
 
 This follows GPUI's hybrid model: long-lived state owns focus, component values,
@@ -127,8 +130,8 @@ application. GPUI parity still requires substantial systems, notably:
 - glyph-run extraction, editable text measurement, and a bounded glyph atlas
   (whole-label shaping and GPU mask composition work now);
 - grid and intrinsic text/image measurement (flex layout works);
-- variable-height lists, transforms, shadows, general images, SVG, and paths
-  (uniform virtual scrolling and nested rectangular GPU clipping work);
+- variable-height lists, transforms, shadows, SVG, and paths
+  (general raster images, uniform virtual scrolling, and nested rectangular GPU clipping work);
 - hierarchical capture/bubble listeners, configurable keymaps, IME, drag/drop,
   and accessibility (focus traversal and logical actions work);
 - retained entities, subscriptions, observation, async executor integration, assets,
@@ -148,3 +151,4 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [Apple CAMetalLayer documentation](https://developer.apple.com/documentation/QuartzCore/CAMetalLayer)
 - [Apple MTLRenderCommandEncoder documentation](https://developer.apple.com/documentation/metal/mtlrendercommandencoder)
 - [Apple CTRun documentation](https://developer.apple.com/documentation/coretext/ctrun)
+- [Apple ImageIO documentation](https://developer.apple.com/documentation/imageio)
