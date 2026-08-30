@@ -3,8 +3,14 @@
 (import "coil.arraylist" :as al)
 (import "coil.primitive" :as primitive)
 
+(extern sinf :cc c [f32] (-> f32))
+
+(extern cosf :cc c [f32] (-> f32))
+
 (export Color
         Rect
+        Point
+        Affine
         EdgeInsets
         Primitive
         TextSprite
@@ -19,6 +25,15 @@
         contains?
         inset
         intersect
+        affine-identity
+        affine-translate
+        affine-scale
+        affine-rotate
+        affine-multiply
+        affine-invertible?
+        affine-inverse
+        affine-transform-point
+        affine-transform-bounds
         scene-rect!
         scene-rounded-rect!
         scene-shadow!
@@ -28,6 +43,8 @@
         scene-hitbox!
         scene-push-clip!
         scene-pop-clip!
+        scene-push-transform!
+        scene-pop-transform!
         Axis
         Horizontal
         Vertical
@@ -64,6 +81,10 @@
 
 (defstruct Rect [(x f32) (y f32) (w f32) (h f32)])
 
+(defstruct Point [(x f32) (y f32)])
+
+(defstruct Affine [(m11 f32) (m12 f32) (m21 f32) (m22 f32) (tx f32) (ty f32)])
+
 (defstruct EdgeInsets [(top f32) (right f32) (bottom f32) (left f32)])
 
 ;;; GPU instance payload. The Metal vertex shader expands each instance into
@@ -75,21 +96,30 @@
    (border-width f32)
    (border-color Color)
    (clip Rect)
+   (transform Affine)
    (kind i32)
    (id i32)])
 
 (defstruct TextSprite
-  [(bounds Rect) (color Color) (clip Rect) (texture (ptr i8)) (id i32) (mode i32)])
+  [(bounds Rect) (color Color) (clip Rect) (transform Affine) (texture (ptr i8)) (id i32) (mode i32)])
 
 (defstruct Hitbox
-  [(bounds Rect) (clip Rect) (id i32) (parent i32) (focusable bool) (occludes bool)])
+  [(bounds Rect)
+   (clip Rect)
+   (inverse-transform Affine)
+   (id i32)
+   (parent i32)
+   (focusable bool)
+   (occludes bool)
+   (transform-valid bool)])
 
 (defstruct Scene
   [(items (al/ArrayList Primitive))
    (shadows (al/ArrayList Primitive))
    (text (al/ArrayList TextSprite))
    (hitboxes (al/ArrayList Hitbox))
-   (current-clip Rect)])
+   (current-clip Rect)
+   (current-transform Affine)])
 
 (defn rgba [(r f32) (g f32) (b f32) (a f32)] (-> Color)
   (Color
@@ -107,6 +137,163 @@
     :y y
     :w w
     :h h))
+
+(defn affine-identity [] (-> Affine)
+  (Affine
+    :m11 1.0
+    :m12 0.0
+    :m21 0.0
+    :m22 1.0
+    :tx 0.0
+    :ty 0.0))
+
+(defn affine-translate [(x f32) (y f32)] (-> Affine)
+  (Affine
+    :m11 1.0
+    :m12 0.0
+    :m21 0.0
+    :m22 1.0
+    :tx x
+    :ty y))
+
+(defn affine-scale [(x f32) (y f32)] (-> Affine)
+  (Affine
+    :m11 x
+    :m12 0.0
+    :m21 0.0
+    :m22 y
+    :tx 0.0
+    :ty 0.0))
+
+(defn affine-rotate [(degrees f32)] (-> Affine)
+  (let [radians (* degrees 0.017453292519943295)
+        cosine (cosf radians)
+        sine (sinf radians)]
+    (Affine
+      :m11 cosine
+      :m12 sine
+      :m21 (- (primitive/cast f32 0.0) sine)
+      :m22 cosine
+      :tx 0.0
+      :ty 0.0)))
+
+;;; Composition `a * b`: apply b first, then a.
+(defn affine-multiply [(a Affine) (b Affine)] (-> Affine)
+  (Affine
+    :m11
+      (+ (* (load (field a m11)) (load (field b m11)))
+         (* (load (field a m21)) (load (field b m12))))
+    :m12
+      (+ (* (load (field a m12)) (load (field b m11)))
+         (* (load (field a m22)) (load (field b m12))))
+    :m21
+      (+ (* (load (field a m11)) (load (field b m21)))
+         (* (load (field a m21)) (load (field b m22))))
+    :m22
+      (+ (* (load (field a m12)) (load (field b m21)))
+         (* (load (field a m22)) (load (field b m22))))
+    :tx
+      (+ (+ (* (load (field a m11)) (load (field b tx)))
+            (* (load (field a m21)) (load (field b ty))))
+         (load (field a tx)))
+    :ty
+      (+ (+ (* (load (field a m12)) (load (field b tx)))
+            (* (load (field a m22)) (load (field b ty))))
+         (load (field a ty)))))
+
+(defn affine-determinant [(transform Affine)] (-> f32)
+  (- (* (load (field transform m11)) (load (field transform m22)))
+     (* (load (field transform m12)) (load (field transform m21)))))
+
+(defn affine-invertible? [(transform Affine)] (-> bool)
+  (let [determinant (affine-determinant transform)]
+    (or (> determinant 0.000001) (< determinant -0.000001))))
+
+(defn affine-inverse [(transform Affine)] (-> Affine)
+  (let [determinant (affine-determinant transform)]
+    (if (not (affine-invertible? transform))
+        (affine-identity)
+        (let [inverse-det (/ (primitive/cast f32 1.0) determinant)
+              m11 (* (load (field transform m22)) inverse-det)
+              m12 (* (- (primitive/cast f32 0.0) (load (field transform m12))) inverse-det)
+              m21 (* (- (primitive/cast f32 0.0) (load (field transform m21))) inverse-det)
+              m22 (* (load (field transform m11)) inverse-det)
+              tx
+                (- (primitive/cast f32 0.0)
+                   (+ (* m11 (load (field transform tx)))
+                      (* m21 (load (field transform ty)))))
+              ty
+                (- (primitive/cast f32 0.0)
+                   (+ (* m12 (load (field transform tx)))
+                      (* m22 (load (field transform ty)))))]
+          (Affine
+            :m11 m11
+            :m12 m12
+            :m21 m21
+            :m22 m22
+            :tx tx
+            :ty ty)))))
+
+(defn affine-transform-point [(transform Affine) (point Point)] (-> Point)
+  (Point :x
+           (+ (+ (* (load (field transform m11)) (load (field point x)))
+                 (* (load (field transform m21)) (load (field point y))))
+              (load (field transform tx)))
+    :y
+      (+ (+ (* (load (field transform m12)) (load (field point x)))
+            (* (load (field transform m22)) (load (field point y))))
+         (load (field transform ty)))))
+
+(defn affine-transform-bounds [(transform Affine) (bounds Rect)] (-> Rect)
+  (let [x (load (field bounds x))
+        y (load (field bounds y))
+        right (+ x (load (field bounds w)))
+        bottom (+ y (load (field bounds h)))
+        p0 (affine-transform-point transform (Point :x x :y y))
+        p1 (affine-transform-point transform (Point :x right :y y))
+        p2 (affine-transform-point transform (Point :x x :y bottom))
+        p3 (affine-transform-point transform (Point :x right :y bottom))
+        min-x
+          (let [a
+                  (if (< (load (field p0 x)) (load (field p1 x)))
+                      (load (field p0 x))
+                      (load (field p1 x)))
+                b
+                  (if (< (load (field p2 x)) (load (field p3 x)))
+                      (load (field p2 x))
+                      (load (field p3 x)))]
+            (if (< a b) a b))
+        max-x
+          (let [a
+                  (if (> (load (field p0 x)) (load (field p1 x)))
+                      (load (field p0 x))
+                      (load (field p1 x)))
+                b
+                  (if (> (load (field p2 x)) (load (field p3 x)))
+                      (load (field p2 x))
+                      (load (field p3 x)))]
+            (if (> a b) a b))
+        min-y
+          (let [a
+                  (if (< (load (field p0 y)) (load (field p1 y)))
+                      (load (field p0 y))
+                      (load (field p1 y)))
+                b
+                  (if (< (load (field p2 y)) (load (field p3 y)))
+                      (load (field p2 y))
+                      (load (field p3 y)))]
+            (if (< a b) a b))
+        max-y
+          (let [a
+                  (if (> (load (field p0 y)) (load (field p1 y)))
+                      (load (field p0 y))
+                      (load (field p1 y)))
+                b
+                  (if (> (load (field p2 y)) (load (field p3 y)))
+                      (load (field p2 y))
+                      (load (field p3 y)))]
+            (if (> a b) a b))]
+    (rect min-x min-y (- max-x min-x) (- max-y min-y))))
 
 (defn contains? [(r Rect) (px f32) (py f32)] (-> bool)
   (and (>= px (load (field r x)))
@@ -141,7 +328,8 @@
       :shadows (al/al-new [Primitive] allocator)
       :text (al/al-new [TextSprite] allocator)
       :hitboxes (al/al-new [Hitbox] allocator)
-      :current-clip (rect -100000.0 -100000.0 200000.0 200000.0))))
+      :current-clip (rect -100000.0 -100000.0 200000.0 200000.0)
+      :current-transform (affine-identity))))
 
 (defn scene-clear! [(scene (mut Scene))] (-> i64)
   (do
@@ -150,6 +338,7 @@
     (al/al-clear! [TextSprite] (mut (.text scene)))
     (al/al-clear! [Hitbox] (mut (.hitboxes scene)))
     (set! (.current-clip scene) (rect -100000.0 -100000.0 200000.0 200000.0))
+    (set! (.current-transform scene) (affine-identity))
     0))
 
 (defn scene-free! [(scene (mut Scene))] (-> i64)
@@ -178,6 +367,7 @@
                  :border-width border-width
                  :border-color border-color
                  :clip (load (field scene current-clip))
+                 :transform (load (field scene current-transform))
                  :kind 0
                  :id id)))
 
@@ -215,6 +405,8 @@
                             (rgba extent 0.0 0.0 0.0)
                             :clip
                             (load (field scene current-clip))
+                            :transform
+                            (load (field scene current-transform))
                             :kind
                             1
                             :id
@@ -222,7 +414,7 @@
 
 ;;; Queue a two-stop linear gradient. CSS-compatible degrees are measured
 ;;; clockwise from the upward direction, so 90 degrees runs left-to-right.
-;;; The existing 80-byte primitive ABI carries start/end colors, radius, angle,
+;;; The shared primitive ABI carries start/end colors, radius, angle, affine,
 ;;; clip, and identity; gradients remain a single instanced GPU batch.
 (defn scene-linear-gradient! [(scene (mut Scene))
                               (bounds Rect)
@@ -240,6 +432,7 @@
                  :border-width angle-degrees
                  :border-color end-color
                  :clip (load (field scene current-clip))
+                 :transform (load (field scene current-transform))
                  :kind 2
                  :id id)))
 
@@ -256,6 +449,7 @@
                  :bounds bounds
                  :color color
                  :clip (load (field scene current-clip))
+                 :transform (load (field scene current-transform))
                  :texture texture
                  :id id
                  :mode 0)))
@@ -273,6 +467,7 @@
                  :bounds bounds
                  :color tint
                  :clip (load (field scene current-clip))
+                 :transform (load (field scene current-transform))
                  :texture texture
                  :id id
                  :mode 1)))
@@ -288,19 +483,31 @@
                (Hitbox
                  :bounds bounds
                  :clip (load (field scene current-clip))
+                 :inverse-transform (affine-inverse (load (field scene current-transform)))
                  :id id
                  :parent parent
                  :focusable focusable
-                 :occludes occludes)))
+                 :occludes occludes
+                 :transform-valid (affine-invertible? (load (field scene current-transform))))))
 
 (defn scene-push-clip! [(scene (mut Scene)) (clip Rect)] (-> Rect)
-  (let [prior (load (field scene current-clip))]
+  (let [prior (load (field scene current-clip))
+        transformed (affine-transform-bounds (load (field scene current-transform)) clip)]
     (do
-      (set! (.current-clip scene) (intersect prior clip))
+      (set! (.current-clip scene) (intersect prior transformed))
       prior)))
 
 (defn scene-pop-clip! [(scene (mut Scene)) (prior Rect)] (-> i64)
   (do (set! (.current-clip scene) prior) 0))
+
+(defn scene-push-transform! [(scene (mut Scene)) (transform Affine)] (-> Affine)
+  (let [prior (load (field scene current-transform))]
+    (do
+      (set! (.current-transform scene) (affine-multiply prior transform))
+      prior)))
+
+(defn scene-pop-transform! [(scene (mut Scene)) (prior Affine)] (-> i64)
+  (do (set! (.current-transform scene) prior) 0))
 
 (defsum Axis (Horizontal) (Vertical))
 
@@ -471,15 +678,28 @@
                          id)))
 
 (defn hit-test [(primitive Primitive) (x f32) (y f32)] (-> bool)
-  (contains? (load (field primitive bounds)) x y))
+  (let [local
+          (affine-transform-point (affine-inverse (load (field primitive transform)))
+                                  (Point :x x :y y))]
+    (and (affine-invertible? (load (field primitive transform)))
+         (contains? (load (field primitive bounds))
+                    (load (field local x))
+                    (load (field local y)))
+         (contains? (load (field primitive clip)) x y))))
 
 (defn topmost-hit [(scene Scene) (x f32) (y f32)] (-> i32)
   (let [(mut i) (- (al/al-len [Hitbox] (load (field scene hitboxes))) 1)]
     (block :found
            (while (>= (load i) 0)
              (let [hitbox (al/al-get [Hitbox] (load (field scene hitboxes)) (load i))]
-               (if (and (contains? (load (field hitbox bounds)) x y)
-                        (contains? (load (field hitbox clip)) x y))
-                   (return-from :found (load (field hitbox id)))
-                   (store! i (- (load i) 1)))))
+               (let [local
+                       (affine-transform-point (load (field hitbox inverse-transform))
+                                               (Point :x x :y y))]
+                 (if (and (load (field hitbox transform-valid))
+                          (contains? (load (field hitbox bounds))
+                                     (load (field local x))
+                                     (load (field local y)))
+                          (contains? (load (field hitbox clip)) x y))
+                     (return-from :found (load (field hitbox id)))
+                     (store! i (- (load i) 1))))))
            -1)))

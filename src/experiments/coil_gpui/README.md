@@ -13,6 +13,9 @@ layer in the runtime path.
 - Triple-buffered, power-of-two-growing shared `MTLBuffer` uploads; large scenes
   do not rely on Metal's small inline-byte path and are never truncated.
 - GPU-expanded quads, antialiased rounded rectangles, borders, and alpha blending.
+- Composable translate/scale/rotate affine transforms applied on the GPU to solid,
+  gradient, shadow, text, and image geometry; pointer hit testing uses the exact
+  inverse transform and rejects singular transforms.
 - Rounded two-stop linear gradients at arbitrary CSS-compatible angles, mixed
   with solid primitives in exact scene order inside the same instanced draw.
 - Batched analytic rounded-rectangle shadows with GPU-computed soft falloff,
@@ -52,13 +55,13 @@ retained application state
 flex layout -> component functions rebuild a transient Scene each frame
         |
         v
-paint list + clipped hitbox/focus dispatch list + texture-sprite list
+paint list + clipped inverse-transform hitbox/focus list + texture-sprite list
         |
         v
 triple-buffered shared MTLBuffer upload + batched shadow/shape Metal draws
         |
         v
-vertex shader expands quads; fragment shaders perform SDF shape/gradient/shadow rasterization
+affine vertex shaders expand/transform quads; fragments perform SDF paint
 
 CoreText-backed shaping/rasterization -> cached high-DPI mask textures
 ImageIO decode -> cached BGRA textures
@@ -119,7 +122,8 @@ cd src/experiments/coil_gpui
 ## Performance contract
 
 The scene retains shape, shadow, and texture-list allocations after `scene-clear!`,
-avoiding steady-state list allocation. A primitive is 80 bytes. Ordinary shapes and
+avoiding steady-state list allocation. A paint primitive is 104 bytes, including its
+six-float affine transform. Ordinary shapes and
 analytic shadows are each rendered through one instanced command, independent of
 their counts. Both contiguous batches share a three-slot buffer ring; each slot starts
 at 64 KiB and doubles until the complete scene fits. The demo intentionally rebuilds
@@ -129,8 +133,8 @@ objects are drained every frame.
 
 The release scene benchmark rebuilds 1,049 paint primitives while advancing a
 100,000-row virtual list. On the development Apple Silicon machine it measured
-**1,840 ns/frame after adding mixed solid/gradient painting**, with earlier milestones
-measuring 1,862–1,930 ns/frame. This measures Coil scene construction and
+**4,136 ns/frame with per-primitive affine transforms**, versus 1,840 ns/frame before
+the transform payload. This measures Coil scene construction and
 visible-range calculation, not GPU presentation or display latency; the benchmark
 is checked in as `bench.coil` so results remain reproducible and comparable.
 
@@ -152,9 +156,9 @@ application. GPUI parity still requires substantial systems, notably:
 - glyph-run extraction, editable text measurement, and a bounded glyph atlas
   (whole-label shaping and GPU mask composition work now);
 - grid and intrinsic text/image measurement (flex layout works);
-- transforms, SVG, and paths (analytic shadows, linear gradients, general raster
-  images, uniform and variable-height virtual scrolling, and nested rectangular
-  GPU clipping work);
+- SVG and arbitrary paths (affine transforms, analytic shadows, linear gradients,
+  general raster images, uniform and variable-height virtual scrolling, and nested
+  rectangular GPU clipping work);
 - hierarchical capture/bubble listeners, configurable keymaps, IME, drag/drop,
   and accessibility (focus traversal and logical actions work);
 - retained entities, subscriptions, observation, async executor integration, assets,
