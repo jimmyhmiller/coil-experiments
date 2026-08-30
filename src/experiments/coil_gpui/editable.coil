@@ -1,0 +1,281 @@
+(module experiments.coil_gpui.editable)
+(import "experiments.coil_gpui.ui" :as ui)
+(import "experiments.coil_gpui.text" :as text)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+
+(export TextField
+        text-field-new
+        text-field-free!
+        text-field-bytes
+        text-field-length
+        text-field-caret
+        text-field-revision
+        text-field-selection-start
+        text-field-selection-end
+        text-field-select!
+        text-field-collapse!
+        text-field-insert!
+        text-field-backspace!
+        text-field-delete-forward!
+        text-field-move-left!
+        text-field-move-right!
+        text-field-set-caret-from-x!
+        text-field-paint!)
+
+(extern strlen :cc c [(ptr i8)] (-> i64))
+
+(extern memmove :cc c [(ptr i8) (ptr i8) i64] (-> (ptr i8)))
+
+(extern memcpy :cc c [(ptr i8) (ptr i8) i64] (-> (ptr i8)))
+
+;;; bytes always contains one trailing NUL, while caret and anchor are UTF-8
+;;; byte boundaries in the content before it.
+(defstruct TextField
+  [(bytes (al/ArrayList u8))
+   (caret i64)
+   (anchor i64)
+   (revision i64)
+   (focused bool)])
+
+(defn text-field-new [(initial (ptr i8))] (-> TextField)
+  (let [(mut field) (primitive/zeroed TextField)
+        length (strlen initial)]
+    (do
+      (store! (field field bytes) (al/al-new [u8] (alloc/malloc-allocator)))
+      (al/al-reserve! [u8] (mut (.bytes field)) (+ length 1))
+      (let [bytes (load (field field bytes))
+            data (load (field bytes data))]
+        (do
+          (if (> length 0)
+              (do
+                (memcpy (primitive/cast (ptr i8) data) initial length)
+                0)
+              0)
+          (store! (primitive/index data length) (primitive/cast u8 0))))
+      (set! (.len (.bytes field)) (+ length 1))
+      (store! (field field caret) length)
+      (store! (field field anchor) length)
+      (store! (field field revision) 0)
+      (store! (field field focused) false)
+      (load field))))
+
+(defn text-field-free! [(field (mut TextField))] (-> i64)
+  (al/al-free! [u8] (mut (.bytes field))))
+
+(defn text-field-bytes [(field TextField)] (-> (ptr i8))
+  (let [bytes (load (field field bytes))]
+    (primitive/cast (ptr i8) (load (field bytes data)))))
+
+(defn text-field-length [(field TextField)] (-> i64)
+  (let [length (al/al-len [u8] (load (field field bytes)))]
+    (if (> length 0) (- length 1) 0)))
+
+(defn text-field-caret [(field TextField)] (-> i64)
+  (load (field field caret)))
+
+(defn text-field-revision [(field TextField)] (-> i64)
+  (load (field field revision)))
+
+(defn text-field-selection-start [(field TextField)] (-> i64)
+  (let [caret (load (field field caret))
+        anchor (load (field field anchor))]
+    (if (< caret anchor) caret anchor)))
+
+(defn text-field-selection-end [(field TextField)] (-> i64)
+  (let [caret (load (field field caret))
+        anchor (load (field field anchor))]
+    (if (> caret anchor) caret anchor)))
+
+(defn clamp-index [(field TextField) (index i64)] (-> i64)
+  (let [length (text-field-length field)]
+    (cond (< index 0) 0 (> index length) length :else index)))
+
+(defn text-field-select! [(field (mut TextField))
+                          (anchor i64)
+                          (caret i64)] (-> i64)
+  (do
+    (set! (.anchor field) (clamp-index (load field) anchor))
+    (set! (.caret field) (clamp-index (load field) caret))
+    (load (field field caret))))
+
+(defn text-field-collapse! [(field (mut TextField)) (index i64)] (-> i64)
+  (let [clamped (clamp-index (load field) index)]
+    (do
+      (set! (.anchor field) clamped)
+      (set! (.caret field) clamped)
+      clamped)))
+
+(defn delete-selection! [(field (mut TextField))] (-> bool)
+  (let [start (text-field-selection-start (load field))
+        end (text-field-selection-end (load field))]
+    (if (= start end)
+        false
+        (let [length (text-field-length (load field))
+              bytes (load (field field bytes))
+              data (load (field bytes data))
+              removed (- end start)]
+          (do
+            ;; Include the trailing NUL in the overlapping move.
+            (memmove (primitive/cast (ptr i8) (primitive/index data start))
+                     (primitive/cast (ptr i8) (primitive/index data end))
+                     (+ (- length end) 1))
+            (set! (.len (.bytes field)) (- (al/al-len [u8] (load (field field bytes))) removed))
+            (text-field-collapse! (mut field) start)
+            (set! (.revision field) (+ (load (field field revision)) 1))
+            true)))))
+
+(defn text-field-insert! [(field (mut TextField))
+                          (utf8 (ptr i8))] (-> i64)
+  (let [insert-length (strlen utf8)]
+    (do
+      (delete-selection! (mut field))
+      (if (= insert-length 0)
+          (load (field field caret))
+          (let [caret (load (field field caret))
+                length (text-field-length (load field))
+                required (+ (+ length insert-length) 1)]
+            (do
+              (if (> required (al/al-cap [u8] (load (field field bytes))))
+                  (al/al-reserve! [u8]
+                                  (mut (.bytes field))
+                                  (let [capacity (al/al-cap [u8] (load (field field bytes)))]
+                                    (if (> (* capacity 2) required) (* capacity 2) required)))
+                  0)
+              (let [bytes (load (field field bytes))
+                    data (load (field bytes data))]
+                (do
+                  (memmove (primitive/cast (ptr i8) (primitive/index data (+ caret insert-length)))
+                           (primitive/cast (ptr i8) (primitive/index data caret))
+                           (+ (- length caret) 1))
+                  (memcpy (primitive/cast (ptr i8) (primitive/index data caret))
+                          utf8
+                          insert-length)))
+              (set! (.len (.bytes field)) required)
+              (set! (.revision field) (+ (load (field field revision)) 1))
+              (text-field-collapse! (mut field) (+ caret insert-length))))))))
+
+(defn previous-boundary [(field TextField) (index i64)] (-> i64)
+  (if (<= index 0)
+      0
+      (let [bytes (load (field field bytes))
+            data (load (field bytes data))
+            (mut prior) (- index 1)]
+        (do
+          (while (and (> (load prior) 0)
+                      (= (& (load (primitive/index data (load prior))) 192) 128))
+            (store! prior (- (load prior) 1)))
+          (load prior)))))
+
+(defn next-boundary [(field TextField) (index i64)] (-> i64)
+  (let [length (text-field-length field)]
+    (if (>= index length)
+        length
+        (let [bytes (load (field field bytes))
+              data (load (field bytes data))
+              lead (load (primitive/index data index))
+              step
+                (cond (= (& lead 240) 240) 4
+                      (= (& lead 224) 224) 3
+                      (= (& lead 192) 192) 2
+                      :else 1)
+              next (+ index step)]
+          (if (> next length) length next)))))
+
+(defn text-field-backspace! [(field (mut TextField))] (-> bool)
+  (if (delete-selection! (mut field))
+      true
+      (let [caret (load (field field caret))]
+        (if (= caret 0)
+            false
+            (do
+              (text-field-select! (mut field) (previous-boundary (load field) caret) caret)
+              (delete-selection! (mut field)))))))
+
+(defn text-field-delete-forward! [(field (mut TextField))] (-> bool)
+  (if (delete-selection! (mut field))
+      true
+      (let [caret (load (field field caret))
+            next (next-boundary (load field) caret)]
+        (if (= caret next)
+            false
+            (do
+              (text-field-select! (mut field) caret next)
+              (delete-selection! (mut field)))))))
+
+(defn text-field-move-left! [(field (mut TextField)) (extend bool)] (-> i64)
+  (let [next
+          (if (and (not extend)
+                   (!= (load (field field caret)) (load (field field anchor))))
+              (text-field-selection-start (load field))
+              (previous-boundary (load field) (load (field field caret))))]
+    (if extend
+        (do (set! (.caret field) next) next)
+        (text-field-collapse! (mut field) next))))
+
+(defn text-field-move-right! [(field (mut TextField)) (extend bool)] (-> i64)
+  (let [next
+          (if (and (not extend)
+                   (!= (load (field field caret)) (load (field field anchor))))
+              (text-field-selection-end (load field))
+              (next-boundary (load field) (load (field field caret))))]
+    (if extend
+        (do (set! (.caret field) next) next)
+        (text-field-collapse! (mut field) next))))
+
+(defn text-field-set-caret-from-x! [(field (mut TextField))
+                                    (line text/ShapedLine)
+                                    (x f32)
+                                    (extend bool)] (-> i64)
+  (let [index (text/shaped-line-index-for-x line x)]
+    (if extend
+        (do (set! (.caret field) index) index)
+        (text-field-collapse! (mut field) index))))
+
+(defn text-field-paint! [(scene (mut ui/Scene))
+                         (field TextField)
+                         (line text/ShapedLine)
+                         (bounds ui/Rect)
+                         (id i32)] (-> i64)
+  (let [text-x (+ (load (field bounds x)) 10.0)
+        line-height (+ (load (field line ascent)) (load (field line descent)))
+        text-y (+ (load (field bounds y)) (/ (- (load (field bounds h)) line-height) 2.0))
+        selection-start (text-field-selection-start field)
+        selection-end (text-field-selection-end field)]
+    (do
+      (ui/scene-rounded-rect! (mut scene)
+                              bounds
+                              (ui/rgb 0.10 0.12 0.17)
+                              6.0
+                              (if (load (field field focused)) 2.0 1.0)
+                              (if (load (field field focused))
+                                  (ui/rgb 0.40 0.63 1.0)
+                                  (ui/rgb 0.30 0.33 0.40))
+                              id)
+      (if (!= selection-start selection-end)
+          (ui/scene-rect! (mut scene)
+                          (text/shaped-line-selection-bounds line
+                                                             selection-start
+                                                             selection-end
+                                                             text-x
+                                                             text-y)
+                          (ui/rgba 0.24 0.48 0.92 0.55)
+                          (+ id 1))
+          0)
+      (text/paint-shaped-line! (mut scene)
+                               line
+                               text-x
+                               text-y
+                               (ui/rgb 0.93 0.95 0.98)
+                               (+ id 10))
+      (if (and (load (field field focused)) (= selection-start selection-end))
+          (ui/scene-rect! (mut scene)
+                          (ui/rect (+ text-x (text/shaped-line-x-for-index line selection-end))
+                                   text-y
+                                   1.5
+                                   line-height)
+                          (ui/rgb 0.88 0.92 1.0)
+                          (+ id 2))
+          0)
+      (ui/scene-hitbox! (mut scene) bounds id -1 true true))))

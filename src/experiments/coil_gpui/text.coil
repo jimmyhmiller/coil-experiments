@@ -23,6 +23,9 @@
         shaped-line-free!
         paint-shaped-line!
         text-atlas-glyph-count
+        shaped-line-x-for-index
+        shaped-line-index-for-x
+        shaped-line-selection-bounds
         text-atlas-free!)
 
 (extern malloc :cc c [i64] (-> (ptr i8)))
@@ -30,6 +33,8 @@
 (extern free :cc c [(ptr i8)] (-> void))
 
 (extern memset :cc c [(ptr i8) i32 i64] (-> (ptr i8)))
+
+(extern strlen :cc c [(ptr i8)] (-> i64))
 
 (extern CGColorSpaceCreateDeviceRGB :cc c [] (-> (ptr i8)))
 
@@ -126,6 +131,7 @@
   [(texture TextTexture)
    (x f32)
    (y f32)
+   (pen-x f32)
    (advance f32)
    (string-index i64)
    (glyph u16)])
@@ -135,6 +141,7 @@
    (width f32)
    (ascent f32)
    (descent f32)
+   (length i64)
    (valid bool)])
 
 (defstruct AtlasRegion [(x i64) (y i64) (w i64) (h i64) (valid bool)])
@@ -552,6 +559,27 @@
                                                         (/ (primitive/cast f32 pixel-height)
                                                            (primitive/cast f32 (load (field atlas height))))))))))))))))
 
+;;; CoreText cluster indices address UTF-16 code units. Public layout APIs use
+;;; UTF-8 byte offsets, matching Coil strings and GPUI's LineLayout contract.
+(defn utf16-index-to-utf8 [(utf8 (ptr i8)) (target i64)] (-> i64)
+  (let [bytes (primitive/cast (ptr u8) utf8)
+        length (strlen utf8)
+        (mut byte-index) 0
+        (mut utf16-index) 0]
+    (do
+      (while (and (< (load byte-index) length) (< (load utf16-index) target))
+        (let [lead (load (primitive/index bytes (load byte-index)))
+              step
+                (cond (= (& lead 240) 240) 4
+                      (= (& lead 224) 224) 3
+                      (= (& lead 192) 192) 2
+                      :else 1)]
+          (do
+            (store! byte-index
+                    (let [next (+ (load byte-index) step)] (if (> next length) length next)))
+            (store! utf16-index (+ (load utf16-index) (if (= step 4) 2 1))))))
+      (load byte-index))))
+
 (defn push-shaped-glyph! [(line (mut ShapedLine))
                           (atlas (mut TextAtlas))
                           (entry (ptr GlyphEntry))
@@ -583,6 +611,9 @@
                                      (/ (load (field position x)) (primitive/cast f64 scale)))
                      (load (field entry bearing-x))))
           (store! (field item y) (+ (load (field line ascent)) (load (field entry bearing-top))))
+          (store! (field item pen-x)
+                  (primitive/cast f32
+                                  (/ (load (field position x)) (primitive/cast f64 scale))))
           (store! (field item advance) (load (field entry advance)))
           (store! (field item string-index) string-index)
           (store! (field item glyph) glyph)
@@ -646,6 +677,7 @@
                           (primitive/cast f32 (/ (load ascent) (primitive/cast f64 scale))))
                     (set! (.descent shaped)
                           (primitive/cast f32 (/ (load descent) (primitive/cast f64 scale))))
+                    (set! (.length shaped) (strlen utf8))
                     (set! (.valid shaped) true)
                     (for [run-index 0 (CFArrayGetCount runs)]
                       (let [run (CFArrayGetValueAtIndex runs run-index)
@@ -676,7 +708,8 @@
                                                         (mut atlas)
                                                         entry
                                                         (load position)
-                                                        (load string-index)
+                                                        (utf16-index-to-utf8 utf8
+                                                                             (load string-index))
                                                         (load glyph))
                                     0))))))))
                   (CFRelease ct-line)
@@ -685,6 +718,48 @@
 
 (defn shaped-line-free! [(line (mut ShapedLine))] (-> i64)
   (al/al-free! [ShapedGlyph] (mut (.glyphs line))))
+
+(defn shaped-line-x-for-index [(line ShapedLine) (index i64)] (-> f32)
+  (let [glyphs (load (field line glyphs))]
+    (block :found
+           (for [i 0 (al/al-len [ShapedGlyph] glyphs)]
+             (let [glyph (primitive/index (load (field glyphs data)) i)]
+               (if (>= (load (field glyph string-index)) index)
+                   (return-from :found (load (field glyph pen-x)))
+                   0)))
+           (load (field line width)))))
+
+(defn shaped-line-index-for-x [(line ShapedLine) (x f32)] (-> i64)
+  (let [glyphs (load (field line glyphs))
+        (mut previous-index) 0
+        (mut previous-x) (primitive/cast f32 0.0)]
+    (block :found
+           (for [i 0 (al/al-len [ShapedGlyph] glyphs)]
+             (let [glyph (primitive/index (load (field glyphs data)) i)
+                   glyph-x (load (field glyph pen-x))]
+               (if (>= glyph-x x)
+                   (return-from :found
+                                  (if (< (- glyph-x x) (- x (load previous-x)))
+                                      (load (field glyph string-index))
+                                      (load previous-index)))
+                   (do
+                     (store! previous-index (load (field glyph string-index)))
+                     (store! previous-x glyph-x)))))
+           (load (field line length)))))
+
+(defn shaped-line-selection-bounds [(line ShapedLine)
+                                    (start i64)
+                                    (end i64)
+                                    (x f32)
+                                    (y f32)] (-> ui/Rect)
+  (let [start-x (shaped-line-x-for-index line start)
+        end-x (shaped-line-x-for-index line end)
+        left (if (< start-x end-x) start-x end-x)
+        right (if (> start-x end-x) start-x end-x)]
+    (ui/rect (+ x left)
+             y
+             (- right left)
+             (+ (load (field line ascent)) (load (field line descent))))))
 
 (defn paint-shaped-line! [(scene (mut ui/Scene))
                           (line ShapedLine)

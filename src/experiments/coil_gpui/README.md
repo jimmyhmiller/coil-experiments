@@ -87,7 +87,10 @@ layer in the runtime path.
   measurement updates and pixel-offset lookup, with scroll-anchor preservation.
 - The demo's scroll view has 100,000 heterogeneously sized logical rows but
   measures and constructs only visible rows plus three-row overscan each frame.
-- Interactive buttons, checkbox, slider, progress, divider, and panel components.
+- Interactive buttons, checkbox, slider, progress, divider, panel, and single-line
+  text-field components. The text field owns a NUL-terminated UTF-8 buffer, supports
+  insertion, selection replacement, code-point-safe deletion/navigation, shaped
+  pointer hit-testing, and GPU-rendered selection and caret geometry.
 - GPU text labels integrated with the reusable scene and demo components.
 - Mouse hover, press, release, checkbox toggling, slider dragging, plus keyboard
   activation and arrow-key slider adjustment.
@@ -208,9 +211,10 @@ one instanced Metal run. Whole-label caching remains available for static labels
 The current milestone proves the complete Coil-to-Metal path and a real component
 application. GPUI parity still requires substantial systems, notably:
 
-- editable text selection/caret measurement, shaped-line caching, fallback-font cache
-  key hardening, and atlas-page eviction (glyph-run extraction, cluster indices,
-  subpixel glyph caching, bounded atlas allocation, and GPU mask composition work now);
+- grapheme-aware navigation, multiline wrapping, shaped-line caching, fallback-font
+  cache key hardening, and atlas-page eviction (editable selection/caret measurement,
+  UTF-8/CoreText cluster conversion, glyph-run extraction, subpixel glyph caching,
+  bounded atlas allocation, and GPU mask composition work now);
 - intrinsic text/image measurement (flex and constrained grid layout work);
 - endpoint-parameterized SVG arcs, closed-path dash seam merging,
   SVG parsing, and non-simple/multi-contour fill rules (adaptive quadratic/cubic
@@ -218,7 +222,8 @@ application. GPUI parity still requires substantial systems, notably:
   fills, butt-cap/miter strokes, affine transforms, analytic shadows, linear
   gradients, general raster images, virtual scrolling, and nested rectangular
   GPU clipping work);
-- keymap predicate expressions and source metadata, IME, drag/drop, and accessibility
+- keymap predicate expressions and source metadata, NSTextInputClient/IME composition,
+  drag/drop, and accessibility
   (hierarchical capture/target/bubble listeners with stop-propagation, focus
   traversal, and logical actions work);
 - weak/strong retained handles, dependency-tracked observation, async executor
