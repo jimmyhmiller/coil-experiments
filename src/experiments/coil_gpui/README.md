@@ -39,6 +39,8 @@ layer in the runtime path.
 - Unified transformed-bounds culling for ordinary boxes, gradients, text atlas
   sprites, and images. Invisible records split batches; remaining adjacent records
   still form maximal ordered instanced runs.
+- Analytic shadow instances are filtered and compacted in scene order before
+  upload, retaining a single instanced shadow draw with no invisible records.
 - Adaptive center-parameterized elliptical arcs with positive or negative sweeps,
   full-circle support, and the same caller-controlled geometric tolerance.
 - Batched analytic rounded-rectangle shadows with GPU-computed soft falloff,
@@ -204,7 +206,7 @@ application. GPUI parity still requires substantial systems, notably:
   and accessibility (focus traversal and logical actions work);
 - retained entities, subscriptions, observation, async executor integration, assets,
   inspector support, deterministic UI tests, and multiple windows;
-- shadow culling, damage tracking, frame pacing, occlusion handling, multi-page texture-atlas eviction,
+- damage tracking, frame pacing, occlusion handling, multi-page texture-atlas eviction,
   and GPU/CPU profiling.
 
 These are explicit missing capabilities, not features claimed by the prototype.
