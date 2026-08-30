@@ -98,6 +98,9 @@ layer in the runtime path.
 - GPU text labels integrated with the reusable scene and demo components.
 - Mouse hover, press, release, checkbox toggling, slider dragging, plus keyboard
   activation and arrow-key slider adjustment.
+- Owned UTF-8 clipboard items through `NSPasteboard`, with native Copy/Cut/Paste/
+  Select-All responder commands. External text and file-URL drags enter through
+  Coil-defined AppKit callbacks and update a reusable GPU-painted drop target.
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
   batching, ABI, and allocation-reuse tests.
 
@@ -233,7 +236,8 @@ application. GPUI parity still requires substantial systems, notably:
   gradients, general raster images, virtual scrolling, and nested rectangular
   GPU clipping work);
 - keymap predicate expressions and source metadata, richer multiline IME geometry,
-  drag/drop, richer text-field accessibility ranges, and accessibility text actions
+  internal drag sources, multi-item external drops, richer text-field accessibility
+  ranges, and accessibility text actions
   (hierarchical capture/target/bubble listeners with stop-propagation, focus
   traversal, and logical actions work);
 - weak/strong retained handles, dependency-tracked observation, async executor
