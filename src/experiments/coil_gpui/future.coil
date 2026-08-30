@@ -1,0 +1,146 @@
+(module experiments.coil_gpui.future)
+(import "coil.atomic" :as atomic)
+(import "coil.primitive" :as primitive)
+(import "experiments.coil_gpui.scheduler" :as scheduler)
+
+(export Future
+        future-spawn!
+        future-ready?
+        future-cancelled?
+        future-cancel!
+        future-take!
+        future-free!)
+
+(extern malloc :cc c [u64] (-> (ptr i8)))
+
+(extern free :cc c [(ptr i8)] (-> void))
+
+;;; Background workers use Scheduler's C ABI and return either zero or an owned
+;;; pointer encoded as i64. `Future<T>` is the typed ownership boundary. A
+;;; required erased destructor makes abandoned and cancelled ready values safe
+;;; for arbitrary resource-owning T without fabricating or copying a T.
+(defstruct FutureCore
+  [(job scheduler/JobHandle)
+   (result (ptr i8))
+   (destroy (fnptr c [(ptr i8)] i64))
+   (state i64)
+   (references i64)])
+
+(defstruct Future [T] [(core (ptr FutureCore))])
+
+(const state-pending i64 0)
+
+(const state-ready i64 1)
+
+(const state-cancelled i64 2)
+
+(defn null-core [] (-> (ptr FutureCore))
+  (primitive/cast (ptr FutureCore) 0))
+
+(defn future-destroy-core! [(core (ptr FutureCore))] (-> i64)
+  (do
+    (let [result (load (field core result))]
+      (when (!= (primitive/cast i64 result) 0)
+        (primitive/call-ptr (load (field core destroy)) result)))
+    (free (primitive/cast (ptr i8) core))
+    0))
+
+(defn future-release-core! [(core (ptr FutureCore))] (-> i64)
+  (let [previous (atomic/atomic-add (field core references) -1)]
+    (if (= previous 1) (future-destroy-core! core) 0)))
+
+(defn future-completion [(raw (ptr i8)) (result i64) (cancelled i64)] (-> i64)
+  (let [core (primitive/cast (ptr FutureCore) raw)]
+    (do
+      (if (and (!= result 0) (= cancelled 0))
+          (do
+            (store! (field core result) (primitive/cast (ptr i8) result))
+            (atomic/atomic-store (field core state) state-ready))
+          (do
+            (when (!= result 0)
+              (primitive/call-ptr (load (field core destroy))
+                                  (primitive/cast (ptr i8) result)))
+            (atomic/atomic-store (field core state) state-cancelled)))
+      (future-release-core! core))))
+
+(defn future-spawn! [T] [(executor (mut scheduler/Scheduler))
+                         (priority i64)
+                         (worker (fnptr c [(ptr i8) (ptr i64)] i64))
+                         (worker-context (ptr i8))
+                         (destroy (fnptr c [(ptr i8)] i64))] (-> (Future T))
+  (let [memory (malloc (primitive/cast u64 (primitive/sizeof FutureCore)))]
+    (if (= (primitive/cast i64 memory) 0)
+        (Future [T] :core (null-core))
+        (let [core (primitive/cast (ptr FutureCore) memory)]
+          (do
+            (store! core (primitive/zeroed FutureCore))
+            (store! (field core destroy) destroy)
+            (atomic/atomic-store (field core state) state-pending)
+            (atomic/atomic-store (field core references) 2)
+            (let [job
+                    (scheduler/scheduler-spawn-priority! (mut executor)
+                                                         priority
+                                                         worker
+                                                         (primitive/fnptr-of future-completion)
+                                                         worker-context
+                                                         memory)]
+              (store! (field core job) job)
+              (if (< (load (field job slot)) 0)
+                  (do
+                    (future-release-core! core)
+                    (future-release-core! core)
+                    (Future [T] :core (null-core)))
+                  (Future [T] :core core))))))))
+
+(defn future-ready? [T] [(future (ref (Future T)))] (-> bool)
+  (let [core (load (field future core))]
+    (and (!= (primitive/cast i64 core) 0)
+         (= (atomic/atomic-load (field core state)) state-ready))))
+
+(defn future-cancelled? [T] [(future (ref (Future T)))] (-> bool)
+  (let [core (load (field future core))]
+    (or (= (primitive/cast i64 core) 0)
+        (= (atomic/atomic-load (field core state)) state-cancelled))))
+
+(defn future-cancel! [T] [(executor (mut scheduler/Scheduler))
+                          (future (mut (Future T)))] (-> bool)
+  (let [core (load (field future core))]
+    (and (!= (primitive/cast i64 core) 0)
+         (scheduler/scheduler-cancel! (mut executor) (load (field core job))))))
+
+(defn future-take! [T] [(future (mut (Future T)))] (-> (ptr T))
+  (let [core (load (field future core))]
+    (if (or (= (primitive/cast i64 core) 0)
+            (!= (atomic/atomic-load (field core state)) state-ready))
+        (primitive/cast (ptr T) 0)
+        (let [result (load (field core result))]
+          (do
+            (store! (field core result) (primitive/cast (ptr i8) 0))
+            (store! (field future core) (null-core))
+            (future-release-core! core)
+            (primitive/cast (ptr T) result))))))
+
+(defn future-free! [T] [(executor (mut scheduler/Scheduler))
+                        (future (mut (Future T)))] (-> i64)
+  (let [core (load (field future core))]
+    (if (= (primitive/cast i64 core) 0)
+        0
+        (do
+          (when (= (atomic/atomic-load (field core state)) state-pending)
+            (do
+              (scheduler/scheduler-cancel! (mut executor) (load (field core job)))
+              0))
+          (store! (field future core) (null-core))
+          (future-release-core! core)))))
+
+(impl [T] Drop (Future T)
+  (drop [(self (mut (Future T)))]
+        (-> void)
+        (let [core (load (field self core))]
+          (when (!= (primitive/cast i64 core) 0)
+            (do
+              ;; Implicit abandonment releases ownership without reaching through a
+              ;; potentially expired Scheduler borrow. Explicit future-free! is the
+              ;; cooperative-cancellation path.
+              (store! (field self core) (null-core))
+              (future-release-core! core))))))

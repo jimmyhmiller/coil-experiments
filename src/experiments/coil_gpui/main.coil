@@ -13,6 +13,7 @@
 (import "experiments.coil_gpui.reactive" :as reactive)
 (import "experiments.coil_gpui.inspector" :as inspector)
 (import "experiments.coil_gpui.scheduler" :as scheduler)
+(import "experiments.coil_gpui.future" :as future)
 (import "experiments.coil_gpui.editable" :as editable)
 (import "experiments.coil_gpui.ime" :as ime)
 (import "experiments.coil_gpui.accessibility" :as access)
@@ -43,6 +44,8 @@
    (async-ready bool)
    (async-result i64)])
 
+(defstruct DemoChecksum [(value i64)])
+
 (defn demo-background-work [(raw (ptr i8)) (cancel (ptr i64))] (-> i64)
   (let [iterations (load (primitive/cast (ptr i64) raw))
         (mut checksum) 1469598103934665603
@@ -53,17 +56,20 @@
         (do
           (set! checksum (primitive/imul (^ (load checksum) (load i)) 1099511628211))
           (set! i (+ (load i) 1))))
-      (load checksum))))
+      (if (scheduler/scheduler-cancel-requested? cancel)
+          0
+          (match (alloc/alloc [DemoChecksum] (alloc/malloc-allocator) 1)
+            (None [] 0)
+            (Some [memory]
+                  (let [result (alloc/alloc-slice-data memory)]
+                    (do
+                      (store! result (DemoChecksum :value (load checksum)))
+                      (primitive/cast i64 result)))))))))
 
-(defn demo-background-complete [(raw (ptr i8)) (result i64) (cancelled i64)] (-> i64)
-  (let [state (primitive/cast (ptr DemoState) raw)]
-    (do
-      (when (= cancelled 0)
-        (do
-          (set! (field state async-result) result)
-          (set! (field state async-ready) true)
-          0))
-      0)))
+(defn demo-checksum-free [(raw (ptr i8))] (-> i64)
+  (alloc/free [DemoChecksum]
+              (alloc/malloc-allocator)
+              (alloc/alloc-slice-new (primitive/cast (ptr DemoChecksum) raw) 1)))
 
 (defstruct Labels
   [(title text/ShapedLine)
@@ -775,7 +781,7 @@
         (mut drop-state) (primitive/zeroed drag/DropState)
         (mut frame-clock) (primitive/zeroed clock/FrameClock)
         (mut task-scheduler) (primitive/zeroed scheduler/Scheduler)
-        (mut demo-task-scope) (primitive/zeroed scheduler/TaskScope)
+        (mut checksum-future) (primitive/zeroed (future/Future DemoChecksum))
         async-input (primitive/alloc-stack i64)
         (mut editor-paragraph) (primitive/zeroed text/ShapedParagraph)
         (mut editor-revision) 0
@@ -801,7 +807,6 @@
           (store! companion (gpu-window/window-host-new companion-options))))
       (store! frame-clock (clock/frame-clock-new))
       (store! task-scheduler (scheduler/scheduler-new))
-      (store! demo-task-scope (scheduler/task-scope-new))
       (scheduler/scheduler-set-wake! (mut task-scheduler)
                                      (primitive/fnptr-of clock/frame-clock-wake!)
                                      (clock/frame-clock-wake-context frame-clock))
@@ -991,12 +996,13 @@
         (do
           (set! (.checked state) true)
           (set! (.slider state) 0.62)
-          (scheduler/task-scope-spawn! (mut demo-task-scope)
-                                       (mut task-scheduler)
-                                       (primitive/fnptr-of demo-background-work)
-                                       (primitive/fnptr-of demo-background-complete)
-                                       (primitive/cast (ptr i8) async-input)
-                                       (primitive/cast (ptr i8) state))))
+          (store! checksum-future
+                  (future/future-spawn! [DemoChecksum]
+                                        (mut task-scheduler)
+                                        scheduler/priority-low
+                                        (primitive/fnptr-of demo-background-work)
+                                        (primitive/cast (ptr i8) async-input)
+                                        (primitive/fnptr-of demo-checksum-free)))))
       (if (not (metal/renderer-valid? renderer))
           (do (printf c"coil-gpui: Metal pipeline creation failed\n") 1)
           (do
@@ -1063,6 +1069,14 @@
                                                  (load state-id))]
                 (do
                   (scheduler/scheduler-poll! (mut task-scheduler))
+                  (when (future/future-ready? [DemoChecksum] checksum-future)
+                    (let [checksum (future/future-take! [DemoChecksum] (mut checksum-future))]
+                      (when (!= (primitive/cast i64 checksum) 0)
+                        (do
+                          (set! (field state async-result) (load (field checksum value)))
+                          (set! (field state async-ready) true)
+                          (demo-checksum-free (primitive/cast (ptr i8) checksum))
+                          0))))
                   (set! width (primitive/cast f32 (load (field bounds w))))
                   (set! height (primitive/cast f32 (load (field bounds h))))
                   (metal/renderer-resize! (mut renderer) (load width) (load height) scale)
@@ -1230,7 +1244,7 @@
       (keymap/key-dispatcher-free! (mut key-dispatcher))
       (key-context/context-stack-free! (mut key-contexts))
       (reactive/reactive-graph-free! (mut reactive-graph))
-      (scheduler/task-scope-free! (mut demo-task-scope) (mut task-scheduler))
+      (future/future-free! [DemoChecksum] (mut task-scheduler) (mut checksum-future))
       (scheduler/scheduler-free! (mut task-scheduler))
       (retained/entity-store-free! [DemoState] (mut state-store))
       (clock/frame-clock-free! (mut frame-clock))

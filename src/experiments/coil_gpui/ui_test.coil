@@ -30,6 +30,7 @@
 (import "experiments.coil_gpui.reactive" :as reactive)
 (import "experiments.coil_gpui.inspector" :as inspector)
 (import "experiments.coil_gpui.scheduler" :as scheduler)
+(import "experiments.coil_gpui.future" :as future)
 (import "experiments.coil_gpui.window" :as window)
 (import "experiments.coil_gpui.event-test" :as event-test)
 (import "experiments.coil_gpui.measure" :as measure)
@@ -49,6 +50,21 @@
 (defstruct SchedulerProbe [(calls i64) (result i64) (cancelled i64)])
 
 (defstruct SchedulerBatchProbe [(completed i64) (sum i64)])
+
+(defstruct SchedulerPriorityProbe
+  [(gate i64) (started i64) (next i64) (order (ptr i64))])
+
+(defstruct SchedulerPriorityJob [(probe (ptr SchedulerPriorityProbe)) (id i64)])
+
+(defstruct FutureOwnedResult [(drops (ptr i64)) (value i64)])
+
+(defstruct FutureWorkerInput [(drops (ptr i64)) (value i64) (wait-cancel bool)])
+
+(impl Drop FutureOwnedResult
+  (drop [(self (mut FutureOwnedResult))]
+        (-> void)
+        (let [drops (load (field self drops))]
+          (store! drops (+ (load drops) 1)))))
 
 (defn build-replay-component-scene! [(scene (mut Scene))
                                      (router input/Router)
@@ -106,6 +122,45 @@
       (set! (field probe completed) (+ (load (field probe completed)) 1))
       (set! (field probe sum) (+ (load (field probe sum)) result))
       0)))
+
+(defn scheduler-test-priority-worker [(raw (ptr i8)) (cancel (ptr i64))] (-> i64)
+  (let [job (primitive/cast (ptr SchedulerPriorityJob) raw)
+        probe (load (field job probe))
+        id (load (field job id))]
+    (if (< id 0)
+        (do
+          (atomic/atomic-store (field probe started) 1)
+          (while (= (atomic/atomic-load (field probe gate)) 0) 0)
+          id)
+        (let [index (atomic/atomic-add (field probe next) 1)]
+          (do
+            (store! (primitive/index (load (field probe order)) index) id)
+            id)))))
+
+(defn scheduler-test-priority-completion [(raw (ptr i8)) (result i64) (cancelled i64)] (-> i64)
+  0)
+
+(defn future-test-worker [(raw (ptr i8)) (cancel (ptr i64))] (-> i64)
+  (let [input (primitive/cast (ptr FutureWorkerInput) raw)]
+    (do
+      (when (load (field input wait-cancel))
+        (while (not (scheduler/scheduler-cancel-requested? cancel)) 0))
+      (match (alloc/alloc [FutureOwnedResult] (alloc/malloc-allocator) 1)
+        (None [] 0)
+        (Some [memory]
+              (let [value (alloc/alloc-slice-data memory)]
+                (do
+                  (store! value
+                          (FutureOwnedResult :drops (load (field input drops))
+                            :value (load (field input value))))
+                  (primitive/cast i64 value))))))))
+
+(defn future-test-destroy [(raw (ptr i8))] (-> i64)
+  (let [value (primitive/cast (ptr FutureOwnedResult) raw)
+        owned (take! [FutureOwnedResult] value)]
+    (alloc/free [FutureOwnedResult]
+                (alloc/malloc-allocator)
+                (alloc/alloc-slice-new value 1))))
 
 (deftest scheduler-orders-owner-thread-work-and-rejects-stale-handles
          (let [(mut executor) (scheduler/scheduler-new)
@@ -223,6 +278,165 @@
              (assert-eq (atomic/atomic-load sequence) 64)
              (assert-eq (scheduler/scheduler-active-count executor) 0)
              (scheduler/scheduler-free! (mut executor)))))
+
+(deftest scheduler-priority-lanes-preserve-fifo-and-bound-low-starvation
+         (let [(mut executor) (scheduler/scheduler-new-with-workers 1)
+               (mut order) (al/al-new [i64] (alloc/malloc-allocator))
+               (mut jobs) (al/al-new [SchedulerPriorityJob] (alloc/malloc-allocator))
+               probe (primitive/alloc-stack SchedulerPriorityProbe)]
+           (for [i 0 16] (al/al-push! [i64] (mut order) -1))
+           (al/al-reserve! [SchedulerPriorityJob] (mut jobs) 7)
+           (store! probe
+                   (SchedulerPriorityProbe
+                     :gate 0
+                     :started 0
+                     :next 0
+                     :order (load (field order data))))
+           (al/al-push! [SchedulerPriorityJob]
+                        (mut jobs)
+                        (SchedulerPriorityJob :probe probe :id -1))
+           (scheduler/scheduler-spawn-priority! (mut executor)
+                                                scheduler/priority-medium
+                                                (primitive/fnptr-of scheduler-test-priority-worker)
+                                                (primitive/fnptr-of scheduler-test-priority-completion)
+                                                (primitive/cast (ptr i8)
+                                                                (al/al-elem [SchedulerPriorityJob] (mut jobs) 0))
+                                                (primitive/cast (ptr i8) 0))
+           (while (= (atomic/atomic-load (field probe started)) 0) 0)
+           ;; Queue low first to prove priority, while retaining FIFO in each lane.
+           (for [id 0 2]
+             (do
+               (al/al-push! [SchedulerPriorityJob]
+                            (mut jobs)
+                            (SchedulerPriorityJob :probe probe :id (+ 300 id)))
+               (scheduler/scheduler-spawn-priority! (mut executor)
+                                                    scheduler/priority-low
+                                                    (primitive/fnptr-of scheduler-test-priority-worker)
+                                                    (primitive/fnptr-of scheduler-test-priority-completion)
+                                                    (primitive/cast (ptr i8)
+                                                                    (al/al-elem [SchedulerPriorityJob]
+                                                                                (mut jobs)
+                                                                                (+ id 1)))
+                                                    (primitive/cast (ptr i8) 0))))
+           (for [id 0 2]
+             (do
+               (al/al-push! [SchedulerPriorityJob]
+                            (mut jobs)
+                            (SchedulerPriorityJob :probe probe :id (+ 200 id)))
+               (scheduler/scheduler-spawn-priority! (mut executor)
+                                                    scheduler/priority-medium
+                                                    (primitive/fnptr-of scheduler-test-priority-worker)
+                                                    (primitive/fnptr-of scheduler-test-priority-completion)
+                                                    (primitive/cast (ptr i8)
+                                                                    (al/al-elem [SchedulerPriorityJob]
+                                                                                (mut jobs)
+                                                                                (+ id 3)))
+                                                    (primitive/cast (ptr i8) 0))))
+           (for [id 0 2]
+             (do
+               (al/al-push! [SchedulerPriorityJob]
+                            (mut jobs)
+                            (SchedulerPriorityJob :probe probe :id (+ 100 id)))
+               (scheduler/scheduler-spawn-priority! (mut executor)
+                                                    scheduler/priority-high
+                                                    (primitive/fnptr-of scheduler-test-priority-worker)
+                                                    (primitive/fnptr-of scheduler-test-priority-completion)
+                                                    (primitive/cast (ptr i8)
+                                                                    (al/al-elem [SchedulerPriorityJob]
+                                                                                (mut jobs)
+                                                                                (+ id 5)))
+                                                    (primitive/cast (ptr i8) 0))))
+           (atomic/atomic-store (field probe gate) 1)
+           (while (> (scheduler/scheduler-active-count executor) 0)
+             (scheduler/scheduler-poll-at! (mut executor) 0))
+           (assert-eq (al/al-get [i64] order 0) 100)
+           (assert-eq (al/al-get [i64] order 1) 101)
+           (assert-eq (al/al-get [i64] order 2) 200)
+           (assert-eq (al/al-get [i64] order 3) 201)
+           (assert-eq (al/al-get [i64] order 4) 300)
+           (assert-eq (al/al-get [i64] order 5) 301)
+           (scheduler/scheduler-free! (mut executor))
+           (al/al-free! [SchedulerPriorityJob] (mut jobs))
+           (al/al-free! [i64] (mut order))))
+
+(deftest typed-futures-transfer-owned-values-and-destroy-abandoned-results
+         (let [(mut executor) (scheduler/scheduler-new-with-workers 1)
+               drops (primitive/alloc-stack i64)
+               first-input (primitive/alloc-stack FutureWorkerInput)
+               second-input (primitive/alloc-stack FutureWorkerInput)
+               cancelled-input (primitive/alloc-stack FutureWorkerInput)]
+           (store! drops 0)
+           (store! first-input
+                   (FutureWorkerInput
+                     :drops drops
+                     :value 41
+                     :wait-cancel false))
+           (store! second-input
+                   (FutureWorkerInput
+                     :drops drops
+                     :value 52
+                     :wait-cancel false))
+           (store! cancelled-input
+                   (FutureWorkerInput
+                     :drops drops
+                     :value 63
+                     :wait-cancel true))
+           (let [(mut first)
+                   (future/future-spawn! [FutureOwnedResult]
+                                         (mut executor)
+                                         scheduler/priority-high
+                                         (primitive/fnptr-of future-test-worker)
+                                         (primitive/cast (ptr i8) first-input)
+                                         (primitive/fnptr-of future-test-destroy))]
+             (while (not (future/future-ready? [FutureOwnedResult] first))
+               (scheduler/scheduler-poll-at! (mut executor) 0))
+             (let [value (future/future-take! [FutureOwnedResult] (mut first))]
+               (do
+                 (assert (!= (primitive/cast i64 value) 0))
+                 (assert-eq (load (field value value)) 41)
+                 (future-test-destroy (primitive/cast (ptr i8) value))))
+             (assert-eq (load drops) 1))
+           (let [(mut abandoned)
+                   (future/future-spawn! [FutureOwnedResult]
+                                         (mut executor)
+                                         scheduler/priority-medium
+                                         (primitive/fnptr-of future-test-worker)
+                                         (primitive/cast (ptr i8) second-input)
+                                         (primitive/fnptr-of future-test-destroy))]
+             (while (not (future/future-ready? [FutureOwnedResult] abandoned))
+               (scheduler/scheduler-poll-at! (mut executor) 0))
+             (future/future-free! [FutureOwnedResult] (mut executor) (mut abandoned))
+             (assert-eq (load drops) 2))
+           (let [implicit-input (primitive/alloc-stack FutureWorkerInput)]
+             (store! implicit-input
+                     (FutureWorkerInput
+                       :drops drops
+                       :value 57
+                       :wait-cancel false))
+             (let [(mut implicit)
+                     (future/future-spawn! [FutureOwnedResult]
+                                           (mut executor)
+                                           scheduler/priority-medium
+                                           (primitive/fnptr-of future-test-worker)
+                                           (primitive/cast (ptr i8) implicit-input)
+                                           (primitive/fnptr-of future-test-destroy))]
+               (while (not (future/future-ready? [FutureOwnedResult] implicit))
+                 (scheduler/scheduler-poll-at! (mut executor) 0))))
+           (assert-eq (load drops) 3)
+           (let [(mut cancelled)
+                   (future/future-spawn! [FutureOwnedResult]
+                                         (mut executor)
+                                         scheduler/priority-low
+                                         (primitive/fnptr-of future-test-worker)
+                                         (primitive/cast (ptr i8) cancelled-input)
+                                         (primitive/fnptr-of future-test-destroy))]
+             (assert (future/future-cancel! [FutureOwnedResult] (mut executor) (mut cancelled)))
+             (while (> (scheduler/scheduler-active-count executor) 0)
+               (scheduler/scheduler-poll-at! (mut executor) 0))
+             (assert (future/future-cancelled? [FutureOwnedResult] cancelled))
+             (future/future-free! [FutureOwnedResult] (mut executor) (mut cancelled))
+             (assert-eq (load drops) 4))
+           (scheduler/scheduler-free! (mut executor))))
 
 (deftest scheduler-pool-shutdown-cancels-running-and-queued-work-before-join
          (let [(mut executor) (scheduler/scheduler-new-with-workers 1)
@@ -1224,8 +1438,7 @@
 (deftest editable-text-area-navigates-and-paints-retained-lines
          (let [device (MTLCreateSystemDefaultDevice)
                (mut atlas) (text/text-atlas-new device 1024 512 2 1.0)
-               (mut area)
-                 (editable/text-area-new c"first line with width\nsecond 😀 line is longer\nthird line")
+               (mut area) (editable/text-area-new c"first line with width\nsecond 😀 line is longer\nthird line")
                field-value (editable/text-area-field area)
                (mut paragraph)
                  (text/text-shape-paragraph! (mut atlas)

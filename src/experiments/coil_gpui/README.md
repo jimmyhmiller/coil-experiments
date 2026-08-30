@@ -236,13 +236,22 @@ layer in the runtime path.
 - A Coil-native UI scheduler with generation-checked cancellable handles,
   owner-thread foreground and monotonic timer queues, and pthread-backed background
   work on a bounded reusable pool (four workers by default, configurable at
-  construction). A mutex/condition FIFO feeds heap-stable control blocks to the
-  pool; cross-thread result state is atomic, workers receive cooperative
+  construction). Mutex/condition-protected high, medium, and low FIFO lanes feed
+  heap-stable control blocks to the pool. A deterministic 8:4:1 weighted service
+  cycle biases latency-sensitive jobs while guaranteeing a continuously queued
+  low-priority job service within thirteen selections. Cross-thread result state
+  is atomic, workers receive cooperative
   cancellation, and pool threads are joined before synchronization or job storage
   is released. Completion publication signals the frame
   semaphore, waking both active display pacing and the occluded fallback without
   exposing UI state across threads. The demo computes a checksum off-thread and
   paints its owner-thread completion as a GPU status badge.
+- Affine typed `Future<T>` handles retain reference-counted completion cores.
+  Workers publish owned result pointers, owner-thread polling exposes readiness,
+  `future-take!` transfers exact T ownership, and required destructors reclaim
+  cancelled, explicitly freed, or implicitly abandoned results exactly once. The
+  demo checksum now uses a low-priority typed future rather than an untyped result
+  callback.
 - Structured task scopes group foreground, timed, and background work under one
   lifecycle. They prune completed generation handles, reject additions after
   closure, and cooperatively cancel all remaining jobs before releasing their own
@@ -394,7 +403,7 @@ reuse one Metal texture, while budget pressure evicts only unpinned least-recent
 used entries. Asset generations make cached handles safe across slot recycling.
 
 Background work does not create one operating-system thread per task. Scheduler
-construction starts a fixed worker set; tasks enter a condition-variable FIFO and
+construction starts a fixed worker set; tasks enter weighted priority FIFOs and
 reuse those threads. Result and cancellation publication use sequentially consistent
 atomics, while queue ownership stays under one mutex. Polling reclaims a completed
 block only after the worker's final `done` store. Teardown first marks every live
@@ -416,7 +425,7 @@ application. GPUI parity still requires substantial systems, notably:
   fills, butt-cap/miter strokes, affine transforms, analytic shadows, linear
   gradients, general raster images, virtual scrolling, and nested rectangular
   GPU clipping work);
-- typed future values, worker-pool priority lanes and work stealing,
+- worker-pool work stealing,
   non-image/remote asset sources,
   editable style inspection;
 - deeper GPU/CPU profiling.
@@ -432,6 +441,8 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI keymap precedence and matching](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/keymap.rs)
 - [GPUI key-context predicate language](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/keymap/context.rs)
 - [GPUI binding metadata indirection](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/keymap/binding.rs)
+- [GPUI typed tasks and priority spawning](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/executor.rs)
+- [GPUI weighted priority queues](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/queue.rs)
 - [GPUI retained entity map](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/app/entity_map.rs)
 - [GPUI subscriptions](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/subscription.rs)
 - [GPUI image element](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/elements/img.rs)
