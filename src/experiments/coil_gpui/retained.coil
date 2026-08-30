@@ -1,0 +1,241 @@
+(module experiments.coil_gpui.retained)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+
+(export EntityId
+        EntityStore
+        ObservationHub
+        Subscription
+        Notification
+        entity-store-new
+        entity-store-create!
+        entity-store-alive?
+        entity-store-get
+        entity-store-remove!
+        entity-store-free!
+        observation-hub-new
+        observation-subscribe!
+        observation-unsubscribe!
+        observation-notify!
+        observation-count
+        observation-at
+        observation-clear!
+        observation-hub-free!)
+
+;;; A generation is part of identity so stale handles cannot address a reused slot.
+;;; type-id keeps erased IDs from one typed store from being accepted by another.
+(defstruct EntityId [(type-id i64) (slot i64) (generation i64)])
+
+(defstruct EntitySlot [T] [(value T) (generation i64) (alive bool)])
+
+(defstruct EntityStore [T]
+  [(slots (al/ArrayList (EntitySlot T))) (free-slots (al/ArrayList i64))])
+
+(defstruct Subscription [(index i64) (generation i64)])
+
+(defstruct ObserverSlot
+  [(subject EntityId) (token i32) (generation i64) (active bool)])
+
+(defstruct Notification [(subject EntityId) (token i32)])
+
+(defstruct ObservationHub
+  [(observers (al/ArrayList ObserverSlot))
+   (free-observers (al/ArrayList i64))
+   (notifications (al/ArrayList Notification))])
+
+(defn entity-id [T] [(slot i64) (generation i64)] (-> EntityId)
+  (let [(mut id) (primitive/zeroed EntityId)]
+    (do
+      (store! (field id type-id) (alloc/type-id [T]))
+      (store! (field id slot) slot)
+      (store! (field id generation) generation)
+      (load id))))
+
+(defn entity-store-new [T] [] (-> (EntityStore T))
+  (let [(mut store) (primitive/zeroed (EntityStore T))]
+    (do
+      (store! (field store slots) (al/al-new [(EntitySlot T)] (alloc/malloc-allocator)))
+      (store! (field store free-slots) (al/al-new [i64] (alloc/malloc-allocator)))
+      (load store))))
+
+(defn entity-store-create! [T] [(store (mut (EntityStore T)))
+                                (value T)] (-> EntityId)
+  (let [free-count (al/al-len [i64] (load (field store free-slots)))]
+    (if (> free-count 0)
+        (let [index (al/al-get [i64] (load (field store free-slots)) (- free-count 1))]
+          (do
+            (set! (.len (.free-slots store)) (- free-count 1))
+            (let [slots (load (field store slots))
+                  slot (primitive/index (load (field slots data)) index)]
+              (do
+                (store! (field slot value) value)
+                (store! (field slot alive) true)
+                (entity-id [T] index (load (field slot generation)))))))
+        ;; Initialize the destination in place after reserving. This permits T to
+        ;; own resources and avoids constructing an invalid zero T during growth.
+        (let [slots (load (field store slots))
+              index (al/al-len [(EntitySlot T)] slots)]
+          (do
+            (if (>= index (al/al-cap [(EntitySlot T)] slots))
+                (al/al-reserve! [(EntitySlot T)]
+                                (mut (.slots store))
+                                (if (= index 0) 2 (* index 2)))
+                0)
+            (let [grown-slots (load (field store slots))
+                  destination (primitive/index (load (field grown-slots data)) index)]
+              (do
+                (store! (field destination value) value)
+                (store! (field destination generation) 1)
+                (store! (field destination alive) true)
+                (set! (.len (.slots store)) (+ index 1))
+                (entity-id [T] index 1))))))))
+
+(defn entity-store-alive? [T] [(store (EntityStore T))
+                               (id EntityId)] (-> bool)
+  (let [slots (load (field store slots))
+        index (load (field id slot))]
+    (and (= (load (field id type-id)) (alloc/type-id [T]))
+         (and (>= index 0)
+              (and (< index (al/al-len [(EntitySlot T)] slots))
+                   (let [slot (primitive/index (load (field slots data)) index)]
+                     (and (load (field slot alive))
+                          (= (load (field slot generation))
+                             (load (field id generation))))))))))
+
+;;; The returned pointer remains valid until the store is structurally mutated.
+(defn entity-store-get [T] [(store (mut (EntityStore T)))
+                            (id EntityId)] (-> (ptr T))
+  (if (entity-store-alive? [T] (load store) id)
+      (let [slots (load (field store slots))]
+        (field (primitive/index (load (field slots data)) (load (field id slot))) value))
+      (primitive/cast (ptr T) 0)))
+
+(defn entity-store-remove! [T] [(store (mut (EntityStore T)))
+                                (id EntityId)] (-> bool)
+  (if (not (entity-store-alive? [T] (load store) id))
+      false
+      (let [slots (load (field store slots))
+            slot (primitive/index (load (field slots data)) (load (field id slot)))
+            removed (take! [T] (field slot value))]
+        (do
+          (store! (field slot alive) false)
+          (store! (field slot generation) (+ (load (field slot generation)) 1))
+          (al/al-push! [i64] (mut (.free-slots store)) (load (field id slot)))
+          true))))
+
+(defn entity-store-free! [T] [(store (mut (EntityStore T)))] (-> i64)
+  (do
+    (let [slots (load (field store slots))]
+      (for [i 0 (al/al-len [(EntitySlot T)] slots)]
+        (let [slot (primitive/index (load (field slots data)) i)]
+          (if (load (field slot alive))
+              (let [removed (take! [T] (field slot value))]
+                (do
+                  (store! (field slot alive) false)
+                  0))
+              0))))
+    (al/al-free! [(EntitySlot T)] (mut (.slots store)))
+    (al/al-free! [i64] (mut (.free-slots store)))))
+
+(defn same-entity? [(a (ref EntityId)) (b (ref EntityId))] (-> bool)
+  (and (= (load (field a type-id)) (load (field b type-id)))
+       (and (= (load (field a slot)) (load (field b slot)))
+            (= (load (field a generation)) (load (field b generation))))))
+
+(defn observation-hub-new [] (-> ObservationHub)
+  (let [(mut hub) (primitive/zeroed ObservationHub)]
+    (do
+      (store! (field hub observers) (al/al-new [ObserverSlot] (alloc/malloc-allocator)))
+      (store! (field hub free-observers) (al/al-new [i64] (alloc/malloc-allocator)))
+      (store! (field hub notifications) (al/al-new [Notification] (alloc/malloc-allocator)))
+      (load hub))))
+
+(defn observation-subscribe! [(hub (mut ObservationHub))
+                              (subject EntityId)
+                              (token i32)] (-> Subscription)
+  (let [free-count (al/al-len [i64] (load (field hub free-observers)))
+        (mut index) 0]
+    (do
+      (if (> free-count 0)
+          (do
+            (store! index (al/al-get [i64] (load (field hub free-observers)) (- free-count 1)))
+            (set! (.len (.free-observers hub)) (- free-count 1)))
+          (let [(mut zero) (primitive/zeroed ObserverSlot)]
+            (do
+              (al/al-push! [ObserverSlot] (mut (.observers hub)) (load zero))
+              (store! index (- (al/al-len [ObserverSlot] (load (field hub observers))) 1)))))
+      (let [observers (load (field hub observers))
+            slot (primitive/index (load (field observers data)) (load index))]
+        (do
+          (store! (field slot subject) subject)
+          (store! (field slot token) token)
+          (if (= (load (field slot generation)) 0) (store! (field slot generation) 1) 0)
+          (store! (field slot active) true)
+          (let [(mut subscription) (primitive/zeroed Subscription)]
+            (do
+              (store! (field subscription index) (load index))
+              (store! (field subscription generation) (load (field slot generation)))
+              (load subscription))))))))
+
+(defn observation-unsubscribe! [(hub (mut ObservationHub))
+                                (subscription Subscription)] (-> bool)
+  (let [observers (load (field hub observers))
+        index (load (field subscription index))]
+    (if (or (< index 0) (>= index (al/al-len [ObserverSlot] observers)))
+        false
+        (let [slot (primitive/index (load (field observers data)) index)]
+          (if (or (not (load (field slot active)))
+                  (!= (load (field slot generation)) (load (field subscription generation))))
+              false
+              (do
+                (store! (field slot active) false)
+                (store! (field slot generation) (+ (load (field slot generation)) 1))
+                (al/al-push! [i64] (mut (.free-observers hub)) index)
+                true))))))
+
+(defn push-notification! [(hub (mut ObservationHub))
+                          (subject (ref EntityId))
+                          (token i32)] (-> i64)
+  (let [(mut zero) (primitive/zeroed Notification)]
+    (do
+      (al/al-push! [Notification] (mut (.notifications hub)) (load zero))
+      (let [notifications (load (field hub notifications))
+            item
+              (primitive/index (load (field notifications data))
+                               (- (al/al-len [Notification] notifications) 1))]
+        (do
+          (store! (field item subject) (load subject))
+          (store! (field item token) token)
+          (al/al-len [Notification] notifications))))))
+
+(defn observation-notify! [(hub (mut ObservationHub))
+                           (subject EntityId)] (-> i64)
+  (let [observers (load (field hub observers))]
+    (do
+      (for [i 0 (al/al-len [ObserverSlot] observers)]
+        (let [slot (primitive/index (load (field observers data)) i)]
+          (if (and (load (field slot active))
+                   (same-entity? (field slot subject) subject))
+              (push-notification! (mut hub) subject (load (field slot token)))
+              0)))
+      (al/al-len [Notification] (load (field hub notifications))))))
+
+(defn observation-count [(hub ObservationHub)] (-> i64)
+  (al/al-len [Notification] (load (field hub notifications))))
+
+(defn observation-at [(hub (mut ObservationHub))
+                      (index i64)] (-> (ptr Notification))
+  (let [notifications (load (field hub notifications))]
+    (primitive/index (load (field notifications data)) index)))
+
+(defn observation-clear! [(hub (mut ObservationHub))] (-> i64)
+  (do
+    (set! (.len (.notifications hub)) 0)
+    0))
+
+(defn observation-hub-free! [(hub (mut ObservationHub))] (-> i64)
+  (do
+    (al/al-free! [ObserverSlot] (mut (.observers hub)))
+    (al/al-free! [i64] (mut (.free-observers hub)))
+    (al/al-free! [Notification] (mut (.notifications hub)))))

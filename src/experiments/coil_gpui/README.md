@@ -75,6 +75,10 @@ layer in the runtime path.
 - Configurable keymaps with platform-independent modifiers, multi-stroke chords,
   global and stacked component contexts, deepest-context and latest-binding
   precedence, explicit disabled bindings, versioning, and failed-prefix retry.
+- Typed retained entity stores with type/slot/generation identities, stale-handle
+  rejection, slot reuse, deterministic destruction of owned values, ordered
+  observation queues, and generation-safe subscription cancellation. The demo's
+  application state lives in a retained entity rather than a frame-local value.
 - Uniform and variable-height virtual lists with retained pixel offsets, bounded
   overscan, exact visible ranges, viewport clipping, wheel input, and stable GPU
   scrollbars. Variable lists use a Fenwick prefix-sum index for logarithmic
@@ -214,8 +218,8 @@ application. GPUI parity still requires substantial systems, notably:
 - keymap predicate expressions and source metadata, IME, drag/drop, and accessibility
   (hierarchical capture/target/bubble listeners with stop-propagation, focus
   traversal, and logical actions work);
-- retained entities, subscriptions, observation, async executor integration, assets,
-  inspector support, deterministic UI tests, and multiple windows;
+- weak/strong retained handles, dependency-tracked observation, async executor
+  integration, assets, inspector support, deterministic UI tests, and multiple windows;
 - damage tracking, frame pacing, occlusion handling, multi-page texture-atlas eviction,
   and GPU/CPU profiling.
 
@@ -227,6 +231,8 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI element lifecycle](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/element.rs)
 - [GPUI key dispatch](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/key_dispatch.rs)
 - [GPUI keymap precedence and matching](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/keymap.rs)
+- [GPUI retained entity map](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/app/entity_map.rs)
+- [GPUI subscriptions](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/subscription.rs)
 - [GPUI window, focus, and hitbox model](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/window.rs)
 - [GPUI list example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/list_example.rs)
 - [GPUI responsive grid example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/grid_layout.rs)

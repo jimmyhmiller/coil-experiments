@@ -8,6 +8,7 @@
 (import "experiments.coil_gpui.grid" :as grid)
 (import "experiments.coil_gpui.input" :as input)
 (import "experiments.coil_gpui.keymap" :as keymap)
+(import "experiments.coil_gpui.retained" :as retained)
 (import "experiments.coil_gpui.scroll" :as scroll)
 (import "experiments.coil_gpui.variable_scroll" :as variable)
 (import "experiments.coil_gpui.text" :as text)
@@ -26,6 +27,14 @@
           (store! (field item key) key)
           (store! (field item modifiers) modifiers)
           (al/al-len [keymap/KeyStroke] (load strokes)))))))
+
+(defstruct RetainedDropProbe [(counter (ptr i64)) (value i64)])
+
+(impl Drop RetainedDropProbe
+  (drop [(self (mut RetainedDropProbe))]
+        (-> void)
+        (let [counter (load (field self counter))]
+          (store! counter (+ (load counter) 1)))))
 
 (deftest metal-buffer-capacity-grows-by-powers-of-two
          (assert-eq (metal/next-buffer-capacity 0 1) 65536)
@@ -1043,6 +1052,62 @@
            (al/al-free! [keymap/KeyStroke] (mut sequence))
            (keymap/key-dispatcher-free! (mut dispatcher))
            (keymap/keymap-free! (mut map))))
+
+(deftest retained-entity-generations-reject-stale-reused-handles
+         (let [drops (primitive/alloc-stack i64)
+               (mut store) (retained/entity-store-new [RetainedDropProbe])
+               first
+                 (retained/entity-store-create! [RetainedDropProbe]
+                                                (mut store)
+                                                (RetainedDropProbe :counter drops
+                                                  :value 11))]
+           (store! drops 0)
+           (assert (retained/entity-store-alive? [RetainedDropProbe] store first))
+           (let [value (retained/entity-store-get [RetainedDropProbe] (mut store) first)]
+             (assert (!= (primitive/cast i64 value) 0))
+             (assert-eq (load (field value value)) 11))
+           (assert (retained/entity-store-remove! [RetainedDropProbe] (mut store) first))
+           (assert-eq (load drops) 1)
+           (assert (not (retained/entity-store-alive? [RetainedDropProbe] store first)))
+           (let [second
+                   (retained/entity-store-create! [RetainedDropProbe]
+                                                  (mut store)
+                                                  (RetainedDropProbe :counter drops
+                                                    :value 22))]
+             (assert-eq (load (field first slot)) (load (field second slot)))
+             (assert (!= (load (field first generation)) (load (field second generation))))
+             (assert (= (primitive/cast i64
+                                        (retained/entity-store-get [RetainedDropProbe]
+                                                                   (mut store)
+                                                                   first))
+                        0))
+             (let [value (retained/entity-store-get [RetainedDropProbe] (mut store) second)]
+               (assert-eq (load (field value value)) 22)))
+           (retained/entity-store-free! [RetainedDropProbe] (mut store))
+           (assert-eq (load drops) 2)))
+
+(deftest retained-observers-queue-in-order-and-unsubscribe-by-generation
+         (let [(mut store) (retained/entity-store-new [i64])
+               subject (retained/entity-store-create! [i64] (mut store) 42)
+               (mut hub) (retained/observation-hub-new)
+               first (retained/observation-subscribe! (mut hub) subject 101)
+               second (retained/observation-subscribe! (mut hub) subject 102)]
+           (assert-eq (retained/observation-notify! (mut hub) subject) 2)
+           (assert-eq (load (field (retained/observation-at (mut hub) 0) token)) 101)
+           (assert-eq (load (field (retained/observation-at (mut hub) 1) token)) 102)
+           (retained/observation-clear! (mut hub))
+           (assert (retained/observation-unsubscribe! (mut hub) first))
+           (let [replacement (retained/observation-subscribe! (mut hub) subject 103)]
+             (assert (not (retained/observation-unsubscribe! (mut hub) first)))
+             (assert-eq (retained/observation-notify! (mut hub) subject) 2)
+             ;; The surviving old subscription keeps registration-slot order;
+             ;; the reused slot follows it during the observer scan.
+             (assert-eq (load (field (retained/observation-at (mut hub) 0) token)) 103)
+             (assert-eq (load (field (retained/observation-at (mut hub) 1) token)) 102)
+             (assert (retained/observation-unsubscribe! (mut hub) replacement)))
+           (assert (retained/observation-unsubscribe! (mut hub) second))
+           (retained/observation-hub-free! (mut hub))
+           (retained/entity-store-free! [i64] (mut store))))
 
 (deftest focus-and-actions-survive-transient-scenes
          (let [(mut scene) (scene-new)
