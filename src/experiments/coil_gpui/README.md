@@ -41,6 +41,9 @@ layer in the runtime path.
   still form maximal ordered instanced runs.
 - Analytic shadow instances are filtered and compacted in scene order before
   upload, retaining a single instanced shadow draw with no invisible records.
+- Allocation-free retained damage tracking unions consecutive transformed scene
+  regions, correctly invalidating moved and removed content. Partial presentation
+  awaits a persistent backing texture; rotating layer drawables are always fully drawn.
 - Adaptive center-parameterized elliptical arcs with positive or negative sweeps,
   full-circle support, and the same caller-controlled geometric tolerance.
 - Batched analytic rounded-rectangle shadows with GPU-computed soft falloff,
