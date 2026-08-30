@@ -2,6 +2,7 @@
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :as al)
 (import "coil.primitive" :as primitive)
+(import "coil.hashmap" :as hm)
 (import "experiments.coil_gpui.path" :as path)
 
 (extern sinf :cc c [f32] (-> f32))
@@ -53,6 +54,7 @@
         damage-union
         damage-tracker-new
         damage-tracker-advance!
+        damage-tracker-free!
         scene-texture!
         scene-texture-region!
         scene-image!
@@ -150,7 +152,16 @@
 
 (defstruct DamageRegion [(bounds Rect) (valid bool)])
 
-(defstruct DamageTracker [(previous DamageRegion) (initialized bool)])
+(defstruct DamageRecord [(bounds Rect) (signature i64)])
+
+;;; Two reusable snapshots let the retained renderer compare frame records in
+;;; linear time without allocating. Scene order is deliberately part of the
+;;; identity: insertion or removal invalidates the shifted suffix, which is
+;;; conservative and preserves exact compositing semantics for duplicate IDs.
+(defstruct DamageTracker
+  [(previous (al/ArrayList DamageRecord))
+   (scratch (al/ArrayList DamageRecord))
+   (initialized bool)])
 
 (defstruct Hitbox
   [(bounds Rect)
@@ -734,21 +745,128 @@
 
 (defn damage-tracker-new [] (-> DamageTracker)
   (DamageTracker
-    :previous (DamageRegion :bounds (rect 0.0 0.0 0.0 0.0) :valid false)
+    :previous (al/al-new [DamageRecord] (alloc/malloc-allocator))
+    :scratch (al/al-new [DamageRecord] (alloc/malloc-allocator))
     :initialized false))
+
+(defn damage-record! [(records (mut (al/ArrayList DamageRecord)))
+                      (bounds Rect)
+                      (source (ptr i8))
+                      (byte-count i64)
+                      (extra-signature i64)] (-> i64)
+  (let [signature (primitive/ixor (hm/bytewise-hash source byte-count) extra-signature)]
+    (al/al-push! [DamageRecord] (mut records)
+                 (DamageRecord :bounds bounds :signature signature))))
+
+(defn scene-damage-records! [(records (mut (al/ArrayList DamageRecord)))
+                             (scene Scene)
+                             (viewport Rect)] (-> i64)
+  (let [items (load (field scene items))
+        shadows (load (field scene shadows))
+        sprites (load (field scene text))
+        draws (load (field scene path-draws))
+        vertices (load (field scene path-vertices))]
+    (do
+      (al/al-clear! [DamageRecord] (mut records))
+      (for [i 0 (al/al-len [Primitive] shadows)]
+        (let [item (primitive/index (load (field shadows data)) i)
+              value (load item)]
+          (damage-record! (mut records)
+                          (intersect viewport
+                                     (affine-transform-bounds (load (field value transform))
+                                                              (load (field value bounds))))
+                          (primitive/cast (ptr i8) item)
+                          (primitive/sizeof Primitive)
+                          1)))
+      (for [i 0 (al/al-len [Primitive] items)]
+        (let [item (primitive/index (load (field items data)) i)
+              value (load item)]
+          (damage-record! (mut records)
+                          (intersect viewport
+                                     (intersect
+                                       (affine-transform-bounds (load (field value transform))
+                                                                (load (field value bounds)))
+                                       (load (field value clip))))
+                          (primitive/cast (ptr i8) item)
+                          (primitive/sizeof Primitive)
+                          2)))
+      (for [i 0 (al/al-len [TextSprite] sprites)]
+        (let [sprite (primitive/index (load (field sprites data)) i)
+              value (load sprite)]
+          (damage-record! (mut records)
+                          (intersect viewport
+                                     (intersect
+                                       (affine-transform-bounds (load (field value transform))
+                                                                (load (field value bounds)))
+                                       (load (field value clip))))
+                          (primitive/cast (ptr i8) sprite)
+                          (primitive/sizeof TextSprite)
+                          3)))
+      (for [i 0 (al/al-len [PathDraw] draws)]
+        (let [draw (primitive/index (load (field draws data)) i)
+              value (load draw)
+              vertex-start (load (field value vertex-start))
+              vertex-count (load (field value vertex-count))
+              vertex-signature
+                (if (> vertex-count 0)
+                    (hm/bytewise-hash
+                      (primitive/cast (ptr i8)
+                                      (primitive/index (load (field vertices data)) vertex-start))
+                      (* vertex-count (primitive/sizeof path/PathPoint)))
+                    0)]
+          (damage-record! (mut records)
+                          (intersect viewport
+                                     (intersect
+                                       (affine-transform-bounds (load (field value transform))
+                                                                (load (field value bounds)))
+                                       (load (field value clip))))
+                          (primitive/cast (ptr i8) draw)
+                          (primitive/sizeof PathDraw)
+                          (primitive/ixor vertex-signature 4))))
+      (al/al-len [DamageRecord] (load records)))))
 
 (defn damage-tracker-advance! [(tracker (mut DamageTracker))
                                (scene Scene)
                                (viewport Rect)] (-> DamageRegion)
-  (let [current (scene-visual-bounds scene viewport)
-        damage
-          (if (load (field tracker initialized))
-              (damage-union (load (field tracker previous)) current)
-              (load current))]
+  (let [(mut damage) (primitive/zeroed DamageRegion)]
     (do
-      (set! (.previous tracker) current)
+      (scene-damage-records! (mut (field tracker scratch)) scene viewport)
+      (if (not (load (field tracker initialized)))
+          (damage-add! (mut damage) viewport)
+          (let [previous (load (field tracker previous))
+                current (load (field tracker scratch))
+                previous-count (al/al-len [DamageRecord] previous)
+                current-count (al/al-len [DamageRecord] current)
+                shared-count (if (< previous-count current-count) previous-count current-count)]
+            (do
+              (for [i 0 shared-count]
+                (let [old (al/al-get [DamageRecord] previous i)
+                      fresh (al/al-get [DamageRecord] current i)]
+                  (if (!= (load (field old signature)) (load (field fresh signature)))
+                      (do
+                        (damage-add! (mut damage) (load (field old bounds)))
+                        (damage-add! (mut damage) (load (field fresh bounds)))
+                        0)
+                      0)))
+              (for [i shared-count previous-count]
+                (let [old (al/al-get [DamageRecord] previous i)]
+                  (damage-add! (mut damage) (load (field old bounds)))))
+              (for [i shared-count current-count]
+                (let [fresh (al/al-get [DamageRecord] current i)]
+                  (damage-add! (mut damage) (load (field fresh bounds))))))))
+      (let [swap (load (field tracker previous))]
+        (do
+          (set! (.previous tracker) (load (field tracker scratch)))
+          (set! (.scratch tracker) swap)))
       (set! (.initialized tracker) true)
-      damage)))
+      (load damage))))
+
+(defn damage-tracker-free! [(tracker (mut DamageTracker))] (-> i64)
+  (do
+    (al/al-free! [DamageRecord] (mut (field tracker previous)))
+    (al/al-free! [DamageRecord] (mut (field tracker scratch)))
+    (set! (.initialized tracker) false)
+    0))
 
 ;;; Queue a cached alpha-mask texture for GPU compositing. Texture ownership
 ;;; remains with the renderer/text cache; the transient scene only borrows it.

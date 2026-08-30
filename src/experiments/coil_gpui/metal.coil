@@ -9,6 +9,7 @@
         renderer-new
         renderer-resize!
         renderer-draw!
+        renderer-draw-damage!
         renderer-valid?
         renderer-free!
         next-buffer-capacity
@@ -24,12 +25,15 @@
 (extern printf :cc c [(ptr i8) ...] (-> i32))
 
 (extern memcpy :cc c [(ptr i8) (ptr i8) i64] (-> (ptr i8)))
+(extern floorf :cc c [f32] (-> f32))
+(extern ceilf :cc c [f32] (-> f32))
 
 (defstruct CGSize [(w f64) (h f64)])
 
 (defstruct CGRect [(x f64) (y f64) (w f64) (h f64)])
 
 (defstruct MTLClearColor [(r f64) (g f64) (b f64) (a f64)])
+(defstruct MTLScissorRect [(x i64) (y i64) (width i64) (height i64)])
 
 (defstruct Renderer
   [(device (ptr i8))
@@ -40,11 +44,16 @@
    (text-pipeline (ptr i8))
    (image-pipeline (ptr i8))
    (grayscale-image-pipeline (ptr i8))
+   (presentation-pipeline (ptr i8))
    (primitive-buffer-0 (ptr i8))
    (primitive-buffer-1 (ptr i8))
    (primitive-buffer-2 (ptr i8))
    (primitive-capacity i64)
    (layer (ptr i8))
+   (backing-texture (ptr i8))
+   (backing-width i64)
+   (backing-height i64)
+   (backing-valid bool)
    (width f32)
    (height f32)
    (scale f32)
@@ -232,6 +241,34 @@
 (defn path-shader-source [] (-> (ptr i8))
   c"#include <metal_stdlib>\nusing namespace metal;\nstruct Point { float x,y; };\nstruct Color { float r,g,b,a; };\nstruct Rect { float x,y,w,h; };\nstruct Affine { float m11,m12,m21,m22,tx,ty; };\nstruct Frame { float2 viewport; float2 pad; };\nstruct Uniform { Color color; Rect clip; Affine transform; float opacity; int padding; };\nstruct Out { float4 position [[position]]; float2 pixel; float4 color; float4 clip; float opacity; };\nvertex Out path_vertex(uint vid [[vertex_id]],constant Point* points [[buffer(0)]],constant Frame& frame [[buffer(1)]],constant Uniform& u [[buffer(2)]]) { Point p=points[vid]; float2 pixel=float2(u.transform.m11*p.x+u.transform.m21*p.y+u.transform.tx,u.transform.m12*p.x+u.transform.m22*p.y+u.transform.ty); Out o; o.position=float4(pixel.x/frame.viewport.x*2.0-1.0,1.0-pixel.y/frame.viewport.y*2.0,0,1); o.pixel=pixel; o.color=float4(u.color.r,u.color.g,u.color.b,u.color.a); o.clip=float4(u.clip.x,u.clip.y,u.clip.w,u.clip.h); o.opacity=u.opacity; return o; }\nfragment float4 path_fragment(Out in [[stage_in]]) { if(in.pixel.x<in.clip.x||in.pixel.y<in.clip.y||in.pixel.x>=in.clip.x+in.clip.z||in.pixel.y>=in.clip.y+in.clip.w) discard_fragment(); return float4(in.color.rgb,in.color.a*in.opacity); }\n")
 
+(defn presentation-shader-source [] (-> (ptr i8))
+  c"#include <metal_stdlib>\nusing namespace metal;\nstruct PresentOut { float4 position [[position]]; float2 uv; };\nvertex PresentOut present_vertex(uint vid [[vertex_id]]) { constexpr float2 positions[3]={float2(-1.0,1.0),float2(-1.0,-3.0),float2(3.0,1.0)}; constexpr float2 uvs[3]={float2(0.0,0.0),float2(0.0,2.0),float2(2.0,0.0)}; PresentOut o; o.position=float4(positions[vid],0.0,1.0); o.uv=uvs[vid]; return o; }\nfragment float4 present_fragment(PresentOut in [[stage_in]],texture2d<float> backing [[texture(0)]]) { constexpr sampler s(coord::normalized,address::clamp_to_edge,filter::nearest); return backing.sample(s,in.uv); }\n")
+
+(defn presentation-pipeline-new [(device (ptr i8))] (-> (ptr i8))
+  (let [library (msg (ptr i8) device (sel c"newLibraryWithSource:options:error:")
+                     [(ptr i8) (ptr i8) (ptr (ptr i8))]
+                     (nsstr (presentation-shader-source))
+                     (primitive/cast (ptr i8) 0)
+                     (primitive/cast (ptr (ptr i8)) 0))
+        vertex (msg (ptr i8) library (sel c"newFunctionWithName:") [(ptr i8)] (nsstr c"present_vertex"))
+        fragment (msg (ptr i8) library (sel c"newFunctionWithName:") [(ptr i8)] (nsstr c"present_fragment"))
+        descriptor (msg (ptr i8) (class c"MTLRenderPipelineDescriptor") (sel c"new") [])
+        colors (msg (ptr i8) descriptor (sel c"colorAttachments") [])
+        color0 (msg (ptr i8) colors (sel c"objectAtIndexedSubscript:") [i64] 0)]
+    (do
+      (msg i64 descriptor (sel c"setVertexFunction:") [(ptr i8)] vertex)
+      (msg i64 descriptor (sel c"setFragmentFunction:") [(ptr i8)] fragment)
+      (msg i64 color0 (sel c"setPixelFormat:") [i64] 80)
+      (let [pipeline (msg (ptr i8) device (sel c"newRenderPipelineStateWithDescriptor:error:")
+                          [(ptr i8) (ptr (ptr i8))]
+                          descriptor (primitive/cast (ptr (ptr i8)) 0))]
+        (do
+          (msg i64 vertex (sel c"release") [])
+          (msg i64 fragment (sel c"release") [])
+          (msg i64 library (sel c"release") [])
+          (msg i64 descriptor (sel c"release") [])
+          pipeline)))))
+
 (defn renderer-valid? [(renderer Renderer)] (-> bool)
   (and (!= (primitive/cast i64 (load (field renderer device))) 0)
        (!= (primitive/cast i64 (load (field renderer pipeline))) 0)
@@ -369,7 +406,8 @@
                              [(ptr i8) (ptr (ptr i8))]
                              descriptor
                              (primitive/cast (ptr (ptr i8)) 0)))
-                    layer (msg (ptr i8) (class c"CAMetalLayer") (sel c"layer") [])]
+                    layer (msg (ptr i8) (class c"CAMetalLayer") (sel c"layer") [])
+                    presentation-pipeline (presentation-pipeline-new device)]
                 (do
                   (msg i64 layer (sel c"setDevice:") [(ptr i8)] device)
                   (msg i64 layer (sel c"setPixelFormat:") [i64] 80)
@@ -387,11 +425,45 @@
                       (set! (.text-pipeline renderer) text-pipeline)
                       (set! (.image-pipeline renderer) image-pipeline)
                       (set! (.grayscale-image-pipeline renderer) grayscale-image-pipeline)
+                      (set! (.presentation-pipeline renderer) presentation-pipeline)
                       (set! (.path-pipeline renderer) path-pipeline)
                       (set! (.layer renderer) layer)
                       (renderer-ensure-capacity! (mut renderer) 65536)
                       (renderer-resize! (mut renderer) width height scale)
                       (load renderer))))))))))))
+
+(defn renderer-ensure-backing! [(renderer (mut Renderer))
+                                (pixel-width i64)
+                                (pixel-height i64)] (-> bool)
+  (if (and (= (load (field renderer backing-width)) pixel-width)
+           (and (= (load (field renderer backing-height)) pixel-height)
+                (!= (primitive/cast i64 (load (field renderer backing-texture))) 0)))
+      true
+      (do
+        (release-object! (load (field renderer backing-texture)))
+        (set! (.backing-texture renderer) (primitive/cast (ptr i8) 0))
+        (set! (.backing-valid renderer) false)
+        (if (or (<= pixel-width 0) (<= pixel-height 0))
+            false
+            (let [descriptor
+                    (msg (ptr i8)
+                         (class c"MTLTextureDescriptor")
+                         (sel c"texture2DDescriptorWithPixelFormat:width:height:mipmapped:")
+                         [i64 i64 i64 i8]
+                         80 pixel-width pixel-height (primitive/cast i8 0))]
+              (do
+                (msg i64 descriptor (sel c"setUsage:") [u64] (primitive/cast u64 5))
+                (msg i64 descriptor (sel c"setStorageMode:") [u64] (primitive/cast u64 2))
+                (let [texture
+                        (msg (ptr i8)
+                             (load (field renderer device))
+                             (sel c"newTextureWithDescriptor:")
+                             [(ptr i8)] descriptor)]
+                  (do
+                    (set! (.backing-texture renderer) texture)
+                    (set! (.backing-width renderer) pixel-width)
+                    (set! (.backing-height renderer) pixel-height)
+                    (!= (primitive/cast i64 texture) 0)))))))))
 
 (defn renderer-resize! [(renderer (mut Renderer)) (width f32) (height f32) (scale f32)] (-> i64)
   (do
@@ -412,9 +484,14 @@
          (sel c"setDrawableSize:")
          [CGSize]
          (CGSize :w (primitive/cast f64 (* width scale)) :h (primitive/cast f64 (* height scale))))
+    (renderer-ensure-backing! (mut renderer)
+                              (primitive/cast i64 (* width scale))
+                              (primitive/cast i64 (* height scale)))
     0))
 
-(defn renderer-draw! [(renderer (mut Renderer)) (scene ui/Scene)] (-> i64)
+(defn renderer-draw-damage! [(renderer (mut Renderer))
+                             (scene ui/Scene)
+                             (damage ui/DamageRegion)] (-> i64)
   (let [items (load (field scene items))
         shadows (load (field scene shadows))
         text-items (load (field scene text))
@@ -423,7 +500,12 @@
         paint-commands (load (field scene paint-commands))
         count (al/al-len [ui/Primitive] items)
         shadow-count (al/al-len [ui/Primitive] shadows)
-        viewport (ui/rect 0.0 0.0 (load (field renderer width)) (load (field renderer height)))
+        full-viewport (ui/rect 0.0 0.0
+                               (load (field renderer width))
+                               (load (field renderer height)))
+        viewport (if (load (field renderer backing-valid))
+                     (ui/intersect (load full-viewport) (load (field damage bounds)))
+                     (load full-viewport))
         visible-shadow-count (visible-primitive-count shadows viewport)
         text-count (al/al-len [ui/TextSprite] text-items)
         path-vertex-count (al/al-len [path/PathPoint] path-vertices)
@@ -436,22 +518,27 @@
         path-offset (+ sprite-offset sprite-bytes)
         path-bytes (* path-vertex-count (primitive/sizeof path/PathPoint))
         total-bytes (+ path-offset path-bytes)]
-    (if (or (and (= count 0) (and (= path-draw-count 0) (and (= shadow-count 0) (= text-count 0))))
-            (not (renderer-valid? (load renderer))))
+    (if (or (and (load (field renderer backing-valid))
+                 (not (load (field damage valid))))
+            (or (<= (load (field viewport w)) 0.0)
+                (or (<= (load (field viewport h)) 0.0)
+                    (not (renderer-valid? (load renderer))))))
         0
         (if (< (renderer-ensure-capacity! (mut renderer) total-bytes) 0)
             0
             (let [drawable (msg (ptr i8) (load (field renderer layer)) (sel c"nextDrawable") [])]
               (if (= (primitive/cast i64 drawable) 0)
                   0
-                  (let [texture (msg (ptr i8) drawable (sel c"texture") [])
+                  (let [drawable-texture (msg (ptr i8) drawable (sel c"texture") [])
+                        texture (load (field renderer backing-texture))
                         pass (msg (ptr i8) (class c"MTLRenderPassDescriptor") (sel c"renderPassDescriptor") [])
                         colors (msg (ptr i8) pass (sel c"colorAttachments") [])
                         color0 (msg (ptr i8) colors (sel c"objectAtIndexedSubscript:") [i64] 0)
                         command (msg (ptr i8) (load (field renderer queue)) (sel c"commandBuffer") [])]
                     (do
                       (msg i64 color0 (sel c"setTexture:") [(ptr i8)] texture)
-                      (msg i64 color0 (sel c"setLoadAction:") [i64] 2)
+                      (msg i64 color0 (sel c"setLoadAction:") [i64]
+                           (if (load (field renderer backing-valid)) 1 2))
                       (msg i64 color0 (sel c"setStoreAction:") [i64] 1)
                       (msg i64
                            color0
@@ -464,6 +551,7 @@
                              :a 1.0))
                       (let [encoder (msg (ptr i8) command (sel c"renderCommandEncoderWithDescriptor:") [(ptr i8)] pass)
                             frame (primitive/alloc-stack (array f32 4))
+                            clear-item (primitive/alloc-stack ui/Primitive)
                             primitive-buffer (renderer-frame-buffer (load renderer))
                             (mut texture-runs) 0
                             (mut paint-runs) 0]
@@ -472,6 +560,24 @@
                           (store! (primitive/index frame 1) (load (field renderer height)))
                           (store! (primitive/index frame 2) 0.0)
                           (store! (primitive/index frame 3) 0.0)
+                          (let [pixel-left (primitive/cast i64
+                                                          (floorf (* (load (field viewport x))
+                                                                     (load (field renderer scale)))))
+                                pixel-top (primitive/cast i64
+                                                         (floorf (* (load (field viewport y))
+                                                                    (load (field renderer scale)))))
+                                pixel-right (primitive/cast i64
+                                                           (ceilf (* (+ (load (field viewport x))
+                                                                        (load (field viewport w)))
+                                                                     (load (field renderer scale)))))
+                                pixel-bottom (primitive/cast i64
+                                                            (ceilf (* (+ (load (field viewport y))
+                                                                         (load (field viewport h)))
+                                                                      (load (field renderer scale)))))]
+                            (msg i64 encoder (sel c"setScissorRect:") [MTLScissorRect]
+                                 (MTLScissorRect :x pixel-left :y pixel-top
+                                                 :width (- pixel-right pixel-left)
+                                                 :height (- pixel-bottom pixel-top))))
                           (msg i64
                                encoder
                                (sel c"setVertexBytes:length:atIndex:")
@@ -479,6 +585,32 @@
                                (primitive/cast (ptr i8) frame)
                                16
                                1)
+                          ; Repaint the damaged pixels to the window clear color
+                          ; before replaying intersecting scene records. The
+                          ; scissor keeps this full-viewport quad damage-local.
+                          (store! clear-item
+                                  (ui/Primitive
+                                    :bounds (ui/rect 0.0 0.0
+                                                     (load (field renderer width))
+                                                     (load (field renderer height)))
+                                    :color (ui/rgba 0.055 0.063 0.082 1.0)
+                                    :radius 0.0 :border-width 0.0
+                                    :border-color (ui/rgba 0.0 0.0 0.0 0.0)
+                                    :clip (ui/rect 0.0 0.0
+                                                   (load (field renderer width))
+                                                   (load (field renderer height)))
+                                    :transform (ui/affine-identity)
+                                    :kind 0 :id -1 :opacity 1.0 :padding 0))
+                          (msg i64 encoder (sel c"setRenderPipelineState:") [(ptr i8)]
+                               (load (field renderer pipeline)))
+                          (msg i64 encoder (sel c"setVertexBytes:length:atIndex:")
+                               [(ptr i8) i64 i64]
+                               (primitive/cast (ptr i8) clear-item)
+                               (primitive/sizeof ui/Primitive)
+                               0)
+                          (msg i64 encoder
+                               (sel c"drawPrimitives:vertexStart:vertexCount:instanceCount:")
+                               [i64 i64 i64 i64] 3 0 6 1)
                           (if (> visible-shadow-count 0)
                               (do
                                 (compact-visible-primitives! (msg (ptr i8) primitive-buffer (sel c"contents") [])
@@ -694,14 +826,54 @@
                                 0)
                               0)
                           (msg i64 encoder (sel c"endEncoding") [])
+                          ; Present through a fullscreen render pass. CAMetalLayer
+                          ; remains framebuffer-only, allowing the driver to keep
+                          ; its optimal drawable allocation while the private
+                          ; backing texture remains sampleable and persistent.
+                          (let [present-pass
+                                  (msg (ptr i8) (class c"MTLRenderPassDescriptor")
+                                       (sel c"renderPassDescriptor") [])
+                                present-colors
+                                  (msg (ptr i8) present-pass (sel c"colorAttachments") [])
+                                present-color0
+                                  (msg (ptr i8) present-colors
+                                       (sel c"objectAtIndexedSubscript:") [i64] 0)]
+                            (do
+                              (msg i64 present-color0 (sel c"setTexture:") [(ptr i8)] drawable-texture)
+                              (msg i64 present-color0 (sel c"setLoadAction:") [i64] 0)
+                              (msg i64 present-color0 (sel c"setStoreAction:") [i64] 1)
+                              (let [present-encoder
+                                      (msg (ptr i8) command
+                                           (sel c"renderCommandEncoderWithDescriptor:")
+                                           [(ptr i8)] present-pass)]
+                                (do
+                                  (msg i64 present-encoder (sel c"setRenderPipelineState:")
+                                       [(ptr i8)] (load (field renderer presentation-pipeline)))
+                                  (msg i64 present-encoder (sel c"setFragmentTexture:atIndex:")
+                                       [(ptr i8) i64] texture 0)
+                                  (msg i64 present-encoder
+                                       (sel c"drawPrimitives:vertexStart:vertexCount:")
+                                       [i64 i64 i64] 3 0 3)
+                                  (msg i64 present-encoder (sel c"endEncoding") [])))))
                           (msg i64 command (sel c"presentDrawable:") [(ptr i8)] drawable)
                           (msg i64 command (sel c"commit") [])
                           (set! (.frames renderer) (+ (load (field renderer frames)) 1))
+                          (set! (.backing-valid renderer) true)
                           (set! (.draw-calls renderer)
                                 (+ (load (field renderer draw-calls))
-                                   (+ (+ (if (> visible-shadow-count 0) 1 0) (load paint-runs))
-                                      (load texture-runs))))
+                                   (+ 1
+                                      (+ (+ (if (> visible-shadow-count 0) 1 0)
+                                            (load paint-runs))
+                                         (load texture-runs)))))
                           1))))))))))
+
+(defn renderer-draw! [(renderer (mut Renderer)) (scene ui/Scene)] (-> i64)
+  (renderer-draw-damage!
+    (mut renderer)
+    scene
+    (ui/DamageRegion
+      :bounds (ui/rect 0.0 0.0 (load (field renderer width)) (load (field renderer height)))
+      :valid true)))
 
 (defn release-object! [(object (ptr i8))] (-> i64)
   (if (!= (primitive/cast i64 object) 0)
@@ -713,21 +885,26 @@
     (release-object! (load (field renderer primitive-buffer-0)))
     (release-object! (load (field renderer primitive-buffer-1)))
     (release-object! (load (field renderer primitive-buffer-2)))
+    (release-object! (load (field renderer backing-texture)))
     (release-object! (load (field renderer pipeline)))
     (release-object! (load (field renderer shadow-pipeline)))
     (release-object! (load (field renderer path-pipeline)))
     (release-object! (load (field renderer text-pipeline)))
     (release-object! (load (field renderer image-pipeline)))
     (release-object! (load (field renderer grayscale-image-pipeline)))
+    (release-object! (load (field renderer presentation-pipeline)))
     (release-object! (load (field renderer queue)))
     (set! (.primitive-buffer-0 renderer) (primitive/cast (ptr i8) 0))
     (set! (.primitive-buffer-1 renderer) (primitive/cast (ptr i8) 0))
     (set! (.primitive-buffer-2 renderer) (primitive/cast (ptr i8) 0))
+    (set! (.backing-texture renderer) (primitive/cast (ptr i8) 0))
+    (set! (.backing-valid renderer) false)
     (set! (.pipeline renderer) (primitive/cast (ptr i8) 0))
     (set! (.shadow-pipeline renderer) (primitive/cast (ptr i8) 0))
     (set! (.path-pipeline renderer) (primitive/cast (ptr i8) 0))
     (set! (.text-pipeline renderer) (primitive/cast (ptr i8) 0))
     (set! (.image-pipeline renderer) (primitive/cast (ptr i8) 0))
     (set! (.grayscale-image-pipeline renderer) (primitive/cast (ptr i8) 0))
+    (set! (.presentation-pipeline renderer) (primitive/cast (ptr i8) 0))
     (set! (.queue renderer) (primitive/cast (ptr i8) 0))
     0))

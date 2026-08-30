@@ -67,9 +67,13 @@ layer in the runtime path.
   still form maximal ordered instanced runs.
 - Analytic shadow instances are filtered and compacted in scene order before
   upload, retaining a single instanced shadow draw with no invisible records.
-- Allocation-free retained damage tracking unions consecutive transformed scene
-  regions, correctly invalidating moved and removed content. Partial presentation
-  awaits a persistent backing texture; rotating layer drawables are always fully drawn.
+- Allocation-free retained damage snapshots hash ordered primitive, shadow,
+  glyph/image, path, and path-vertex records. Identical transient rebuilds submit
+  nothing; paint-only changes, movement, insertion, and removal invalidate the
+  exact old/new union. A private, resize-aware Metal backing texture preserves
+  unchanged pixels, while a device-pixel scissor clears and replays only records
+  intersecting damage. A framebuffer-only drawable is presented with one
+  fullscreen GPU sample, retaining the layer's optimal allocation mode.
 - Adaptive center-parameterized elliptical arcs with positive or negative sweeps,
   full-circle support, and the same caller-controlled geometric tolerance.
 - SVG endpoint-parameterized elliptical arcs with x-axis rotation, radii
@@ -370,8 +374,7 @@ application. GPUI parity still requires substantial systems, notably:
 - typed future values, worker-pool priority lanes and work stealing,
   non-image/remote asset sources,
   editable style inspection, and deterministic pixel/event UI tests;
-- persistent partial-presentation backing, multi-page texture-atlas eviction,
-  and deeper GPU/CPU profiling.
+- multi-page texture-atlas eviction and deeper GPU/CPU profiling.
 
 These are explicit missing capabilities, not features claimed by the prototype.
 
@@ -399,6 +402,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI popover and deferred-layer example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/popover.rs)
 - [GPUI multiple-window example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/window.rs)
 - [GPUI entity transfer between windows](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/move_entity_between_windows.rs)
+- [GPUI macOS Metal renderer](https://github.com/zed-industries/zed/blob/main/crates/gpui_macos/src/metal_renderer.rs)
 - [Apple CAMetalLayer documentation](https://developer.apple.com/documentation/QuartzCore/CAMetalLayer)
 - [Apple MTLRenderCommandEncoder documentation](https://developer.apple.com/documentation/metal/mtlrendercommandencoder)
 - [Apple CTRun documentation](https://developer.apple.com/documentation/coretext/ctrun)
