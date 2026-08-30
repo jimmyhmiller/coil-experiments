@@ -106,8 +106,10 @@ layer in the runtime path.
   `<svg>`/`<g>`/`<path>` structure, root `viewBox`, inherited presentation
   attributes and inline `style` declarations, `fill-opacity`, nonzero/even-odd
   fill rules, and composed `translate`/`scale`/`rotate`/`matrix` transforms.
-  Parsed paths retain their Metal triangle meshes and per-shape paint state; the
-  demo's animated two-color icon now exercises document parsing and painting.
+  Retained strokes support inherited color, opacity, width, miter limit, and
+  butt/square/round caps plus miter/bevel/round joins. Fill and stroke geometry
+  retain separate Metal triangle meshes in SVG paint order. The demo's animated
+  outlined two-color icon exercises document parsing and painting.
 - Batched analytic rounded-rectangle shadows with GPU-computed soft falloff,
   configurable offset, blur sigma, spread, radius, color, and scene clipping.
 - Native Unicode line shaping through CoreText `CTLine`/`CTRun`, preserving shaped
@@ -429,7 +431,7 @@ application. GPUI parity still requires substantial systems, notably:
 - richer shaped-layout caching (editable selection/caret measurement,
   UTF-8/CoreText cluster conversion, glyph-run extraction, subpixel glyph caching,
   bounded atlas allocation, and GPU mask composition work now);
-- closed-path dash seam merging, additional SVG elements/strokes/paint servers,
+- closed-path dash seam merging, additional SVG elements and paint servers,
   CSS stylesheets and collinear-overlap normalization (path-data parsing,
   retained compound vector components, adaptive quadratic/cubic
   curves and elliptical arcs, polygon
