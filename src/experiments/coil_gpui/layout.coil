@@ -1,10 +1,12 @@
 (module experiments.coil_gpui.layout)
 (import "experiments.coil_gpui.ui" :as ui)
+(import "experiments.coil_gpui.measure" :as measure)
 (import "coil.arraylist" :as al)
 (import "coil.alloc" :as alloc)
 (import "coil.primitive" :as primitive)
 
-(export FlexItem FlexLayout flex-new flex-clear! flex-free! flex-push! flex-compute!)
+(export FlexItem FlexLayout flex-new flex-clear! flex-free! flex-push!
+        flex-push-intrinsic! flex-compute!)
 
 ;;; Per-child flex inputs. `basis` is the preferred main-axis size, `cross` is
 ;;; the preferred cross-axis size (zero means stretch), and min/max are hard
@@ -18,7 +20,9 @@
    (min-main f32)
    (max-main f32)
    (min-cross f32)
-   (max-cross f32)])
+   (max-cross f32)
+   (resolved-main f32)
+   (frozen bool)])
 
 (defstruct FlexLayout
   [(items (al/ArrayList FlexItem))
@@ -54,7 +58,38 @@
                  :min-main 0.0
                  :max-main 0.0
                  :min-cross 0.0
-                 :max-cross 0.0)))
+                 :max-cross 0.0
+                 :resolved-main basis
+                 :frozen false)))
+
+(defn flex-push-intrinsic! [(layout (mut FlexLayout))
+                            (intrinsic measure/IntrinsicSize)
+                            (axis ui/Axis)
+                            (grow f32)
+                            (shrink f32)] (-> i64)
+  (let [horizontal (match axis (ui/Horizontal [] true) (ui/Vertical [] false))]
+    (al/al-push! [FlexItem]
+                 (mut (.items layout))
+                 (FlexItem
+                   :basis (if horizontal
+                              (load (field intrinsic preferred-width))
+                              (load (field intrinsic preferred-height)))
+                   :cross (if horizontal
+                              (load (field intrinsic preferred-height))
+                              (load (field intrinsic preferred-width)))
+                   :grow grow :shrink shrink
+                   :min-main (if horizontal
+                                 (load (field intrinsic min-width))
+                                 (load (field intrinsic min-height)))
+                   :max-main 0.0
+                   :min-cross (if horizontal
+                                  (load (field intrinsic min-height))
+                                  (load (field intrinsic min-width)))
+                   :max-cross 0.0
+                   :resolved-main (if horizontal
+                                      (load (field intrinsic preferred-width))
+                                      (load (field intrinsic preferred-height)))
+                   :frozen false))))
 
 (defn clamp-dimension [(value f32) (minimum f32) (maximum f32)] (-> f32)
   (let [lowered (if (< value minimum) minimum value)]
@@ -85,6 +120,78 @@
                (load shrink-weight)
                (primitive/cast f32 count)))))
 
+(defn flex-resolve-main! [(layout (mut FlexLayout))
+                          (available f32)
+                          (gap f32)] (-> f32)
+  (let [count (al/al-len [FlexItem] (load (field layout items)))
+        content-space (- available (* gap (primitive/cast f32
+                                            (if (> count 0) (- count 1) 0))))
+        (mut solving) true]
+    (do
+      (for [i 0 count]
+        (let [(mut item) (al/al-get [FlexItem] (load (field layout items)) i)]
+          (do
+            (set! (.resolved-main item) (item-main (load item)))
+            (set! (.frozen item) false)
+            (al/al-set! [FlexItem] (mut (.items layout)) i (load item)))))
+      (while (load solving)
+        (let [(mut frozen-total) (primitive/cast f32 0.0)
+              (mut active-basis) (primitive/cast f32 0.0)
+              (mut factor-total) (primitive/cast f32 0.0)]
+          (do
+            (for [i 0 count]
+              (let [item (al/al-get [FlexItem] (load (field layout items)) i)
+                    base (item-main item)]
+                (if (load (field item frozen))
+                    (store! frozen-total (+ (load frozen-total)
+                                            (load (field item resolved-main))))
+                    (do
+                      (store! active-basis (+ (load active-basis) base))
+                      0))))
+            (let [free (- content-space (+ (load frozen-total) (load active-basis)))]
+              (do
+                (for [i 0 count]
+                  (let [item (al/al-get [FlexItem] (load (field layout items)) i)]
+                    (if (not (load (field item frozen)))
+                        (store! factor-total
+                                (+ (load factor-total)
+                                   (if (> free 0.0)
+                                       (load (field item grow))
+                                       (* (load (field item shrink)) (item-main item)))))
+                        0)))
+                (let [(mut froze-any) false]
+                  (do
+                    (for [i 0 count]
+                      (let [(mut item) (al/al-get [FlexItem] (load (field layout items)) i)]
+                        (if (not (load (field item frozen)))
+                            (let [base (item-main (load item))
+                                  factor (if (> free 0.0)
+                                             (load (field item grow))
+                                             (* (load (field item shrink)) base))
+                                  proposed (if (> (load factor-total) 0.0)
+                                               (+ base (* free (/ factor (load factor-total))))
+                                               base)
+                                  clamped (clamp-dimension proposed
+                                                           (load (field item min-main))
+                                                           (load (field item max-main)))
+                                  hit-limit (or (< clamped (- proposed 0.0001))
+                                                (> clamped (+ proposed 0.0001)))]
+                              (do
+                                (set! (.resolved-main item) clamped)
+                                (if hit-limit
+                                    (do (set! (.frozen item) true)
+                                        (store! froze-any true))
+                                    0)
+                                (al/al-set! [FlexItem] (mut (.items layout)) i (load item))))
+                            0)))
+                    (if (not (load froze-any)) (store! solving false) 0))))))))
+      (let [(mut used) (* gap (primitive/cast f32 (if (> count 0) (- count 1) 0)))]
+        (do
+          (for [i 0 count]
+            (let [item (al/al-get [FlexItem] (load (field layout items)) i)]
+              (store! used (+ (load used) (load (field item resolved-main))))))
+          (load used))))))
+
 (defn flex-compute! [(layout (mut FlexLayout))
                      (bounds ui/Rect)
                      (axis ui/Axis)
@@ -98,13 +205,9 @@
         cross-size (if horizontal (load (field inner h)) (load (field inner w)))
         main-origin (if horizontal (load (field inner x)) (load (field inner y)))
         cross-origin (if horizontal (load (field inner y)) (load (field inner x)))
-        totals (compute-totals (load layout) gap)
-        basis-total (load (field totals x))
-        grow-total (load (field totals y))
-        shrink-total (load (field totals w))
         count (al/al-len [FlexItem] (load (field layout items)))
-        free (- main-size basis-total)
-        leftover (if (> free 0.0) (if (> grow-total 0.0) 0.0 free) 0.0)
+        used (flex-resolve-main! (mut layout) main-size gap)
+        leftover (let [free (- main-size used)] (if (> free 0.0) free 0.0))
         justify-offset
           (match justify
             (ui/Leading [] 0.0)
@@ -121,19 +224,7 @@
       (al/al-clear! [ui/Rect] (mut (.rects layout)))
       (for [i 0 count]
         (let [item (al/al-get [FlexItem] (load (field layout items)) i)
-              base (item-main item)
-              grown
-                (if (and (> free 0.0) (> grow-total 0.0))
-                    (+ base (* free (/ (load (field item grow)) grow-total)))
-                    base)
-              shrunk
-                (if (and (< free 0.0) (> shrink-total 0.0))
-                    (+ grown (* free (/ (* (load (field item shrink)) base) shrink-total)))
-                    grown)
-              main
-                (clamp-dimension shrunk
-                                 (load (field item min-main))
-                                 (load (field item max-main)))
+              main (load (field item resolved-main))
               requested-cross (load (field item cross))
               stretched
                 (or (match align (ui/Stretch [] true) (_ false))

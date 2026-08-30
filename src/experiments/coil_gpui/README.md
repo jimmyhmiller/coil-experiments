@@ -139,9 +139,18 @@ layer in the runtime path.
 - Immediate element reconstruction over retained application/component state.
 - Reusable flex row/column solving with basis, grow, weighted shrink, gaps,
   padding, main-axis justification, cross-axis alignment, and hard min/max clamps.
+- Shared intrinsic measurement records carry minimum/preferred dimensions and
+  optional aspect ratios through explicit constraints. Shaped lines, paragraphs,
+  cached text textures, and decoded images expose native measurements; flex
+  consumes them as basis/min-content sizes with iterative freeze-and-redistribute
+  when siblings hit limits.
 - Responsive grid solving with fixed and weighted fractional rows/columns,
   hard min/max tracks, iterative cap-and-redistribute behavior, gaps, padding,
   and row/column spanning placements.
+- Content-sized grid tracks grow from measured placements, including spanning
+  children, and redistribute intrinsic deficits when one track reaches its cap.
+  Authored minima are restored before every solve so changing content can shrink
+  as well as grow. The demo's button grid is sized from its cached text assets.
 - Nested clipping propagated to both GPU paint records and hitboxes.
 - A separate reverse-painted hitbox list with stable component IDs; decorative
   paint no longer accidentally participates in input.
@@ -222,7 +231,7 @@ layer in the runtime path.
   storage. The demo owns its background checksum through such a scope.
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
   batching, scheduler lifecycle, ABI, allocation-reuse, and deterministic Metal
-  pixel/event replay tests (97 total).
+  pixel/event replay tests (99 total).
 
 ## Architecture
 
@@ -382,7 +391,6 @@ application. GPUI parity still requires substantial systems, notably:
 - richer shaped-layout caching (editable selection/caret measurement,
   UTF-8/CoreText cluster conversion, glyph-run extraction, subpixel glyph caching,
   bounded atlas allocation, and GPU mask composition work now);
-- intrinsic text/image measurement (flex and constrained grid layout work);
 - closed-path dash seam merging, full SVG XML/style/transform document loading,
   and non-simple/multi-contour hole fill rules (path-data parsing, retained vector
   components, adaptive quadratic/cubic
@@ -406,6 +414,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 
 - [GPUI README](https://github.com/zed-industries/zed/blob/main/crates/gpui/README.md)
 - [GPUI element lifecycle](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/element.rs)
+- [GPUI image intrinsic render sizing](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/assets.rs)
 - [GPUI key dispatch](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/key_dispatch.rs)
 - [GPUI keymap precedence and matching](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/keymap.rs)
 - [GPUI retained entity map](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/app/entity_map.rs)
