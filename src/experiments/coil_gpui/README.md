@@ -24,6 +24,10 @@ layer in the runtime path.
   paint no longer accidentally participates in input.
 - Retained focus routing across transient scenes, disabled-control skipping,
   Tab/Shift-Tab traversal, and logical activate/decrement/increment actions.
+- Uniform virtual lists with retained pixel offsets, bounded overscan, exact
+  visible ranges, viewport clipping, wheel input, and stable GPU scrollbars.
+- The demo's scroll view has 100,000 logical rows but constructs only visible
+  rows plus three-row overscan each frame.
 - Interactive buttons, checkbox, slider, progress, divider, and panel components.
 - GPU text labels integrated with the reusable scene and demo components.
 - Mouse hover, press, release, checkbox toggling, slider dragging, plus keyboard
@@ -85,6 +89,15 @@ Run the focused tests from the repository root:
 /Users/jimmyhmiller/Documents/Code/projects/coil/build/bin/coil test --suite coil-gpui --jobs 4
 ```
 
+Run the Coil-native release scene benchmark:
+
+```sh
+cd src/experiments/coil_gpui
+/Users/jimmyhmiller/Documents/Code/projects/coil/build/bin/coil build bench.coil \
+  -o build/release/coil-gpui-bench --release
+./build/release/coil-gpui-bench
+```
+
 ## Performance contract
 
 The scene retains both shape and text-list allocations after `scene-clear!`, avoiding
@@ -94,6 +107,12 @@ shared-buffer ring; each slot starts at 64 KiB and doubles until the complete sc
 fits. The demo intentionally rebuilds 1,024 background instances per frame so the
 large-scene path remains exercised. The layer uses three drawables and display
 synchronization. Per-frame autoreleased Cocoa objects are drained every frame.
+
+The release scene benchmark rebuilds 1,049 paint primitives while advancing a
+100,000-row virtual list. On the development Apple Silicon machine it measured
+**1,862–1,930 ns/frame across two 5,000-frame runs**. This measures Coil scene construction and
+visible-range calculation, not GPU presentation or display latency; the benchmark
+is checked in as `bench.coil` so results remain reproducible and comparable.
 
 Text rasterization is cached rather than repeated each frame. The current cache is
 application-owned and one texture is bound per label. The next text tier should pack
@@ -108,8 +127,8 @@ application. GPUI parity still requires substantial systems, notably:
 - glyph-run extraction, editable text measurement, and a bounded glyph atlas
   (whole-label shaping and GPU mask composition work now);
 - grid and intrinsic text/image measurement (flex layout works);
-- scroll views, transforms, shadows, general images, SVG, and paths (nested
-  rectangular GPU clipping works);
+- variable-height lists, transforms, shadows, general images, SVG, and paths
+  (uniform virtual scrolling and nested rectangular GPU clipping work);
 - hierarchical capture/bubble listeners, configurable keymaps, IME, drag/drop,
   and accessibility (focus traversal and logical actions work);
 - retained entities, subscriptions, observation, async executor integration, assets,
@@ -125,6 +144,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI element lifecycle](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/element.rs)
 - [GPUI key dispatch](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/key_dispatch.rs)
 - [GPUI window, focus, and hitbox model](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/window.rs)
+- [GPUI list example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/list_example.rs)
 - [Apple CAMetalLayer documentation](https://developer.apple.com/documentation/QuartzCore/CAMetalLayer)
 - [Apple MTLRenderCommandEncoder documentation](https://developer.apple.com/documentation/metal/mtlrendercommandencoder)
 - [Apple CTRun documentation](https://developer.apple.com/documentation/coretext/ctrun)
