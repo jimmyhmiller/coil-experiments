@@ -59,6 +59,12 @@ layer in the runtime path.
 - SVG endpoint-parameterized elliptical arcs with x-axis rotation, radii
   correction, large-arc and sweep flags, exact endpoints, and tolerance-derived
   subdivision. Degenerate SVG radii correctly fall back to a straight segment.
+- Coil-native SVG path-data parsing for every absolute and relative command
+  family (`M/L/H/V/C/S/Q/T/A/Z`), implicit repetitions, compact signs, decimals,
+  exponents, smooth-control reflection, and multiple subpaths. `SvgVector`
+  validates and tessellates filled contours once, retains the meshes, and paints
+  aspect-preserving instances through the ordered Metal path pipeline. The demo
+  uses this component for its cyan lightning icon.
 - Batched analytic rounded-rectangle shadows with GPU-computed soft falloff,
   configurable offset, blur sigma, spread, radius, color, and scene clipping.
 - Native Unicode line shaping through CoreText `CTLine`/`CTRun`, preserving shaped
@@ -333,8 +339,9 @@ application. GPUI parity still requires substantial systems, notably:
   UTF-8/CoreText cluster conversion, glyph-run extraction, subpixel glyph caching,
   bounded atlas allocation, and GPU mask composition work now);
 - intrinsic text/image measurement (flex and constrained grid layout work);
-- closed-path dash seam merging, SVG parsing, and non-simple/multi-contour fill
-  rules (adaptive quadratic/cubic
+- closed-path dash seam merging, full SVG XML/style/transform document loading,
+  and non-simple/multi-contour hole fill rules (path-data parsing, retained vector
+  components, adaptive quadratic/cubic
   curves and elliptical arcs, polygon
   fills, butt-cap/miter strokes, affine transforms, analytic shadows, linear
   gradients, general raster images, virtual scrolling, and nested rectangular
@@ -372,6 +379,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI list example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/list_example.rs)
 - [GPUI responsive grid example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/grid_layout.rs)
 - [GPUI painting example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/painting.rs)
+- [GPUI SVG example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/svg/svg.rs)
 - [Apple CAMetalLayer documentation](https://developer.apple.com/documentation/QuartzCore/CAMetalLayer)
 - [Apple MTLRenderCommandEncoder documentation](https://developer.apple.com/documentation/metal/mtlrendercommandencoder)
 - [Apple CTRun documentation](https://developer.apple.com/documentation/coretext/ctrun)

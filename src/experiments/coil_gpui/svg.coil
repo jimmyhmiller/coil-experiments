@@ -1,0 +1,482 @@
+(module experiments.coil_gpui.svg)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+(import "experiments.coil_gpui.path" :as path)
+(import "experiments.coil_gpui.ui" :as ui)
+
+(export SvgPathData
+        SvgVector
+        svg-path-data-parse
+        svg-path-data-valid?
+        svg-path-data-contour-count
+        svg-path-data-contour
+        svg-path-data-free!
+        svg-vector-new
+        svg-vector-valid?
+        svg-vector-paint!
+        svg-vector-free!)
+
+(extern strtod :cc c [(ptr i8) (ptr (ptr i8))] (-> f64))
+
+(defstruct SvgReader [(cursor (ptr u8)) (valid bool)])
+
+;;; Each SVG subpath owns one Coil path. This preserves move/close boundaries
+;;; rather than flattening unrelated contours into connecting line segments.
+(defstruct SvgPathData [(contours (al/ArrayList path/Path)) (valid bool)])
+
+;;; Reusable, pre-tessellated vector asset. Geometry is retained once and copied
+;;; into the scene's shared GPU upload ring only when the component is painted.
+(defstruct SvgVector
+  [(meshes (al/ArrayList path/Tessellation)) (bounds path/PathBounds) (valid bool)])
+
+(defn reader-byte [(reader SvgReader)] (-> u8)
+  (if (= (primitive/cast i64 (load (field reader cursor))) 0)
+      (primitive/cast u8 0)
+      (load (load (field reader cursor)))))
+
+(defn reader-advance! [(reader (mut SvgReader))] (-> i64)
+  (do
+    (set! (.cursor reader)
+          (primitive/cast (ptr u8)
+                          (+ (primitive/cast i64 (load (field reader cursor))) 1)))
+    0))
+
+(defn separator? [(byte u8)] (-> bool)
+  (or (= byte (primitive/cast u8 44))
+      (or (= byte (primitive/cast u8 32))
+          (or (= byte (primitive/cast u8 9))
+              (or (= byte (primitive/cast u8 10)) (= byte (primitive/cast u8 13)))))))
+
+(defn reader-skip-separators! [(reader (mut SvgReader))] (-> i64)
+  (do
+    (while (separator? (reader-byte (load reader))) (reader-advance! (mut reader)))
+    0))
+
+(defn command? [(byte u8)] (-> bool)
+  (or (and (>= byte (primitive/cast u8 65)) (<= byte (primitive/cast u8 90)))
+      (and (>= byte (primitive/cast u8 97)) (<= byte (primitive/cast u8 122)))))
+
+(defn number-start? [(byte u8)] (-> bool)
+  (or (and (>= byte (primitive/cast u8 48)) (<= byte (primitive/cast u8 57)))
+      (or (= byte (primitive/cast u8 43))
+          (or (= byte (primitive/cast u8 45)) (= byte (primitive/cast u8 46))))))
+
+(defn reader-number! [(reader (mut SvgReader))] (-> f32)
+  (do
+    (reader-skip-separators! (mut reader))
+    (let [start (load (field reader cursor))
+          end (primitive/alloc-stack (ptr i8))]
+      (do
+        (store! end (primitive/cast (ptr i8) 0))
+        (let [value (strtod (primitive/cast (ptr i8) start) end)
+              finish (primitive/cast (ptr u8) (load end))]
+          (if (= (primitive/cast i64 finish) (primitive/cast i64 start))
+              (do
+                (set! (.valid reader) false)
+                (primitive/cast f32 0.0))
+              (do
+                (set! (.cursor reader) finish)
+                (primitive/cast f32 value))))))))
+
+(defn relative-command? [(command u8)] (-> bool)
+  (and (>= command (primitive/cast u8 97)) (<= command (primitive/cast u8 122))))
+
+(defn cubic-command? [(command u8)] (-> bool)
+  (or (= command (primitive/cast u8 67))
+      (or (= command (primitive/cast u8 99))
+          (or (= command (primitive/cast u8 83)) (= command (primitive/cast u8 115))))))
+
+(defn quadratic-command? [(command u8)] (-> bool)
+  (or (= command (primitive/cast u8 81))
+      (or (= command (primitive/cast u8 113))
+          (or (= command (primitive/cast u8 84)) (= command (primitive/cast u8 116))))))
+
+(defn svg-path-data-empty [] (-> SvgPathData)
+  (SvgPathData :contours (al/al-new [path/Path] (alloc/malloc-allocator)) :valid false))
+
+(defn svg-path-data-valid? [(data SvgPathData)] (-> bool)
+  (load (field data valid)))
+
+(defn svg-path-data-contour-count [(data SvgPathData)] (-> i64)
+  (al/al-len [path/Path] (load (field data contours))))
+
+(defn svg-path-data-contour [(data SvgPathData) (index i64)] (-> path/Path)
+  (al/al-get [path/Path] (load (field data contours)) index))
+
+(defn svg-path-data-free! [(data (mut SvgPathData))] (-> i64)
+  (do
+    (let [contours (load (field data contours))]
+      (for [i 0 (al/al-len [path/Path] contours)]
+        (path/path-free! (mut (primitive/index (load (field contours data)) i)))))
+    (al/al-free! [path/Path] (mut (.contours data)))
+    (set! (.valid data) false)
+    0))
+
+(defn push-contour! [(data (mut SvgPathData)) (x f32) (y f32)] (-> i64)
+  (let [(mut contour) (path/path-new)]
+    (do
+      (path/path-move-to! (mut contour) x y)
+      (al/al-push! [path/Path] (mut (.contours data)) (load contour))
+      (- (al/al-len [path/Path] (load (field data contours))) 1))))
+
+(defn active-contour [(data (mut SvgPathData)) (index i64)] (-> (ptr path/Path))
+  (primitive/index (load (field (field data contours) data)) index))
+
+(defn absolute-coordinate [(value f32) (origin f32) (relative bool)] (-> f32)
+  (if relative (+ origin value) value))
+
+;;; Parse the complete SVG path-data command language: M/L/H/V/C/S/Q/T/A/Z,
+;;; absolute and relative forms, implicit repetitions, compact signs, decimals,
+;;; and scientific notation. Invalid input is reported without leaking contours.
+(defn svg-path-data-parse [(source (ptr i8)) (tolerance f32)] (-> SvgPathData)
+  (let [(mut result) (svg-path-data-empty)
+        (mut reader) (primitive/zeroed SvgReader)
+        curve-tolerance (if (> tolerance 0.0) tolerance 0.25)
+        (mut command) (primitive/cast u8 0)
+        (mut previous-command) (primitive/cast u8 0)
+        (mut contour-index) (primitive/cast i64 -1)
+        (mut current-x) (primitive/cast f32 0.0)
+        (mut current-y) (primitive/cast f32 0.0)
+        (mut contour-x) (primitive/cast f32 0.0)
+        (mut contour-y) (primitive/cast f32 0.0)
+        (mut cubic-control-x) (primitive/cast f32 0.0)
+        (mut cubic-control-y) (primitive/cast f32 0.0)
+        (mut quadratic-control-x) (primitive/cast f32 0.0)
+        (mut quadratic-control-y) (primitive/cast f32 0.0)]
+    (do
+      (set! (.cursor reader) (primitive/cast (ptr u8) source))
+      (set! (.valid reader) (!= (primitive/cast i64 source) 0))
+      (while (and (load (field reader valid))
+                  (!= (reader-byte (load reader)) (primitive/cast u8 0)))
+        (do
+          (reader-skip-separators! (mut reader))
+          (if (= (reader-byte (load reader)) (primitive/cast u8 0)) (break 0) 0)
+          (let [next (reader-byte (load reader))]
+            (if (command? next)
+                (do (store! command next) (reader-advance! (mut reader)))
+                (if (or (= (load command) (primitive/cast u8 0)) (not (number-start? next)))
+                    (set! (.valid reader) false)
+                    0)))
+          (when (load (field reader valid))
+            (let [op (load command)
+                  relative (relative-command? op)]
+              (cond
+                (or (= op (primitive/cast u8 77)) (= op (primitive/cast u8 109)))
+                  (let [raw-x (reader-number! (mut reader))
+                        raw-y (reader-number! (mut reader))
+                        x (absolute-coordinate raw-x (load current-x) relative)
+                        y (absolute-coordinate raw-y (load current-y) relative)]
+                    (when (load (field reader valid))
+                      (do
+                        (store! contour-index (push-contour! (mut result) x y))
+                        (store! current-x x)
+                        (store! current-y y)
+                        (store! contour-x x)
+                        (store! contour-y y)
+                        (store! previous-command op)
+                        (store! command
+                                (if relative (primitive/cast u8 108) (primitive/cast u8 76))))))
+                (or (= op (primitive/cast u8 76)) (= op (primitive/cast u8 108)))
+                  (let [raw-x (reader-number! (mut reader))
+                        raw-y (reader-number! (mut reader))
+                        x (absolute-coordinate raw-x (load current-x) relative)
+                        y (absolute-coordinate raw-y (load current-y) relative)]
+                    (if (and (load (field reader valid)) (>= (load contour-index) 0))
+                        (do
+                          (path/path-line-to! (mut (active-contour (mut result) (load contour-index))) x y)
+                          (store! current-x x)
+                          (store! current-y y)
+                          (store! previous-command op))
+                        (set! (.valid reader) false)))
+                (or (= op (primitive/cast u8 72)) (= op (primitive/cast u8 104)))
+                  (let [x (absolute-coordinate (reader-number! (mut reader))
+                                               (load current-x)
+                                               relative)]
+                    (if (and (load (field reader valid)) (>= (load contour-index) 0))
+                        (do
+                          (path/path-line-to! (mut (active-contour (mut result) (load contour-index)))
+                                              x
+                                              (load current-y))
+                          (store! current-x x)
+                          (store! previous-command op))
+                        (set! (.valid reader) false)))
+                (or (= op (primitive/cast u8 86)) (= op (primitive/cast u8 118)))
+                  (let [y (absolute-coordinate (reader-number! (mut reader))
+                                               (load current-y)
+                                               relative)]
+                    (if (and (load (field reader valid)) (>= (load contour-index) 0))
+                        (do
+                          (path/path-line-to! (mut (active-contour (mut result) (load contour-index)))
+                                              (load current-x)
+                                              y)
+                          (store! current-y y)
+                          (store! previous-command op))
+                        (set! (.valid reader) false)))
+                (or (= op (primitive/cast u8 67)) (= op (primitive/cast u8 99)))
+                  (let [raw-c1x (reader-number! (mut reader))
+                        raw-c1y (reader-number! (mut reader))
+                        raw-c2x (reader-number! (mut reader))
+                        raw-c2y (reader-number! (mut reader))
+                        raw-x (reader-number! (mut reader))
+                        raw-y (reader-number! (mut reader))
+                        c1x (absolute-coordinate raw-c1x (load current-x) relative)
+                        c1y (absolute-coordinate raw-c1y (load current-y) relative)
+                        c2x (absolute-coordinate raw-c2x (load current-x) relative)
+                        c2y (absolute-coordinate raw-c2y (load current-y) relative)
+                        x (absolute-coordinate raw-x (load current-x) relative)
+                        y (absolute-coordinate raw-y (load current-y) relative)]
+                    (if (and (load (field reader valid)) (>= (load contour-index) 0))
+                        (do
+                          (path/path-cubic-to! (mut (active-contour (mut result) (load contour-index)))
+                                               c1x c1y c2x c2y x y curve-tolerance)
+                          (store! cubic-control-x c2x)
+                          (store! cubic-control-y c2y)
+                          (store! current-x x)
+                          (store! current-y y)
+                          (store! previous-command op))
+                        (set! (.valid reader) false)))
+                (or (= op (primitive/cast u8 83)) (= op (primitive/cast u8 115)))
+                  (let [raw-c2x (reader-number! (mut reader))
+                        raw-c2y (reader-number! (mut reader))
+                        raw-x (reader-number! (mut reader))
+                        raw-y (reader-number! (mut reader))
+                        c1x (if (cubic-command? (load previous-command))
+                                (- (* (primitive/cast f32 2.0) (load current-x))
+                                   (load cubic-control-x))
+                                (load current-x))
+                        c1y (if (cubic-command? (load previous-command))
+                                (- (* (primitive/cast f32 2.0) (load current-y))
+                                   (load cubic-control-y))
+                                (load current-y))
+                        c2x (absolute-coordinate raw-c2x (load current-x) relative)
+                        c2y (absolute-coordinate raw-c2y (load current-y) relative)
+                        x (absolute-coordinate raw-x (load current-x) relative)
+                        y (absolute-coordinate raw-y (load current-y) relative)]
+                    (if (and (load (field reader valid)) (>= (load contour-index) 0))
+                        (do
+                          (path/path-cubic-to! (mut (active-contour (mut result) (load contour-index)))
+                                               c1x c1y c2x c2y x y curve-tolerance)
+                          (store! cubic-control-x c2x)
+                          (store! cubic-control-y c2y)
+                          (store! current-x x)
+                          (store! current-y y)
+                          (store! previous-command op))
+                        (set! (.valid reader) false)))
+                (or (= op (primitive/cast u8 81)) (= op (primitive/cast u8 113)))
+                  (let [raw-cx (reader-number! (mut reader))
+                        raw-cy (reader-number! (mut reader))
+                        raw-x (reader-number! (mut reader))
+                        raw-y (reader-number! (mut reader))
+                        cx (absolute-coordinate raw-cx (load current-x) relative)
+                        cy (absolute-coordinate raw-cy (load current-y) relative)
+                        x (absolute-coordinate raw-x (load current-x) relative)
+                        y (absolute-coordinate raw-y (load current-y) relative)]
+                    (if (and (load (field reader valid)) (>= (load contour-index) 0))
+                        (do
+                          (path/path-quadratic-to! (mut (active-contour (mut result) (load contour-index)))
+                                                   cx cy x y curve-tolerance)
+                          (store! quadratic-control-x cx)
+                          (store! quadratic-control-y cy)
+                          (store! current-x x)
+                          (store! current-y y)
+                          (store! previous-command op))
+                        (set! (.valid reader) false)))
+                (or (= op (primitive/cast u8 84)) (= op (primitive/cast u8 116)))
+                  (let [raw-x (reader-number! (mut reader))
+                        raw-y (reader-number! (mut reader))
+                        cx (if (quadratic-command? (load previous-command))
+                               (- (* (primitive/cast f32 2.0) (load current-x))
+                                  (load quadratic-control-x))
+                               (load current-x))
+                        cy (if (quadratic-command? (load previous-command))
+                               (- (* (primitive/cast f32 2.0) (load current-y))
+                                  (load quadratic-control-y))
+                               (load current-y))
+                        x (absolute-coordinate raw-x (load current-x) relative)
+                        y (absolute-coordinate raw-y (load current-y) relative)]
+                    (if (and (load (field reader valid)) (>= (load contour-index) 0))
+                        (do
+                          (path/path-quadratic-to! (mut (active-contour (mut result) (load contour-index)))
+                                                   cx cy x y curve-tolerance)
+                          (store! quadratic-control-x cx)
+                          (store! quadratic-control-y cy)
+                          (store! current-x x)
+                          (store! current-y y)
+                          (store! previous-command op))
+                        (set! (.valid reader) false)))
+                (or (= op (primitive/cast u8 65)) (= op (primitive/cast u8 97)))
+                  (let [radius-x (reader-number! (mut reader))
+                        radius-y (reader-number! (mut reader))
+                        rotation (reader-number! (mut reader))
+                        large-value (reader-number! (mut reader))
+                        sweep-value (reader-number! (mut reader))
+                        raw-x (reader-number! (mut reader))
+                        raw-y (reader-number! (mut reader))
+                        flags-valid
+                          (and (or (and (> large-value -0.0001) (< large-value 0.0001))
+                                   (and (> large-value 0.9999) (< large-value 1.0001)))
+                               (or (and (> sweep-value -0.0001) (< sweep-value 0.0001))
+                                   (and (> sweep-value 0.9999) (< sweep-value 1.0001))))
+                        x (absolute-coordinate raw-x (load current-x) relative)
+                        y (absolute-coordinate raw-y (load current-y) relative)]
+                    (if (and flags-valid
+                             (and (load (field reader valid)) (>= (load contour-index) 0)))
+                        (do
+                          (path/path-svg-arc-to!
+                            (mut (active-contour (mut result) (load contour-index)))
+                            radius-x radius-y rotation (> large-value 0.5) (> sweep-value 0.5)
+                            x y curve-tolerance)
+                          (store! current-x x)
+                          (store! current-y y)
+                          (store! previous-command op))
+                        (set! (.valid reader) false)))
+                (or (= op (primitive/cast u8 90)) (= op (primitive/cast u8 122)))
+                  (if (>= (load contour-index) 0)
+                      (do
+                        (path/path-close! (mut (active-contour (mut result) (load contour-index))))
+                        (store! current-x (load contour-x))
+                        (store! current-y (load contour-y))
+                        (store! previous-command op)
+                        (store! command (primitive/cast u8 0)))
+                      (set! (.valid reader) false))
+                :else (set! (.valid reader) false))))))
+      (reader-skip-separators! (mut reader))
+      (set! (.valid result)
+            (and (load (field reader valid))
+                 (and (= (reader-byte (load reader)) (primitive/cast u8 0))
+                      (> (svg-path-data-contour-count (load result)) 0))))
+      (load result))))
+
+(defn svg-vector-empty [] (-> SvgVector)
+  (SvgVector
+    :meshes (al/al-new [path/Tessellation] (alloc/malloc-allocator))
+    :bounds (path/PathBounds :x 0.0 :y 0.0 :w 0.0 :h 0.0 :valid false)
+    :valid false))
+
+(defn svg-vector-valid? [(vector SvgVector)] (-> bool)
+  (load (field vector valid)))
+
+(defn svg-vector-free! [(vector (mut SvgVector))] (-> i64)
+  (do
+    (let [meshes (load (field vector meshes))]
+      (for [i 0 (al/al-len [path/Tessellation] meshes)]
+        (path/tessellation-free!
+          (mut (primitive/index (load (field meshes data)) i)))))
+    (al/al-free! [path/Tessellation] (mut (.meshes vector)))
+    (set! (.valid vector) false)
+    0))
+
+;;; Parse and tessellate filled SVG path data once. SVG fill semantics implicitly
+;;; close open subpaths, so the retained local contour is closed before ear
+;;; clipping. Invalid or non-simple contours reject the complete vector atomically.
+(defn svg-vector-new [(source (ptr i8)) (tolerance f32)] (-> SvgVector)
+  (let [(mut vector) (svg-vector-empty)
+        (mut parsed) (svg-path-data-parse source tolerance)]
+    (do
+      (if (svg-path-data-valid? parsed)
+          (let [contours (load (field parsed contours))
+                (mut minimum-x) (primitive/cast f32 0.0)
+                (mut minimum-y) (primitive/cast f32 0.0)
+                (mut maximum-x) (primitive/cast f32 0.0)
+                (mut maximum-y) (primitive/cast f32 0.0)
+                (mut have-bounds) false]
+            (do
+              (for [i 0 (al/al-len [path/Path] contours)]
+                (let [contour (primitive/index (load (field contours data)) i)]
+                  (do
+                    (store! (field contour closed) true)
+                    (let [(mut mesh) (path/path-tessellate (load contour))]
+                      (if (load (field mesh valid))
+                          (let [bounds (path/tessellation-bounds mesh)]
+                            (do
+                              (if (load (field bounds valid))
+                                  (if (load have-bounds)
+                                      (do
+                                        (if (< (load (field bounds x)) (load minimum-x))
+                                            (store! minimum-x (load (field bounds x)))
+                                            0)
+                                        (if (< (load (field bounds y)) (load minimum-y))
+                                            (store! minimum-y (load (field bounds y)))
+                                            0)
+                                        (if (> (+ (load (field bounds x)) (load (field bounds w)))
+                                               (load maximum-x))
+                                            (store! maximum-x
+                                                    (+ (load (field bounds x))
+                                                       (load (field bounds w))))
+                                            0)
+                                        (if (> (+ (load (field bounds y)) (load (field bounds h)))
+                                               (load maximum-y))
+                                            (store! maximum-y
+                                                    (+ (load (field bounds y))
+                                                       (load (field bounds h))))
+                                            0))
+                                      (do
+                                        (store! minimum-x (load (field bounds x)))
+                                        (store! minimum-y (load (field bounds y)))
+                                        (store! maximum-x
+                                                (+ (load (field bounds x))
+                                                   (load (field bounds w))))
+                                        (store! maximum-y
+                                                (+ (load (field bounds y))
+                                                   (load (field bounds h))))
+                                        (store! have-bounds true)))
+                                  0)
+                              (al/al-push! [path/Tessellation]
+                                           (mut (.meshes vector))
+                                           (load mesh))))
+                          (do
+                            (path/tessellation-free! (mut mesh))
+                            (set! (.valid parsed) false)))))))
+              (if (and (load (field parsed valid)) (load have-bounds))
+                  (do
+                    (set! (.bounds vector)
+                          (path/PathBounds
+                            :x (load minimum-x)
+                            :y (load minimum-y)
+                            :w (- (load maximum-x) (load minimum-x))
+                            :h (- (load maximum-y) (load minimum-y))
+                            :valid true))
+                    (set! (.valid vector) true))
+                  0)))
+          0)
+      (svg-path-data-free! (mut parsed))
+      (load vector))))
+
+;;; Paint a reusable vector with aspect-preserving `contain` fitting. The local
+;;; SVG-to-component transform composes with any parent scene transform, and each
+;;; contour remains an ordered GPU path draw using the shared frame buffers.
+(defn svg-vector-paint! [(scene (mut ui/Scene))
+                         (vector SvgVector)
+                         (bounds ui/Rect)
+                         (color ui/Color)
+                         (id i32)] (-> i64)
+  (if (or (not (load (field vector valid)))
+          (or (<= (load (field bounds w)) 0.0) (<= (load (field bounds h)) 0.0)))
+      0
+      (let [source (load (field vector bounds))
+            scale-x (/ (load (field bounds w)) (load (field source w)))
+            scale-y (/ (load (field bounds h)) (load (field source h)))
+            scale (if (< scale-x scale-y) scale-x scale-y)
+            fitted-width (* (load (field source w)) scale)
+            fitted-height (* (load (field source h)) scale)
+            tx (- (+ (load (field bounds x)) (* (- (load (field bounds w)) fitted-width) 0.5))
+                  (* (load (field source x)) scale))
+            ty (- (+ (load (field bounds y)) (* (- (load (field bounds h)) fitted-height) 0.5))
+                  (* (load (field source y)) scale))
+            transform
+              (ui/Affine :m11 scale :m12 0.0 :m21 0.0 :m22 scale :tx tx :ty ty)
+            prior (ui/scene-push-transform! (mut scene) transform)
+            meshes (load (field vector meshes))
+            (mut draws) 0]
+        (do
+          (for [i 0 (al/al-len [path/Tessellation] meshes)]
+            (do
+              (ui/scene-path-fill!
+                (mut scene)
+                (load (primitive/index (load (field meshes data)) i))
+                color
+                (primitive/cast i32 (+ (primitive/cast i64 id) i)))
+              (store! draws (+ (load draws) 1))))
+          (ui/scene-pop-transform! (mut scene) prior)
+          (load draws)))))
