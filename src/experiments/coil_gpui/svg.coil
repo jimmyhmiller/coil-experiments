@@ -12,7 +12,10 @@
         svg-path-data-contour-count
         svg-path-data-contour
         svg-path-data-free!
+        FillRuleNonzero
+        FillRuleEvenodd
         svg-vector-new
+        svg-vector-new-with-fill-rule
         svg-vector-valid?
         svg-vector-paint!
         svg-vector-free!)
@@ -29,6 +32,11 @@
 ;;; into the scene's shared GPU upload ring only when the component is painted.
 (defstruct SvgVector
   [(meshes (al/ArrayList path/Tessellation)) (bounds path/PathBounds) (valid bool)])
+
+(defstruct FillCrossing [(x0 f32) (x1 f32) (xmid f32) (winding i32)])
+
+(defn FillRuleNonzero [] (-> i32) (primitive/cast i32 0))
+(defn FillRuleEvenodd [] (-> i32) (primitive/cast i32 1))
 
 (defn reader-byte [(reader SvgReader)] (-> u8)
   (if (= (primitive/cast i64 (load (field reader cursor))) 0)
@@ -348,6 +356,180 @@
                       (> (svg-path-data-contour-count (load result)) 0))))
       (load result))))
 
+(defn sort-f32! [(values (mut (al/ArrayList f32)))] (-> i64)
+  (do
+    (for [i 1 (al/al-len [f32] (load values))]
+      (let [value (al/al-get [f32] (load values) i)
+            (mut slot) i]
+        (do
+          (while (and (> (load slot) 0)
+                      (> (al/al-get [f32] (load values) (- (load slot) 1)) value))
+            (do
+              (al/al-set! [f32] (mut values) (load slot)
+                          (al/al-get [f32] (load values) (- (load slot) 1)))
+              (store! slot (- (load slot) 1))))
+          (al/al-set! [f32] (mut values) (load slot) value))))
+    0))
+
+(defn sort-crossings! [(values (mut (al/ArrayList FillCrossing)))] (-> i64)
+  (do
+    (for [i 1 (al/al-len [FillCrossing] (load values))]
+      (let [value (al/al-get [FillCrossing] (load values) i)
+            (mut slot) i]
+        (do
+          (while (and (> (load slot) 0)
+                      (let [prior (al/al-get [FillCrossing]
+                                             (load values)
+                                             (- (load slot) 1))]
+                        (> (load (field prior xmid)) (load (field value xmid)))))
+            (let [prior (al/al-get [FillCrossing]
+                                    (load values)
+                                    (- (load slot) 1))]
+              (do
+                (al/al-set! [FillCrossing] (mut values) (load slot) prior)
+                (store! slot (- (load slot) 1)))))
+          (al/al-set! [FillCrossing] (mut values) (load slot) value))))
+    0))
+
+(defn crossing-x [(a path/PathPoint) (b path/PathPoint) (y f32)] (-> f32)
+  (+ (load (field a x))
+     (* (/ (- y (load (field a y)))
+           (- (load (field b y)) (load (field a y))))
+        (- (load (field b x)) (load (field a x))))))
+
+(defn append-fill-band! [(vertices (mut (al/ArrayList path/PathPoint)))
+                         (left FillCrossing)
+                         (right FillCrossing)
+                         (y0 f32)
+                         (y1 f32)] (-> i64)
+  (let [left0 (path/PathPoint :x (load (field left x0)) :y y0)
+        left1 (path/PathPoint :x (load (field left x1)) :y y1)
+        right0 (path/PathPoint :x (load (field right x0)) :y y0)
+        right1 (path/PathPoint :x (load (field right x1)) :y y1)]
+    (do
+      (al/al-push! [path/PathPoint] (mut vertices) left0)
+      (al/al-push! [path/PathPoint] (mut vertices) right0)
+      (al/al-push! [path/PathPoint] (mut vertices) right1)
+      (al/al-push! [path/PathPoint] (mut vertices) left0)
+      (al/al-push! [path/PathPoint] (mut vertices) right1)
+      (al/al-push! [path/PathPoint] (mut vertices) left1))))
+
+(defn contours-disjoint? [(contours (al/ArrayList path/Path))] (-> bool)
+  (block :result
+    (for [left-index 0 (al/al-len [path/Path] contours)]
+      (let [left (al/al-get [path/Path] contours left-index)
+            left-points (load (field left points))
+            left-count (al/al-len [path/PathPoint] left-points)]
+        (for [right-index (+ left-index 1) (al/al-len [path/Path] contours)]
+          (let [right (al/al-get [path/Path] contours right-index)
+                right-points (load (field right points))
+                right-count (al/al-len [path/PathPoint] right-points)]
+            (for [left-edge 0 left-count]
+              (let [a (al/al-get [path/PathPoint] left-points left-edge)
+                    b (al/al-get [path/PathPoint]
+                                 left-points
+                                 (% (+ left-edge 1) left-count))]
+                (for [right-edge 0 right-count]
+                  (let [c (al/al-get [path/PathPoint] right-points right-edge)
+                        d (al/al-get [path/PathPoint]
+                                     right-points
+                                     (% (+ right-edge 1) right-count))]
+                    (if (path/segments-intersect? a b c d)
+                        (return-from :result false)
+                        0)))))))))
+    true))
+
+;;; Tessellate all subpaths as one SVG shape. Horizontal bands end at every
+;;; contour vertex, so active non-horizontal edges are linear throughout a band.
+;;; Sorted crossings then implement the SVG winding rules directly and emit
+;;; trapezoids into the ordinary Metal triangle stream.
+(defn compound-tessellate [(contours (al/ArrayList path/Path)) (fill-rule i32)]
+                          (-> path/Tessellation)
+  (let [allocator (alloc/malloc-allocator)
+        (mut ys) (al/al-new [f32] allocator)
+        (mut vertices) (al/al-new [path/PathPoint] allocator)
+        (mut valid) (or (= fill-rule (FillRuleNonzero))
+                        (= fill-rule (FillRuleEvenodd)))]
+    (do
+      (for [contour-index 0 (al/al-len [path/Path] contours)]
+        (let [contour (al/al-get [path/Path] contours contour-index)]
+          (do
+            (if (not (path/path-simple? contour)) (store! valid false) 0)
+            (let [points (load (field contour points))]
+              (for [point-index 0 (al/al-len [path/PathPoint] points)]
+                (let [point (al/al-get [path/PathPoint] points point-index)]
+                  (al/al-push! [f32] (mut ys) (load (field point y)))))))))
+      (if (not (contours-disjoint? contours)) (store! valid false) 0)
+      (sort-f32! (mut ys))
+      (if (load valid)
+          (for [band 0 (- (al/al-len [f32] (load ys)) 1)]
+            (let [y0 (al/al-get [f32] (load ys) band)
+                  y1 (al/al-get [f32] (load ys) (+ band 1))]
+              (if (> (- y1 y0) 0.00001)
+                  (let [ymid (* (+ y0 y1) 0.5)
+                        (mut crossings) (al/al-new [FillCrossing] allocator)]
+                    (do
+                      (for [contour-index 0 (al/al-len [path/Path] contours)]
+                        (let [contour (al/al-get [path/Path] contours contour-index)
+                              points (load (field contour points))
+                              count (al/al-len [path/PathPoint] points)]
+                          (for [edge 0 count]
+                            (let [a (al/al-get [path/PathPoint] points edge)
+                                  b (al/al-get [path/PathPoint] points (% (+ edge 1) count))
+                                  ay (load (field a y))
+                                  by (load (field b y))]
+                              (if (or (and (< ay ymid) (> by ymid))
+                                      (and (> ay ymid) (< by ymid)))
+                                  (al/al-push!
+                                    [FillCrossing]
+                                    (mut crossings)
+                                    (FillCrossing
+                                      :x0 (crossing-x a b y0)
+                                      :x1 (crossing-x a b y1)
+                                      :xmid (crossing-x a b ymid)
+                                      :winding (if (> by ay)
+                                                   (primitive/cast i32 1)
+                                                   (primitive/cast i32 -1))))
+                                  0)))))
+                      (sort-crossings! (mut crossings))
+                      (let [(mut winding) (primitive/cast i32 0)
+                            (mut inside) false
+                            (mut left-index) (primitive/cast i64 0)]
+                        (do
+                          (for [crossing-index 0 (al/al-len [FillCrossing] (load crossings))]
+                            (let [crossing (al/al-get [FillCrossing] (load crossings) crossing-index)
+                                  was-inside (load inside)]
+                              (do
+                                (if (= fill-rule (FillRuleEvenodd))
+                                    (store! inside (not was-inside))
+                                    (do
+                                      (store! winding (+ (load winding)
+                                                         (load (field crossing winding))))
+                                      (store! inside
+                                              (!= (load winding) (primitive/cast i32 0)))))
+                                (if (and (not was-inside) (load inside))
+                                    (store! left-index crossing-index)
+                                    (if (and was-inside (not (load inside)))
+                                        (let [left (al/al-get [FillCrossing]
+                                                              (load crossings)
+                                                              (load left-index))]
+                                          (append-fill-band! (mut vertices)
+                                                             left
+                                                             crossing
+                                                             y0
+                                                             y1))
+                                        0)))))
+                          (if (load inside) (store! valid false) 0)))
+                      (al/al-free! [FillCrossing] (mut crossings))))
+                  0)))
+          0)
+      (al/al-free! [f32] (mut ys))
+      (if (and (load valid) (> (al/al-len [path/PathPoint] (load vertices)) 0))
+          (path/Tessellation :vertices (load vertices) :valid true)
+          (do
+            (al/al-clear! [path/PathPoint] (mut vertices))
+            (path/Tessellation :vertices (load vertices) :valid false))))))
+
 (defn svg-vector-empty [] (-> SvgVector)
   (SvgVector
     :meshes (al/al-new [path/Tessellation] (alloc/malloc-allocator))
@@ -368,84 +550,36 @@
     0))
 
 ;;; Parse and tessellate filled SVG path data once. SVG fill semantics implicitly
-;;; close open subpaths, so the retained local contour is closed before ear
-;;; clipping. Invalid or non-simple contours reject the complete vector atomically.
-(defn svg-vector-new [(source (ptr i8)) (tolerance f32)] (-> SvgVector)
+;;; close open subpaths. All contours are resolved together under the requested
+;;; fill rule, retaining one triangle mesh for the complete shape.
+(defn svg-vector-new-with-fill-rule [(source (ptr i8)) (tolerance f32) (fill-rule i32)]
+                                    (-> SvgVector)
   (let [(mut vector) (svg-vector-empty)
         (mut parsed) (svg-path-data-parse source tolerance)]
     (do
       (if (svg-path-data-valid? parsed)
-          (let [contours (load (field parsed contours))
-                (mut minimum-x) (primitive/cast f32 0.0)
-                (mut minimum-y) (primitive/cast f32 0.0)
-                (mut maximum-x) (primitive/cast f32 0.0)
-                (mut maximum-y) (primitive/cast f32 0.0)
-                (mut have-bounds) false]
+          (let [contours (load (field parsed contours))]
             (do
               (for [i 0 (al/al-len [path/Path] contours)]
-                (let [contour (primitive/index (load (field contours data)) i)]
-                  (do
-                    (store! (field contour closed) true)
-                    (let [(mut mesh) (path/path-tessellate (load contour))]
-                      (if (load (field mesh valid))
-                          (let [bounds (path/tessellation-bounds mesh)]
-                            (do
-                              (if (load (field bounds valid))
-                                  (if (load have-bounds)
-                                      (do
-                                        (if (< (load (field bounds x)) (load minimum-x))
-                                            (store! minimum-x (load (field bounds x)))
-                                            0)
-                                        (if (< (load (field bounds y)) (load minimum-y))
-                                            (store! minimum-y (load (field bounds y)))
-                                            0)
-                                        (if (> (+ (load (field bounds x)) (load (field bounds w)))
-                                               (load maximum-x))
-                                            (store! maximum-x
-                                                    (+ (load (field bounds x))
-                                                       (load (field bounds w))))
-                                            0)
-                                        (if (> (+ (load (field bounds y)) (load (field bounds h)))
-                                               (load maximum-y))
-                                            (store! maximum-y
-                                                    (+ (load (field bounds y))
-                                                       (load (field bounds h))))
-                                            0))
-                                      (do
-                                        (store! minimum-x (load (field bounds x)))
-                                        (store! minimum-y (load (field bounds y)))
-                                        (store! maximum-x
-                                                (+ (load (field bounds x))
-                                                   (load (field bounds w))))
-                                        (store! maximum-y
-                                                (+ (load (field bounds y))
-                                                   (load (field bounds h))))
-                                        (store! have-bounds true)))
-                                  0)
-                              (al/al-push! [path/Tessellation]
-                                           (mut (.meshes vector))
-                                           (load mesh))))
-                          (do
-                            (path/tessellation-free! (mut mesh))
-                            (set! (.valid parsed) false)))))))
-              (if (and (load (field parsed valid)) (load have-bounds))
-                  (do
-                    (set! (.bounds vector)
-                          (path/PathBounds
-                            :x (load minimum-x)
-                            :y (load minimum-y)
-                            :w (- (load maximum-x) (load minimum-x))
-                            :h (- (load maximum-y) (load minimum-y))
-                            :valid true))
-                    (set! (.valid vector) true))
-                  0)))
+                (store! (field (primitive/index (load (field contours data)) i) closed) true))
+              (let [(mut mesh) (compound-tessellate contours fill-rule)]
+                (if (load (field mesh valid))
+                    (let [bounds (path/tessellation-bounds (load mesh))]
+                      (do
+                        (al/al-push! [path/Tessellation] (mut (.meshes vector)) (load mesh))
+                        (set! (.bounds vector) bounds)
+                        (set! (.valid vector) (load (field bounds valid)))))
+                    (path/tessellation-free! (mut mesh))))))
           0)
       (svg-path-data-free! (mut parsed))
       (load vector))))
 
+(defn svg-vector-new [(source (ptr i8)) (tolerance f32)] (-> SvgVector)
+  (svg-vector-new-with-fill-rule source tolerance (FillRuleNonzero)))
+
 ;;; Paint a reusable vector with aspect-preserving `contain` fitting. The local
 ;;; SVG-to-component transform composes with any parent scene transform, and each
-;;; contour remains an ordered GPU path draw using the shared frame buffers.
+;;; compound mesh remains one ordered GPU path draw using the shared frame buffers.
 (defn svg-vector-paint! [(scene (mut ui/Scene))
                          (vector SvgVector)
                          (bounds ui/Rect)

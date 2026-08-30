@@ -94,9 +94,12 @@ layer in the runtime path.
 - Coil-native SVG path-data parsing for every absolute and relative command
   family (`M/L/H/V/C/S/Q/T/A/Z`), implicit repetitions, compact signs, decimals,
   exponents, smooth-control reflection, and multiple subpaths. `SvgVector`
-  validates and tessellates filled contours once, retains the meshes, and paints
-  aspect-preserving instances through the ordered Metal path pipeline. The demo
-  uses this component for its cyan lightning icon.
+  validates and tessellates all filled contours once into one retained mesh,
+  with SVG-default nonzero winding and explicit even-odd fill support. A
+  Coil-native scanline tessellator preserves nested holes, islands, disjoint
+  contours, and orientation-sensitive winding while painting aspect-preserving
+  instances through the ordered Metal path pipeline. The demo uses this
+  component for its cyan lightning icon.
 - Batched analytic rounded-rectangle shadows with GPU-computed soft falloff,
   configurable offset, blur sigma, spread, radius, color, and scene clipping.
 - Native Unicode line shaping through CoreText `CTLine`/`CTRun`, preserving shaped
@@ -419,8 +422,8 @@ application. GPUI parity still requires substantial systems, notably:
   UTF-8/CoreText cluster conversion, glyph-run extraction, subpixel glyph caching,
   bounded atlas allocation, and GPU mask composition work now);
 - closed-path dash seam merging, full SVG XML/style/transform document loading,
-  and non-simple/multi-contour hole fill rules (path-data parsing, retained vector
-  components, adaptive quadratic/cubic
+  and intersecting/self-intersecting contour fill rules (path-data parsing,
+  retained compound vector components, adaptive quadratic/cubic
   curves and elliptical arcs, polygon
   fills, butt-cap/miter strokes, affine transforms, analytic shadows, linear
   gradients, general raster images, virtual scrolling, and nested rectangular
