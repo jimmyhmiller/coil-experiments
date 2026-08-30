@@ -1,0 +1,179 @@
+(module experiments.manual-live.blocked)
+
+(import "coil.primitive" :as primitive)
+(import "coil.atomic" :as atomic)
+(import "coil.sync" :as sync)
+
+(const FUNCTION_EMPTY 0)
+(const FUNCTION_BLOCKED 1)
+(const FUNCTION_READY 2)
+(const FUNCTION_CLOSED 3)
+(const CANDIDATE_MISSING 0)
+(const CANDIDATE_READY 1)
+(const CANDIDATE_BLOCKED 2)
+
+(defstruct PartialGeneration
+  [(epochs (array i64 64)) (states (array i64 64))])
+
+(defn partial-generation-init! [(plan (ptr PartialGeneration))] (-> i64)
+  (store! plan (primitive/zeroed PartialGeneration))
+  0)
+
+(defn partial-generation-record! [(plan (ptr PartialGeneration))
+                                   (definition-id i64) (epoch i64)
+                                   (state i64)] (-> i64)
+  (if (or (< definition-id 0)
+          (or (>= definition-id 64)
+              (and (!= state CANDIDATE_READY) (!= state CANDIDATE_BLOCKED))))
+      -1
+      (do
+        (store! (primitive/index (field plan epochs) definition-id) epoch)
+        (store! (primitive/index (field plan states) definition-id) state)
+        0)))
+
+; A changed generation is publishable only when every definition in its exact
+; reverse dependency closure has either checked code or a typed blocked artifact
+; for this same candidate epoch. Old-generation code is never counted as cover.
+(defn partial-generation-covered? [(plan (ptr PartialGeneration))
+                                    (marks (ptr (array bool 64)))
+                                    (epoch i64)] (-> bool)
+  (let [(mut covered) true]
+    (for [i 0 64]
+      (when (load (primitive/index marks i))
+        (let [state (load (primitive/index (field plan states) i))]
+          (if (and (= (load (primitive/index (field plan epochs) i)) epoch)
+                   (or (= state CANDIDATE_READY) (= state CANDIDATE_BLOCKED)))
+              0
+              (set! covered false)))))
+    (load covered)))
+
+; This is the first concrete ABI lineage proof. The general metaprogram will
+; generate the same cell and gate shape for each checked function signature.
+(defstruct BlockedFunction
+  [(event sync/Event)
+   (state i64)
+   (implementation (ptr i8))
+   (diagnostic-id i64)
+   (waiters i64)
+   (calls i64)])
+
+(defn blocked-i64-init! [(cell (ptr BlockedFunction))] (-> i64)
+  (store! cell (primitive/zeroed BlockedFunction))
+  (match (sync/event-init (field cell event))
+    (Err [_] -1)
+    (Ok [_] 0)))
+
+(defn blocked-i64-block! [(cell (ptr BlockedFunction))
+                          (diagnostic-id i64)] (-> i64)
+  ; A blocked publication is complete before its notification becomes visible.
+  (atomic/atomic-store-ptr [i8] (field cell implementation) (primitive/cast (ptr i8) 0))
+  (atomic/atomic-store (field cell diagnostic-id) diagnostic-id)
+  (atomic/atomic-store (field cell state) FUNCTION_BLOCKED)
+  (match (sync/event-notify-all! (field cell event))
+    (Err [_] -1)
+    (Ok [_] 0)))
+
+(defn blocked-i64-publish! [(cell (ptr BlockedFunction))
+                            (implementation (ptr i8))] (-> i64)
+  (if (= (primitive/cast i64 implementation) 0) -1
+      (do
+        ; Pointer first, Ready second: a caller observing Ready must observe the
+        ; complete implementation publication.
+        (atomic/atomic-store-ptr [i8] (field cell implementation) implementation)
+        (atomic/atomic-store (field cell diagnostic-id) 0)
+        (atomic/atomic-store (field cell state) FUNCTION_READY)
+        (match (sync/event-notify-all! (field cell event))
+          (Err [_] -1)
+          (Ok [_] 0)))))
+
+(defn blocked-i64-state [(cell (ptr BlockedFunction))] (-> i64)
+  (atomic/atomic-load (field cell state)))
+
+(defn blocked-i64-diagnostic [(cell (ptr BlockedFunction))] (-> i64)
+  (atomic/atomic-load (field cell diagnostic-id)))
+
+(defn blocked-i64-waiters [(cell (ptr BlockedFunction))] (-> i64)
+  (atomic/atomic-load (field cell waiters)))
+
+; ABI-independent half of a generated typed gate. It returns only after a
+; same-lineage implementation is Ready. The caller's typed native frame keeps
+; all arguments alive while this function waits.
+(defn blocked-wait-implementation [(cell (ptr BlockedFunction))] (-> (ptr i8))
+  (block :done
+    (loop
+      (let [state (atomic/atomic-load (field cell state))]
+        (cond
+          (= state FUNCTION_READY)
+            (let [raw (atomic/atomic-load-ptr [i8] (field cell implementation))]
+              (if (= (primitive/cast i64 raw) 0)
+                  (break :done (primitive/cast (ptr i8) 0))
+                  (do
+                    (atomic/atomic-add (field cell calls) 1)
+                    (break :done raw))))
+          (= state FUNCTION_BLOCKED)
+            (match (sync/event-generation (field cell event))
+              (Err [_] (break :done (primitive/cast (ptr i8) 0)))
+              (Ok [generation]
+                (do
+                  (atomic/atomic-add (field cell waiters) 1)
+                  (let [still-blocked
+                          (= (atomic/atomic-load (field cell state)) FUNCTION_BLOCKED)]
+                    (if still-blocked
+                        (match (sync/event-wait! (field cell event) generation)
+                          (Err [_]
+                            (do
+                              (atomic/atomic-add (field cell waiters) -1)
+                              (break :done (primitive/cast (ptr i8) 0))))
+                          (Ok [_] 0))
+                        0))
+                  (atomic/atomic-add (field cell waiters) -1))))
+          :else (break :done (primitive/cast (ptr i8) 0)))))))
+
+; The original argument remains in this native frame for the entire wait. The
+; general form gives this frame ownership of affine arguments and transfers them
+; exactly once when a repaired implementation becomes Ready.
+(defn blocked-i64-call [(cell (ptr BlockedFunction)) (argument i64)] (-> i64)
+  (block :done
+    (loop
+      (let [state (atomic/atomic-load (field cell state))]
+        (cond
+          (= state FUNCTION_READY)
+            (let [raw (atomic/atomic-load-ptr [i8] (field cell implementation))]
+              (if (= (primitive/cast i64 raw) 0)
+                  (break :done -701)
+                  (do
+                    (atomic/atomic-add (field cell calls) 1)
+                    (break :done
+                      (primitive/call-ptr
+                        (primitive/cast (fnptr c [i64] i64) raw) argument)))))
+          (= state FUNCTION_BLOCKED)
+            (match (sync/event-generation (field cell event))
+              (Err [_] (break :done -702))
+              (Ok [generation]
+                (do
+                  (atomic/atomic-add (field cell waiters) 1)
+                  ; Close the publication race between observing Blocked and
+                  ; entering the condition wait.
+                  (let [still-blocked
+                          (= (atomic/atomic-load (field cell state)) FUNCTION_BLOCKED)]
+                    (if still-blocked
+                        (match (sync/event-wait! (field cell event) generation)
+                          (Err [_]
+                            (do
+                              (atomic/atomic-add (field cell waiters) -1)
+                              (break :done -703)))
+                          (Ok [_] 0))
+                        0))
+                  (atomic/atomic-add (field cell waiters) -1))))
+          (= state FUNCTION_CLOSED) (break :done -704)
+          :else (break :done -705))))))
+
+(defn blocked-i64-close! [(cell (ptr BlockedFunction))] (-> i64)
+  (if (!= (atomic/atomic-load (field cell waiters)) 0) -1
+      (do
+        (atomic/atomic-store (field cell state) FUNCTION_CLOSED)
+        (atomic/atomic-store-ptr [i8] (field cell implementation)
+          (primitive/cast (ptr i8) 0))
+        (match (sync/event-destroy! (field cell event))
+          (Err [_] -2)
+          (Ok [_] 0)))))

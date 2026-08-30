@@ -714,6 +714,7 @@
           (if (nd/obj-local? o)
               (put! (mut e) (slot-of (mut e) o))
               (do (put! (mut e) "(") (put! (mut e) (slot-of (mut e) o)) (put! (mut e) ")"))))
+      (= k nd/ND-STMT-EXPR) (emit-compound-literal! (mut e) n true)
       ;; The pointer's own type says nothing about what it points at, so the
       ;; address is retyped here, where the type of the thing being reached is
       ;; known.
@@ -1146,6 +1147,64 @@
           (put-int! (mut e) (narrow-to (.i v) (ct/ty-size ty) (ct/ty-unsigned? ty))))
         (emit-expr! (mut e) n))))
 
+(defn emit-atomic! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
+  (let [name (nd/nd-label n)
+        args (nd/nd-args n)
+        count (al/al-len [(ptr nd/Node)] args)]
+    (if (str/str-eq name "__builtin_alloca")
+        (do (put! (mut e) "(llvm-ir (ptr i8) [")
+            (emit-expr! (mut e) (al/al-get [(ptr nd/Node)] args 0))
+            (put! (mut e) "] \"%p = alloca i8, i64 $0, align 16\\nret ptr %p\")"))
+        (emit-sync-atomic! (mut e) n name args count)))
+  0)
+
+(defn emit-sync-atomic! [(e (mut Emitter))
+                         (n (ptr nd/Node))
+                         (name (slice u8))
+                         (args (al/ArrayList (ptr nd/Node)))
+                         (count i64)] (-> i64)
+  (do
+    (put! (mut e) "(llvm-ir ")
+    (emit-type! (mut e) (nd/nd-type n))
+    (put! (mut e) " [")
+    (let [(mut i) 0]
+      (loop (if (>= (load i) count)
+                (break)
+                (do (if (> (load i) 0) (put! (mut e) " ") 0)
+                    (emit-expr! (mut e) (al/al-get [(ptr nd/Node)] args (load i)))
+                    (store! i (+ (load i) 1))))))
+    (put! (mut e) "] \"")
+    (cond
+      (str/str-eq name "__sync_synchronize")
+        (put! (mut e) "fence seq_cst\\nret i32 0")
+      (str/str-eq name "__sync_val_compare_and_swap")
+        (do (put! (mut e) "%pair = cmpxchg ptr $0, ")
+            (emit-type! (mut e) (nd/nd-type n))
+            (put! (mut e) " $1, ")
+            (emit-type! (mut e) (nd/nd-type n))
+            (put! (mut e) " $2 seq_cst seq_cst\\n%old = extractvalue { ")
+            (emit-type! (mut e) (nd/nd-type n))
+            (put! (mut e) ", i1 } %pair, 0\\nret ")
+            (emit-type! (mut e) (nd/nd-type n))
+            (put! (mut e) " %old"))
+      :else
+        (let [op (cond
+                   (str/str-eq name "__sync_lock_test_and_set") "xchg"
+                   (str/str-eq name "__sync_fetch_and_add") "add"
+                   (str/str-eq name "__sync_fetch_and_sub") "sub"
+                   (str/str-eq name "__sync_fetch_and_or") "or"
+                   (str/str-eq name "__sync_fetch_and_xor") "xor"
+                   :else "and")]
+          (put! (mut e) "%old = atomicrmw ")
+          (put! (mut e) op)
+          (put! (mut e) " ptr $0, ")
+          (emit-type! (mut e) (nd/nd-type n))
+          (put! (mut e) " $1 seq_cst\\nret ")
+          (emit-type! (mut e) (nd/nd-type n))
+          (put! (mut e) " %old")))
+    (put! (mut e) "\")"))
+  0)
+
 (defn emit-binary! [(e (mut Emitter)) (n (ptr nd/Node)) (op (slice u8))] (-> i64)
   (put! (mut e) "(")
   (put! (mut e) op)
@@ -1426,6 +1485,7 @@
                   (put! (mut e) (slot-of (mut e) (nd/nd-obj n)))
                 :else
                   (do (put! (mut e) "(load ") (emit-addr! (mut e) n) (put! (mut e) ")"))))
+          (= k nd/ND-STMT-EXPR) (emit-compound-literal! (mut e) n false)
           (= k nd/ND-MEMBER)
             (if (>= (nd/nd-member-bit-width n) 0)
                 (emit-bitfield-load! (mut e) n)
@@ -1441,6 +1501,7 @@
           (= k nd/ND-COMPOUND) (emit-compound! (mut e) n)
           (= k nd/ND-TARGET)
             (emit-target-load! (mut e) n (top-label (load (field e target-addrs))))
+          (= k nd/ND-ATOMIC) (emit-atomic! (mut e) n)
           ;; A record has no cast: the value already has the storage type the
           ;; target wants, and Coil has no conversion between aggregates.
           (and (= k nd/ND-CAST) (ct/record? t)) (emit-expr! (mut e) (nd/nd-lhs n))
@@ -1657,11 +1718,15 @@
                 (store! i (+ (load i) 1)))))
     (if (= (load found) -1) (load group) (load found))))
 
-;;; The chain of comparisons that turns the switch value into a group index.
-(defn emit-switch-selector! [(e (mut Emitter)) (flat (al/ArrayList (ptr nd/Node)))
-                             (value (slice u8))] (-> i64)
+;;; Emit a bounded leaf of comparisons that turns the switch value into a group
+;;; index. `default` has no comparison; it is supplied as the final fallback.
+(defn emit-switch-selector-leaf! [(e (mut Emitter))
+                                  (flat (al/ArrayList (ptr nd/Node)))
+                                  (value (slice u8))
+                                  (from i64)
+                                  (until i64)
+                                  (fallback i64)] (-> i64)
   (let [count (al/al-len [(ptr nd/Node)] flat)
-        fallback (switch-default-group flat)
         (mut i) 0
         (mut group) 0
         (mut opened) 0]
@@ -1670,7 +1735,9 @@
               (let [s (al/al-get [(ptr nd/Node)] flat (load i))]
                 (if (= (nd/nd-kind s) nd/ND-CASE)
                     (do
-                      (if (str/str-eq (nd/nd-label s) "default")
+                      (if (or (< (load group) from)
+                              (>= (load group) until)
+                              (str/str-eq (nd/nd-label s) "default"))
                           0
                           (do
                             (put! (mut e) "(if (= ")
@@ -1691,34 +1758,102 @@
                 (do (put! (mut e) ")") (store! j (+ (load j) 1))))))
     0))
 
-;;; Every group from the selected one onward runs, which is what makes control
-;;; fall out of one case and into the next without any extra machinery.
-(defn emit-switch-groups! [(e (mut Emitter)) (flat (al/ArrayList (ptr nd/Node)))
-                           (index (slice u8))] (-> i64)
+;;; Generated parsers can contain hundreds of switch labels. A balanced search
+;;; shape prevents those labels from becoming hundreds of nested macro visits.
+(defn emit-switch-selector-range! [(e (mut Emitter))
+                                   (flat (al/ArrayList (ptr nd/Node)))
+                                   (value (slice u8))
+                                   (from i64)
+                                   (until i64)
+                                   (fallback i64)] (-> i64)
+  (if (<= (- until from) 16)
+      (emit-switch-selector-leaf! (mut e) flat value from until fallback)
+      (let [middle (+ from (primitive/idiv (- until from) 2))
+            candidate (fresh (mut e) "sc")]
+        (put! (mut e) "(let [")
+        (put! (mut e) candidate)
+        (put! (mut e) " ")
+        (emit-switch-selector-range! (mut e) flat value from middle -1)
+        (put! (mut e) "] (if (>= ")
+        (put! (mut e) candidate)
+        (put! (mut e) " 0) ")
+        (put! (mut e) candidate)
+        (put! (mut e) " ")
+        (emit-switch-selector-range! (mut e) flat value middle until fallback)
+        (put! (mut e) "))")))
+  0)
+
+(defn emit-switch-selector! [(e (mut Emitter)) (flat (al/ArrayList (ptr nd/Node)))
+                             (value (slice u8))] (-> i64)
+  (emit-switch-selector-range! (mut e) flat value 0 (switch-group-count flat)
+                               (switch-default-group flat)))
+
+;;; Emit one guarded case group. Every group from the selected one onward runs,
+;;; which implements C fallthrough; a break still exits the surrounding scope.
+(defn emit-switch-group! [(e (mut Emitter)) (flat (al/ArrayList (ptr nd/Node)))
+                          (index (slice u8)) (wanted i64)] (-> i64)
   (let [count (al/al-len [(ptr nd/Node)] flat)
         (mut i) 0
         (mut group) -1]
-    (put! (mut e) "(do")
+    (put! (mut e) " (if (<= ")
+    (put! (mut e) index)
+    (put! (mut e) " ")
+    (put-int! (mut e) wanted)
+    (put! (mut e) ") (do")
     (loop (if (>= (load i) count)
               (break)
               (let [s (al/al-get [(ptr nd/Node)] flat (load i))]
                 (if (= (nd/nd-kind s) nd/ND-CASE)
-                    (do
-                      (if (>= (load group) 0) (put! (mut e) " 0) 0)") 0)
-                      (store! group (+ (load group) 1))
-                      (put! (mut e) " (if (<= ")
-                      (put! (mut e) index)
-                      (put! (mut e) " ")
-                      (put-int! (mut e) (load group))
-                      (put! (mut e) ") (do"))
-                    ;; Statements before the first case are unreachable in C.
-                    (if (>= (load group) 0)
+                    (store! group (+ (load group) 1))
+                    (if (= (load group) wanted)
                         (do (put! (mut e) " ") (emit-stmt! (mut e) s))
                         0))
                 (store! i (+ (load i) 1)))))
-    (if (>= (load group) 0) (put! (mut e) " 0) 0)") 0)
-    (put! (mut e) " 0)")
+    (put! (mut e) " 0) 0)")
     0))
+
+;;; Keep the generated `do` tree shallow even for generated-code switches with
+;;; hundreds of labels (GLAD contains several). A flat variadic `do`, or the old
+;;; linear nesting of case groups, exceeds Coil's macro expansion guard.
+(defn emit-switch-group-range! [(e (mut Emitter))
+                                (flat (al/ArrayList (ptr nd/Node)))
+                                (index (slice u8))
+                                (from i64)
+                                (until i64)] (-> i64)
+  (if (<= (- until from) 16)
+      (let [(mut group) from]
+        (loop (if (>= (load group) until)
+                  (break)
+                  (do (emit-switch-group! (mut e) flat index (load group))
+                      (store! group (+ (load group) 1))))))
+      (let [middle (+ from (primitive/idiv (- until from) 2))]
+        (put! (mut e) " (do")
+        (emit-switch-group-range! (mut e) flat index from middle)
+        (put! (mut e) " 0)")
+        (put! (mut e) " (do")
+        (emit-switch-group-range! (mut e) flat index middle until)
+        (put! (mut e) " 0)")))
+  0)
+
+(defn switch-group-count [(flat (al/ArrayList (ptr nd/Node)))] (-> i64)
+  (let [count (al/al-len [(ptr nd/Node)] flat)
+        (mut i) 0
+        (mut groups) 0]
+    (loop (if (>= (load i) count)
+              (break)
+              (do
+                (if (= (nd/nd-kind (al/al-get [(ptr nd/Node)] flat (load i))) nd/ND-CASE)
+                    (store! groups (+ (load groups) 1))
+                    0)
+                (store! i (+ (load i) 1)))))
+    (load groups)))
+
+(defn emit-switch-groups! [(e (mut Emitter)) (flat (al/ArrayList (ptr nd/Node)))
+                           (index (slice u8))] (-> i64)
+  (put! (mut e) "(do")
+  (emit-switch-group-range! (mut e) flat index 0 (switch-group-count flat))
+  (put! (mut e) " 0)")
+  0)
 
 (defn emit-switch! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
   (let [body (nd/nd-then n)]
@@ -1753,25 +1888,40 @@
             (pop-break! (mut e))
             0)))))
 
+;;; Coil's `do` is a variadic macro. Feeding it thousands of static initializer
+;;; stores makes macro expansion exceed its recursion guard, so long C blocks
+;;; are emitted as a balanced tree of bounded `do` forms. Evaluation order is
+;;; unchanged and nesting depth grows logarithmically.
+(defn emit-block-range! [(e (mut Emitter))
+                         (body (al/ArrayList (ptr nd/Node)))
+                         (from i64)
+                         (until i64)] (-> i64)
+  (if (<= (- until from) 32)
+      (let [(mut i) from]
+        (loop (if (>= (load i) until)
+                  (break)
+                  (let [s (al/al-get [(ptr nd/Node)] body (load i))]
+                    (cond
+                      (nothing-to-do? s) 0
+                      (= (nd/nd-kind s) nd/ND-BLOCK) (emit-block-body! (mut e) s)
+                      :else (do (put! (mut e) " ") (emit-stmt! (mut e) s)))
+                    (store! i (+ (load i) 1))))))
+      (let [middle (+ from (primitive/idiv (- until from) 2))]
+        (put! (mut e) " (do")
+        (emit-block-range! (mut e) body from middle)
+        (put! (mut e) " 0)")
+        (put! (mut e) " (do")
+        (emit-block-range! (mut e) body middle until)
+        (put! (mut e) " 0)")))
+  0)
+
 ;;; The statements of a block, and of any block directly inside it. C nests a
 ;;; block wherever it declares something, and the declarations have already been
-;;; hoisted out with names of their own, so the nesting carries nothing: one
-;;; sequence of statements reads as one sequence of statements.
+;;; hoisted out with names of their own, so the nesting carries nothing.
 (defn emit-block-body! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
-  (let [body (nd/nd-body n)
-        count (al/al-len [(ptr nd/Node)] body)
-        (mut i) 0]
-    (loop (if (>= (load i) count)
-              (break)
-              (let [s (al/al-get [(ptr nd/Node)] body (load i))]
-                (cond
-                  ;; `int x;` declares storage and says nothing else, so there
-                  ;; is nothing to write for it here.
-                  (nothing-to-do? s) 0
-                  (= (nd/nd-kind s) nd/ND-BLOCK) (emit-block-body! (mut e) s)
-                  :else (do (put! (mut e) " ") (emit-stmt! (mut e) s)))
-                (store! i (+ (load i) 1)))))
-    0))
+  (let [body (nd/nd-body n)]
+    (emit-block-range! (mut e) body 0 (al/al-len [(ptr nd/Node)] body)))
+  0)
 
 (defn emit-stmt! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
   (if (= (primitive/cast i64 n) 0)
@@ -1975,6 +2125,25 @@
 (defn flow-push-stmt! [(f (mut Flow)) (n (ptr nd/Node))] (-> i64)
   (let [b (flow-here (mut f))]
     (al/al-push! [(ptr nd/Node)] (mut (field b stmts)) n))
+  0)
+
+;;; Initializes the unnamed object represented by a compound literal, then
+;;; yields either its value or its address depending on the expression context.
+(defn emit-compound-literal! [(e (mut Emitter))
+                              (n (ptr nd/Node))
+                              (address? bool)] (-> i64)
+  (let [o (nd/nd-obj n)]
+    (put! (mut e) "(do")
+    (emit-block-body! (mut e) (nd/nd-lhs n))
+    (put! (mut e) " ")
+    (if address?
+        (put! (mut e) (slot-of (mut e) o))
+        (if (direct-value? (mut e) o)
+            (put! (mut e) (slot-of (mut e) o))
+            (do (put! (mut e) "(load ")
+                (put! (mut e) (slot-of (mut e) o))
+                (put! (mut e) ")"))))
+    (put! (mut e) ")"))
   0)
 
 (defn flow-jump! [(f (mut Flow)) (target i64)] (-> i64)

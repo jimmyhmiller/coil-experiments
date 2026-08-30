@@ -598,12 +598,11 @@
       :else (None [lex/Token]))))
 
 ;;; Expands one invocation and appends the result. The replacement is rescanned
-;;; on its own, which is what keeps the recursion stack sound: a macro is off
-;;; limits for exactly as long as its own expansion is being scanned. The cost is
-;;; that an expansion ending in a function-like macro name does not reach past
-;;; itself for the `(` that follows, so `#define G F` leaves `G(1)` as `F(1)`.
-;;; Trading that for a hide set would buy a construct that essentially no real
-;;; code uses, at the price of the guarantee that expansion terminates.
+;;; while this macro remains disabled, which gives recursive definitions their
+;;; required stopping point. If that rescan ends in a function-like macro name,
+;;; the following `(` in the containing reader belongs to the same rescan. It is
+;;; consumed here, before the current macro is enabled again. This is the common
+;;; `#define public_allocator configured_allocator` alias pattern.
 (defn expand-call! [(p (mut PP))
                     (r (mut Reader))
                     (t lex/Token)
@@ -627,6 +626,20 @@
           (mut inner) (make-reader (load (field p a)) replacement 0 (tok-count replacement))]
       (al/al-push! [(slice u8)] (mut (field p expanding)) (.name m))
       (expand-into! (mut p) (mut inner) (mut acc))
+      (let [count (al/al-len [lex/Token] (mut acc))]
+        (if (and (> count 0)
+                 (and (not (r-done? (mut r))) (is-punct? (r-peek (mut r)) "(")))
+            (let [last (al/al-get [lex/Token] (load (mut acc)) (- count 1))]
+              (match (macro-of (mut p) (lex/token-text last))
+                (Some [next]
+                  (let [next-macro next]
+                    (if (and (!= (.function-like next-macro) 0)
+                             (not (expanding? (mut p) (.name next-macro))))
+                        (do (al/al-pop! [lex/Token] (mut acc))
+                            (expand-call! (mut p) (mut r) last next-macro (mut acc)))
+                        0)))
+                (None [] 0)))
+            0))
       (al/al-pop! [(slice u8)] (mut (field p expanding)))
       (append-all! (mut out) (load (mut acc)))))
   0)
@@ -711,6 +724,30 @@
     (Ok [_] true)
     (Err [_] false)))
 
+;;; Framework includes spell `<CoreAudio/CoreAudio.h>`, while the file lives at
+;;; `CoreAudio.framework/Headers/CoreAudio.h` beneath a framework search root.
+(defn framework-path [(p (mut PP))
+                      (root (slice u8))
+                      (name (slice u8))] (-> (slice u8))
+  (let [n (slice-len name)
+        (mut slash) -1
+        (mut i) 0]
+    (loop (if (or (>= (load i) n) (>= (load slash) 0))
+              (break)
+              (do (if (= (primitive/cast i64 (slice-get name (load i))) 47)
+                      (store! slash (load i))
+                      0)
+                  (store! i (+ (load i) 1)))))
+    (if (< (load slash) 1)
+        ""
+        (let [(mut b) (str/sb-new (load (field p a)))]
+          (str/sb-push-str! (mut b) root)
+          (str/sb-push-byte! (mut b) (primitive/cast u8 47))
+          (str/sb-push-str! (mut b) (subslice name 0 (load slash)))
+          (str/sb-push-str! (mut b) ".framework/Headers/")
+          (str/sb-push-str! (mut b) (subslice name (+ (load slash) 1) n))
+          (str/sb-str (load (mut b)))))))
+
 ;;; The index returned is the include path the file was found in, which is what
 ;;; `#include_next` needs in order to resume the search past it.
 (defstruct Found [(ok i64) (path (slice u8)) (index i64)])
@@ -733,12 +770,14 @@
               n (al/al-len [(slice u8)] (load (field p include-paths)))]
           (loop (if (or (!= (load (field result ok)) 0) (>= (load i) n))
                     (break)
-                    (let [candidate (join-path (mut p)
-                                               (al/al-get [(slice u8)] (load (field p include-paths)) (load i))
-                                               name)]
+                    (let [root (al/al-get [(slice u8)] (load (field p include-paths)) (load i))
+                          candidate (join-path (mut p) root name)
+                          framework (framework-path (mut p) root name)]
                       (if (file-exists? (mut p) candidate)
                           (store! result (Found :ok 1 :path candidate :index (load i)))
-                          0)
+                          (if (and (> (slice-len framework) 0) (file-exists? (mut p) framework))
+                              (store! result (Found :ok 1 :path framework :index (load i)))
+                              0))
                       (store! i (+ (load i) 1)))))
           0))
     (load result)))
@@ -1073,7 +1112,36 @@
           (text=? name "pragma")
             (if (and (< body until) (is-word? (tok-at tokens body) "once"))
                 (do (hm/hm-put! (mut (field p once)) (copy-text (mut p) file) true) 0)
-                0)
+                ;; Preserve packing directives in the token stream. Packing is
+                ;; lexical parser state, so dropping the directive here loses
+                ;; which later record declarations it governs.
+                (if (and (< (+ body 2) until)
+                         (and (is-word? (tok-at tokens body) "pack")
+                              (is-punct? (tok-at tokens (+ body 1)) "(")))
+                    (let [op (tok-at tokens (+ body 2))
+                          marker (cond
+                                   (is-word? op "push") "__coil_pack_push"
+                                   (is-word? op "pop") "__coil_pack_pop"
+                                   (= (lex/token-kind op) lex/TK-NUMBER) "__coil_pack_set"
+                                   (is-punct? op ")") "__coil_pack_reset"
+                                   :else "")]
+                      (if (> (slice-len marker) 0)
+                          (do
+                            (al/al-push! [lex/Token] (mut (field p out)) (retext head lex/TK-IDENT marker))
+                            (let [(mut i) (+ body 3)]
+                              (if (= (lex/token-kind op) lex/TK-NUMBER)
+                                  (al/al-push! [lex/Token] (mut (field p out)) op)
+                                  (loop (if (>= (load i) until)
+                                            (break)
+                                            (let [candidate (tok-at tokens (load i))]
+                                              (if (= (lex/token-kind candidate) lex/TK-NUMBER)
+                                                  (do (al/al-push! [lex/Token] (mut (field p out)) candidate)
+                                                      (break))
+                                                  (store! i (+ (load i) 1))))))))
+                            (al/al-push! [lex/Token] (mut (field p out)) (retext head lex/TK-PUNCT ";"))
+                            0)
+                          0))
+                    0))
           :else (fail! (mut p) "unknown preprocessing directive" head)))))
 
 (defn process-tokens! [(p (mut PP))

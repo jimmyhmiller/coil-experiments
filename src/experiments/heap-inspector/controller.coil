@@ -3,6 +3,7 @@
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.atomic" :as atomic)
+(import "coil.arraylist" :use [ArrayList al-new al-elem len push!])
 (import "coil.jit" :as jit)
 (import "coil.slice" :use [slice-new slice-len slice-get subslice])
 (import "coil.str" :as str)
@@ -10,6 +11,9 @@
 (import "experiments.heap-inspector.live-api" :as api)
 (import "experiments.heap-inspector.native-demo-api" :as demo)
 (import "experiments.heap-inspector.runtime" :as inspector)
+
+(defstruct LiveRepair
+  [(function (slice u8)) (diagnostic (slice u8))])
 
 (defstruct LiveController
   [(session jit/JitSession)
@@ -24,6 +28,7 @@
    (pending-live-owned bool)
    (broken-diagnostic (slice u8))
    (broken-diagnostic-owned bool)
+   (repairs (ArrayList LiveRepair))
    ; Host callback installation is runtime integration state, not accepted
    ; source/metaprogram state. It is published once with the first native demo
    ; candidate and never used to classify source.
@@ -101,6 +106,8 @@
                           (set! (.native-callback-generation controller) 0)
                           (set! (.pending-live controller) "")
                           (set! (.broken-diagnostic controller) "")
+                          (set! (.repairs controller)
+                                (al-new [LiveRepair] (alloc/malloc-allocator)))
                           (set! (.native-callbacks-published controller) false)
                           (api/live-api-register! (primitive/fnptr-of live-controller-snapshot)
                                                   (primitive/fnptr-of live-controller-edit-source!)
@@ -139,6 +146,29 @@
     (= kind 6) "export"
     :else "unknown"))
 
+; Generated live implementation owners retain the source name as
+; `<module>.<source>--live-...`. Preserve the exact compiler owner separately,
+; but present the stable source identity as the repair target.
+(defn live-controller-repair-source-name [(owner (slice u8))] (-> (slice u8))
+  (let [(mut start) 0 (mut finish) (slice-len owner) (mut i) 0]
+    (loop (if (>= (load i) (slice-len owner))
+              (break)
+              (do
+                (if (= (slice-get owner (load i)) 46)
+                    (set! start (+ (load i) 1)) 0)
+                (if (and (= (load finish) (slice-len owner))
+                         (and (<= (+ (load i) 7) (slice-len owner))
+                              (and (= (slice-get owner (load i)) 45)
+                                   (and (= (slice-get owner (+ (load i) 1)) 45)
+                                        (and (= (slice-get owner (+ (load i) 2)) 108)
+                                             (and (= (slice-get owner (+ (load i) 3)) 105)
+                                                  (and (= (slice-get owner (+ (load i) 4)) 118)
+                                                       (and (= (slice-get owner (+ (load i) 5)) 101)
+                                                            (= (slice-get owner (+ (load i) 6)) 45)))))))))
+                    (set! finish (load i)) 0)
+                (set! i (+ (load i) 1)))))
+    (subslice owner (load start) (load finish))))
+
 (defn live-controller-save-broken-diagnostic! [] (-> i64)
   (let [controller (live-controller)
         a (alloc/malloc-allocator)]
@@ -150,6 +180,29 @@
     (set! (.broken-diagnostic-owned controller) true)
     0))
 
+(defn live-controller-clear-repairs! [] (-> i64)
+  (let [controller (live-controller)
+        a (alloc/malloc-allocator)]
+    (for [i 0 (len (.repairs controller))]
+      (let [repair (al-elem [LiveRepair] (field controller repairs) i)]
+        (alloc/free [u8] a (.function repair))
+        (alloc/free [u8] a (.diagnostic repair))))
+    (set! (field (field controller repairs) len) 0)
+    0))
+
+(defn live-controller-save-repairs! [] (-> i64)
+  (let [controller (live-controller)]
+    (live-controller-clear-repairs!)
+    (for [i 0 (jit/jit-repair-count (field controller session))]
+      (push! (mut (.repairs controller))
+        (LiveRepair
+          :function (live-controller-copy
+                      (jit/jit-repair-function (field controller session) i))
+          :diagnostic (live-controller-copy
+                        (jit/jit-repair-diagnostic
+                          (field controller session) i)))))
+    0))
+
 (defn live-controller-clear-broken-diagnostic! [] (-> i64)
   (let [controller (live-controller)]
     (if (.broken-diagnostic-owned controller)
@@ -158,6 +211,33 @@
     (set! (.broken-diagnostic controller) "")
     (set! (.broken-diagnostic-owned controller) false)
     0))
+
+; Every implementation fnptr stored in a permanent live slot owns an exact
+; lease on the JIT image containing that implementation. Candidate binders
+; stage stable source identities while loading; only after the backend marks
+; the new image current can the host transfer those leases safely.
+(defn live-controller-transfer-code-owner-leases! [] (-> i64)
+  (let [controller (live-controller) (mut failure) 0]
+    (for [i 0 (load (live/live-staged-code-owner-count))]
+      (if (!= (load failure) 0) 0
+          (let [identity (load (primitive/index (live/live-staged-code-owners) i))
+                token (jit/jit-generation-retain-current!
+                        (field controller session))]
+            (if (<= token 0)
+                (set! failure -1)
+                (let [old (live/live-source-generation-token-swap! identity token)]
+                  (if (< old 0)
+                      (do
+                        (jit/jit-generation-release-token!
+                          (field controller session) token)
+                        (set! failure old))
+                      (if (> old 0)
+                          (if (< (jit/jit-generation-release-token!
+                                   (field controller session) old) 0)
+                              (set! failure -1) 0)
+                          0)))))))
+    (live/live-clear-staged-code-owners!)
+    (load failure)))
 
 (defn live-controller-publish-broken-candidate! [] (-> i64)
   (let [controller (live-controller)
@@ -187,6 +267,7 @@
             0)
         (do
           (live-controller-save-broken-diagnostic!)
+          (live-controller-save-repairs!)
           (let [condition-kind
                   (if (= (jit/jit-condition-kind (field controller session)) 1)
                       1 2)
@@ -206,9 +287,17 @@
           (live-controller-set-phase! 4)
           (live-controller-set-phase! 6)
           (live-controller-set-phase! 5)
-          (let [status (jit/jit-commit-prepared! (field controller session))]
-            (if (= status 0)
-                (do
+          (let [(mut status) (jit/jit-commit-prepared! (field controller session))]
+            (if (= (load status) 0)
+                (let [owner-status (live-controller-transfer-code-owner-leases!)]
+                  (if (!= owner-status 0)
+                      (do
+                        ; The generation is already current, so preserve every
+                        ; image rather than reclaim through an incomplete lease
+                        ; transfer. This is a terminal publication failure.
+                        (set! status owner-status)
+                        (live/live-condition-raise! 3 owner-status))
+                      (do
                   (if (.native-demo controller) (demo/native-demo-publish-staged!) 0)
                   ; The native host receives permanent trampolines only on the
                   ; first successful native-demo publication. Retain their exact
@@ -222,22 +311,24 @@
                       0)
                   (live/live-condition-clear!)
                   (live-controller-clear-broken-diagnostic!)
+                  (live-controller-clear-repairs!)
                   (set! (.last-reclaimed controller)
-                        (jit/jit-reclaim-retired! (field controller session))))
+                        (jit/jit-reclaim-retired! (field controller session))))))
                 (do
+                  (live/live-clear-staged-code-owners!)
                   (if (.native-demo controller) (demo/native-demo-abort-staged!) 0)
-                  (live/live-condition-raise! 3 status)))
+                  (live/live-condition-raise! 3 (load status))))
             (live/live-end-affected-publication!)
-            (set! (.last-result controller) status)
+            (set! (.last-result controller) (load status))
             (live-controller-set-phase!
-                  (cond (= status 0) 7
-                        (or (= status -8) (= status -10)) 10
-                        (= status -12) 11
-                        (= status -13) 12
-                        (= status -14) 13
-                        (= status -11) 14
+                  (cond (= (load status) 0) 7
+                        (or (= (load status) -8) (= (load status) -10)) 10
+                        (= (load status) -12) 11
+                        (= (load status) -13) 12
+                        (= (load status) -14) 13
+                        (= (load status) -11) 14
                         :else 8))
-            status)))))
+            (load status))))))
 
 (defn live-controller-edit-source! [(source (slice u8))] (-> i64)
   ; Phase is published before taking the mutation lock. A status request that
@@ -409,6 +500,21 @@
                 (inspector/json-quoted! (.name (load affected)))
                 (inspector/json-text! "}")
                 (set! affected (.next (load affected)))))))
+  (inspector/json-text! "]")
+  (inspector/json-text! ",\"requiredRepairs\":[")
+  (let [count (if transient 0 (len (.repairs (live-controller))))]
+    (for [i 0 count]
+      (let [repair (al-elem [LiveRepair]
+                     (field (live-controller) repairs) i)
+            owner (.function repair)]
+        (if (> i 0) (inspector/json-text! ",") 0)
+        (inspector/json-text! "{\"module\":\"replsession\",\"kind\":\"function\",\"name\":")
+        (inspector/json-quoted! (live-controller-repair-source-name owner))
+        (inspector/json-text! ",\"compilerFunction\":")
+        (inspector/json-quoted! owner)
+        (inspector/json-text! ",\"diagnostic\":")
+        (inspector/json-quoted! (.diagnostic repair))
+        (inspector/json-text! "}"))))
   (inspector/json-text! "]")
   (inspector/json-text! ",\"blocker\":{\"kind\":")
   (inspector/json-int! (load (live/live-blocker-kind)))

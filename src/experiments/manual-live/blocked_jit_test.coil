@@ -1,0 +1,127 @@
+(module experiments.manual-live.blocked-jit-test)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.atomic" :as atomic)
+(import "coil.jit" :as jit)
+(import "coil.slice" :as slice)
+(import "coil.thread" :as thread)
+(import "experiments.manual-live.blocked" :as blocked)
+(import "experiments.manual-live.blocked-meta" :use [live-blockable-function])
+(import "experiments.manual-live.runtime" :as live)
+
+(defstruct Worker
+  [(argument i64)
+   (result i64)
+   (finished i64)])
+
+(live-blockable-function deferred [(x i64)] (-> i64))
+(live-blockable-function choose [(enabled bool) (x i64)] (-> i64))
+
+(defn choose-implementation [(enabled bool) (x i64)] (-> i64)
+  (if enabled (+ x 10) x))
+
+(export-c [deferred--publish! :as "blocked_live_publish_repair"])
+
+(defn worker-main [(raw (ptr i8))] (-> (ptr i8))
+  (let [worker (primitive/cast (ptr Worker) raw)]
+    (atomic/atomic-store (field worker result)
+      (deferred (.argument worker)))
+    (atomic/atomic-store (field worker finished) 1)
+    (primitive/cast (ptr i8) 0)))
+
+(defn invalid-candidate [] (-> (slice u8))
+  "(defsum Mode (A) (B) (C))
+   (defn deferred [(x i64)] (-> i64)
+     (let [mode (if (= x 0) (A) (B))]
+       (match mode (A [] 10) (B [] 20))))")
+
+(defn type-candidate [] (-> (slice u8))
+  "(defsum Mode (A) (B) (C))")
+
+(defn repaired-candidate [] (-> (slice u8))
+  "(import \"coil.primitive\" :as primitive)
+   (extern blocked_live_publish_repair :cc c [(ptr i8)] (-> i64))
+   (defn deferred-repaired [(x i64)] (-> i64) (+ x 1))")
+
+(defn main [] (-> i64)
+  (block :done
+    (let [a (alloc/malloc-allocator)
+          cell (deferred--blocked-cell)
+          worker (primitive/alloc-stack Worker)
+          th (primitive/alloc-stack thread/Thread)
+          runtime (primitive/alloc-stack live/Runtime)
+          marks (primitive/alloc-stack (array bool 64))
+          plan (primitive/alloc-stack blocked/PartialGeneration)
+          (mut type-session) (jit/jit-session-new a)
+          (mut session) (jit/jit-session-new a)]
+      (when (!= (deferred--blocked-init!) 0) (break :done 1))
+      (when (!= (choose--blocked-init!) 0) (break :done 22))
+      (when (!= (choose--publish!
+                  (primitive/cast (ptr i8)
+                    (primitive/fnptr-of choose-implementation))) 0)
+        (break :done 23))
+      (when (!= (choose true 5) 15) (break :done 24))
+      (live/runtime-init! runtime a)
+      (blocked/partial-generation-init! plan)
+      ; Definition 1 is the changed sum, 2 is its matching function, and 3 is
+      ; a transitive caller. A stale old implementation cannot cover epoch 7.
+      (live/register-dependency! runtime 2 1 2)
+      (live/register-dependency! runtime 3 2 1)
+      (when (!= (live/dependency-closure! runtime 1 marks) 3) (break :done 16))
+      (blocked/partial-generation-record! plan 1 7 blocked/CANDIDATE_READY)
+      (blocked/partial-generation-record! plan 3 7 blocked/CANDIDATE_READY)
+      (when (blocked/partial-generation-covered? plan marks 7) (break :done 17))
+      (jit/jit-session-set-legacy-reload! (mut session) false)
+      (jit/jit-session-set-legacy-reload! (mut type-session) false)
+
+      ; The valid type part is staged independently. It cannot publish until
+      ; every dependent in the closure has Ready or Blocked coverage.
+      (when (!= (jit/jit-prepare-replace! (mut type-session) (type-candidate)) 0)
+        (break :done 19))
+
+      ; The candidate has a valid ABI header but an invalid body. JIT checking
+      ; rejects it; the controller converts that rejection into a blocked cell.
+      (when (= (jit/jit-prepare-replace! (mut session) (invalid-candidate)) 0)
+        (break :done 2))
+      (when (= (slice/slice-len (jit/jit-diagnostic (mut session))) 0)
+        (break :done 3))
+      (when (!= (deferred--block! 1001) 0) (break :done 4))
+      (blocked/partial-generation-record! plan 2 7 blocked/CANDIDATE_BLOCKED)
+      (when (not (blocked/partial-generation-covered? plan marks 7)) (break :done 18))
+      (when (!= (jit/jit-commit-prepared! (mut type-session)) 0) (break :done 20))
+      (when (!= (jit/jit-epoch (mut type-session)) 1) (break :done 21))
+      (when (!= (blocked/blocked-i64-diagnostic cell) 1001) (break :done 5))
+
+      (set! (.argument worker) 41)
+      (atomic/atomic-store (field worker result) -1)
+      (atomic/atomic-store (field worker finished) 0)
+      (when (!= (thread/thread-spawn th (primitive/fnptr-of worker-main)
+                   (primitive/cast (ptr i8) worker)) (primitive/cast i32 0))
+        (break :done 6))
+      (loop (if (= (blocked/blocked-i64-waiters cell) 1) (break) 0))
+      (when (!= (atomic/atomic-load (field worker finished)) 0) (break :done 7))
+
+      ; The successful entry's last operation publishes the implementation and
+      ; wakes the parked call. Its stack frame still owns argument 41.
+      (when (!= (jit/jit-prepare-replace-with-entry! (mut session)
+                  (repaired-candidate)
+                  "(blocked_live_publish_repair
+                     (primitive/cast (ptr i8)
+                       (primitive/fnptr-of deferred-repaired)))") 0)
+        (break :done 8))
+      (when (!= (jit/jit-commit-prepared! (mut session)) 0) (break :done 9))
+      (let [token (jit/jit-generation-retain-current! (mut session))]
+        (when (!= (thread/thread-join th) (primitive/cast i32 0)) (break :done 10))
+        (when (!= (atomic/atomic-load (field worker result)) 42) (break :done 11))
+        (when (!= (atomic/atomic-load (field worker finished)) 1) (break :done 12))
+        (when (!= (blocked/blocked-i64-state cell) blocked/FUNCTION_READY)
+          (break :done 13))
+        (when (!= (.calls cell) 1) (break :done 14))
+        (blocked/partial-generation-record! plan 2 7 blocked/CANDIDATE_READY)
+        (jit/jit-generation-release-token! (mut session) token))
+      (when (!= (blocked/blocked-i64-close! cell) 0) (break :done 15))
+      (when (!= (blocked/blocked-i64-close! (choose--blocked-cell)) 0)
+        (break :done 25))
+      (live/runtime-destroy! runtime)
+      0)))

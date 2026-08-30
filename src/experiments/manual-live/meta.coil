@@ -1,0 +1,473 @@
+(module experiments.manual-live.meta)
+
+(import "coil.primitive" :as primitive)
+(import "experiments.manual-live.runtime" :as live)
+(import "experiments.manual-live.ownership" :as ownership)
+
+; Phase 1 automation: one explicit form expands into the same declarations and
+; registration calls used by the manual proof. The runtime protocol remains the
+; authority; this macro only removes transcription work.
+
+(defn registration-name [(T Code)] (-> Code)
+  (primitive/syntax->datum (primitive/code-symbol T "--register-schema!")))
+
+(defn reference-calls [(T Code) (refs Code) (runtime Code) (schema Code)
+                       (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `()
+      (let [spec (primitive/code-nth refs i)]
+        (if (or (not (primitive/code-list? spec))
+                (!= (primitive/code-count spec) 2))
+            (do
+              (primitive/report spec
+                "live-struct reference metadata must be [field target-logical-id]")
+              (reference-calls T refs runtime schema (+ i 1) n))
+            (let [field (primitive/code-nth spec 0)
+                  target (primitive/code-nth spec 1)]
+              `((if (< (live/register-reference!
+                          ~runtime ~schema (primitive/offsetof ~T ~field) ~target) 0)
+                    -2
+                    ~(if (= (+ i 1) n)
+                         schema
+                         `(do ~@(reference-calls T refs runtime schema (+ i 1) n))))))))))
+
+(defn slice-calls [(T Code) (slice-specs Code) (runtime Code) (schema Code)
+                   (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `()
+      (let [spec (primitive/code-nth slice-specs i)]
+        `((if (< (live/register-slice! ~runtime ~schema
+                    (primitive/offsetof ~T ~(primitive/code-nth spec 0))
+                    (primitive/sizeof ~(primitive/code-nth spec 1))) 0)
+              -3
+              ~(if (= (+ i 1) n)
+                   schema
+                   `(do ~@(slice-calls T slice-specs runtime schema (+ i 1) n))))))))
+
+(defn declared-slice? [(T Code)] (-> bool)
+  (and (primitive/code-list? T)
+       (and (= (primitive/code-count T) 2)
+            (primitive/code-eq (primitive/code-nth T 0) `slice))))
+
+(defn declared-slice-specs [(fields Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count fields)]
+      (let [field (primitive/code-nth fields i)]
+        (when (and (primitive/code-list? field) (= (primitive/code-count field) 2))
+          (let [T (primitive/code-nth field 1)]
+            (when (declared-slice? T)
+              (primitive/code-list-push! out
+                `(~(primitive/code-nth field 0) ~(primitive/code-nth T 1)))
+              0)))))
+    (primitive/code-list-done out)))
+
+;;; Declare one physical schema version and its explicit runtime registrar.
+;;;
+;;;   (live-struct NodeV2 101 2
+;;;     [(value i64) (next (ptr NodeV2))]
+;;;     [[next 101]] validate-node destroy-node)
+;;;
+;;; `refs` is deliberately explicit in this first layer. A later semantic pass
+;;; may infer it, but it must produce exactly these checked offset registrations.
+(defn live-struct-full [(T Code) (logical-id Code) (version Code)
+                        (fields Code) (refs Code)
+                        (validate Code) (destroy Code)] (-> Code)
+  (let [registrar (registration-name T)
+        runtime (primitive/fresh-identifier "runtime")
+        schema (primitive/fresh-identifier "schema")
+        slices (declared-slice-specs fields)]
+    `(do
+       (defstruct ~T ~fields)
+       (defn ~registrar [(~runtime (ptr live/Runtime))] (-> i64)
+         (let [~schema
+                 (live/register-schema! ~runtime ~logical-id ~version
+                   (primitive/sizeof ~T) (primitive/alignof ~T)
+                   (primitive/fnptr-of ~validate)
+                   (primitive/fnptr-of ~destroy))]
+           (if (< ~schema 0)
+               -1
+               (let [ref-status
+                       ~(if (= (primitive/code-count refs) 0)
+                            schema
+                            `(do ~@(reference-calls T refs runtime schema 0
+                                      (primitive/code-count refs))))]
+                 (if (< ref-status 0)
+                     ref-status
+                     ~(if (= (primitive/code-count slices) 0)
+                          schema
+                          `(do ~@(slice-calls T slices runtime schema 0
+                                    (primitive/code-count slices))))))))))))
+
+(defn live-struct [(T Code) (logical-id Code) (version Code)
+                   (fields Code) (refs Code)
+                   (validate Code) (destroy Code)] (-> Code)
+  (live-struct-full T logical-id version fields refs validate destroy))
+
+(defn dependency-name [(name Code)] (-> Code)
+  (primitive/syntax->datum (primitive/code-symbol name "--register-dependencies!")))
+
+(defn dependency-calls [(runtime Code) (from Code) (targets Code)
+                        (kind i64) (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `()
+      `((if (< (live/register-dependency!
+                  ~runtime ~from ~(primitive/code-nth targets i) ~kind) 0)
+            -1
+            ~(if (= (+ i 1) n)
+                 `0
+                 `(do ~@(dependency-calls runtime from targets kind (+ i 1) n)))))))
+
+;;; Declare a physical implementation and the dependency edges its source model
+;;; currently supplies explicitly. `type-dependencies` and `calls` are definition
+;;; IDs. The next layer will derive these lists from checked Code and must produce
+;;; the same registrations.
+(defn live-function [(name Code) (definition-id Code)
+                     (type-dependencies Code) (calls Code)
+                     (params Code) (returns Code) & (body Code)] (-> Code)
+  (let [registrar (dependency-name name)
+        runtime (primitive/fresh-identifier "runtime")
+        type-count (primitive/code-count type-dependencies)
+        call-count (primitive/code-count calls)]
+    `(do
+       (defn ~name ~params ~returns ~@body)
+       (defn ~registrar [(~runtime (ptr live/Runtime))] (-> i64)
+         ~(if (> type-count 0)
+              `(let [status
+                       (do ~@(dependency-calls runtime definition-id
+                                type-dependencies 2 0 type-count))]
+                 (if (!= status 0)
+                     status
+                     ~(if (> call-count 0)
+                          `(do ~@(dependency-calls runtime definition-id
+                                   calls 1 0 call-count))
+                          `0)))
+              (if (> call-count 0)
+                  `(do ~@(dependency-calls runtime definition-id calls 1 0 call-count))
+                  `0))))))
+
+(defn versioned-function-name [(logical-name Code) (version Code)] (-> Code)
+  (primitive/syntax->datum
+    (primitive/code-symbol logical-name "--v" version)))
+
+;;; Give every ABI/body version a distinct native symbol while exposing
+;;; candidate-local registration/address accessors with stable source names.
+;;; The controller calls the accessors; it never reconstructs the physical name.
+(defn live-function-versioned [(logical-name Code) (version Code)
+                               (definition-id Code)
+                               (type-dependencies Code) (calls Code)
+                               (params Code) (returns Code) & (body Code)] (-> Code)
+  (let [physical (versioned-function-name logical-name version)
+        address (primitive/syntax->datum
+                  (primitive/code-symbol physical "--candidate-address"))]
+    `(do
+       ~(live-function physical definition-id type-dependencies calls params returns body)
+       (defn ~address [] (-> (ptr i8))
+         (primitive/cast (ptr i8) (primitive/fnptr-of ~physical))))))
+
+(defn transition-registration-name [(name Code)] (-> Code)
+  (primitive/syntax->datum (primitive/code-symbol name "--register-transition!")))
+
+(defn copy-field-forms [(source Code) (target Code) (pairs Code)
+                        (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `()
+      (let [pair (primitive/code-nth pairs i)]
+        (if (or (not (primitive/code-list? pair))
+                (!= (primitive/code-count pair) 2))
+            (do
+              (primitive/report pair "live-transition copy entry must be [old-field new-field]")
+              (copy-field-forms source target pairs (+ i 1) n))
+            `((primitive/store!
+                (primitive/field ~target ~(primitive/code-nth pair 1))
+                (primitive/load
+                  (primitive/field ~source ~(primitive/code-nth pair 0))))
+              ~@(copy-field-forms source target pairs (+ i 1) n))))))
+
+(defn self-reference-forms [(source Code) (target Code) (New Code) (pairs Code)
+                            (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `()
+      (let [pair (primitive/code-nth pairs i)]
+        (if (or (not (primitive/code-list? pair))
+                (!= (primitive/code-count pair) 2))
+            (do
+              (primitive/report pair "live-transition self reference must be [old-field new-field]")
+              (self-reference-forms source target New pairs (+ i 1) n))
+            `((primitive/store!
+                (primitive/field ~target ~(primitive/code-nth pair 1))
+                (primitive/cast (ptr ~New)
+                  (primitive/load
+                    (primitive/field ~source ~(primitive/code-nth pair 0)))))
+              ~@(self-reference-forms source target New pairs (+ i 1) n))))))
+
+(defn default-field-forms [(target Code) (pairs Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `()
+      (let [pair (primitive/code-nth pairs i)]
+        (if (or (not (primitive/code-list? pair))
+                (!= (primitive/code-count pair) 2))
+            (do
+              (primitive/report pair "live-transition default entry must be [new-field value]")
+              (default-field-forms target pairs (+ i 1) n))
+            `((primitive/store!
+                (primitive/field ~target ~(primitive/code-nth pair 0))
+                ~(primitive/code-nth pair 1))
+              ~@(default-field-forms target pairs (+ i 1) n))))))
+
+;;; Generate a checked exact-layout transition. `copies` are fields whose types
+;;; Coil proves assignment-compatible. `self-references` are raw self pointers
+;;; copied only as forwarding placeholders; the runtime rewrites them in pass 2.
+;;; New fields require explicit defaults. Changed/owning fields are intentionally
+;;; absent from this macro and require a handwritten transition.
+(defn live-transition [(name Code) (Old Code) (New Code)
+                       (copies Code) (self-references Code)
+                       (defaults Code)] (-> Code)
+  (let [registrar (transition-registration-name name)
+        old-raw (primitive/fresh-identifier "old")
+        new-raw (primitive/fresh-identifier "new")
+        source (primitive/fresh-identifier "source")
+        target (primitive/fresh-identifier "target")
+        journal (primitive/fresh-identifier "journal")
+        runtime (primitive/fresh-identifier "runtime")
+        from-schema (primitive/fresh-identifier "from_schema")
+        to-schema (primitive/fresh-identifier "to_schema")]
+    `(do
+       (defn ~name [(~old-raw (ptr i8)) (~new-raw (ptr i8))
+                    (~journal (ptr ownership/RelocationJournal))] (-> i64)
+         (let [~source (primitive/cast (ptr ~Old) ~old-raw)
+               ~target (primitive/cast (ptr ~New) ~new-raw)]
+           (primitive/cast i64 ~journal)
+           ~@(copy-field-forms source target copies 0 (primitive/code-count copies))
+           ~@(self-reference-forms source target New self-references 0
+               (primitive/code-count self-references))
+           ~@(default-field-forms target defaults 0 (primitive/code-count defaults))
+           0))
+       (defn ~registrar [(~runtime (ptr live/Runtime))
+                         (~from-schema i64) (~to-schema i64)] (-> i64)
+         (live/register-transition! ~runtime ~from-schema ~to-schema
+           (primitive/fnptr-of ~name))))))
+
+; ── Derived layout policy ────────────────────────────────────────────────────
+
+(defn auto-field-name [(field Code)] (-> Code)
+  (if (and (primitive/code-list? field)
+           (or (= (primitive/code-count field) 2)
+               (= (primitive/code-count field) 4)))
+      (primitive/code-nth field 0)
+      (primitive/error
+        "live-struct-auto fields must be [name type] or [name type :default value]")))
+
+(defn auto-field-type [(field Code)] (-> Code)
+  (auto-field-name field)
+  (primitive/code-nth field 1))
+
+(defn auto-field-has-default? [(field Code)] (-> bool)
+  (and (= (primitive/code-count field) 4)
+       (primitive/code-eq (primitive/code-nth field 2) `:default)))
+
+(defn auto-field-default [(field Code)] (-> Code)
+  (if (auto-field-has-default? field)
+      (primitive/code-nth field 3)
+      (primitive/error "live migration: added field requires :default")))
+
+(defn auto-scalar-type? [(T Code)] (-> bool)
+  (or (primitive/code-eq T `bool)
+      (or (primitive/code-eq T `i8)
+      (or (primitive/code-eq T `i16)
+      (or (primitive/code-eq T `i32)
+      (or (primitive/code-eq T `i64)
+      (or (primitive/code-eq T `u8)
+      (or (primitive/code-eq T `u16)
+      (or (primitive/code-eq T `u32)
+      (or (primitive/code-eq T `u64)
+      (or (primitive/code-eq T `f32)
+          (primitive/code-eq T `f64))))))))))))
+
+(defn auto-self-pointer? [(T Code) (Self Code)] (-> bool)
+  (and (primitive/code-list? T)
+       (and (= (primitive/code-count T) 2)
+            (and (primitive/code-eq (primitive/code-nth T 0) `ptr)
+                 (primitive/code-eq (primitive/code-nth T 1) Self)))))
+
+(defn auto-slice? [(T Code)] (-> bool)
+  (declared-slice? T))
+
+(defn auto-slice-element [(T Code)] (-> Code)
+  (if (auto-slice? T) (primitive/code-nth T 1)
+      (primitive/error "live slice field has malformed type")))
+
+(defn auto-check-field-policy [(field Code) (Self Code)] (-> i64)
+  ; Every non-scalar/non-self-pointer exact type is checked through generated
+  ; LiveValue calls. This helper still validates the field shape here; missing
+  ; support becomes a normal trait-resolution error later.
+  (auto-field-type field)
+  0)
+
+(defn auto-owned-field? [(field Code) (Self Code)] (-> bool)
+  (let [T (auto-field-type field)]
+    (and (not (auto-scalar-type? T))
+         (and (not (auto-self-pointer? T Self)) (not (auto-slice? T))))))
+
+(defn auto-destroy-forms [(payload Code) (fields Code) (Self Code) (i i64)] (-> Code)
+  (if (< i 0)
+      `()
+      (let [field (primitive/code-nth fields i)]
+        (if (auto-owned-field? field Self)
+            `((ownership/live-destroy!
+                (primitive/field ~payload ~(auto-field-name field)))
+              ~@(auto-destroy-forms payload fields Self (- i 1)))
+            (auto-destroy-forms payload fields Self (- i 1))))))
+
+(defn auto-clean-fields [(fields Code) (Self Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count fields)]
+      (let [field (primitive/code-nth fields i)]
+        (auto-check-field-policy field Self)
+        (primitive/code-list-push! out
+          `(~(auto-field-name field) ~(auto-field-type field)))))
+    `[~@(primitive/code-list-done out)]))
+
+(defn auto-reference-specs [(fields Code) (Self Code) (logical-id Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count fields)]
+      (let [field (primitive/code-nth fields i)]
+        (if (auto-self-pointer? (auto-field-type field) Self)
+            (do
+              (primitive/code-list-push! out `(~(auto-field-name field) ~logical-id))
+              0)
+            0)))
+    (primitive/code-list-done out)))
+
+(defn auto-slice-specs [(fields Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count fields)]
+      (let [field (primitive/code-nth fields i)
+            T (auto-field-type field)]
+        (if (auto-slice? T)
+            (do
+              (primitive/code-list-push! out
+                `(~(auto-field-name field) ~(auto-slice-element T)))
+              0)
+            0)))
+    (primitive/code-list-done out)))
+
+;;; Infer safe reference metadata and generate destruction for trait-managed
+;;; fields. Defaults are migration policy and are stripped from the physical
+;;; `defstruct` declaration.
+(defn live-struct-auto [(T Code) (logical-id Code) (version Code)
+                        (fields Code) (validate Code) (destroy Code)] (-> Code)
+  (let [wrapper (primitive/fresh-identifier "live_schema_destroy")
+        raw (primitive/fresh-identifier "raw")
+        payload (primitive/fresh-identifier "payload")]
+    `(do
+       (defn ~wrapper [(~raw (ptr i8))] (-> i64)
+         (let [~payload (primitive/cast (ptr ~T) ~raw)]
+           (let [status (~destroy ~raw)]
+             ~@(auto-destroy-forms payload fields T (- (primitive/code-count fields) 1))
+             status)))
+       ~(live-struct-full T logical-id version
+          (auto-clean-fields fields T)
+          (auto-reference-specs fields T logical-id)
+          validate wrapper))))
+
+(defn auto-find-field [(fields Code) (name Code)] (-> Code)
+  (let [(mut found) `:missing]
+    (for [i 0 (primitive/code-count fields)]
+      (let [field (primitive/code-nth fields i)]
+        (if (primitive/code-eq (auto-field-name field) name)
+            (set! found field)
+            0)))
+    (load found)))
+
+(defn auto-transition-lists [(Old Code) (New Code)
+                             (old-fields Code) (new-fields Code)] (-> Code)
+  (let [copies (primitive/code-list-new)
+        refs (primitive/code-list-new)
+        owned (primitive/code-list-new)
+        defaults (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count new-fields)]
+      (let [new-field (primitive/code-nth new-fields i)
+            name (auto-field-name new-field)
+            new-type (auto-field-type new-field)
+            old-field (auto-find-field old-fields name)]
+        (auto-check-field-policy new-field New)
+        (if (primitive/code-eq old-field `:missing)
+            (do
+              (primitive/code-list-push! defaults
+                `(~name ~(auto-field-default new-field)))
+              0)
+            (let [old-type (auto-field-type old-field)]
+              (auto-check-field-policy old-field Old)
+              (cond
+                (and (auto-self-pointer? old-type Old)
+                     (auto-self-pointer? new-type New))
+                  (do (primitive/code-list-push! refs `(~name ~name)) 0)
+                (primitive/code-eq old-type new-type)
+                  (if (auto-owned-field? new-field New)
+                      (do (primitive/code-list-push! owned `(~name ~name)) 0)
+                      (do (primitive/code-list-push! copies `(~name ~name)) 0))
+                :else
+                  (primitive/error
+                    (primitive/code-str
+                      "live-transition-auto: field '" (primitive/code-str name)
+                      "' changes type and requires an explicit transition")))))))
+    `(~(primitive/code-list-done copies)
+      ~(primitive/code-list-done refs)
+      ~(primitive/code-list-done owned)
+      ~(primitive/code-list-done defaults))))
+
+(defn auto-owned-copy-forms [(source Code) (target Code) (status Code) (journal Code) (pairs Code)
+                             (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `()
+      (let [pair (primitive/code-nth pairs i)]
+        `((if (= (load ~status) 0)
+              (set! ~status
+                (ownership/live-copy!
+                  (primitive/field ~source ~(primitive/code-nth pair 0))
+                  (primitive/field ~target ~(primitive/code-nth pair 1))
+                  ~journal))
+              0)
+          ~@(auto-owned-copy-forms source target status journal pairs (+ i 1) n)))))
+
+(defn live-transition-auto-generated [(name Code) (Old Code) (New Code)
+                                      (copies Code) (self-references Code)
+                                      (owned Code) (defaults Code)] (-> Code)
+  (let [registrar (transition-registration-name name)
+        old-raw (primitive/fresh-identifier "old")
+        new-raw (primitive/fresh-identifier "new")
+        source (primitive/fresh-identifier "source")
+        target (primitive/fresh-identifier "target")
+        status (primitive/fresh-identifier "status")
+        journal (primitive/fresh-identifier "journal")
+        runtime (primitive/fresh-identifier "runtime")
+        from-schema (primitive/fresh-identifier "from_schema")
+        to-schema (primitive/fresh-identifier "to_schema")]
+    `(do
+       (defn ~name [(~old-raw (ptr i8)) (~new-raw (ptr i8))
+                    (~journal (ptr ownership/RelocationJournal))] (-> i64)
+         (let [~source (primitive/cast (ptr ~Old) ~old-raw)
+               ~target (primitive/cast (ptr ~New) ~new-raw)
+               (mut ~status) 0]
+           ~@(copy-field-forms source target copies 0 (primitive/code-count copies))
+           ~@(self-reference-forms source target New self-references 0
+               (primitive/code-count self-references))
+           ~@(default-field-forms target defaults 0 (primitive/code-count defaults))
+           ~@(auto-owned-copy-forms source target status journal owned 0 (primitive/code-count owned))
+           (load ~status)))
+       (defn ~registrar [(~runtime (ptr live/Runtime))
+                         (~from-schema i64) (~to-schema i64)] (-> i64)
+         (live/register-transition! ~runtime ~from-schema ~to-schema
+           (primitive/fnptr-of ~name))))))
+
+;;; Derive the exact safe field-copy plan. Removed scalar/reference fields need
+;;; no destruction. LiveValue fields are independently cloned into the shadow
+;;; payload and destroyed by the generated schema destructor on abort or retire.
+(defn live-transition-auto [(name Code) (Old Code) (New Code)
+                            (old-fields Code) (new-fields Code)] (-> Code)
+  (let [plans (auto-transition-lists Old New old-fields new-fields)]
+    (live-transition-auto-generated name Old New
+      (primitive/code-nth plans 0)
+      (primitive/code-nth plans 1)
+      (primitive/code-nth plans 2)
+      (primitive/code-nth plans 3))))

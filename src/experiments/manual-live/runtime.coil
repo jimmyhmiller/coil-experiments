@@ -1,0 +1,451 @@
+(module experiments.manual-live.runtime)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.atomic" :as atomic)
+(import "coil.slice" :use [slice-data])
+(import "experiments.manual-live.ownership" :as ownership)
+
+; This is deliberately a small, explicit runtime. Nothing here discovers source,
+; rewrites definitions, or guesses ownership. A later metaprogram must generate
+; calls to this protocol, not replace its invariants.
+
+(const MAX_SCHEMAS 16)
+(const MAX_TRANSITIONS 16)
+(const MAX_HANDLES 64)
+(const MAX_ROOTS 16)
+(const MAX_REFS 32)
+(const MAX_SLICE_REFS 32)
+(const MAX_DEPS 64)
+
+(defstruct SliceLayout [(data (ptr i8)) (len i64)])
+
+(defstruct Schema
+  [(id i64)
+   (logical-id i64)
+   (version i64)
+   (size i64)
+   (alignment i64)
+   (validate (fnptr c [(ptr i8)] i64))
+   (destroy (fnptr c [(ptr i8)] i64))])
+
+(defstruct Transition
+  [(from-schema i64)
+   (to-schema i64)
+   (apply (fnptr c [(ptr i8) (ptr i8) (ptr ownership/RelocationJournal)] i64))])
+
+(defstruct ReferenceField
+  [(schema-id i64)
+   (offset i64)
+   (target-logical-id i64)])
+
+(defstruct SliceField
+  [(schema-id i64) (offset i64) (element-size i64)])
+
+; The header is stable. Only payload/memory/schema change at publication.
+(defstruct Handle
+  [(id i64)
+   (logical-id i64)
+   (schema-id i64)
+   (payload (ptr i8))
+   (memory (slice u8))
+   (borrows i64)
+   (live bool)])
+
+(defstruct Root
+  [(id i64) (name (slice u8)) (handle (ptr Handle)) (live bool)])
+
+; kind: 1 = function, 2 = type. `from` depends on `to`.
+(defstruct Dependency [(from i64) (to i64) (kind i64)])
+
+(defstruct Staged
+  [(handle (ptr Handle))
+   (old-schema i64)
+   (new-schema i64)
+   (old-payload (ptr i8))
+   (old-memory (slice u8))
+   (new-payload (ptr i8))
+   (new-memory (slice u8))])
+
+(defstruct Runtime
+  [(allocator (dyn alloc/Allocator))
+   (schemas (array Schema 16))
+   (schema-count i64)
+   (transitions (array Transition 16))
+   (transition-count i64)
+   (references (array ReferenceField 32))
+   (reference-count i64)
+   (slices (array SliceField 32))
+   (slice-count i64)
+   (relocations ownership/RelocationJournal)
+   (handles (array (ptr Handle) 64))
+   (handle-count i64)
+   (roots (array Root 16))
+   (root-count i64)
+   (dependencies (array Dependency 64))
+   (dependency-count i64)
+   (staged (array Staged 64))
+   (staged-count i64)
+   (readers i64)
+   (writer i64)
+   (epoch i64)])
+
+(defn runtime-init! [(rt (ptr Runtime)) (a (dyn alloc/Allocator))] (-> i64)
+  (store! rt (primitive/zeroed Runtime))
+  (set! (.allocator rt) a)
+  0)
+
+(defn schema-at [(rt (ptr Runtime)) (id i64)] (-> (ptr Schema))
+  (if (or (< id 0) (>= id (.schema-count rt)))
+      (primitive/cast (ptr Schema) 0)
+      (primitive/index (field rt schemas) id)))
+
+(defn register-schema! [(rt (ptr Runtime))
+                         (logical-id i64)
+                         (version i64)
+                         (size i64)
+                         (alignment i64)
+                         (validate (fnptr c [(ptr i8)] i64))
+                         (destroy (fnptr c [(ptr i8)] i64))] (-> i64)
+  (let [id (.schema-count rt)]
+    (if (or (>= id MAX_SCHEMAS)
+            (or (<= size 0) (<= alignment 0)))
+        -1
+        (let [s (primitive/index (field rt schemas) id)]
+          (set! (.id s) id)
+          (set! (.logical-id s) logical-id)
+          (set! (.version s) version)
+          (set! (.size s) size)
+          (set! (.alignment s) alignment)
+          (set! (.validate s) validate)
+          (set! (.destroy s) destroy)
+          (set! (.schema-count rt) (+ id 1))
+          id))))
+
+(defn register-transition! [(rt (ptr Runtime))
+                             (from-schema i64)
+                             (to-schema i64)
+                             (apply (fnptr c [(ptr i8) (ptr i8) (ptr ownership/RelocationJournal)] i64))] (-> i64)
+  (let [id (.transition-count rt)]
+    (if (or (>= id MAX_TRANSITIONS)
+            (or (= (primitive/cast i64 (schema-at rt from-schema)) 0)
+                (= (primitive/cast i64 (schema-at rt to-schema)) 0)))
+        -1
+        (let [edge (primitive/index (field rt transitions) id)]
+          (set! (.from-schema edge) from-schema)
+          (set! (.to-schema edge) to-schema)
+          (set! (.apply edge) apply)
+          (set! (.transition-count rt) (+ id 1))
+          id))))
+
+(defn register-slice! [(rt (ptr Runtime)) (schema-id i64)
+                       (offset i64) (element-size i64)] (-> i64)
+  (let [id (.slice-count rt)
+        schema (schema-at rt schema-id)]
+    (if (or (>= id MAX_SLICE_REFS)
+            (or (= (primitive/cast i64 schema) 0)
+                (or (<= element-size 0)
+                    (> (+ offset (primitive/sizeof SliceLayout)) (.size schema)))))
+        -1
+        (let [entry (primitive/index (field rt slices) id)]
+          (set! (.schema-id entry) schema-id)
+          (set! (.offset entry) offset)
+          (set! (.element-size entry) element-size)
+          (set! (.slice-count rt) (+ id 1))
+          id))))
+
+(defn register-reference! [(rt (ptr Runtime))
+                            (schema-id i64)
+                            (offset i64)
+                            (target-logical-id i64)] (-> i64)
+  (let [id (.reference-count rt)
+        schema (schema-at rt schema-id)]
+    (if (or (>= id MAX_REFS)
+            (or (= (primitive/cast i64 schema) 0)
+                (or (< offset 0) (> (+ offset (primitive/sizeof (ptr i8))) (.size schema)))))
+        -1
+        (let [ref (primitive/index (field rt references) id)]
+          (set! (.schema-id ref) schema-id)
+          (set! (.offset ref) offset)
+          (set! (.target-logical-id ref) target-logical-id)
+          (set! (.reference-count rt) (+ id 1))
+          id))))
+
+(defn transition-for [(rt (ptr Runtime)) (from i64) (to i64)] (-> (ptr Transition))
+  (let [(mut i) 0 (mut found) (primitive/cast (ptr Transition) 0)]
+    (loop (if (or (!= (primitive/cast i64 (load found)) 0)
+                  (>= (load i) (.transition-count rt)))
+              (break)
+              (let [edge (primitive/index (field rt transitions) (load i))]
+                (if (and (= (.from-schema edge) from) (= (.to-schema edge) to))
+                    (set! found edge)
+                    (set! i (+ (load i) 1))))))
+    (load found)))
+
+(defn allocate-payload [(rt (ptr Runtime)) (schema-id i64)] (-> (slice u8))
+  (let [schema (schema-at rt schema-id)]
+    (if (= (primitive/cast i64 schema) 0)
+        (alloc/alloc-slice-new (primitive/cast (ptr u8) 0) 0)
+        (match (alloc/alloc-bytes (.allocator rt) (.size schema) (.alignment schema))
+          (None [] (alloc/alloc-slice-new (primitive/cast (ptr u8) 0) 0))
+          (Some [memory]
+            (do
+              (for [i 0 (.size schema)]
+                (store! (primitive/index (slice-data memory) i) (primitive/cast u8 0)))
+              memory))))))
+
+(defn free-payload! [(rt (ptr Runtime)) (schema-id i64)
+                     (payload (ptr i8)) (memory (slice u8))] (-> i64)
+  (let [schema (schema-at rt schema-id)]
+    (if (= (primitive/cast i64 schema) 0)
+        -1
+        (do
+          (primitive/call-ptr (.destroy schema) payload)
+          (alloc/free-bytes (.allocator rt) memory (.alignment schema))))))
+
+(defn handle-new! [(rt (ptr Runtime)) (logical-id i64) (schema-id i64)] (-> (ptr Handle))
+  (let [schema (schema-at rt schema-id)]
+    (if (or (= (primitive/cast i64 schema) 0)
+            (or (!= (.logical-id schema) logical-id)
+                (>= (.handle-count rt) MAX_HANDLES)))
+        (primitive/cast (ptr Handle) 0)
+        (let [memory (allocate-payload rt schema-id)]
+          (if (= (primitive/cast i64 (slice-data memory)) 0)
+              (primitive/cast (ptr Handle) 0)
+              (match (alloc/box (.allocator rt) Handle (primitive/zeroed Handle))
+                (None []
+                  (do
+                    (alloc/free-bytes (.allocator rt) memory (.alignment schema))
+                    (primitive/cast (ptr Handle) 0)))
+                (Some [handle]
+                  (do
+                    (set! (.id handle) (+ (.handle-count rt) 1))
+                    (set! (.logical-id handle) logical-id)
+                    (set! (.schema-id handle) schema-id)
+                    (set! (.payload handle) (primitive/cast (ptr i8) (slice-data memory)))
+                    (set! (.memory handle) memory)
+                    (set! (.live handle) true)
+                    (store! (primitive/index (field rt handles) (.handle-count rt)) handle)
+                    (set! (.handle-count rt) (+ (.handle-count rt) 1))
+                    handle))))))))
+
+(defn root-register! [(rt (ptr Runtime)) (name (slice u8)) (handle (ptr Handle))] (-> i64)
+  (let [id (.root-count rt)]
+    (if (or (>= id MAX_ROOTS)
+            (or (= (primitive/cast i64 handle) 0) (not (.live handle))))
+        -1
+        (let [root (primitive/index (field rt roots) id)]
+          (set! (.id root) (+ id 1))
+          (set! (.name root) name)
+          (set! (.handle root) handle)
+          (set! (.live root) true)
+          (set! (.root-count rt) (+ id 1))
+          (+ id 1)))))
+
+(defn register-dependency! [(rt (ptr Runtime)) (from i64) (to i64) (kind i64)] (-> i64)
+  (let [id (.dependency-count rt)]
+    (if (>= id MAX_DEPS) -1
+        (let [dep (primitive/index (field rt dependencies) id)]
+          (set! (.from dep) from)
+          (set! (.to dep) to)
+          (set! (.kind dep) kind)
+          (set! (.dependency-count rt) (+ id 1))
+          id))))
+
+; Returns the number of affected definitions. `marks[id]` is the explicit
+; reverse-dependency closure rooted at `changed`.
+(defn dependency-closure! [(rt (ptr Runtime)) (changed i64)
+                           (marks (ptr (array bool 64)))] (-> i64)
+  (store! marks (primitive/zeroed (array bool 64)))
+  (if (or (< changed 0) (>= changed 64)) 0
+      (do
+        (store! (primitive/index marks changed) true)
+        (let [(mut changed-any) true]
+          (loop (if (not (load changed-any)) (break)
+                    (do
+                      (set! changed-any false)
+                      (for [i 0 (.dependency-count rt)]
+                        (let [dep (primitive/index (field rt dependencies) i)]
+                          (if (and (>= (.to dep) 0)
+                                   (and (< (.to dep) 64)
+                                        (and (load (primitive/index marks (.to dep)))
+                                             (and (>= (.from dep) 0)
+                                                  (and (< (.from dep) 64)
+                                                       (not (load (primitive/index marks (.from dep)))))))))
+                              (do (store! (primitive/index marks (.from dep)) true)
+                                  (set! changed-any true)) 0)))))))
+        (let [(mut count) 0]
+          (for [i 0 64]
+            (if (load (primitive/index marks i)) (set! count (+ (load count) 1)) 0))
+          (load count)))))
+
+; Readers borrow typed payload pointers only inside this epoch lease.
+(defn enter! [(rt (ptr Runtime))] (-> i64)
+  (block :entered
+    (loop
+      (loop (if (= (atomic/atomic-load (field rt writer)) 0) (break) 0))
+      (atomic/atomic-add (field rt readers) 1)
+      (if (= (atomic/atomic-load (field rt writer)) 0)
+          (break :entered (.epoch rt))
+          (atomic/atomic-add (field rt readers) -1)))))
+
+(defn exit! [(rt (ptr Runtime))] (-> i64)
+  (atomic/atomic-add (field rt readers) -1))
+
+(defn pause! [(rt (ptr Runtime))] (-> i64)
+  (loop (if (= (atomic/atomic-cas (field rt writer) 0 1) 0) (break) 0))
+  (loop (if (= (atomic/atomic-load (field rt readers)) 0) (break) 0))
+  0)
+
+(defn resume! [(rt (ptr Runtime))] (-> i64)
+  (atomic/atomic-store (field rt writer) 0))
+
+(defn handle-borrow! [(handle (ptr Handle))] (-> (ptr i8))
+  (if (or (= (primitive/cast i64 handle) 0) (not (.live handle)))
+      (primitive/cast (ptr i8) 0)
+      (do (atomic/atomic-add (field handle borrows) 1) (.payload handle))))
+
+(defn handle-release-borrow! [(handle (ptr Handle))] (-> i64)
+  (if (or (= (primitive/cast i64 handle) 0) (<= (.borrows handle) 0))
+      -1
+      (do (atomic/atomic-add (field handle borrows) -1)
+          (atomic/atomic-load (field handle borrows)))))
+
+(defn staged-forward [(rt (ptr Runtime)) (old (ptr i8))
+                      (logical-id i64)] (-> (ptr i8))
+  (let [(mut i) 0 (mut result) (primitive/cast (ptr i8) 0)]
+    (loop (if (or (!= (primitive/cast i64 (load result)) 0)
+                  (>= (load i) (.staged-count rt)))
+              (break)
+              (let [item (primitive/index (field rt staged) (load i))]
+                (if (and (= (primitive/cast i64 (.old-payload item))
+                            (primitive/cast i64 old))
+                         (= (.logical-id (load (field item handle))) logical-id))
+                    (set! result (.new-payload item))
+                    (set! i (+ (load i) 1))))))
+    (load result)))
+
+(defn abort-staged! [(rt (ptr Runtime))] (-> i64)
+  (for [i 0 (.staged-count rt)]
+    (let [item (primitive/index (field rt staged) i)]
+      (free-payload! rt (.new-schema item) (.new-payload item) (.new-memory item))))
+  (set! (.staged-count rt) 0)
+  0)
+
+; Stop-the-world, eagerly migrate one nominal type, rewrite the complete shadow
+; graph, then publish. The old graph is untouched until every step succeeds.
+(defn migrate-type! [(rt (ptr Runtime)) (logical-id i64) (target-schema i64)] (-> i64)
+  (pause! rt)
+  (set! (.staged-count rt) 0)
+  (ownership/relocation-reset! (field rt relocations))
+  (let [target (schema-at rt target-schema) (mut failure) 0]
+    (if (or (= (primitive/cast i64 target) 0) (!= (.logical-id target) logical-id))
+        (set! failure -1) 0)
+    ; Pass 1: allocate every destination and copy non-reference fields through
+    ; the exact handwritten transition. No accepted handle changes here.
+    (for [i 0 (.handle-count rt)]
+      (when (= (load failure) 0)
+        (let [handle (load (primitive/index (field rt handles) i))]
+          (when (and (.live handle)
+                     (and (= (.logical-id handle) logical-id)
+                          (!= (.schema-id handle) target-schema)))
+            (if (> (atomic/atomic-load (field handle borrows)) 0)
+                (set! failure -2)
+                (let [edge (transition-for rt (.schema-id handle) target-schema)]
+                  (if (= (primitive/cast i64 edge) 0)
+                      (set! failure -3)
+                      (let [memory (allocate-payload rt target-schema)]
+                        (if (= (primitive/cast i64 (slice-data memory)) 0)
+                            (set! failure -4)
+                            (let [new-payload (primitive/cast (ptr i8) (slice-data memory))
+                                  status (primitive/call-ptr (.apply edge) (.payload handle) new-payload
+                                           (field rt relocations))]
+                              (if (!= status 0)
+                                  (do (free-payload! rt target-schema new-payload memory)
+                                      (set! failure status))
+                                  (let [item (primitive/index (field rt staged) (.staged-count rt))]
+                                    (set! (.handle item) handle)
+                                    (set! (.old-schema item) (.schema-id handle))
+                                    (set! (.new-schema item) target-schema)
+                                    (set! (.old-payload item) (.payload handle))
+                                    (set! (.old-memory item) (.memory handle))
+                                    (set! (.new-payload item) new-payload)
+                                    (set! (.new-memory item) memory)
+                                    (set! (.staged-count rt) (+ (.staged-count rt) 1)))))))))))
+          0)))
+    ; Borrowed slices are not owners. Their placeholders are rewritten only
+    ; after every owning value has contributed its allocation-range mapping.
+    (when (= (load failure) 0)
+      (for [i 0 (.staged-count rt)]
+        (let [item (primitive/index (field rt staged) i)]
+          (for [j 0 (.slice-count rt)]
+            (let [entry (primitive/index (field rt slices) j)]
+              (when (= (.schema-id entry) target-schema)
+                (let [slot (primitive/cast (ptr SliceLayout)
+                             (primitive/index (.new-payload item) (.offset entry)))
+                      rewritten (primitive/alloc-stack (ptr i8))
+                      status (ownership/relocation-rewrite-range!
+                               (field rt relocations)
+                               (.data slot)
+                               (.len slot) (.element-size entry)
+                               rewritten)]
+                  (if (!= status 0)
+                      (set! failure status)
+                      (set! (.data slot) (load rewritten))))))))))
+    ; Pass 2: references still contain old payload addresses. Rewrite them only
+    ; after the forwarding map is complete, preserving sharing and cycles.
+    (when (= (load failure) 0)
+      (for [i 0 (.staged-count rt)]
+        (let [item (primitive/index (field rt staged) i)]
+          (for [j 0 (.reference-count rt)]
+            (let [ref (primitive/index (field rt references) j)]
+              (when (= (.schema-id ref) target-schema)
+                (let [slot (primitive/cast (ptr (ptr i8))
+                             (primitive/index (.new-payload item) (.offset ref)))
+                      old-target (load slot)]
+                  (when (!= (primitive/cast i64 old-target) 0)
+                    (let [new-target (staged-forward rt old-target (.target-logical-id ref))]
+                      (if (= (primitive/cast i64 new-target) 0)
+                          (set! failure -5)
+                          (store! slot new-target)))) 0))))
+          0)))
+    ; Validation sees the complete rewritten shadow graph, never a mixture of
+    ; accepted and candidate addresses.
+    (when (= (load failure) 0)
+      (for [i 0 (.staged-count rt)]
+        (let [item (primitive/index (field rt staged) i)
+              status (primitive/call-ptr (.validate target) (.new-payload item))]
+          (if (!= status 0) (set! failure status) 0))))
+    (if (!= (load failure) 0)
+        (do (abort-staged! rt) (resume! rt) (load failure))
+        (do
+          ; Publication is infallible: update stable headers first, then retire
+          ; allocations that are unreachable from the newly published graph.
+          (for [i 0 (.staged-count rt)]
+            (let [item (primitive/index (field rt staged) i)
+                  handle (.handle item)]
+              (set! (.schema-id handle) (.new-schema item))
+              (set! (.payload handle) (.new-payload item))
+              (set! (.memory handle) (.new-memory item))))
+          (for [i 0 (.staged-count rt)]
+            (let [item (primitive/index (field rt staged) i)]
+              (free-payload! rt (.old-schema item) (.old-payload item)
+                             (.old-memory item))))
+          (set! (.staged-count rt) 0)
+          (set! (.epoch rt) (+ (.epoch rt) 1))
+          (resume! rt)
+          0))))
+
+(defn runtime-destroy! [(rt (ptr Runtime))] (-> i64)
+  (pause! rt)
+  (for [i 0 (.handle-count rt)]
+    (let [handle (load (primitive/index (field rt handles) i))]
+      (when (and (!= (primitive/cast i64 handle) 0) (.live handle))
+        (free-payload! rt (.schema-id handle) (.payload handle) (.memory handle))
+        (set! (.live handle) false)
+        (alloc/destroy [Handle] (.allocator rt) handle)
+        0)))
+  (set! (.handle-count rt) 0)
+  (set! (.root-count rt) 0)
+  (resume! rt)
+  0)

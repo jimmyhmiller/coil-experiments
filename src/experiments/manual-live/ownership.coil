@@ -1,0 +1,137 @@
+(module experiments.manual-live.ownership)
+
+(import "coil.primitive" :as primitive)
+(import "coil.arraylist" :as arraylist)
+
+(const MAX_RELOCATIONS 64)
+
+(defstruct Relocation
+  [(old-base (ptr i8)) (old-bytes i64)
+   (new-base (ptr i8)) (new-bytes i64)])
+
+(defstruct RelocationJournal
+  [(entries (array Relocation 64)) (count i64)])
+
+(defn relocation-reset! [(journal (ptr RelocationJournal))] (-> i64)
+  (set! (.count journal) 0)
+  0)
+
+(defn relocation-register! [(journal (ptr RelocationJournal))
+                             (old-base (ptr i8)) (old-bytes i64)
+                             (new-base (ptr i8)) (new-bytes i64)] (-> i64)
+  (let [i (.count journal)]
+    (if (or (>= i MAX_RELOCATIONS)
+            (or (< old-bytes 0) (< new-bytes 0)))
+        -31
+        (let [entry (primitive/index (field journal entries) i)]
+          (set! (.old-base entry) old-base)
+          (set! (.old-bytes entry) old-bytes)
+          (set! (.new-base entry) new-base)
+          (set! (.new-bytes entry) new-bytes)
+          (set! (.count journal) (+ i 1))
+          0))))
+
+; Resolve a complete borrowed byte range. Interior offsets are preserved, but a
+; range that does not fit both the old logical allocation and its replacement is
+; rejected. Exactly one owning relocation must contain a non-empty slice.
+(defn relocation-rewrite-range!
+  [(journal (ptr RelocationJournal)) (data (ptr i8))
+   (count i64) (element-size i64)
+   (target (ptr (ptr i8)))] (-> i64)
+  (cond (or (< count 0) (<= element-size 0)) -32
+        (> count (/ 9223372036854775807 element-size)) -32
+        (= (primitive/cast i64 data) 0)
+          (if (= count 0) (do (store! target data) 0) -32)
+          :else
+            (let [bytes (primitive/imul count element-size)
+                  address (primitive/cast i64 data)
+                  (mut found) 0
+                  (mut rewritten) (primitive/cast (ptr i8) 0)]
+              (for [i 0 (.count journal)]
+                (let [entry (primitive/index (field journal entries) i)
+                      base (primitive/cast i64 (.old-base entry))]
+                  (when (>= address base)
+                    (let [offset (- address base)]
+                      (when (and (<= offset (.old-bytes entry))
+                                 (and (<= bytes (- (.old-bytes entry) offset))
+                                      (and (<= offset (.new-bytes entry))
+                                           (<= bytes (- (.new-bytes entry) offset)))))
+                        (set! found (+ (load found) 1))
+                        (set! rewritten (primitive/index (.new-base entry) offset)))))))
+              (if (!= (load found) 1)
+                  -33
+                  (do
+                    (store! target (load rewritten))
+                    0)))))
+
+; A value stored inside a live schema must be able to construct an independent
+; candidate and destroy either a candidate or an accepted value. `live-copy!`
+; may fail, but its destination must remain safe to pass to `live-destroy!`.
+; This is what lets the runtime abort a partially prepared shadow graph without
+; touching the currently published graph.
+(deftrait LiveValue [Self]
+  (live-copy! [(source (ref Self)) (target (mut Self))
+               (journal (ptr RelocationJournal))] (-> i64))
+  (live-destroy! [(value (mut Self))] (-> i64)))
+
+(defn trivial-live-value [(T Code)] (-> Code)
+  `(impl LiveValue ~T
+     (live-copy! [(source (ref ~T)) (target (mut ~T))
+                  (journal (ptr RelocationJournal))] (-> i64)
+       (primitive/store! target (primitive/load source))
+       0)
+     (live-destroy! [(value (mut ~T))] (-> i64)
+       0)))
+
+(trivial-live-value bool)
+(trivial-live-value i8)
+(trivial-live-value i16)
+(trivial-live-value i32)
+(trivial-live-value i64)
+(trivial-live-value u8)
+(trivial-live-value u16)
+(trivial-live-value u32)
+(trivial-live-value u64)
+(trivial-live-value f32)
+(trivial-live-value f64)
+
+; ArrayList cloning deliberately preserves the source allocator while creating
+; independent backing storage. Abort destroys only the clone; commit destroys
+; the old list after publication. Elements recurse through LiveValue, so nested
+; ownership has the same transaction semantics.
+(impl [(T LiveValue)] LiveValue (arraylist/ArrayList T)
+  (live-copy! [(source (ref (arraylist/ArrayList T)))
+               (target (mut (arraylist/ArrayList T)))
+               (journal (ptr RelocationJournal))] (-> i64)
+    (store! target (arraylist/al-new [T] (load (field source alc))))
+    (let [(mut status) 0 (mut i) 0]
+      (loop
+        (if (or (!= (load status) 0) (>= (load i) (load (field source len))))
+            (break)
+            (let [(mut element) (primitive/zeroed T)]
+              (set! status
+                (live-copy! (primitive/index (load (field source data)) (load i))
+                            (mut element) journal))
+              (if (= (load status) 0)
+                  (do
+                    (arraylist/al-push! [T] (mut target) (load element))
+                    (set! i (+ (load i) 1)))
+                  (live-destroy! (mut element))))))
+      (if (!= (load status) 0)
+          (load status)
+          (relocation-register! journal
+            (primitive/cast (ptr i8) (load (field source data)))
+            (primitive/imul (load (field source len)) (primitive/sizeof T))
+            (primitive/cast (ptr i8) (load (field target data)))
+            (primitive/imul (load (field target len)) (primitive/sizeof T))))))
+
+  (live-destroy! [(value (mut (arraylist/ArrayList T)))] (-> i64)
+    (let [(mut i) (load (field value len))]
+      (loop
+        (if (<= (load i) 0)
+            (break)
+            (do
+              (set! i (- (load i) 1))
+              (live-destroy!
+                (primitive/index (load (field value data)) (load i)))))))
+    (arraylist/al-free! [T] (mut value))))

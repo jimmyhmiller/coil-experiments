@@ -15,6 +15,12 @@ From the repository root:
 PATH=/path/to/current/coil/bin:$PATH ./scripts/native-live-demo.sh
 ```
 
+To pin a particular compiler candidate instead of relying on `PATH`:
+
+```sh
+COIL=/absolute/path/to/coil-candidate ./scripts/native-live-demo.sh
+```
+
 Then open <http://127.0.0.1:7391/native-demo>. The numbered source presets cover
 function replacement, defaulted struct fields, a rejected bool-to-enum edit,
 an explicit field transition, enum dispatch, a rejected non-exhaustive match,
@@ -280,6 +286,17 @@ registered and `Z_Free` retires them because the surrounding zone is one large l
 allocation. This is still a transparent, opt-in metaprogram; Coil's allocator and
 standard library are unchanged.
 
+Run the complete windowed Doom integration from the repository root:
+
+```sh
+python3 scripts/c-doom-native.py --play --heap-inspector
+```
+
+The launcher builds the transformed module at `-O2`, starts Doom, waits for the
+in-process viewer, and opens <http://127.0.0.1:7391/>. Plain windowed Doom remains
+`python3 scripts/c-doom-native.py --play`. An occupied port is handled by choosing
+the next free one; `--inspector-port N` selects a different preferred port.
+
 This recovers exact record identity only where the C source retains a direct typed
 allocation cast. Untyped `void *` dataflow cannot be reconstructed after lowering.
 When a marker names one of the frontend's real explicit-layout Coil structs, the
@@ -290,9 +307,8 @@ structural placeholders until reflection exposes enough qualified shape informat
 to generate their decoders safely.
 
 Very large generated C modules can overflow an LLVM `-O3` optimization worker stack
-independently of the inspector. Build those artifacts with `-O0` while that LLVM
-pipeline limitation remains; the metaprogram and explicit-layout metadata work at
-that optimization level.
+independently of the inspector. Doom plus the inspector is verified at `-O2`; use
+that level while the separate `-O3` LLVM pipeline limitation remains.
 
 ## Current files
 

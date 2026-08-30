@@ -1,0 +1,270 @@
+(module experiments.manual-live.semantic-policy)
+
+(import "coil.primitive" :as primitive)
+(import "experiments.manual-live.runtime" :as live)
+
+; These calls are typed descriptors in the initially checked program. The
+; semantic transform replaces the containing registrar body after resolution.
+(defn semantic-function! [(rt (ptr live/Runtime)) (id i64) (address (ptr i8))] (-> i64)
+  (primitive/cast i64 rt) (primitive/cast i64 address) id 0)
+(defn semantic-type! [(rt (ptr live/Runtime)) (id i64) (size i64)] (-> i64)
+  (primitive/cast i64 rt) id size 0)
+(defn semantic-autowire! [(rt (ptr live/Runtime))] (-> i64)
+  (primitive/cast i64 rt) 0)
+
+(defn semantic-type-descriptors [(runtime Code) (types Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count types)]
+      (let [entry (primitive/code-nth types i)]
+        (if (or (not (primitive/code-list? entry))
+                (!= (primitive/code-count entry) 2))
+            (primitive/error "semantic-catalog type entry must be [id Type]")
+            (primitive/code-list-push! out
+              `(semantic-type! ~runtime ~(primitive/code-nth entry 0)
+                 (primitive/sizeof ~(primitive/code-nth entry 1)))))))
+    (primitive/code-list-done out)))
+
+(defn semantic-function-descriptors [(runtime Code) (functions Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count functions)]
+      (let [entry (primitive/code-nth functions i)]
+        (if (or (not (primitive/code-list? entry))
+                (!= (primitive/code-count entry) 2))
+            (primitive/error "semantic-catalog function entry must be [id function]")
+            (primitive/code-list-push! out
+              `(semantic-function! ~runtime ~(primitive/code-nth entry 0)
+                 (primitive/cast (ptr i8)
+                   (primitive/fnptr-of ~(primitive/code-nth entry 1))))))))
+    (primitive/code-list-done out)))
+
+;;; Associate stable IDs with exact source artifacts. The semantic transform
+;;; resolves these descriptors and replaces `semantic-autowire!` with the exact
+;;; call/type dependency registrations; callers never provide dependency lists.
+(defn semantic-catalog [(name Code) (types Code) (functions Code)] (-> Code)
+  (let [runtime (primitive/fresh-identifier "runtime")]
+    `(defn ~name [(~runtime (ptr live/Runtime))] (-> i64)
+       ~@(semantic-type-descriptors runtime types)
+       ~@(semantic-function-descriptors runtime functions)
+       (semantic-autowire! ~runtime))))
+
+(defn policy-decl? [(decl Code) (kind Code)] (-> bool)
+  (and (primitive/code-list? decl)
+       (and (>= (primitive/code-count decl) 4)
+            (and (primitive/code-eq (primitive/code-nth decl 0) `decl)
+                 (primitive/code-eq (primitive/code-nth decl 2) kind)))))
+
+(defn policy-owned-decl? [(node Code) (kind Code) (name Code)] (-> bool)
+  (let [decl (primitive/code-decl node)]
+    (and (policy-decl? decl kind)
+         (and (primitive/code-eq (primitive/code-nth decl 1)
+                `experiments.manual-live.semantic-policy)
+              (primitive/code-eq (primitive/code-nth decl 3)
+                (primitive/syntax->datum
+                  (primitive/code-symbol
+                    "experiments.manual-live.semantic-policy." name)))))))
+
+(defn policy-call? [(form Code) (name Code)] (-> bool)
+  (and (primitive/code-list? form)
+       (and (> (primitive/code-count form) 0)
+            (policy-owned-decl? (primitive/code-nth form 0) `fn name))))
+
+(defn policy-fnptr-symbol [(form Code)] (-> Code)
+  ; (semantic-function! rt id (primitive/cast (ptr i8)
+  ;   (primitive/fnptr-of function)))
+  (let [cast-form (primitive/code-nth form 3)]
+    (if (and (primitive/code-list? cast-form)
+             (and (= (primitive/code-count cast-form) 3)
+                  (primitive/code-list? (primitive/code-nth cast-form 2))))
+        (let [fnptr-form (primitive/code-nth cast-form 2)]
+          (if (= (primitive/code-count fnptr-form) 2)
+              (primitive/code-nth fnptr-form 1)
+              (primitive/error "semantic-function!: malformed fnptr descriptor")))
+        (primitive/error "semantic-function!: malformed address descriptor"))))
+
+(defn policy-type-symbol [(form Code)] (-> Code)
+  ; (semantic-type! rt id (primitive/sizeof Type))
+  (let [size-form (primitive/code-nth form 3)]
+    (if (and (primitive/code-list? size-form)
+             (= (primitive/code-count size-form) 2))
+        (primitive/code-nth size-form 1)
+        (primitive/error "semantic-type!: malformed sizeof descriptor"))))
+
+; Mapping: (policy-mapping kind numeric-id canonical-decl source-symbol).
+(defn policy-mapping [(kind Code) (id Code) (symbol Code)] (-> Code)
+  `(policy-mapping ~kind ~id ~(primitive/code-decl symbol) ~symbol))
+(defn policy-map-kind [(mapping Code)] (-> Code) (primitive/code-nth mapping 1))
+(defn policy-map-id [(mapping Code)] (-> Code) (primitive/code-nth mapping 2))
+(defn policy-map-decl [(mapping Code)] (-> Code) (primitive/code-nth mapping 3))
+
+(defn policy-collect-mappings [(modules Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [mi 0 (primitive/code-count modules)]
+      (let [module (primitive/code-nth modules mi)]
+        (for [fi 1 (primitive/code-count module)]
+          (let [form (primitive/code-nth module fi)]
+            (if (and (primitive/code-list? form)
+                     (and (> (primitive/code-count form) 4)
+                          (primitive/code-eq (primitive/code-nth form 0) `defn)))
+                (for [bi 4 (primitive/code-count form)]
+                  (let [body (primitive/code-nth form bi)]
+                    (cond
+                      (policy-call? body `semantic-function!)
+                        (primitive/code-list-push! out
+                          (policy-mapping `:function (primitive/code-nth body 2)
+                            (policy-fnptr-symbol body)))
+                      (policy-call? body `semantic-type!)
+                        (primitive/code-list-push! out
+                          (policy-mapping `:type (primitive/code-nth body 2)
+                            (policy-type-symbol body)))
+                      :else out)))
+                0)))))
+    (primitive/code-list-done out)))
+
+(defn policy-find-mapping [(mappings Code) (decl Code) (kind Code)] (-> Code)
+  (let [(mut found) `:missing]
+    (for [i 0 (primitive/code-count mappings)]
+      (let [mapping (primitive/code-nth mappings i)]
+        (if (and (primitive/code-eq (policy-map-kind mapping) kind)
+                 (primitive/code-eq (policy-map-decl mapping) decl))
+            (set! found mapping) 0)))
+    (load found)))
+
+(defn policy-add-edge! [(edges CodeBuilder) (from Code) (to Code) (kind Code)] (-> i64)
+  (primitive/code-list-push! edges `(~from ~to ~kind))
+  0)
+
+(defn policy-edge-in-list? [(edges Code) (end i64) (edge Code)] (-> bool)
+  (let [(mut found) false]
+    (for [i 0 end]
+      (if (primitive/code-eq (primitive/code-nth edges i) edge)
+          (set! found true) 0))
+    (load found)))
+
+(defn policy-dedupe-edges [(edges Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count edges)]
+      (let [edge (primitive/code-nth edges i)]
+        (if (policy-edge-in-list? edges i edge) 0
+            (do (primitive/code-list-push! out edge) 0))))
+    (primitive/code-list-done out)))
+
+(defn policy-collect-node! [(node Code) (owner Code) (mappings Code)
+                            (edges CodeBuilder)] (-> i64)
+  (let [decl (primitive/code-decl node)
+        fn-target (policy-find-mapping mappings decl `:function)
+        type-target (policy-find-mapping mappings decl `:type)]
+    (if (and (primitive/code-list? fn-target)
+             (!= (primitive/code-count fn-target) 0))
+        (if (!= (primitive/code-nth fn-target 2) owner)
+            (policy-add-edge! edges owner (policy-map-id fn-target) `1) 0)
+        0)
+    (if (and (primitive/code-list? type-target)
+             (!= (primitive/code-count type-target) 0))
+        (policy-add-edge! edges owner (policy-map-id type-target) `2) 0)
+    (let [inferred (primitive/type-of node)
+          inferred-target
+            (policy-find-mapping mappings (primitive/code-decl inferred) `:type)]
+      (if (and (primitive/code-list? inferred-target)
+               (!= (primitive/code-count inferred-target) 0))
+          (policy-add-edge! edges owner (policy-map-id inferred-target) `2) 0))
+    (if (primitive/code-list? node)
+        (if (and (> (primitive/code-count node) 0)
+                 (or (primitive/code-eq (primitive/code-nth node 0) `quote)
+                     (primitive/code-eq (primitive/code-nth node 0) `quasiquote)))
+            0
+            (do
+              (for [i 0 (primitive/code-count node)]
+                (policy-collect-node! (primitive/code-nth node i) owner mappings edges))
+              0))
+        0)))
+
+(defn policy-find-definition [(modules Code) (mapping Code)] (-> Code)
+  (let [(mut found) `:missing]
+    (for [mi 0 (primitive/code-count modules)]
+      (let [module (primitive/code-nth modules mi)]
+        (for [fi 1 (primitive/code-count module)]
+          (let [form (primitive/code-nth module fi)]
+            (if (and (primitive/code-list? form)
+                     (and (> (primitive/code-count form) 1)
+                          (and (primitive/code-eq (primitive/code-nth form 0) `defn)
+                               (primitive/code-eq
+                                 (primitive/code-decl (primitive/code-nth form 1))
+                                 (policy-map-decl mapping)))))
+                (set! found form) 0)))))
+    (load found)))
+
+(defn policy-collect-edges [(modules Code) (mappings Code)] (-> Code)
+  (let [edges (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count mappings)]
+      (let [mapping (primitive/code-nth mappings i)]
+        (if (primitive/code-eq (policy-map-kind mapping) `:function)
+            (let [definition (policy-find-definition modules mapping)]
+              (if (primitive/code-eq definition `:missing)
+                  (primitive/error "semantic live policy: mapped function definition is missing")
+                  (for [j 2 (primitive/code-count definition)]
+                    (policy-collect-node! (primitive/code-nth definition j)
+                      (policy-map-id mapping) mappings edges))))
+            0)))
+    (policy-dedupe-edges (primitive/code-list-done edges))))
+
+(defn policy-registration-expression [(runtime Code) (edges Code)
+                                      (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `0
+      (let [edge (primitive/code-nth edges i)]
+        `(if (< (live/register-dependency! ~runtime
+                  ~(primitive/code-nth edge 0)
+                  ~(primitive/code-nth edge 1)
+                  ~(primitive/code-nth edge 2)) 0)
+             -1
+             ~(policy-registration-expression runtime edges (+ i 1) n)))))
+
+(defn policy-registrar? [(form Code)] (-> bool)
+  (if (and (primitive/code-list? form)
+           (and (> (primitive/code-count form) 4)
+                (primitive/code-eq (primitive/code-nth form 0) `defn)))
+      (let [(mut found) false]
+        (for [i 4 (primitive/code-count form)]
+          (if (policy-call? (primitive/code-nth form i) `semantic-autowire!)
+              (set! found true) 0))
+        (load found))
+      false))
+
+(defn policy-module-has-registrar? [(module Code)] (-> bool)
+  (let [(mut found) false]
+    (for [i 1 (primitive/code-count module)]
+      (if (policy-registrar? (primitive/code-nth module i))
+          (set! found true) 0))
+    (load found)))
+
+(defn policy-rewrite-module [(module Code) (edges Code)] (-> Code)
+  (if (not (policy-module-has-registrar? module))
+      module
+      (let [out (primitive/code-list-new)]
+    (primitive/code-list-push! out (primitive/code-nth module 0))
+    (for [i 1 (primitive/code-count module)]
+      (let [form (primitive/code-nth module i)]
+        (if (policy-registrar? form)
+            (let [params (primitive/code-nth form 2)
+                  runtime (primitive/code-nth (primitive/code-nth params 0) 0)]
+              (primitive/code-list-push! out
+                `(defn ~(primitive/code-nth form 1) ~params
+                   ~(primitive/code-nth form 3)
+                   ~(policy-registration-expression runtime edges 0
+                      (primitive/code-count edges)))))
+            (primitive/code-list-push! out form))))
+        (primitive/code-list-done out))))
+
+(defn policy-rewrite-modules [(modules Code) (edges Code)
+                              (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `()
+      `(~(policy-rewrite-module (primitive/code-nth modules i) edges)
+        ~@(policy-rewrite-modules modules edges (+ i 1) n))))
+
+(defn semantic-policy-transform [(modules Code)] (-> Code)
+  (let [mappings (policy-collect-mappings modules)
+        edges (policy-collect-edges modules mappings)
+        rewritten (policy-rewrite-modules modules edges 0
+                    (primitive/code-count modules))]
+    `(do ~@rewritten)))

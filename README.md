@@ -40,7 +40,14 @@ framebuffer hash; `--play` builds the windowed game with sound. See
 ```sh
 python3 scripts/c-doom-native.py          # Doom, 81 translation units
 python3 scripts/c-doom-native.py --play   # the windowed game, with sound
+python3 scripts/c-doom-native.py --play --heap-inspector  # game + live heap viewer
 ```
+
+The heap-inspected build serves the viewer from the Doom process at
+<http://127.0.0.1:7391/> and opens it automatically. Pass
+`--no-open-inspector` to leave the browser closed. If port 7391 is occupied, the
+launcher selects the next available port; `--inspector-port N` changes the
+preferred starting port.
 
 ### `src/dialects/rust-like/` — a round-trippable Rust-like reader
 A reader metaprogram and converter for writing Coil with Rust-like declarations,

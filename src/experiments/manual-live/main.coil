@@ -1,0 +1,284 @@
+(module experiments.manual-live.main)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.jit" :as jit)
+(import "coil.slice" :use [slice-data slice-len])
+(import "experiments.manual-live.runtime" :as live)
+(import "experiments.manual-live.ownership" :as ownership)
+
+(extern printf :cc c [(ptr i8) ...] (-> i32))
+
+(const NODE_TYPE 1)
+(const NODE_VALUE_FN 2)
+(const CYCLE_TOTAL_FN 3)
+
+(defstruct NodeV1 [(value i64) (next (ptr NodeV1))])
+(defstruct NodeV2 [(value i64) (next (ptr NodeV2)) (bonus i64)])
+(defstruct NodeV3 [(value i64) (next (ptr NodeV3)) (bonus i64) (enabled bool)])
+
+(defn runtime [] (-> (ptr live/Runtime)) (primitive/alloc-static live/Runtime))
+(defn handle-a-cell [] (-> (ptr (ptr live/Handle)))
+  (primitive/alloc-static (ptr live/Handle)))
+(defn handle-b-cell [] (-> (ptr (ptr live/Handle)))
+  (primitive/alloc-static (ptr live/Handle)))
+(defn current-schema [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn observed [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn function-slot [] (-> (ptr (ptr i8))) (primitive/alloc-static (ptr i8)))
+
+(defn no-fields [(payload (ptr i8))] (-> i64)
+  (primitive/cast i64 payload)
+  0)
+
+(defn validate-v1 [(payload (ptr i8))] (-> i64)
+  (let [node (primitive/cast (ptr NodeV1) payload)]
+    (if (= (primitive/cast i64 (.next node)) 0) 61 0)))
+
+(defn validate-v2 [(payload (ptr i8))] (-> i64)
+  (let [node (primitive/cast (ptr NodeV2) payload)]
+    (cond (= (primitive/cast i64 (.next node)) 0) 62
+          (!= (.bonus node) 1) 63
+          :else 0)))
+
+(defn validate-v3 [(payload (ptr i8))] (-> i64)
+  (primitive/cast i64 payload)
+  0)
+
+(defn v1-to-v2 [(old (ptr i8)) (new (ptr i8))
+                 (journal (ptr ownership/RelocationJournal))] (-> i64)
+  (primitive/cast i64 journal)
+  (let [source (primitive/cast (ptr NodeV1) old)
+        target (primitive/cast (ptr NodeV2) new)]
+    (set! (.value target) (.value source))
+    ; This address is deliberately stale until the runtime's second pass.
+    (set! (.next target) (primitive/cast (ptr NodeV2) (.next source)))
+    (set! (.bonus target) 1)
+    0))
+
+(defn v2-to-v3-fails [(old (ptr i8)) (new (ptr i8))
+                       (journal (ptr ownership/RelocationJournal))] (-> i64)
+  (primitive/cast i64 old)
+  (primitive/cast i64 new)
+  (primitive/cast i64 journal)
+  77)
+
+(defn manual-handle-a [] (-> (ptr i8))
+  (primitive/cast (ptr i8) (load (handle-a-cell))))
+(defn manual-handle-b [] (-> (ptr i8))
+  (primitive/cast (ptr i8) (load (handle-b-cell))))
+(defn manual-current-schema [] (-> i64) (load (current-schema)))
+
+(defn manual-payload [(raw (ptr i8))] (-> (ptr i8))
+  (let [handle (primitive/cast (ptr live/Handle) raw)]
+    (if (or (= (primitive/cast i64 handle) 0)
+            (!= (.schema-id handle) (load (current-schema))))
+        (primitive/cast (ptr i8) 0)
+        (.payload handle))))
+
+(defn manual-observe [(value i64)] (-> i64)
+  (store! (observed) value)
+  0)
+
+(defn manual-publish-slot [(raw (ptr i8))] (-> i64)
+  (if (= (primitive/cast i64 raw) 0) 78
+      (let [epoch (live/enter! (runtime))
+            value (primitive/call-ptr (primitive/cast (fnptr c [] i64) raw))]
+        (primitive/cast i64 epoch)
+        (live/exit! (runtime))
+        (store! (function-slot) raw)
+        (store! (observed) value)
+        0)))
+
+(defn manual-call-slot [] (-> i64)
+  (let [raw (load (function-slot))]
+    (if (= (primitive/cast i64 raw) 0) -1
+        (let [epoch (live/enter! (runtime))
+              value (primitive/call-ptr (primitive/cast (fnptr c [] i64) raw))]
+          (primitive/cast i64 epoch)
+          (live/exit! (runtime))
+          value))))
+
+; Called by the candidate generation's private commit entry. The runtime checks
+; and rewrites the complete shadow graph before its infallible publication.
+(defn manual-migrate-to [(schema i64)] (-> i64)
+  (let [status (live/migrate-type! (runtime) NODE_TYPE schema)]
+    (if (= status 0) (store! (current-schema) schema) 0)
+    status))
+
+(export-c [manual-handle-a :as "manual_live_handle_a"]
+          [manual-handle-b :as "manual_live_handle_b"]
+          [manual-current-schema :as "manual_live_current_schema"]
+          [manual-payload :as "manual_live_payload"]
+          [manual-observe :as "manual_live_observe"]
+          [manual-publish-slot :as "manual_live_publish_slot"]
+          [manual-migrate-to :as "manual_live_migrate_to"])
+
+(defn report-jit-error [(session (ptr jit/JitSession)) (label (slice u8))] (-> i64)
+  (let [diagnostic (jit/jit-diagnostic session)]
+    (printf c"%.*s failed:\n%.*s\n"
+            (primitive/cast i32 (slice-len label)) (slice-data label)
+            (primitive/cast i32 (slice-len diagnostic)) (slice-data diagnostic))
+    1))
+
+(defn candidate-v1 [] (-> (slice u8))
+  "(import \"coil.primitive\" :as primitive)
+   (extern manual_live_handle_a :cc c [] (-> (ptr i8)))
+   (extern manual_live_handle_b :cc c [] (-> (ptr i8)))
+   (extern manual_live_payload :cc c [(ptr i8)] (-> (ptr i8)))
+   (extern manual_live_publish_slot :cc c [(ptr i8)] (-> i64))
+   (defstruct ManualNodeV1 [(value i64) (next (ptr ManualNodeV1))])
+   (defn node-value-v1 [(handle (ptr i8))] (-> i64)
+     (.value (primitive/cast (ptr ManualNodeV1) (manual_live_payload handle))))
+   (defn cycle-total-v1 [] (-> i64)
+     (let [a (primitive/cast (ptr ManualNodeV1) (manual_live_payload (manual_live_handle_a)))
+           b (primitive/cast (ptr ManualNodeV1) (manual_live_payload (manual_live_handle_b)))]
+       (if (and (= (primitive/cast i64 (.next a)) (primitive/cast i64 b))
+                (= (primitive/cast i64 (.next b)) (primitive/cast i64 a)))
+           (+ (node-value-v1 (manual_live_handle_a)) (node-value-v1 (manual_live_handle_b)))
+           -1000)))")
+
+(defn candidate-v2 [] (-> (slice u8))
+  "(import \"coil.primitive\" :as primitive)
+   (extern manual_live_handle_a :cc c [] (-> (ptr i8)))
+   (extern manual_live_handle_b :cc c [] (-> (ptr i8)))
+   (extern manual_live_payload :cc c [(ptr i8)] (-> (ptr i8)))
+   (extern manual_live_publish_slot :cc c [(ptr i8)] (-> i64))
+   (extern manual_live_migrate_to :cc c [i64] (-> i64))
+   (defstruct ManualNodeV2 [(value i64) (next (ptr ManualNodeV2)) (bonus i64)])
+   (defn node-value-v2 [(handle (ptr i8))] (-> i64)
+     (let [node (primitive/cast (ptr ManualNodeV2) (manual_live_payload handle))]
+       (+ (.value node) (.bonus node))))
+   (defn cycle-total-v2 [] (-> i64)
+     (let [a (primitive/cast (ptr ManualNodeV2) (manual_live_payload (manual_live_handle_a)))
+           b (primitive/cast (ptr ManualNodeV2) (manual_live_payload (manual_live_handle_b)))]
+       (if (and (= (primitive/cast i64 (.next a)) (primitive/cast i64 b))
+                (= (primitive/cast i64 (.next b)) (primitive/cast i64 a)))
+           (+ (node-value-v2 (manual_live_handle_a)) (node-value-v2 (manual_live_handle_b)))
+           -1000)))")
+
+(defn candidate-v3 [] (-> (slice u8))
+  "(import \"coil.primitive\" :as primitive)
+   (extern manual_live_handle_a :cc c [] (-> (ptr i8)))
+   (extern manual_live_payload :cc c [(ptr i8)] (-> (ptr i8)))
+   (extern manual_live_migrate_to :cc c [i64] (-> i64))
+   (defstruct ManualNodeV3 [(value i64) (next (ptr ManualNodeV3)) (bonus i64) (enabled bool)])
+   (defn node-value-v3 [(handle (ptr i8))] (-> i64)
+     (.value (primitive/cast (ptr ManualNodeV3) (manual_live_payload handle))))")
+
+(defn install-v1-data! [] (-> i64)
+  (let [rt (runtime)
+        schema (live/register-schema! rt NODE_TYPE 1
+                 (primitive/sizeof NodeV1) (primitive/alignof NodeV1)
+                 (primitive/fnptr-of validate-v1) (primitive/fnptr-of no-fields))
+        a (live/handle-new! rt NODE_TYPE schema)
+        b (live/handle-new! rt NODE_TYPE schema)]
+    (if (or (= (primitive/cast i64 a) 0) (= (primitive/cast i64 b) 0)) 10
+        (do
+          (let [ap (primitive/cast (ptr NodeV1) (.payload a))
+                bp (primitive/cast (ptr NodeV1) (.payload b))]
+            (set! (.value ap) 10)
+            (set! (.value bp) 20)
+            (set! (.next ap) bp)
+            (set! (.next bp) ap))
+          (store! (handle-a-cell) a)
+          (store! (handle-b-cell) b)
+          (store! (current-schema) schema)
+          (if (or (< (live/root-register! rt "node-a" a) 0)
+                  (< (live/root-register! rt "node-b" b) 0)) 11 0)))))
+
+(defn register-v2! [] (-> i64)
+  (let [rt (runtime)
+        schema (live/register-schema! rt NODE_TYPE 2
+                 (primitive/sizeof NodeV2) (primitive/alignof NodeV2)
+                 (primitive/fnptr-of validate-v2) (primitive/fnptr-of no-fields))]
+    (cond (< schema 0) -1
+          (< (live/register-transition! rt (load (current-schema)) schema
+               (primitive/fnptr-of v1-to-v2)) 0) -2
+          (< (live/register-reference! rt schema (primitive/offsetof NodeV2 next) NODE_TYPE) 0) -3
+          :else schema)))
+
+(defn register-v3! [] (-> i64)
+  (let [rt (runtime)
+        schema (live/register-schema! rt NODE_TYPE 3
+                 (primitive/sizeof NodeV3) (primitive/alignof NodeV3)
+                 (primitive/fnptr-of validate-v3) (primitive/fnptr-of no-fields))]
+    (if (< schema 0) -1
+        (if (< (live/register-transition! rt (load (current-schema)) schema
+                  (primitive/fnptr-of v2-to-v3-fails)) 0) -2 schema))))
+
+(defn main [] (-> i64)
+  (block :main
+    (let [a (alloc/malloc-allocator)
+          rt (runtime)
+          (mut session) (jit/jit-session-new a)
+          marks (primitive/alloc-stack (array bool 64))]
+      (live/runtime-init! rt a)
+      (live/register-dependency! rt NODE_VALUE_FN NODE_TYPE 2)
+      (live/register-dependency! rt CYCLE_TOTAL_FN NODE_VALUE_FN 1)
+      (when (!= (live/dependency-closure! rt NODE_TYPE marks) 3)
+        (break :main 1))
+      (let [data-status (install-v1-data!)]
+        (when (!= data-status 0) (break :main data-status)))
+      (when (!= (jit/jit-session-set-legacy-reload! (mut session) false) 0)
+        (break :main 12))
+      (when (!= (jit/jit-prepare-replace-with-entry!
+                  (mut session) (candidate-v1)
+                  "(manual_live_publish_slot (primitive/cast (ptr i8) (primitive/fnptr-of cycle-total-v1)))") 0)
+        (report-jit-error (mut session) "prepare v1")
+        (break :main 22))
+      (when (!= (jit/jit-commit-prepared! (mut session)) 0)
+        (report-jit-error (mut session) "commit v1")
+        (break :main 23))
+      (when (!= (load (observed)) 30) (break :main 13))
+      (let [(mut slot-token) (jit/jit-generation-retain-current! (mut session))
+            v2 (register-v2!)]
+        (when (!= v2 1) (break :main 14))
+        ; A borrowed payload blocks relocation and leaves every accepted
+        ; handle/address/schema unchanged.
+        (let [old-a (.payload (load (handle-a-cell)))
+              borrowed (live/handle-borrow! (load (handle-a-cell)))
+              blocked (live/migrate-type! rt NODE_TYPE v2)]
+          (primitive/cast i64 borrowed)
+          (live/handle-release-borrow! (load (handle-a-cell)))
+          (when (or (!= blocked -2)
+                    (!= (primitive/cast i64 old-a)
+                        (primitive/cast i64 (.payload (load (handle-a-cell))))))
+            (break :main 15))
+          (when (!= (jit/jit-prepare-replace-with-entry!
+                      (mut session) (candidate-v2)
+                      "(let [status (manual_live_migrate_to 1)] (if (= status 0) (manual_live_publish_slot (primitive/cast (ptr i8) (primitive/fnptr-of cycle-total-v2))) status))") 0)
+            (report-jit-error (mut session) "prepare v2")
+            (break :main 24))
+          (when (!= (jit/jit-commit-prepared! (mut session)) 0)
+            (report-jit-error (mut session) "commit v2")
+            (break :main 25))
+          ; The permanent host slot now points into V2. Transfer its exact image
+          ; lease before any retired generation can be reclaimed.
+          (let [next-token (jit/jit-generation-retain-current! (mut session))]
+            (jit/jit-generation-release-token! (mut session) (load slot-token))
+            (set! slot-token next-token))
+          (when (or (!= (load (observed)) 32)
+                    (= (primitive/cast i64 old-a)
+                       (primitive/cast i64 (.payload (load (handle-a-cell))))))
+            (break :main 16)))
+        (let [v3 (register-v3!)]
+          (when (!= v3 2) (break :main 17))
+          (when (!= (jit/jit-prepare-replace-with-entry!
+                      (mut session) (candidate-v3)
+                      "(manual_live_migrate_to 2)") 0)
+            (report-jit-error (mut session) "prepare v3")
+            (break :main 26))
+          ; The transition returns 77. The candidate native image is rejected,
+          ; and migrate-type! has already freed its shadow allocations.
+          (when (= (jit/jit-commit-prepared! (mut session)) 0)
+            (break :main 18))
+          (when (or (!= (load (current-schema)) v2)
+                    (!= (.schema-id (load (handle-a-cell))) v2))
+            (break :main 19))
+          (when (!= (manual-call-slot) 32) (break :main 20))
+          (when (!= (load (observed)) 32) (break :main 21)))
+        (jit/jit-generation-release-token! (mut session) (load slot-token))
+        (jit/jit-reclaim-retired! (mut session)))
+      (printf c"manual-live: dependency closure=3, v1=30, v2=32, rollback=v2\n")
+      (live/runtime-destroy! rt)
+      0)))

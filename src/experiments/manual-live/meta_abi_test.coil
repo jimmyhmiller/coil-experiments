@@ -1,0 +1,89 @@
+(module experiments.manual-live.meta-abi-test)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.jit" :as jit)
+(import "experiments.manual-live.runtime" :as live)
+
+(defn runtime [] (-> (ptr live/Runtime))
+  (primitive/alloc-static live/Runtime))
+(defn abi-runtime [] (-> (ptr i8))
+  (primitive/cast (ptr i8) (runtime)))
+
+(defn old-slot [] (-> (ptr (fnptr c [i64] i64)))
+  (primitive/alloc-static (fnptr c [i64] i64)))
+(defn new-slot [] (-> (ptr (fnptr c [bool] i64)))
+  (primitive/alloc-static (fnptr c [bool] i64)))
+
+(defn publish-old [(raw (ptr i8))] (-> i64)
+  (store! (old-slot) (primitive/cast (fnptr c [i64] i64) raw))
+  0)
+(defn publish-new [(raw (ptr i8))] (-> i64)
+  (store! (new-slot) (primitive/cast (fnptr c [bool] i64) raw))
+  0)
+
+(export-c [publish-old :as "meta_abi_publish_old"]
+          [publish-new :as "meta_abi_publish_new"]
+          [abi-runtime :as "meta_abi_runtime"])
+
+(defn candidate-v1 [] (-> (slice u8))
+  "(import \"coil.primitive\" :as primitive)
+   (import \"experiments.manual-live.runtime\" :as live)
+   (import \"experiments.manual-live.meta\" :use [live-function-versioned])
+   (import \"experiments.manual-live.semantic-policy\" :use [semantic-catalog])
+   (import \"experiments.manual-live.semantic-transform\" :use *)
+   (extern meta_abi_runtime :cc c [] (-> (ptr i8)))
+   (extern meta_abi_publish_old :cc c [(ptr i8)] (-> i64))
+   (live-function-versioned changing 1 1 [] [] [(value i64)] (-> i64)
+     (+ value 1))
+   (live-function-versioned consumer 1 2 [] [] [] (-> i64)
+     (changing--v1 41))
+   (semantic-catalog register-abi-v1 []
+     [[1 changing--v1] [2 consumer--v1]])")
+
+(defn candidate-v2 [] (-> (slice u8))
+  "(import \"coil.primitive\" :as primitive)
+   (import \"experiments.manual-live.runtime\" :as live)
+   (import \"experiments.manual-live.meta\" :use [live-function-versioned])
+   (import \"experiments.manual-live.semantic-policy\" :use [semantic-catalog])
+   (import \"experiments.manual-live.semantic-transform\" :use *)
+   (extern meta_abi_runtime :cc c [] (-> (ptr i8)))
+   (extern meta_abi_publish_new :cc c [(ptr i8)] (-> i64))
+   (live-function-versioned changing 2 1 [] [] [(enabled bool)] (-> i64)
+     (if enabled 99 0))
+   (live-function-versioned consumer 2 2 [] [] [] (-> i64)
+     (changing--v2 true))
+   (semantic-catalog register-abi-v2 []
+     [[1 changing--v2] [2 consumer--v2]])")
+
+(defn main [] (-> i64)
+  (block :done
+    (let [a (alloc/malloc-allocator)
+          (mut session) (jit/jit-session-new a)
+          marks (primitive/alloc-stack (array bool 64))]
+      (live/runtime-init! (runtime) a)
+      (jit/jit-session-set-legacy-reload! (mut session) false)
+      (when (!= (jit/jit-prepare-replace-with-entry! (mut session) (candidate-v1)
+                  "(let [rt (primitive/cast (ptr live/Runtime) (meta_abi_runtime)) status (register-abi-v1 rt)] (if (= status 0) (meta_abi_publish_old (changing--v1--candidate-address)) status))") 0)
+        (break :done 1))
+      (when (!= (jit/jit-commit-prepared! (mut session)) 0) (break :done 2))
+      (let [old-token (jit/jit-generation-retain-current! (mut session))]
+        (when (!= (primitive/call-ptr (load (old-slot)) 41) 42) (break :done 3))
+        (when (!= (live/dependency-closure! (runtime) 1 marks) 2) (break :done 9))
+        (when (!= (jit/jit-prepare-replace-with-entry! (mut session) (candidate-v2)
+                    "(let [rt (primitive/cast (ptr live/Runtime) (meta_abi_runtime)) status (register-abi-v2 rt)] (if (= status 0) (meta_abi_publish_new (changing--v2--candidate-address)) status))") 0)
+          (break :done 4))
+        (when (!= (jit/jit-commit-prepared! (mut session)) 0) (break :done 5))
+        (let [new-token (jit/jit-generation-retain-current! (mut session))]
+          ; Signature change creates another ABI lineage. It never writes a
+          ; differently typed pointer into the old slot.
+          (when (!= (primitive/call-ptr (load (old-slot)) 41) 42) (break :done 6))
+          (when (!= (primitive/call-ptr (load (new-slot)) true) 99) (break :done 7))
+          (when (!= (live/dependency-closure! (runtime) 1 marks) 2) (break :done 10))
+          (when (!= (jit/jit-generation-token-leases (mut session)) 2)
+            (break :done 8))
+          (jit/jit-generation-release-token! (mut session) old-token)
+          (jit/jit-generation-release-token! (mut session) new-token)
+          (jit/jit-reclaim-retired! (mut session))))
+      (live/runtime-destroy! (runtime))
+      0)))

@@ -7,6 +7,7 @@
 (import "coil.result" :use *)
 (import "coil.socket" :as socket)
 (import "coil.thread" :as thread)
+(import "coil.sync" :as sync)
 (import "experiments.heap-inspector.runtime" :use *)
 (import "experiments.heap-inspector.live-api" :as live-api)
 (import "experiments.heap-inspector.native-demo-api" :as demo-api)
@@ -26,6 +27,7 @@
    (connection socket/TcpConnection)
    (thread thread/Thread)
    (edit-thread thread/Thread)
+   (edit-event sync/Event)
    (edit-active i64)
    (edit-started bool)
    (edit-source (ptr u8))
@@ -132,16 +134,46 @@
 
 (defn viewer-edit-worker [(arg (ptr i8))] (-> (ptr i8))
   (let [state (primitive/cast (ptr ViewerState) arg)
-        source (slice-new (.edit-source state) (.edit-source-len state))
-        result (live-api/live-api-edit! source)]
-    (set! (.edit-result state) result)
-    (free (primitive/cast (ptr i8) (.edit-source state)))
-    (set! (.edit-source state) (primitive/cast (ptr u8) 0))
-    (set! (.edit-source-len state) 0)
-    ; Release publishes both the result and all controller state produced by
-    ; the edit before a status request observes the worker as idle.
-    (atomic/atomic-store (field state edit-active) 0)
+        (mut observed)
+          (match (sync/event-generation (field state edit-event))
+            (Err [e] -1)
+            (Ok [generation] generation))]
+    ; One persistent compiler thread owns every edit for this JIT session.
+    ; Rejected Code state is thread-local to the compiler invocation context,
+    ; so destroying and recreating a pthread between a rejection and its repair
+    ; loses the authoritative recovery branch.
+    (loop
+      (if (= (atomic/atomic-load (field state edit-active)) 2)
+          (let [source (slice-new (.edit-source state) (.edit-source-len state))
+                result (live-api/live-api-edit! source)]
+            (set! (.edit-result state) result)
+            (free (primitive/cast (ptr i8) (.edit-source state)))
+            (set! (.edit-source state) (primitive/cast (ptr u8) 0))
+            (set! (.edit-source-len state) 0)
+            ; Release publishes both the result and all controller state before
+            ; a status request observes the worker as idle.
+            (atomic/atomic-store (field state edit-active) 0))
+          (match (sync/event-wait! (field state edit-event) (load observed))
+            (Err [e] (break))
+            (Ok [wait-result]
+              (match wait-result
+                (sync/Timeout [] 0)
+                (sync/Notified [generation] (set! observed generation)))))))
     (primitive/cast (ptr i8) 0)))
+
+(defn viewer-start-edit-worker! [(state (ptr ViewerState))] (-> i64)
+  (if (.edit-started state) 0
+      (match (sync/event-init (field state edit-event))
+        (Err [e] -1)
+        (Ok [_]
+          (let [status (thread/thread-spawn-configured
+                         (field state edit-thread)
+                         (primitive/fnptr-of viewer-edit-worker)
+                         (primitive/cast (ptr i8) state)
+                         (thread/thread-config 16777216 4096))]
+            (if (= status 0)
+                (do (set! (.edit-started state) true) 0)
+                (do (sync/event-destroy! (field state edit-event)) -1)))))))
 
 ; Returns 0 when accepted for background compilation, -2 while another edit is
 ; active, and -1 on allocation/thread failure. The copied source outlives the
@@ -150,11 +182,9 @@
   (if (!= (atomic/atomic-cas (field state edit-active) 0 1) 0)
       -2
       (do
-        (if (.edit-started state)
-            (do (thread/thread-join (field state edit-thread))
-                (set! (.edit-started state) false))
-            0)
-        (let [copy (malloc (primitive/cast u64 (if (> (slice-len source) 0)
+        (if (!= (viewer-start-edit-worker! state) 0)
+            (do (atomic/atomic-store (field state edit-active) 0) -1)
+            (let [copy (malloc (primitive/cast u64 (if (> (slice-len source) 0)
                                                    (slice-len source) 1)))]
           (if (= (primitive/cast i64 copy) 0)
               (do (atomic/atomic-store (field state edit-active) 0) -1)
@@ -163,23 +193,16 @@
                   (set! (primitive/index copy i) (primitive/cast i8 (slice-get source i))))
                 (set! (.edit-source state) (primitive/cast (ptr u8) copy))
                 (set! (.edit-source-len state) (slice-len source))
-                ; The in-process compiler is recursive over expanded Code. A
-                ; complete live snapshot can be substantially larger than an
-                ; ordinary callback, so do not rely on Darwin's small default
-                ; pthread stack for the compilation worker.
-                (let [status (thread/thread-spawn-configured
-                               (field state edit-thread)
-                               (primitive/fnptr-of viewer-edit-worker)
-                               (primitive/cast (ptr i8) state)
-                               (thread/thread-config 16777216 4096))]
-                  (if (= status 0)
-                      (do (set! (.edit-started state) true) 0)
-                      (do
-                        (free copy)
-                        (set! (.edit-source state) (primitive/cast (ptr u8) 0))
-                        (set! (.edit-source-len state) 0)
-                        (atomic/atomic-store (field state edit-active) 0)
-                        -1)))))))))
+                (atomic/atomic-store (field state edit-active) 2)
+                (match (sync/event-notify-all! (field state edit-event))
+                  (Ok [_] 0)
+                  (Err [e]
+                    (do
+                      (free copy)
+                      (set! (.edit-source state) (primitive/cast (ptr u8) 0))
+                      (set! (.edit-source-len state) 0)
+                      (atomic/atomic-store (field state edit-active) 0)
+                      -1))))))))))
 
 (defn asset-path [(state (ptr ViewerState)) (name (slice u8))] (-> (slice u8))
   (let [root (.asset-root state)
@@ -323,6 +346,17 @@
         "src/experiments/heap-inspector/viewer"
         (cstr-slice p))))
 
+(defn configured-port [] (-> i64)
+  (let [text (getenv c"COIL_HEAP_INSPECTOR_PORT")
+        value (primitive/alloc-stack i64)]
+    (set! value 7391)
+    (if (and (!= (primitive/cast i64 text) 0)
+             (= (sscanf text c"%ld" value) 1))
+        (if (and (> (load value) 0) (<= (load value) 65535))
+            (load value)
+            7391)
+        7391)))
+
 (defn inspector-start-viewer! [(port i64)] (-> bool)
   (let [state (viewer-state)]
     (if (.started state)
@@ -345,4 +379,7 @@
                         true)))))))))
 
 (defn inspector-boot! [] (-> i64)
-  (if (inspector-start-viewer! 7391) 0 (do (printf c"heap inspector: failed to bind 127.0.0.1:7391\n") 1)))
+  (let [port (configured-port)]
+    (if (inspector-start-viewer! port)
+        0
+        (do (printf c"heap inspector: failed to bind 127.0.0.1:%ld\n" port) 1))))
