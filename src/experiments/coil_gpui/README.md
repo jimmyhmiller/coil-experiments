@@ -198,12 +198,12 @@ renderer scans the ordered sprite list into maximal adjacent runs by pipeline an
 texture, issuing one instanced draw per run. This makes a future shared glyph atlas
 translate directly into one draw for all adjacent labels on an atlas page.
 
-The release scene benchmark rebuilds 1,049 paint primitives while advancing a
-100,000-row virtual list. On the development Apple Silicon machine it measured
-**5,790 ns/frame with affine payloads and ordered paint-command recording**, versus
-1,840 ns/frame before transforms and ordering. This measures Coil scene construction and
-visible-range calculation, not GPU presentation or display latency; the benchmark
-is checked in as `bench.coil` so results remain reproducible and comparable.
+The release scene benchmark rebuilds 1,049 paint primitives, emits 99 retained
+paragraph glyph sprites, and advances a 100,000-row virtual list. On the development
+Apple Silicon machine it measured **6,564 ns/frame** across 5,000 frames. This measures
+Coil scene construction, retained-text recording, and visible-range calculation—not
+GPU presentation or display latency. The benchmark is checked in as `bench.coil` so
+results remain reproducible and comparable.
 
 The variable-height benchmark interleaves measurement replacement and inverse-prefix
 lookup across one million rows. It measured **164 ns per update-plus-lookup** across
@@ -216,6 +216,12 @@ variant is rasterized once into an application-owned, explicitly bounded atlas p
 Repeated shaping reuses those entries, and compatible glyph and label sprites remain
 one instanced Metal run. Whole-label caching remains available for static labels.
 
+Retained paragraphs use CoreText's Unicode line breaker with explicit wrap width,
+line height, and optional line clamp. Each visual line owns byte-accurate UTF-8 source
+ranges and a shaped GPU line, enabling point-to-index and index-to-position mapping
+across wrapping, emoji, and explicit newlines. Rebuilding an equivalent paragraph
+reuses semantic font/glyph/subpixel atlas keys rather than duplicating font objects.
+
 Editable text is integrated with AppKit without a native wrapper. Coil dynamically
 registers an `NSView` subclass implementing `NSTextInputClient`, translates UTF-16
 AppKit ranges to the field's UTF-8 byte offsets, and handles marked-text updates,
@@ -227,8 +233,8 @@ marked-text decoration, and the caret are painted through the same GPU scene.
 The current milestone proves the complete Coil-to-Metal path and a real component
 application. GPUI parity still requires substantial systems, notably:
 
-- grapheme-aware navigation, multiline wrapping, shaped-line caching, fallback-font
-  cache key hardening, and atlas-page eviction (editable selection/caret measurement,
+- grapheme-aware navigation, paragraph ellipsis/truncation, richer shaped-layout
+  caching, and atlas-page eviction (editable selection/caret measurement,
   UTF-8/CoreText cluster conversion, glyph-run extraction, subpixel glyph caching,
   bounded atlas allocation, and GPU mask composition work now);
 - intrinsic text/image measurement (flex and constrained grid layout work);

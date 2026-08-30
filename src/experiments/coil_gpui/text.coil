@@ -11,6 +11,9 @@
         GlyphEntry
         ShapedGlyph
         ShapedLine
+        ParagraphLine
+        ShapedParagraph
+        TextPosition
         text-texture-new
         text-texture-valid?
         text-texture-free!
@@ -20,12 +23,18 @@
         text-atlas-reserve!
         text-atlas-add!
         text-shape-line!
+        text-shape-paragraph!
         shaped-line-free!
+        shaped-paragraph-free!
         paint-shaped-line!
+        paint-shaped-paragraph!
         text-atlas-glyph-count
         shaped-line-x-for-index
         shaped-line-index-for-x
         shaped-line-selection-bounds
+        shaped-paragraph-line-count
+        shaped-paragraph-index-for-point
+        shaped-paragraph-position-for-index
         utf16-index-to-utf8
         text-atlas-free!)
 
@@ -60,6 +69,12 @@
 (extern CFDictionaryGetValue :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
 
 (extern CTLineCreateWithAttributedString :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern CTTypesetterCreateWithAttributedString :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern CTTypesetterSuggestLineBreak :cc c [(ptr i8) i64 f64] (-> i64))
+
+(extern CTTypesetterSuggestClusterBreak :cc c [(ptr i8) i64 f64] (-> i64))
 
 (extern CTLineGetGlyphRuns :cc c [(ptr i8)] (-> (ptr i8)))
 
@@ -144,6 +159,23 @@
    (descent f32)
    (length i64)
    (valid bool)])
+
+(defstruct ParagraphLine
+  [(line ShapedLine)
+   (byte-start i64)
+   (byte-content-end i64)
+   (byte-end i64)
+   (y f32)])
+
+(defstruct ShapedParagraph
+  [(lines (al/ArrayList ParagraphLine))
+   (width f32)
+   (height f32)
+   (line-height f32)
+   (length i64)
+   (valid bool)])
+
+(defstruct TextPosition [(x f32) (y f32) (height f32)])
 
 (defstruct AtlasRegion [(x i64) (y i64) (w i64) (h i64) (valid bool)])
 
@@ -401,11 +433,16 @@
     (block :found
            (for [i 0 (al/al-len [GlyphEntry] glyphs)]
              (let [entry (primitive/index (load (field glyphs data)) i)]
-               (if (and (= (primitive/cast i64 (load (field entry font)))
-                           (primitive/cast i64 font))
-                        (and (= (load (field entry glyph)) glyph)
-                             (and (= (load (field entry subpixel-x)) subpixel-x)
-                                  (= (load (field entry subpixel-y)) subpixel-y))))
+               (if (and (!= (primitive/cast i64 (load (field entry font))) 0)
+                        (and (!= (msg i8
+                                      (load (field entry font))
+                                      (sel c"isEqual:")
+                                      [(ptr i8)]
+                                      font)
+                                 (primitive/cast i8 0))
+                             (and (= (load (field entry glyph)) glyph)
+                                  (and (= (load (field entry subpixel-x)) subpixel-x)
+                                       (= (load (field entry subpixel-y)) subpixel-y)))))
                    (return-from :found entry)
                    0)))
            (primitive/cast (ptr GlyphEntry) 0))))
@@ -717,8 +754,210 @@
                   (msg i64 attributed (sel c"release") [])
                   (load shaped))))))))
 
+(defn push-paragraph-line! [(paragraph (mut ShapedParagraph))
+                            (line ShapedLine)
+                            (byte-start i64)
+                            (byte-content-end i64)
+                            (byte-end i64)] (-> i64)
+  (let [(mut zero) (primitive/zeroed ParagraphLine)]
+    (do
+      (al/al-push! [ParagraphLine] (mut (.lines paragraph)) (load zero))
+      (let [lines (load (field paragraph lines))
+            index (- (al/al-len [ParagraphLine] lines) 1)
+            item (primitive/index (load (field lines data)) index)]
+        (do
+          (store! (field item line) line)
+          (store! (field item byte-start) byte-start)
+          (store! (field item byte-content-end) byte-content-end)
+          (store! (field item byte-end) byte-end)
+          (store! (field item y)
+                  (* (primitive/cast f32 index) (load (field paragraph line-height))))
+          index)))))
+
+(defn text-shape-paragraph! [(atlas (mut TextAtlas))
+                             (utf8 (ptr i8))
+                             (font-size f64)
+                             (width f32)
+                             (line-height f32)
+                             (max-lines i64)] (-> ShapedParagraph)
+  (let [(mut paragraph) (primitive/zeroed ShapedParagraph)
+        effective-line-height
+          (if (> line-height 0.0)
+              line-height
+              (primitive/cast f32 (* font-size 1.2)))]
+    (do
+      (store! (field paragraph lines)
+              (al/al-new [ParagraphLine] (alloc/malloc-allocator)))
+      (store! (field paragraph width) width)
+      (store! (field paragraph line-height) effective-line-height)
+      (store! (field paragraph length) (strlen utf8))
+      (if (or (not (text-atlas-valid? (load atlas)))
+              (or (<= font-size 0.0) (<= width 0.0)))
+          (load paragraph)
+          (let [scale (load (field atlas scale))
+                font
+                  (msg (ptr i8)
+                       (class c"NSFont")
+                       (sel c"systemFontOfSize:weight:")
+                       [f64 f64]
+                       (* font-size (primitive/cast f64 scale))
+                       0.0)
+                attributes
+                  (msg (ptr i8)
+                       (class c"NSDictionary")
+                       (sel c"dictionaryWithObject:forKey:")
+                       [(ptr i8) (ptr i8)]
+                       font
+                       (nsstr c"NSFont"))
+                string (nsstr utf8)
+                attributed
+                  (msg (ptr i8)
+                       (msg (ptr i8) (class c"NSAttributedString") (sel c"alloc") [])
+                       (sel c"initWithString:attributes:")
+                       [(ptr i8) (ptr i8)]
+                       string
+                       attributes)
+                typesetter (CTTypesetterCreateWithAttributedString attributed)
+                utf16-length (primitive/cast i64 (msg u64 string (sel c"length") []))
+                (mut start) 0]
+            (do
+              (if (= (primitive/cast i64 typesetter) 0)
+                  0
+                  (if (= utf16-length 0)
+                      (push-paragraph-line! (mut paragraph)
+                                            (text-shape-line! (mut atlas) c"" font-size)
+                                            0
+                                            0
+                                            0)
+                      (while (and (< (load start) utf16-length)
+                                  (or (<= max-lines 0)
+                                      (< (al/al-len [ParagraphLine]
+                                                    (load (field paragraph lines)))
+                                         max-lines)))
+                        (let [suggested
+                                (CTTypesetterSuggestLineBreak typesetter
+                                                              (load start)
+                                                              (* (primitive/cast f64 width)
+                                                                 (primitive/cast f64 scale)))
+                              fallback
+                                (if (> suggested 0)
+                                    suggested
+                                    (CTTypesetterSuggestClusterBreak typesetter
+                                                                     (load start)
+                                                                     (* (primitive/cast f64 width)
+                                                                        (primitive/cast f64 scale))))
+                              consumed (if (> fallback 0) fallback 1)
+                              remaining (- utf16-length (load start))
+                              count (if (> consumed remaining) remaining consumed)
+                              end (+ (load start) count)
+                              (mut content-end) end]
+                          (do
+                            (while (> (load content-end) (load start))
+                              (let [character
+                                      (msg u16
+                                           string
+                                           (sel c"characterAtIndex:")
+                                           [u64]
+                                           (primitive/cast u64 (- (load content-end) 1)))]
+                                (if (or (= character (primitive/cast u16 10))
+                                        (= character (primitive/cast u16 13)))
+                                    (store! content-end (- (load content-end) 1))
+                                    (break 0))))
+                            (let [substring
+                                    (msg (ptr i8)
+                                         string
+                                         (sel c"substringWithRange:")
+                                         [CFRange]
+                                         (CFRange :location (load start)
+                                           :length (- (load content-end) (load start))))
+                                  line-utf8 (msg (ptr i8) substring (sel c"UTF8String") [])
+                                  byte-start (utf16-index-to-utf8 utf8 (load start))
+                                  byte-content-end (utf16-index-to-utf8 utf8 (load content-end))
+                                  byte-end (utf16-index-to-utf8 utf8 end)]
+                              (push-paragraph-line! (mut paragraph)
+                                                    (text-shape-line! (mut atlas)
+                                                                      line-utf8
+                                                                      font-size)
+                                                    byte-start
+                                                    byte-content-end
+                                                    byte-end))
+                            (store! start end))))))
+              (store! (field paragraph height)
+                      (* effective-line-height
+                         (primitive/cast f32
+                                         (al/al-len [ParagraphLine]
+                                                    (load (field paragraph lines))))))
+              (store! (field paragraph valid)
+                      (!= (primitive/cast i64 typesetter) 0))
+              (if (!= (primitive/cast i64 typesetter) 0) (do (CFRelease typesetter) 0) 0)
+              (msg i64 attributed (sel c"release") [])
+              (load paragraph)))))))
+
 (defn shaped-line-free! [(line (mut ShapedLine))] (-> i64)
   (al/al-free! [ShapedGlyph] (mut (.glyphs line))))
+
+(defn shaped-paragraph-free! [(paragraph (mut ShapedParagraph))] (-> i64)
+  (do
+    (let [lines (load (field paragraph lines))]
+      (for [i 0 (al/al-len [ParagraphLine] lines)]
+        (let [item (primitive/index (load (field lines data)) i)]
+          (shaped-line-free! (mut (field item line))))))
+    (al/al-free! [ParagraphLine] (mut (.lines paragraph)))
+    (store! (field paragraph valid) false)
+    0))
+
+(defn shaped-paragraph-line-count [(paragraph ShapedParagraph)] (-> i64)
+  (al/al-len [ParagraphLine] (load (field paragraph lines))))
+
+(defn shaped-paragraph-index-for-point [(paragraph ShapedParagraph)
+                                        (x f32)
+                                        (y f32)] (-> i64)
+  (let [count (shaped-paragraph-line-count paragraph)]
+    (if (<= count 0)
+        0
+        (let [raw (primitive/cast i64 (/ y (load (field paragraph line-height))))
+              index (cond (< raw 0) 0 (>= raw count) (- count 1) :else raw)
+              lines (load (field paragraph lines))
+              item (primitive/index (load (field lines data)) index)
+              line (load (field item line))
+              local (shaped-line-index-for-x line x)
+              result (+ (load (field item byte-start)) local)
+              content-end (load (field item byte-content-end))]
+          (if (> result content-end) content-end result)))))
+
+(defn shaped-paragraph-position-for-index [(paragraph ShapedParagraph)
+                                           (index i64)] (-> TextPosition)
+  (let [lines (load (field paragraph lines))
+        count (al/al-len [ParagraphLine] lines)]
+    (if (<= count 0)
+        (TextPosition
+          :x 0.0
+          :y 0.0
+          :height (load (field paragraph line-height)))
+        (block :found
+               (for [i 0 count]
+                 (let [item (primitive/index (load (field lines data)) i)
+                       is-last (= i (- count 1))]
+                   (if (or (< index (load (field item byte-end))) is-last)
+                       (let [local
+                               (cond (<= index (load (field item byte-start))) 0
+                                     (>= index (load (field item byte-content-end)))
+                                       (- (load (field item byte-content-end))
+                                          (load (field item byte-start)))
+                                     :else (- index (load (field item byte-start))))]
+                         (return-from
+                           :found
+                             (TextPosition
+                               :x
+                                 (shaped-line-x-for-index (load (field item line))
+                                                          local)
+                               :y (load (field item y))
+                               :height (load (field paragraph line-height)))))
+                       0)))
+               (TextPosition
+                 :x 0.0
+                 :y 0.0
+                 :height (load (field paragraph line-height)))))))
 
 (defn shaped-line-x-for-index [(line ShapedLine) (index i64)] (-> f32)
   (let [glyphs (load (field line glyphs))]
@@ -785,6 +1024,29 @@
                                         (primitive/cast i32 (+ (primitive/cast i64 id) i)))
               0)))
       (al/al-len [ShapedGlyph] glyphs))))
+
+(defn paint-shaped-paragraph! [(scene (mut ui/Scene))
+                               (paragraph ShapedParagraph)
+                               (x f32)
+                               (y f32)
+                               (color ui/Color)
+                               (id i32)] (-> i64)
+  (let [lines (load (field paragraph lines))
+        (mut glyph-offset) 0]
+    (do
+      (for [i 0 (al/al-len [ParagraphLine] lines)]
+        (let [item (primitive/index (load (field lines data)) i)
+              painted
+                (paint-shaped-line! (mut scene)
+                                    (load (field item line))
+                                    x
+                                    (+ y (load (field item y)))
+                                    color
+                                    (primitive/cast i32
+                                                    (+ (primitive/cast i64 id)
+                                                       (load glyph-offset))))]
+          (store! glyph-offset (+ (load glyph-offset) painted))))
+      (load glyph-offset))))
 
 (defn text-atlas-glyph-count [(atlas TextAtlas)] (-> i64)
   (al/al-len [GlyphEntry] (load (field atlas glyphs))))
