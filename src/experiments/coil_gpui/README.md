@@ -28,10 +28,12 @@ layer in the runtime path.
   paint no longer accidentally participates in input.
 - Retained focus routing across transient scenes, disabled-control skipping,
   Tab/Shift-Tab traversal, and logical activate/decrement/increment actions.
-- Uniform virtual lists with retained pixel offsets, bounded overscan, exact
-  visible ranges, viewport clipping, wheel input, and stable GPU scrollbars.
-- The demo's scroll view has 100,000 logical rows but constructs only visible
-  rows plus three-row overscan each frame.
+- Uniform and variable-height virtual lists with retained pixel offsets, bounded
+  overscan, exact visible ranges, viewport clipping, wheel input, and stable GPU
+  scrollbars. Variable lists use a Fenwick prefix-sum index for logarithmic
+  measurement updates and pixel-offset lookup, with scroll-anchor preservation.
+- The demo's scroll view has 100,000 heterogeneously sized logical rows but
+  measures and constructs only visible rows plus three-row overscan each frame.
 - Interactive buttons, checkbox, slider, progress, divider, and panel components.
 - GPU text labels integrated with the reusable scene and demo components.
 - Mouse hover, press, release, checkbox toggling, slider dragging, plus keyboard
@@ -103,6 +105,15 @@ cd src/experiments/coil_gpui
 ./build/release/coil-gpui-bench
 ```
 
+Benchmark the million-row variable-height index:
+
+```sh
+cd src/experiments/coil_gpui
+/Users/jimmyhmiller/Documents/Code/projects/coil/build/bin/coil build \
+  variable_scroll_bench.coil -o build/release/coil-gpui-variable-scroll-bench --release
+./build/release/coil-gpui-variable-scroll-bench
+```
+
 ## Performance contract
 
 The scene retains shape, shadow, and texture-list allocations after `scene-clear!`,
@@ -121,6 +132,11 @@ shadow batch**. This measures Coil scene construction and
 visible-range calculation, not GPU presentation or display latency; the benchmark
 is checked in as `bench.coil` so results remain reproducible and comparable.
 
+The variable-height benchmark interleaves measurement replacement and inverse-prefix
+lookup across one million rows. It measured **164 ns per update-plus-lookup** across
+100,000 operations. Initial tree construction is excluded; the timed path covers the
+steady-state work performed as rows are measured during scrolling.
+
 Text rasterization is cached rather than repeated each frame. The current cache is
 application-owned and one texture is bound per label. The next text tier should pack
 individual shaped glyph masks into bounded, evicting atlas pages and batch labels by
@@ -134,9 +150,8 @@ application. GPUI parity still requires substantial systems, notably:
 - glyph-run extraction, editable text measurement, and a bounded glyph atlas
   (whole-label shaping and GPU mask composition work now);
 - grid and intrinsic text/image measurement (flex layout works);
-- variable-height lists, transforms, SVG, and paths
-  (analytic shadows, general raster images, uniform virtual scrolling, and nested
-  rectangular GPU clipping work);
+- transforms, SVG, and paths (analytic shadows, general raster images, uniform and
+  variable-height virtual scrolling, and nested rectangular GPU clipping work);
 - hierarchical capture/bubble listeners, configurable keymaps, IME, drag/drop,
   and accessibility (focus traversal and logical actions work);
 - retained entities, subscriptions, observation, async executor integration, assets,

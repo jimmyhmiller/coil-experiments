@@ -1,0 +1,229 @@
+(module experiments.coil_gpui.variable_scroll)
+(import "experiments.coil_gpui.ui" :as ui)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.primitive" :as primitive)
+
+(export VariableScrollState
+        variable-scroll-new
+        variable-scroll-free!
+        variable-scroll-configure!
+        variable-scroll-to!
+        variable-scroll-by!
+        variable-scroll-max-offset
+        variable-scroll-measure!
+        variable-scroll-prefix
+        variable-scroll-index-at
+        variable-visible-first
+        variable-visible-last
+        variable-visible-count
+        variable-item-rect
+        variable-scroll-begin!
+        variable-scroll-end!
+        variable-scrollbar!)
+
+;;; Variable-height virtualization backed by a Fenwick prefix-sum tree. Height
+;;; updates, prefix queries, and offset-to-row lookup are O(log n); visible scene
+;;; construction remains proportional only to the number of visible rows.
+(defstruct VariableScrollState
+  [(viewport ui/Rect)
+   (offset f32)
+   (content-height f32)
+   (estimate f32)
+   (item-count i64)
+   (overscan i64)
+   (heights (al/ArrayList f32))
+   (tree (al/ArrayList f32))])
+
+(defn lowbit [(value i64)] (-> i64)
+  (& value (- 0 value)))
+
+(defn variable-scroll-new [(item-count i64) (estimate f32) (overscan i64)] (-> VariableScrollState)
+  (let [allocator (alloc/malloc-allocator)
+        count (if (< item-count 0) 0 item-count)
+        row-height (if (> estimate 0.0) estimate 1.0)
+        (mut heights) (al/al-new [f32] allocator)
+        (mut tree) (al/al-new [f32] allocator)]
+    (do
+      ;; Fenwick indices are one-based. Linear construction is possible because
+      ;; every initial row has the same estimated height.
+      (al/al-push! [f32] (mut tree) 0.0)
+      (for [i 0 count]
+        (do
+          (al/al-push! [f32] (mut heights) row-height)
+          (let [tree-index (+ i 1)]
+            (al/al-push! [f32]
+                         (mut tree)
+                         (* row-height (primitive/cast f32 (lowbit tree-index)))))))
+      (VariableScrollState
+        :viewport (ui/rect 0.0 0.0 0.0 0.0)
+        :offset 0.0
+        :content-height (* (primitive/cast f32 count) row-height)
+        :estimate row-height
+        :item-count count
+        :overscan (if (< overscan 0) 0 overscan)
+        :heights (load heights)
+        :tree (load tree)))))
+
+(defn variable-scroll-free! [(state (mut VariableScrollState))] (-> i64)
+  (do
+    (al/al-free! [f32] (mut (.heights state)))
+    (al/al-free! [f32] (mut (.tree state)))))
+
+(defn variable-scroll-prefix [(state VariableScrollState) (exclusive-index i64)] (-> f32)
+  (let [count (load (field state item-count))
+        (mut index) (cond (< exclusive-index 0) 0 (> exclusive-index count) count :else exclusive-index)
+        (mut total) (primitive/cast f32 0.0)]
+    (do
+      (while (> (load index) 0)
+        (do
+          (store! total (+ (load total) (al/al-get [f32] (load (field state tree)) (load index))))
+          (store! index (- (load index) (lowbit (load index))))))
+      (load total))))
+
+(defn variable-scroll-max-offset [(state VariableScrollState)] (-> f32)
+  (let [maximum
+          (- (load (field state content-height))
+             (load (field (field state viewport) h)))]
+    (if (> maximum 0.0) maximum 0.0)))
+
+(defn variable-scroll-to! [(state (mut VariableScrollState)) (offset f32)] (-> f32)
+  (let [maximum (variable-scroll-max-offset (load state))
+        clamped (cond (< offset 0.0) 0.0 (> offset maximum) maximum :else offset)]
+    (do (set! (.offset state) clamped) clamped)))
+
+(defn variable-scroll-by! [(state (mut VariableScrollState)) (delta f32)] (-> f32)
+  (variable-scroll-to! (mut state) (+ (load (field state offset)) delta)))
+
+(defn variable-scroll-configure! [(state (mut VariableScrollState)) (viewport ui/Rect)] (-> i64)
+  (do
+    (set! (.viewport state) viewport)
+    (variable-scroll-to! (mut state) (load (field state offset)))
+    0))
+
+;;; Update a measured row and preserve the visual anchor when that row lies
+;;; wholly above the current viewport. This prevents content from jumping as
+;;; estimates are replaced with actual layout measurements.
+(defn variable-scroll-measure! [(state (mut VariableScrollState))
+                                (index i64)
+                                (height f32)] (-> f32)
+  (if (or (< index 0) (>= index (load (field state item-count))))
+      0.0
+      (let [new-height (if (> height 0.0) height 1.0)
+            old-height (al/al-get [f32] (load (field state heights)) index)
+            delta (- new-height old-height)
+            row-top (variable-scroll-prefix (load state) index)
+            (mut tree-index) (+ index 1)]
+        (do
+          (al/al-set! [f32] (mut (.heights state)) index new-height)
+          (while (<= (load tree-index) (load (field state item-count)))
+            (do
+              (al/al-set! [f32]
+                          (mut (.tree state))
+                          (load tree-index)
+                          (+ (al/al-get [f32] (load (field state tree)) (load tree-index)) delta))
+              (store! tree-index (+ (load tree-index) (lowbit (load tree-index))))))
+          (set! (.content-height state) (+ (load (field state content-height)) delta))
+          (if (< row-top (load (field state offset)))
+              (set! (.offset state) (+ (load (field state offset)) delta))
+              0)
+          (variable-scroll-to! (mut state) (load (field state offset)))
+          delta))))
+
+;;; Return the row containing `offset`, or `item-count` at the exact content end.
+;;; Fenwick binary lifting performs this inverse-prefix query in O(log n).
+(defn variable-scroll-index-at [(state VariableScrollState) (offset f32)] (-> i64)
+  (let [target
+          (cond (< offset 0.0) 0.0
+                (> offset (load (field state content-height))) (load (field state content-height))
+                :else offset)
+        count (load (field state item-count))
+        (mut bit) 1
+        (mut index) 0
+        (mut accumulated) (primitive/cast f32 0.0)]
+    (do
+      (while (<= (* (load bit) 2) count)
+        (store! bit (* (load bit) 2)))
+      (while (> (load bit) 0)
+        (let [next (+ (load index) (load bit))]
+          (if (and (<= next count)
+                   (<= (+ (load accumulated)
+                          (al/al-get [f32] (load (field state tree)) next))
+                       target))
+              (do
+                (store! accumulated
+                        (+ (load accumulated)
+                           (al/al-get [f32] (load (field state tree)) next)))
+                (store! index next))
+              0))
+        (store! bit (/ (load bit) 2)))
+      (load index))))
+
+(defn variable-visible-first [(state VariableScrollState)] (-> i64)
+  (let [raw (variable-scroll-index-at state (load (field state offset)))
+        first (- raw (load (field state overscan)))]
+    (if (> first 0) first 0)))
+
+(defn variable-visible-last [(state VariableScrollState)] (-> i64)
+  (let [bottom (+ (load (field state offset)) (load (field (field state viewport) h)))
+        raw (+ (variable-scroll-index-at state bottom) 1)
+        last (+ raw (load (field state overscan)))
+        count (load (field state item-count))]
+    (if (< last count) last count)))
+
+(defn variable-visible-count [(state VariableScrollState)] (-> i64)
+  (- (variable-visible-last state) (variable-visible-first state)))
+
+(defn variable-item-rect [(state VariableScrollState) (index i64)] (-> ui/Rect)
+  (let [viewport (load (field state viewport))]
+    (ui/rect (load (field viewport x))
+             (+ (load (field viewport y))
+                (- (variable-scroll-prefix state index) (load (field state offset))))
+             (load (field viewport w))
+             (al/al-get [f32] (load (field state heights)) index))))
+
+(defn variable-scroll-begin! [(scene (mut ui/Scene))
+                              (state VariableScrollState)
+                              (id i32)] (-> ui/Rect)
+  (let [viewport (load (field state viewport))
+        prior (ui/scene-push-clip! (mut scene) viewport)]
+    (do (ui/scene-hitbox! (mut scene) viewport id -1 false false) prior)))
+
+(defn variable-scroll-end! [(scene (mut ui/Scene)) (prior ui/Rect)] (-> i64)
+  (ui/scene-pop-clip! (mut scene) prior))
+
+(defn variable-scrollbar! [(scene (mut ui/Scene))
+                           (state VariableScrollState)
+                           (id i32)] (-> i64)
+  (let [viewport (load (field state viewport))
+        content (load (field state content-height))
+        viewport-height (load (field viewport h))
+        maximum (variable-scroll-max-offset state)
+        track
+          (ui/rect (- (+ (load (field viewport x)) (load (field viewport w))) 6.0)
+                   (+ (load (field viewport y)) 2.0)
+                   4.0
+                   (- viewport-height 4.0))
+        track-height (load (field track h))
+        raw-thumb (if (> content 0.0) (* track-height (/ viewport-height content)) track-height)
+        thumb-height
+          (cond (< raw-thumb 24.0) 24.0
+                (> raw-thumb track-height) track-height
+                :else raw-thumb)
+        fraction (if (> maximum 0.0) (/ (load (field state offset)) maximum) 0.0)
+        thumb-y (+ (load (field track y)) (* (- track-height thumb-height) fraction))]
+    (do
+      (ui/scene-rounded-rect! (mut scene)
+                              track
+                              (ui/rgba 1.0 1.0 1.0 0.07)
+                              2.0
+                              0.0
+                              (ui/rgba 0.0 0.0 0.0 0.0)
+                              id)
+      (ui/scene-rounded-rect! (mut scene)
+                              (ui/rect (load (field track x)) thumb-y 4.0 thumb-height)
+                              (ui/rgba 0.62 0.72 0.96 0.72)
+                              2.0
+                              0.0
+                              (ui/rgba 0.0 0.0 0.0 0.0)
+                              id))))
