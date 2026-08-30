@@ -1,0 +1,486 @@
+(module experiments.coil_gpui.key-context)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use [slice-data slice-len slice-get])
+
+(export ContextEntry
+        ContextLayer
+        ContextStack
+        PredicateNode
+        ContextPredicate
+        context-stack-new
+        context-stack-free!
+        context-stack-push-layer!
+        context-stack-pop-layer!
+        context-stack-add!
+        context-stack-set!
+        context-predicate-parse
+        context-predicate-free!
+        context-predicate-valid?
+        context-predicate-error-offset
+        context-predicate-depth)
+
+;;; Context strings are copied into stack/predicate-owned byte arenas. Nodes and
+;;; entries retain offsets, so ArrayList growth cannot invalidate references and
+;;; predicate evaluation performs no allocation.
+(defstruct ContextEntry
+  [(key-start i64)
+   (key-length i64)
+   (value-start i64)
+   (value-length i64)
+   (has-value bool)])
+
+(defstruct ContextLayer [(entry-start i64) (entry-length i64)])
+
+(defstruct ContextStack
+  [(bytes (al/ArrayList u8))
+   (entries (al/ArrayList ContextEntry))
+   (layers (al/ArrayList ContextLayer))])
+
+(const node-identifier i64 1)
+
+(const node-equal i64 2)
+
+(const node-not-equal i64 3)
+
+(const node-not i64 4)
+
+(const node-and i64 5)
+
+(const node-or i64 6)
+
+(const node-descendant i64 7)
+
+(defstruct PredicateNode
+  [(kind i64)
+   (left i64)
+   (right i64)
+   (key-start i64)
+   (key-length i64)
+   (value-start i64)
+   (value-length i64)])
+
+(defstruct ContextPredicate
+  [(source (al/ArrayList u8))
+   (nodes (al/ArrayList PredicateNode))
+   (root i64)
+   (valid bool)
+   (error-offset i64)])
+
+(defstruct PredicateParser
+  [(predicate (ptr ContextPredicate)) (at i64)])
+
+(defn context-stack-new [] (-> ContextStack)
+  (ContextStack
+    :bytes (al/al-new [u8] (alloc/malloc-allocator))
+    :entries (al/al-new [ContextEntry] (alloc/malloc-allocator))
+    :layers (al/al-new [ContextLayer] (alloc/malloc-allocator))))
+
+(defn context-stack-free! [(stack (mut ContextStack))] (-> i64)
+  (do
+    (al/al-free! [u8] (mut (.bytes stack)))
+    (al/al-free! [ContextEntry] (mut (.entries stack)))
+    (al/al-free! [ContextLayer] (mut (.layers stack)))))
+
+(defn context-stack-push-layer! [(stack (mut ContextStack))] (-> i64)
+  (let [(mut layer) (primitive/zeroed ContextLayer)]
+    (do
+      (store! (field layer entry-start) (al/al-len [ContextEntry] (load (field stack entries))))
+      (al/al-push! [ContextLayer] (mut (.layers stack)) (load layer))
+      (al/al-len [ContextLayer] (load (field stack layers))))))
+
+(defn context-stack-pop-layer! [(stack (mut ContextStack))] (-> i64)
+  (let [layers (load (field stack layers))]
+    (if (= (al/al-len [ContextLayer] layers) 0)
+        0
+        (let [layer (primitive/index (load (field layers data)) (- (al/al-len [ContextLayer] layers) 1))]
+          (do
+            (set! (.len (.entries stack)) (load (field layer entry-start)))
+            (set! (.len (.layers stack)) (- (al/al-len [ContextLayer] layers) 1))
+            (al/al-len [ContextLayer] (load (field stack layers))))))))
+
+(defn append-bytes! [(bytes (mut (al/ArrayList u8))) (text (slice u8))] (-> i64)
+  (let [start (al/al-len [u8] (load bytes))]
+    (do
+      (for [i 0 (slice-len text)] (al/al-push! [u8] (mut bytes) (slice-get text i)))
+      start)))
+
+(defn current-layer! [(stack (mut ContextStack))] (-> (ptr ContextLayer))
+  (let [layers (load (field stack layers))]
+    (if (= (al/al-len [ContextLayer] layers) 0)
+        (do
+          (context-stack-push-layer! (mut stack))
+          (let [fresh (load (field stack layers))]
+            (primitive/index (load (field fresh data)) 0)))
+        (primitive/index (load (field layers data)) (- (al/al-len [ContextLayer] layers) 1)))))
+
+(defn push-entry! [(stack (mut ContextStack))
+                   (key (slice u8))
+                   (value (slice u8))
+                   (has-value bool)] (-> i64)
+  (let [layer (current-layer! (mut stack))
+        bytes (load (field stack bytes))
+        entries (load (field stack entries))]
+    (block :insert
+           (for [i 0 (load (field layer entry-length))]
+             (let [entry
+                     (primitive/index (load (field entries data))
+                                      (+ (load (field layer entry-start)) i))]
+               (if (bytes-equal? (load (field bytes data))
+                                 (load (field entry key-start))
+                                 (load (field entry key-length))
+                                 (slice-data key)
+                                 0
+                                 (slice-len key))
+                   (return-from :insert (load (field layer entry-length)))
+                   0)))
+           (let [key-start (append-bytes! (mut (.bytes stack)) key)
+                 value-start (if has-value (append-bytes! (mut (.bytes stack)) value) 0)
+                 (mut entry) (primitive/zeroed ContextEntry)]
+             (do
+               (store! (field entry key-start) key-start)
+               (store! (field entry key-length) (slice-len key))
+               (store! (field entry value-start) value-start)
+               (store! (field entry value-length) (if has-value (slice-len value) 0))
+               (store! (field entry has-value) has-value)
+               (al/al-push! [ContextEntry] (mut (.entries stack)) (load entry))
+               (set! (.entry-length layer) (+ (load (field layer entry-length)) 1))
+               (load (field layer entry-length)))))))
+
+(defn context-stack-add! [(stack (mut ContextStack)) (identifier (slice u8))] (-> i64)
+  (push-entry! (mut stack) identifier "" false))
+
+(defn context-stack-set! [(stack (mut ContextStack))
+                          (key (slice u8))
+                          (value (slice u8))] (-> i64)
+  (push-entry! (mut stack) key value true))
+
+(defn predicate-source-at [(predicate (ptr ContextPredicate)) (at i64)] (-> i64)
+  (let [source (load (field predicate source))]
+    (if (or (< at 0) (>= at (al/al-len [u8] source)))
+        -1
+        (primitive/cast i64 (load (primitive/index (load (field source data)) at))))))
+
+(defn whitespace? [(c i64)] (-> bool)
+  (or (= c 32) (or (= c 9) (or (= c 10) (= c 13)))))
+
+(defn identifier-char? [(c i64)] (-> bool)
+  (and (>= c 0)
+       (not (whitespace? c))
+       (and (!= c 33)
+            (and (!= c 38)
+                 (and (!= c 40)
+                      (and (!= c 41)
+                           (and (!= c 61) (and (!= c 62) (!= c 124)))))))))
+
+(defn skip-space! [(parser (mut PredicateParser))] (-> i64)
+  (do
+    (while (whitespace? (predicate-source-at (load (field parser predicate)) (load (field parser at))))
+      (set! (.at parser) (+ (load (field parser at)) 1)))
+    (load (field parser at))))
+
+(defn parser-fail! [(parser (mut PredicateParser))] (-> i64)
+  (do
+    (if (load (field (load (field parser predicate)) valid))
+        (do
+          (store! (field (load (field parser predicate)) valid) false)
+          (store! (field (load (field parser predicate)) error-offset) (load (field parser at))))
+        0)
+    -1))
+
+(defn push-node! [(predicate (ptr ContextPredicate)) (node PredicateNode)] (-> i64)
+  (do
+    (al/al-push! [PredicateNode] (mut (.nodes predicate)) node)
+    (- (al/al-len [PredicateNode] (load (field predicate nodes))) 1)))
+
+(defn binary-node! [(predicate (ptr ContextPredicate))
+                    (kind i64)
+                    (left i64)
+                    (right i64)] (-> i64)
+  (let [(mut node) (primitive/zeroed PredicateNode)]
+    (do
+      (store! (field node kind) kind)
+      (store! (field node left) left)
+      (store! (field node right) right)
+      (push-node! predicate (load node)))))
+
+(defn predicate-node-kind [(predicate (ptr ContextPredicate)) (index i64)] (-> i64)
+  (let [nodes (load (field predicate nodes))]
+    (load (field (primitive/index (load (field nodes data)) index) kind))))
+
+(defn predicate-node-at [(predicate (ptr ContextPredicate)) (index i64)] (-> (ptr PredicateNode))
+  (let [nodes (load (field predicate nodes))]
+    (primitive/index (load (field nodes data)) index)))
+
+(defn parse-primary! [(parser (mut PredicateParser))] (-> i64)
+  (do
+    (skip-space! (mut parser))
+    (let [c (predicate-source-at (load (field parser predicate)) (load (field parser at)))]
+      (cond (= c 40)
+              (do
+                (set! (.at parser) (+ (load (field parser at)) 1))
+                (let [result (parse-or! (mut parser))]
+                  (skip-space! (mut parser))
+                  (if (= (predicate-source-at (load (field parser predicate)) (load (field parser at))) 41)
+                      (do (set! (.at parser) (+ (load (field parser at)) 1)) result)
+                      (parser-fail! (mut parser)))))
+            (= c 33)
+              (do
+                (set! (.at parser) (+ (load (field parser at)) 1))
+                (let [child (parse-primary! (mut parser))
+                      (mut node) (primitive/zeroed PredicateNode)]
+                  (if (< child 0)
+                      -1
+                      (do
+                        (store! (field node kind) node-not)
+                        (store! (field node left) child)
+                        (push-node! (load (field parser predicate)) (load node))))))
+            (identifier-char? c)
+              (let [start (load (field parser at))]
+                (do
+                  (while (identifier-char? (predicate-source-at (load (field parser predicate))
+                                                                (load (field parser at))))
+                    (set! (.at parser) (+ (load (field parser at)) 1)))
+                  (let [(mut node) (primitive/zeroed PredicateNode)]
+                    (do
+                      (store! (field node kind) node-identifier)
+                      (store! (field node key-start) start)
+                      (store! (field node key-length) (- (load (field parser at)) start))
+                      (push-node! (load (field parser predicate)) (load node))))))
+            :else (parser-fail! (mut parser))))))
+
+(defn operator-at? [(parser (mut PredicateParser)) (a i64) (b i64)] (-> bool)
+  (do
+    (skip-space! (mut parser))
+    (and (= (predicate-source-at (load (field parser predicate)) (load (field parser at))) a)
+         (or (< b 0)
+             (= (predicate-source-at (load (field parser predicate)) (+ (load (field parser at)) 1)) b)))))
+
+(defn parse-equality! [(parser (mut PredicateParser))] (-> i64)
+  (let [left (parse-primary! (mut parser))]
+    (if (< left 0)
+        -1
+        (cond (operator-at? (mut parser) 61 61) (parse-equality-tail! (mut parser) left node-equal)
+              (operator-at? (mut parser) 33 61) (parse-equality-tail! (mut parser) left node-not-equal)
+              :else left))))
+
+(defn parse-equality-tail! [(parser (mut PredicateParser)) (left i64) (kind i64)] (-> i64)
+  (do
+    (set! (.at parser) (+ (load (field parser at)) 2))
+    (let [right (parse-primary! (mut parser))]
+      (if (or (< right 0)
+              (!= (predicate-node-kind (load (field parser predicate)) left) node-identifier)
+              (!= (predicate-node-kind (load (field parser predicate)) right) node-identifier))
+          (parser-fail! (mut parser))
+          (let [left-node (predicate-node-at (load (field parser predicate)) left)
+                right-node (predicate-node-at (load (field parser predicate)) right)
+                (mut node) (primitive/zeroed PredicateNode)]
+            (do
+              (store! (field node kind) kind)
+              (store! (field node key-start) (load (field left-node key-start)))
+              (store! (field node key-length) (load (field left-node key-length)))
+              (store! (field node value-start) (load (field right-node key-start)))
+              (store! (field node value-length) (load (field right-node key-length)))
+              (push-node! (load (field parser predicate)) (load node))))))))
+
+(defn parse-descendant! [(parser (mut PredicateParser))] (-> i64)
+  (let [(mut left) (parse-equality! (mut parser))]
+    (while (and (>= (load left) 0) (operator-at? (mut parser) 62 -1))
+      (do
+        (set! (.at parser) (+ (load (field parser at)) 1))
+        (let [right (parse-equality! (mut parser))]
+          (if (< right 0)
+              (store! left -1)
+              (store! left (binary-node! (load (field parser predicate)) node-descendant (load left) right))))))
+    (load left)))
+
+(defn parse-and! [(parser (mut PredicateParser))] (-> i64)
+  (let [(mut left) (parse-descendant! (mut parser))]
+    (while (and (>= (load left) 0) (operator-at? (mut parser) 38 38))
+      (do
+        (set! (.at parser) (+ (load (field parser at)) 2))
+        (let [right (parse-descendant! (mut parser))]
+          (if (< right 0)
+              (store! left -1)
+              (store! left (binary-node! (load (field parser predicate)) node-and (load left) right))))))
+    (load left)))
+
+(defn parse-or! [(parser (mut PredicateParser))] (-> i64)
+  (let [(mut left) (parse-and! (mut parser))]
+    (while (and (>= (load left) 0) (operator-at? (mut parser) 124 124))
+      (do
+        (set! (.at parser) (+ (load (field parser at)) 2))
+        (let [right (parse-and! (mut parser))]
+          (if (< right 0)
+              (store! left -1)
+              (store! left (binary-node! (load (field parser predicate)) node-or (load left) right))))))
+    (load left)))
+
+(defn context-predicate-parse [(source (slice u8))] (-> ContextPredicate)
+  (let [predicate (primitive/alloc-stack ContextPredicate)]
+    (do
+      (store! predicate (primitive/zeroed ContextPredicate))
+      (store! (field predicate source) (al/al-new [u8] (alloc/malloc-allocator)))
+      (store! (field predicate nodes) (al/al-new [PredicateNode] (alloc/malloc-allocator)))
+      (store! (field predicate root) -1)
+      (store! (field predicate valid) true)
+      (store! (field predicate error-offset) -1)
+      (append-bytes! (mut (.source predicate)) source)
+      (let [(mut parser) (primitive/zeroed PredicateParser)]
+        (store! (field parser predicate) predicate)
+        (store! (field parser at) 0)
+        (let [root (parse-or! (mut parser))]
+          (skip-space! (mut parser))
+          (if (or (< root 0)
+                  (!= (load (field parser at)) (al/al-len [u8] (load (field predicate source)))))
+              (parser-fail! (mut parser))
+              (store! (field predicate root) root))))
+      (load predicate))))
+
+(defn context-predicate-free! [(predicate (mut ContextPredicate))] (-> i64)
+  (do
+    (al/al-free! [u8] (mut (.source predicate)))
+    (al/al-free! [PredicateNode] (mut (.nodes predicate)))))
+
+(defn context-predicate-valid? [(predicate ContextPredicate)] (-> bool)
+  (load (field predicate valid)))
+
+(defn context-predicate-error-offset [(predicate ContextPredicate)] (-> i64)
+  (load (field predicate error-offset)))
+
+(defn bytes-equal? [(a (ptr u8))
+                    (a-start i64)
+                    (a-length i64)
+                    (b (ptr u8))
+                    (b-start i64)
+                    (b-length i64)] (-> bool)
+  (if (!= a-length b-length)
+      false
+      (block :same
+             (for [i 0 a-length]
+               (if (!= (load (primitive/index a (+ a-start i)))
+                       (load (primitive/index b (+ b-start i))))
+                   (return-from :same false)
+                   0))
+             true)))
+
+(defn entry-matches-node? [(stack ContextStack)
+                           (entry (ptr ContextEntry))
+                           (predicate ContextPredicate)
+                           (node (ptr PredicateNode))] (-> bool)
+  (let [stack-bytes (load (field stack bytes))
+        predicate-bytes (load (field predicate source))]
+    (and (bytes-equal? (load (field stack-bytes data))
+                       (load (field entry key-start))
+                       (load (field entry key-length))
+                       (load (field predicate-bytes data))
+                       (load (field node key-start))
+                       (load (field node key-length)))
+         (cond (= (load (field node kind)) node-identifier) true
+               (= (load (field node kind)) node-equal)
+                 (and (load (field entry has-value))
+                      (bytes-equal? (load (field stack-bytes data))
+                                    (load (field entry value-start))
+                                    (load (field entry value-length))
+                                    (load (field predicate-bytes data))
+                                    (load (field node value-start))
+                                    (load (field node value-length))))
+               (= (load (field node kind)) node-not-equal)
+                 (or (not (load (field entry has-value)))
+                     (not (bytes-equal? (load (field stack-bytes data))
+                                        (load (field entry value-start))
+                                        (load (field entry value-length))
+                                        (load (field predicate-bytes data))
+                                        (load (field node value-start))
+                                        (load (field node value-length)))))
+               :else false))))
+
+(defn entry-key-matches? [(stack ContextStack)
+                          (entry (ptr ContextEntry))
+                          (predicate ContextPredicate)
+                          (node (ptr PredicateNode))] (-> bool)
+  (let [stack-bytes (load (field stack bytes))
+        predicate-bytes (load (field predicate source))]
+    (bytes-equal? (load (field stack-bytes data))
+                  (load (field entry key-start))
+                  (load (field entry key-length))
+                  (load (field predicate-bytes data))
+                  (load (field node key-start))
+                  (load (field node key-length)))))
+
+(defn entry-value-equal? [(stack ContextStack)
+                          (entry (ptr ContextEntry))
+                          (predicate ContextPredicate)
+                          (node (ptr PredicateNode))] (-> bool)
+  (if (not (load (field entry has-value)))
+      false
+      (let [stack-bytes (load (field stack bytes))
+            predicate-bytes (load (field predicate source))]
+        (bytes-equal? (load (field stack-bytes data))
+                      (load (field entry value-start))
+                      (load (field entry value-length))
+                      (load (field predicate-bytes data))
+                      (load (field node value-start))
+                      (load (field node value-length))))))
+
+(defn eval-node [(predicate ContextPredicate)
+                 (node-index i64)
+                 (stack ContextStack)
+                 (depth i64)
+                 (all-depth i64)] (-> bool)
+  (if (<= depth 0)
+      false
+      (let [nodes (load (field predicate nodes))
+            node (primitive/index (load (field nodes data)) node-index)
+            kind (load (field node kind))]
+        (cond (or (= kind node-identifier) (or (= kind node-equal) (= kind node-not-equal)))
+                (let [layers (load (field stack layers))
+                      entries (load (field stack entries))
+                      layer (primitive/index (load (field layers data)) (- depth 1))]
+                  (block :found
+                         (for [i 0 (load (field layer entry-length))]
+                           (let [entry
+                                   (primitive/index (load (field entries data)) (+ (load (field layer entry-start)) i))]
+                             (if (= kind node-not-equal)
+                                 (if (entry-key-matches? stack entry predicate node)
+                                     (return-from :found (not (entry-value-equal? stack entry predicate node)))
+                                     0)
+                                 (if (entry-matches-node? stack entry predicate node)
+                                     (return-from :found true)
+                                     0))))
+                         (= kind node-not-equal)))
+              (= kind node-not)
+                (block :absent
+                       (for [i 1 (+ all-depth 1)]
+                         (if (eval-node predicate (load (field node left)) stack i all-depth)
+                             (return-from :absent false)
+                             0))
+                       true)
+              (= kind node-and)
+                (and (eval-node predicate (load (field node left)) stack depth all-depth)
+                     (eval-node predicate (load (field node right)) stack depth all-depth))
+              (= kind node-or)
+                (or (eval-node predicate (load (field node left)) stack depth all-depth)
+                    (eval-node predicate (load (field node right)) stack depth all-depth))
+              (= kind node-descendant)
+                (block :descendant
+                       (for [i 1 depth]
+                         (if (and (eval-node predicate (load (field node left)) stack i all-depth)
+                                  (eval-node predicate (load (field node right)) stack depth all-depth))
+                             (return-from :descendant true)
+                             0))
+                       false)
+              :else false))))
+
+(defn context-predicate-depth [(predicate ContextPredicate) (stack ContextStack)] (-> i64)
+  (if (not (load (field predicate valid)))
+      -1
+      (let [depth-count (al/al-len [ContextLayer] (load (field stack layers)))
+            (mut depth) depth-count]
+        (block :matched
+               (while (> (load depth) 0)
+                 (if (eval-node predicate (load (field predicate root)) stack (load depth) depth-count)
+                     (return-from :matched (load depth))
+                     (store! depth (- (load depth) 1))))
+               -1))))

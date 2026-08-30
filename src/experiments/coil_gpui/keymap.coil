@@ -2,6 +2,7 @@
 (import "coil.arraylist" :as al)
 (import "coil.alloc" :as alloc)
 (import "coil.primitive" :as primitive)
+(import "experiments.coil_gpui.key-context" :as context)
 
 (export KeyStroke
         KeyBinding
@@ -14,12 +15,17 @@
         keymap-bind-sequence!
         keymap-disable!
         keymap-disable-sequence!
+        keymap-bind-context!
+        keymap-bind-context-sequence!
+        keymap-disable-context!
         keymap-resolve
+        keymap-resolve-contexts
         keymap-version
         key-dispatcher-new
         key-dispatcher-free!
         key-dispatcher-reset!
         key-dispatcher-push!
+        key-dispatcher-push-contexts!
         modifier-shift
         modifier-control
         modifier-alt
@@ -42,12 +48,18 @@
   [(start i64)
    (length i64)
    (context i32)
+   (predicate-index i64)
    (action i32)
-   (disabled bool)])
+   (disabled bool)
+   (source-kind i32)
+   (source-id i64)
+   (source-line i64)
+   (source-column i64)])
 
 (defstruct Keymap
   [(strokes (al/ArrayList KeyStroke))
    (bindings (al/ArrayList KeyBinding))
+   (predicates (al/ArrayList context/ContextPredicate))
    (version i64)])
 
 (defstruct KeyResolution
@@ -55,7 +67,16 @@
    (matched bool)
    (pending bool)
    (depth i64)
-   (binding-index i64)])
+   (binding-index i64)
+   (disabled bool)
+   (source-kind i32)
+   (source-id i64)
+   (source-line i64)
+   (source-column i64)
+   (candidate-count i64)
+   (context-rejected-count i64)
+   (prefix-rejected-count i64)
+   (shadowed-count i64)])
 
 (defstruct KeyDispatcher [(input (al/ArrayList KeyStroke))])
 
@@ -64,11 +85,16 @@
     (do
       (store! (field keymap strokes) (al/al-new [KeyStroke] (alloc/malloc-allocator)))
       (store! (field keymap bindings) (al/al-new [KeyBinding] (alloc/malloc-allocator)))
+      (store! (field keymap predicates) (al/al-new [context/ContextPredicate] (alloc/malloc-allocator)))
       (store! (field keymap version) 0)
       (load keymap))))
 
 (defn keymap-free! [(keymap (mut Keymap))] (-> i64)
   (do
+    (let [predicates (load (field keymap predicates))]
+      (for [i 0 (al/al-len [context/ContextPredicate] predicates)]
+        (context/context-predicate-free! (mut (primitive/index (load (field predicates data)) i)))))
+    (al/al-free! [context/ContextPredicate] (mut (.predicates keymap)))
     (al/al-free! [KeyStroke] (mut (.strokes keymap)))
     (al/al-free! [KeyBinding] (mut (.bindings keymap)))))
 
@@ -107,8 +133,13 @@
                      (start i64)
                      (length i64)
                      (context i32)
+                     (predicate-index i64)
                      (action i32)
-                     (disabled bool)] (-> i64)
+                     (disabled bool)
+                     (source-kind i32)
+                     (source-id i64)
+                     (source-line i64)
+                     (source-column i64)] (-> i64)
   (let [(mut zero) (primitive/zeroed KeyBinding)]
     (do
       (al/al-push! [KeyBinding] (mut (.bindings keymap)) (load zero))
@@ -120,8 +151,13 @@
           (store! (field item start) start)
           (store! (field item length) length)
           (store! (field item context) context)
+          (store! (field item predicate-index) predicate-index)
           (store! (field item action) action)
           (store! (field item disabled) disabled)
+          (store! (field item source-kind) source-kind)
+          (store! (field item source-id) source-id)
+          (store! (field item source-line) source-line)
+          (store! (field item source-column) source-column)
           (set! (.version keymap) (+ (load (field keymap version)) 1))
           (al/al-len [KeyBinding] bindings))))))
 
@@ -137,7 +173,7 @@
           (push-stroke! (mut (.strokes keymap))
                         (load (field stroke key))
                         (load (field stroke modifiers)))))
-      (push-binding! (mut keymap) start length context action false))))
+      (push-binding! (mut keymap) start length context -1 action false 0 -1 0 0))))
 
 (defn keymap-disable-sequence! [(keymap (mut Keymap))
                                 (sequence (ptr KeyStroke))
@@ -150,7 +186,7 @@
           (push-stroke! (mut (.strokes keymap))
                         (load (field stroke key))
                         (load (field stroke modifiers)))))
-      (push-binding! (mut keymap) start length context 0 true))))
+      (push-binding! (mut keymap) start length context -1 0 true 0 -1 0 0))))
 
 (defn keymap-bind! [(keymap (mut Keymap))
                     (key i64)
@@ -173,6 +209,99 @@
       (store! (field stroke modifiers) modifiers)
       (keymap-disable-sequence! (mut keymap) stroke 1 context))))
 
+(defn push-context-predicate! [(keymap (mut Keymap))
+                               (source (slice u8))] (-> i64)
+  (let [(mut predicate) (context/context-predicate-parse source)]
+    (if (not (context/context-predicate-valid? (load predicate)))
+        (let [error-offset (context/context-predicate-error-offset (load predicate))]
+          (do
+            (context/context-predicate-free! (mut predicate))
+            (- 0 (+ error-offset 1))))
+        (do
+          (al/al-push! [context/ContextPredicate]
+                       (mut (.predicates keymap))
+                       (load predicate))
+          (- (al/al-len [context/ContextPredicate] (load (field keymap predicates))) 1)))))
+
+(defn keymap-bind-context-sequence! [(keymap (mut Keymap))
+                                     (sequence (ptr KeyStroke))
+                                     (length i64)
+                                     (predicate-source (slice u8))
+                                     (action i32)
+                                     (source-kind i32)
+                                     (source-id i64)
+                                     (source-line i64)
+                                     (source-column i64)
+                                     (disabled bool)] (-> i64)
+  (let [predicate-index (push-context-predicate! (mut keymap) predicate-source)]
+    (if (< predicate-index 0)
+        predicate-index
+        (let [start (al/al-len [KeyStroke] (load (field keymap strokes)))]
+          (do
+            (for [i 0 length]
+              (let [stroke (primitive/index sequence i)]
+                (push-stroke! (mut (.strokes keymap))
+                              (load (field stroke key))
+                              (load (field stroke modifiers)))))
+            (push-binding! (mut keymap)
+                           start
+                           length
+                           -1
+                           predicate-index
+                           action
+                           disabled
+                           source-kind
+                           source-id
+                           source-line
+                           source-column))))))
+
+(defn keymap-bind-context! [(keymap (mut Keymap))
+                            (key i64)
+                            (modifiers i32)
+                            (predicate-source (slice u8))
+                            (action i32)
+                            (source-kind i32)
+                            (source-id i64)
+                            (source-line i64)
+                            (source-column i64)] (-> i64)
+  (let [(mut stroke) (primitive/zeroed KeyStroke)]
+    (do
+      (store! (field stroke key) key)
+      (store! (field stroke modifiers) modifiers)
+      (keymap-bind-context-sequence! (mut keymap)
+                                     stroke
+                                     1
+                                     predicate-source
+                                     action
+                                     source-kind
+                                     source-id
+                                     source-line
+                                     source-column
+                                     false))))
+
+(defn keymap-disable-context! [(keymap (mut Keymap))
+                               (key i64)
+                               (modifiers i32)
+                               (predicate-source (slice u8))
+                               (source-kind i32)
+                               (source-id i64)
+                               (source-line i64)
+                               (source-column i64)] (-> i64)
+  (let [(mut stroke) (primitive/zeroed KeyStroke)]
+    (do
+      (store! (field stroke key) key)
+      (store! (field stroke modifiers) modifiers)
+      (keymap-bind-context-sequence! (mut keymap)
+                                     stroke
+                                     1
+                                     predicate-source
+                                     0
+                                     source-kind
+                                     source-id
+                                     source-line
+                                     source-column
+                                     true))))
+
 (defn context-depth [(context i32)
                      (contexts (ptr i32))
                      (context-count i64)] (-> i64)
@@ -185,6 +314,21 @@
                      (return-from :found (+ (load i) 1))
                      (store! i (- (load i) 1)))))
              -1)))
+
+(defn binding-context-depth [(keymap Keymap)
+                             (binding (ptr KeyBinding))
+                             (contexts (ptr i32))
+                             (context-count i64)
+                             (context-stack context/ContextStack)
+                             (has-context-stack bool)] (-> i64)
+  (let [predicate-index (load (field binding predicate-index))]
+    (if (>= predicate-index 0)
+        (if (not has-context-stack)
+            -1
+            (let [predicates (load (field keymap predicates))]
+              (context/context-predicate-depth (load (primitive/index (load (field predicates data)) predicate-index))
+                                               context-stack)))
+        (context-depth (load (field binding context)) contexts context-count))))
 
 (defn binding-prefix? [(keymap Keymap)
                        (binding (ptr KeyBinding))
@@ -212,22 +356,32 @@
                        (best-index i64)] (-> bool)
   (or (> depth best-depth) (and (= depth best-depth) (> index best-index))))
 
-(defn keymap-resolve [(keymap Keymap)
-                      (input (ptr KeyStroke))
-                      (input-count i64)
-                      (contexts (ptr i32))
-                      (context-count i64)] (-> KeyResolution)
+(defn keymap-resolve-inner [(keymap Keymap)
+                            (input (ptr KeyStroke))
+                            (input-count i64)
+                            (contexts (ptr i32))
+                            (context-count i64)
+                            (context-stack context/ContextStack)
+                            (has-context-stack bool)] (-> KeyResolution)
   (let [bindings (load (field keymap bindings))
         (mut best-depth) -1
         (mut best-index) -1
         (mut best-action) (primitive/cast i32 0)
         (mut best-disabled) false
         (mut pending-depth) -1
-        (mut pending-index) -1]
+        (mut pending-index) -1
+        (mut candidate-count) 0
+        (mut context-rejected-count) 0
+        (mut prefix-rejected-count) 0]
     (do
       (for [i 0 (al/al-len [KeyBinding] bindings)]
         (let [binding (primitive/index (load (field bindings data)) i)
-              depth (context-depth (load (field binding context)) contexts context-count)]
+              depth (binding-context-depth keymap binding contexts context-count context-stack has-context-stack)]
+          (if (< depth 0)
+              (set! context-rejected-count (+ (load context-rejected-count) 1))
+              (if (binding-prefix? keymap binding input input-count)
+                  (set! candidate-count (+ (load candidate-count) 1))
+                  (set! prefix-rejected-count (+ (load prefix-rejected-count) 1))))
           (if (and (>= depth 0) (binding-prefix? keymap binding input input-count))
               (if (= input-count (load (field binding length)))
                   (if (better-binding? depth i (load best-depth) (load best-index))
@@ -255,7 +409,46 @@
           (store! (field result pending) (>= (load pending-index) 0))
           (store! (field result depth) (load best-depth))
           (store! (field result binding-index) (load best-index))
+          (store! (field result disabled) (load best-disabled))
+          (store! (field result candidate-count) (load candidate-count))
+          (store! (field result context-rejected-count) (load context-rejected-count))
+          (store! (field result prefix-rejected-count) (load prefix-rejected-count))
+          (store! (field result shadowed-count)
+                  (if (>= (load best-index) 0) (- (load candidate-count) 1) 0))
+          (if (>= (load best-index) 0)
+              (let [winner (primitive/index (load (field bindings data)) (load best-index))]
+                (do
+                  (store! (field result source-kind) (load (field winner source-kind)))
+                  (store! (field result source-id) (load (field winner source-id)))
+                  (store! (field result source-line) (load (field winner source-line)))
+                  (store! (field result source-column) (load (field winner source-column)))))
+              (store! (field result source-id) -1))
           (load result))))))
+
+(defn keymap-resolve [(keymap Keymap)
+                      (input (ptr KeyStroke))
+                      (input-count i64)
+                      (contexts (ptr i32))
+                      (context-count i64)] (-> KeyResolution)
+  (keymap-resolve-inner keymap
+                        input
+                        input-count
+                        contexts
+                        context-count
+                        (primitive/zeroed context/ContextStack)
+                        false))
+
+(defn keymap-resolve-contexts [(keymap Keymap)
+                               (input (ptr KeyStroke))
+                               (input-count i64)
+                               (contexts context/ContextStack)] (-> KeyResolution)
+  (keymap-resolve-inner keymap
+                        input
+                        input-count
+                        (primitive/cast (ptr i32) 0)
+                        0
+                        contexts
+                        true))
 
 (defn key-dispatcher-push! [(dispatcher (mut KeyDispatcher))
                             (keymap Keymap)
@@ -290,6 +483,40 @@
                                     1
                                     contexts
                                     context-count)]
+              (do
+                (if (and (load (field retry matched)) (not (load (field retry pending))))
+                    (key-dispatcher-reset! (mut dispatcher))
+                    0)
+                retry)))))))
+
+(defn key-dispatcher-push-contexts! [(dispatcher (mut KeyDispatcher))
+                                     (keymap Keymap)
+                                     (key i64)
+                                     (modifiers i32)
+                                     (contexts context/ContextStack)] (-> KeyResolution)
+  (do
+    (push-stroke! (mut (.input dispatcher)) key modifiers)
+    (let [input (load (field dispatcher input))
+          first
+            (keymap-resolve-contexts keymap
+                                     (load (field input data))
+                                     (al/al-len [KeyStroke] input)
+                                     contexts)]
+      (if (or (load (field first matched)) (load (field first pending)))
+          (do
+            (if (and (load (field first matched)) (not (load (field first pending))))
+                (key-dispatcher-reset! (mut dispatcher))
+                0)
+            first)
+          (do
+            (key-dispatcher-reset! (mut dispatcher))
+            (push-stroke! (mut (.input dispatcher)) key modifiers)
+            (let [retry-input (load (field dispatcher input))
+                  retry
+                    (keymap-resolve-contexts keymap
+                                             (load (field retry-input data))
+                                             1
+                                             contexts)]
               (do
                 (if (and (load (field retry matched)) (not (load (field retry pending))))
                     (key-dispatcher-reset! (mut dispatcher))

@@ -162,6 +162,13 @@ layer in the runtime path.
 - Configurable keymaps with platform-independent modifiers, multi-stroke chords,
   global and stacked component contexts, deepest-context and latest-binding
   precedence, explicit disabled bindings, versioning, and failed-prefix retry.
+- GPUI-compatible key-context layers with identifiers and key/value attributes.
+  Context predicates are parsed once into an owned node arena and support `==`,
+  `!=`, `!`, `&&`, `||`, parentheses, and ancestor-descendant `>` matching;
+  dispatch evaluation reuses storage and allocates nothing. Bindings retain opaque
+  source kind/id plus line/column provenance, and every resolution reports the
+  winner, disabled shadow, candidate/rejection counts, and shadowed count for
+  deterministic shortcut inspection.
 - Typed retained entity stores with type/slot/generation identities, stale-handle
   rejection, slot reuse, deterministic destruction of owned values, ordered
   observation queues, generation-safe subscription cancellation, and optional
@@ -409,9 +416,6 @@ application. GPUI parity still requires substantial systems, notably:
   fills, butt-cap/miter strokes, affine transforms, analytic shadows, linear
   gradients, general raster images, virtual scrolling, and nested rectangular
   GPU clipping work);
-- keymap predicate expressions and source metadata
-  (hierarchical capture/target/bubble listeners with stop-propagation, focus
-  traversal, and logical actions work);
 - typed future values, worker-pool priority lanes and work stealing,
   non-image/remote asset sources,
   editable style inspection;
@@ -426,6 +430,8 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI image intrinsic render sizing](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/assets.rs)
 - [GPUI key dispatch](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/key_dispatch.rs)
 - [GPUI keymap precedence and matching](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/keymap.rs)
+- [GPUI key-context predicate language](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/keymap/context.rs)
+- [GPUI binding metadata indirection](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/keymap/binding.rs)
 - [GPUI retained entity map](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/app/entity_map.rs)
 - [GPUI subscriptions](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/subscription.rs)
 - [GPUI image element](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/elements/img.rs)
