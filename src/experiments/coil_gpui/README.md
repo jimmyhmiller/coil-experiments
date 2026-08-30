@@ -5,6 +5,18 @@ It talks directly to the Objective-C runtime, AppKit, QuartzCore, and Metal. The
 is no C, Objective-C, Swift, Rust, Python, wrapper library, or generated binding
 layer in the runtime path.
 
+## Attribution
+
+This project is inspired by [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui),
+the GPU-accelerated UI framework created by the Zed team. GPUI is copyright
+2022–2025 Zed Industries, Inc. and is licensed under the
+[Apache License 2.0](https://github.com/zed-industries/zed/blob/main/LICENSE-APACHE);
+the GPUI crate declares `Apache-2.0` in its package manifest. Its retained
+rendering, entity, input-context, windowing, and component ambitions informed
+this experiment. Coil GPU UI is an independent implementation written from
+scratch in Coil; it contains no copied GPUI source and is not affiliated with or
+endorsed by Zed Industries. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## What works
 
 - Reusable multi-window hosts own independent AppKit windows, views, retained
@@ -311,7 +323,7 @@ layer in the runtime path.
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
   batching, scheduler lifecycle and telemetry, frame profiling, ABI,
   allocation-reuse, upright CoreText glyph orientation, and deterministic Metal
-  pixel/event replay tests (114 total).
+  pixel/event replay tests (115 total).
 
 ## Architecture
 
