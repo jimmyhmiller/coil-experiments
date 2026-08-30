@@ -10,6 +10,7 @@
 (import "experiments.coil_gpui.retained" :as retained)
 (import "experiments.coil_gpui.reactive" :as reactive)
 (import "experiments.coil_gpui.inspector" :as inspector)
+(import "experiments.coil_gpui.scheduler" :as scheduler)
 (import "experiments.coil_gpui.editable" :as editable)
 (import "experiments.coil_gpui.ime" :as ime)
 (import "experiments.coil_gpui.accessibility" :as access)
@@ -29,7 +30,34 @@
 
 (defstruct NSPoint [(x f64) (y f64)])
 
-(defstruct DemoState [(checked bool) (slider f32) (progress f32)])
+(defstruct DemoState
+  [(checked bool)
+   (slider f32)
+   (progress f32)
+   (async-ready bool)
+   (async-result i64)])
+
+(defn demo-background-work [(raw (ptr i8)) (cancel (ptr i64))] (-> i64)
+  (let [iterations (load (primitive/cast (ptr i64) raw))
+        (mut checksum) 1469598103934665603
+        (mut i) 0]
+    (do
+      (while (and (< (load i) iterations)
+                  (not (scheduler/scheduler-cancel-requested? cancel)))
+        (do
+          (set! checksum (primitive/imul (^ (load checksum) (load i)) 1099511628211))
+          (set! i (+ (load i) 1))))
+      (load checksum))))
+
+(defn demo-background-complete [(raw (ptr i8)) (result i64) (cancelled i64)] (-> i64)
+  (let [state (primitive/cast (ptr DemoState) raw)]
+    (do
+      (when (= cancelled 0)
+        (do
+          (set! (field state async-result) result)
+          (set! (field state async-ready) true)
+          0))
+      0)))
 
 (defstruct Labels
   [(title text/ShapedLine)
@@ -208,6 +236,18 @@
                   (ui/rect 56.0 354.0 (- (/ width 2.0) 80.0) 12.0)
                   (ui/ProgressState :value (load (field state progress)))
                   5)
+    ;; This GPU badge is driven by a real Coil pthread task whose completion is
+    ;; delivered by the owner-thread scheduler. It turns green after the joined
+    ;; worker publishes its checksum.
+    (ui/scene-rounded-rect! (mut scene)
+                            (ui/rect (- (/ width 2.0) 10.0) 350.0 12.0 20.0)
+                            (if (load (field state async-ready))
+                                (ui/rgb 0.28 0.90 0.58)
+                                (ui/rgb 0.96 0.68 0.24))
+                            6.0
+                            0.0
+                            (ui/rgba 0.0 0.0 0.0 0.0)
+                            205)
     (ui/divider! (mut scene)
                  (ui/rect 56.0 398.0 (- (/ width 2.0) 80.0) 1.0)
                  (ui/DividerState :vertical false)
@@ -575,6 +615,8 @@
         (mut access-tree) (primitive/zeroed access/AccessTree)
         (mut drop-state) (primitive/zeroed drag/DropState)
         (mut frame-clock) (primitive/zeroed clock/FrameClock)
+        (mut task-scheduler) (primitive/zeroed scheduler/Scheduler)
+        async-input (primitive/alloc-stack i64)
         (mut editor-paragraph) (primitive/zeroed text/ShapedParagraph)
         (mut editor-revision) 0
         (mut editor-layout-width) (primitive/cast f32 0.0)
@@ -589,6 +631,8 @@
     (do
       (store! scene (ui/scene-new))
       (store! frame-clock (clock/frame-clock-new))
+      (store! task-scheduler (scheduler/scheduler-new))
+      (store! async-input 4000000)
       (store! damage-tracker (ui/damage-tracker-new))
       (store! router (input/router-new))
       (store! reactive-graph (reactive/reactive-graph-new))
@@ -748,7 +792,12 @@
       (let [state (retained/entity-store-get [DemoState] (mut state-store) (load state-id))]
         (do
           (set! (.checked state) true)
-          (set! (.slider state) 0.62)))
+          (set! (.slider state) 0.62)
+          (scheduler/scheduler-spawn! (mut task-scheduler)
+                                      (primitive/fnptr-of demo-background-work)
+                                      (primitive/fnptr-of demo-background-complete)
+                                      (primitive/cast (ptr i8) async-input)
+                                      (primitive/cast (ptr i8) state))))
       (if (not (metal/renderer-valid? renderer))
           (do (printf c"coil-gpui: Metal pipeline creation failed\n") 1)
           (do
@@ -807,6 +856,7 @@
                                                  (mut state-store)
                                                  (load state-id))]
                 (do
+                  (scheduler/scheduler-poll! (mut task-scheduler))
                   (set! width (primitive/cast f32 (load (field bounds w))))
                   (set! height (primitive/cast f32 (load (field bounds h))))
                   (metal/renderer-resize! (mut renderer) (load width) (load height) scale)
@@ -951,6 +1001,7 @@
       (keymap/keymap-free! (mut key-map))
       (keymap/key-dispatcher-free! (mut key-dispatcher))
       (reactive/reactive-graph-free! (mut reactive-graph))
+      (scheduler/scheduler-free! (mut task-scheduler))
       (retained/entity-store-free! [DemoState] (mut state-store))
       (clock/frame-clock-free! (mut frame-clock))
       (metal/renderer-free! (mut renderer))

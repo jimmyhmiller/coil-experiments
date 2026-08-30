@@ -1,0 +1,250 @@
+(module experiments.coil_gpui.scheduler)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.atomic" :as atomic)
+(import "coil.primitive" :as primitive)
+(import "coil.thread" :as thread)
+(import "coil.time" :as time)
+
+(export Scheduler
+        JobHandle
+        scheduler-new
+        scheduler-dispatch!
+        scheduler-at!
+        scheduler-after!
+        scheduler-spawn!
+        scheduler-cancel!
+        scheduler-cancel-requested?
+        scheduler-poll!
+        scheduler-poll-at!
+        scheduler-active-count
+        scheduler-free!)
+
+(extern malloc :cc c [u64] (-> (ptr i8)))
+(extern free :cc c [(ptr i8)] (-> void))
+
+;; Foreground jobs are invoked only by scheduler-poll! on the scheduler's owner
+;; thread. Background work receives a stable pointer to its atomic cancellation
+;; flag. Completion is likewise delivered only while polling on the owner thread.
+(defstruct JobHandle [(slot i64) (generation i64)])
+
+(defstruct BackgroundWork
+  [(worker (fnptr c [(ptr i8) (ptr i64)] i64))
+   (completion (fnptr c [(ptr i8) i64 i64] i64))
+   (worker-context (ptr i8))
+   (completion-context (ptr i8))
+   (result i64)
+   (cancel-requested i64)
+   (done i64)
+   (thread thread/Thread)
+   (started bool)])
+
+(defstruct ScheduledJob
+  [(generation i64)
+   (kind i64)
+   (deadline-ms i64)
+   (callback (fnptr c [(ptr i8)] i64))
+   (context (ptr i8))
+   (background (ptr BackgroundWork))])
+
+(defstruct Scheduler [(jobs (al/ArrayList ScheduledJob)) (active i64)])
+
+(defn null-work [] (-> (ptr BackgroundWork))
+  (primitive/cast (ptr BackgroundWork) 0))
+
+(defn null-context [] (-> (ptr i8))
+  (primitive/cast (ptr i8) 0))
+
+(defn empty-job [(generation i64)] (-> ScheduledJob)
+  (let [(mut job) (primitive/zeroed ScheduledJob)]
+    (do
+      (store! (field job generation) generation)
+      (load job))))
+
+(defn scheduler-new [] (-> Scheduler)
+  (Scheduler :jobs (al/al-new [ScheduledJob] (alloc/malloc-allocator)) :active 0))
+
+(defn scheduler-slot! [(scheduler (mut Scheduler))] (-> JobHandle)
+  (block :found
+    (do
+      (for [i 0 (al/al-len [ScheduledJob] (load (field scheduler jobs)))]
+        (let [job (al/al-elem [ScheduledJob] (field scheduler jobs) i)]
+          (when (= (load (field job kind)) 0)
+            (let [generation (+ (load (field job generation)) 1)]
+              (do
+                (store! job (empty-job generation))
+                (return-from :found (JobHandle :slot i :generation generation)))))))
+      (let [slot (al/al-len [ScheduledJob] (load (field scheduler jobs)))]
+        (do
+          (al/al-push! [ScheduledJob] (mut (field scheduler jobs)) (empty-job 1))
+          (JobHandle :slot slot :generation 1))))))
+
+(defn scheduler-job [(scheduler (mut Scheduler)) (handle JobHandle)] (-> (ptr ScheduledJob))
+  (let [slot (load (field handle slot))]
+    (if (or (< slot 0) (>= slot (al/al-len [ScheduledJob] (load (field scheduler jobs)))))
+        (primitive/cast (ptr ScheduledJob) 0)
+        (let [job (al/al-elem [ScheduledJob] (field scheduler jobs) slot)]
+          (if (and (!= (load (field job kind)) 0)
+                   (= (load (field job generation)) (load (field handle generation))))
+              job
+              (primitive/cast (ptr ScheduledJob) 0))))))
+
+(defn scheduler-activate! [(scheduler (mut Scheduler))
+                           (kind i64)
+                           (deadline-ms i64)
+                           (callback (fnptr c [(ptr i8)] i64))
+                           (context (ptr i8))] (-> JobHandle)
+  (let [handle (scheduler-slot! (mut scheduler))
+        job (al/al-elem [ScheduledJob] (field scheduler jobs) (load (field handle slot)))]
+    (do
+      (store! (field job kind) kind)
+      (store! (field job deadline-ms) deadline-ms)
+      (store! (field job callback) callback)
+      (store! (field job context) context)
+      (set! (field scheduler active) (+ (load (field scheduler active)) 1))
+      handle)))
+
+(defn scheduler-dispatch! [(scheduler (mut Scheduler))
+                            (callback (fnptr c [(ptr i8)] i64))
+                            (context (ptr i8))] (-> JobHandle)
+  (scheduler-activate! (mut scheduler) 1 0 callback context))
+
+(defn scheduler-after! [(scheduler (mut Scheduler))
+                         (delay-ms i64)
+                         (callback (fnptr c [(ptr i8)] i64))
+                         (context (ptr i8))] (-> JobHandle)
+  (let [now (match (time/monotonic-now-ms) (Ok [value] value) (Err [_] 0))
+        delay (if (< delay-ms 0) 0 delay-ms)]
+    (scheduler-activate! (mut scheduler) 2 (+ now delay) callback context)))
+
+(defn scheduler-at! [(scheduler (mut Scheduler))
+                      (deadline-ms i64)
+                      (callback (fnptr c [(ptr i8)] i64))
+                      (context (ptr i8))] (-> JobHandle)
+  (scheduler-activate! (mut scheduler) 2 deadline-ms callback context))
+
+(defn background-entry [(raw (ptr i8))] (-> (ptr i8))
+  (let [work (primitive/cast (ptr BackgroundWork) raw)
+        result (primitive/call-ptr (load (field work worker))
+                                   (load (field work worker-context))
+                                   (field work cancel-requested))]
+    (do
+      (atomic/atomic-store (field work result) result)
+      (atomic/atomic-store (field work done) 1)
+      (null-context))))
+
+(defn scheduler-spawn! [(scheduler (mut Scheduler))
+                         (worker (fnptr c [(ptr i8) (ptr i64)] i64))
+                         (completion (fnptr c [(ptr i8) i64 i64] i64))
+                         (worker-context (ptr i8))
+                         (completion-context (ptr i8))] (-> JobHandle)
+  (let [memory (malloc (primitive/cast u64 (primitive/sizeof BackgroundWork)))]
+    (if (= (primitive/cast i64 memory) 0)
+        (JobHandle :slot -1 :generation 0)
+        (let [work (primitive/cast (ptr BackgroundWork) memory)
+              handle (scheduler-slot! (mut scheduler))
+              job (al/al-elem [ScheduledJob] (field scheduler jobs) (load (field handle slot)))]
+          (do
+            (store! work (primitive/zeroed BackgroundWork))
+            (store! (field work worker) worker)
+            (store! (field work completion) completion)
+            (store! (field work worker-context) worker-context)
+            (store! (field work completion-context) completion-context)
+            (atomic/atomic-store (field work result) 0)
+            (atomic/atomic-store (field work cancel-requested) 0)
+            (atomic/atomic-store (field work done) 0)
+            (let [status (thread/thread-spawn (field work thread)
+                                               (primitive/fnptr-of background-entry)
+                                               memory)]
+              (if (= status 0)
+                  (do
+                    (store! (field work started) true)
+                    (store! (field job kind) 3)
+                    (store! (field job background) work)
+                    (set! (field scheduler active) (+ (load (field scheduler active)) 1))
+                    handle)
+                  (do
+                    (store! job (empty-job (load (field handle generation))))
+                    (free memory)
+                    (JobHandle :slot -1 :generation 0)))))))))
+
+(defn scheduler-cancel-requested? [(flag (ptr i64))] (-> bool)
+  (!= (atomic/atomic-load flag) 0))
+
+(defn scheduler-cancel! [(scheduler (mut Scheduler)) (handle JobHandle)] (-> bool)
+  (let [job (scheduler-job (mut scheduler) handle)]
+    (if (= (primitive/cast i64 job) 0)
+        false
+        (if (= (load (field job kind)) 3)
+            (do
+              (atomic/atomic-store (field (load (field job background)) cancel-requested) 1)
+              true)
+            (do
+              (store! job (empty-job (load (field job generation))))
+              (set! (field scheduler active) (- (load (field scheduler active)) 1))
+              true)))))
+
+(defn scheduler-complete-job! [(scheduler (mut Scheduler)) (job (ptr ScheduledJob))] (-> i64)
+  (let [generation (load (field job generation))]
+    (do
+      (store! job (empty-job generation))
+      (set! (field scheduler active) (- (load (field scheduler active)) 1))
+      0)))
+
+(defn scheduler-poll-at! [(scheduler (mut Scheduler)) (now-ms i64)] (-> i64)
+  (let [(mut completed) 0]
+    (do
+      (for [i 0 (al/al-len [ScheduledJob] (load (field scheduler jobs)))]
+        (let [job (al/al-elem [ScheduledJob] (field scheduler jobs) i)
+              kind (load (field job kind))]
+          (cond
+            (= kind 1)
+              (let [callback (load (field job callback)) context (load (field job context))]
+                (do
+                  (scheduler-complete-job! (mut scheduler) job)
+                  (primitive/call-ptr callback context)
+                  (set! completed (+ (load completed) 1))))
+            (and (= kind 2) (>= now-ms (load (field job deadline-ms))))
+              (let [callback (load (field job callback)) context (load (field job context))]
+                (do
+                  (scheduler-complete-job! (mut scheduler) job)
+                  (primitive/call-ptr callback context)
+                  (set! completed (+ (load completed) 1))))
+            (= kind 3)
+              (let [work (load (field job background))]
+                (when (!= (atomic/atomic-load (field work done)) 0)
+                  (let [completion (load (field work completion))
+                        context (load (field work completion-context))
+                        result (atomic/atomic-load (field work result))
+                        cancelled (atomic/atomic-load (field work cancel-requested))]
+                    (do
+                      (thread/thread-join (field work thread))
+                      (scheduler-complete-job! (mut scheduler) job)
+                      (primitive/call-ptr completion context result cancelled)
+                      (free (primitive/cast (ptr i8) work))
+                      (set! completed (+ (load completed) 1))))))
+            :else 0)))
+      (load completed))))
+
+(defn scheduler-poll! [(scheduler (mut Scheduler))] (-> i64)
+  (match (time/monotonic-now-ms)
+    (Ok [now] (scheduler-poll-at! (mut scheduler) now))
+    (Err [_] (scheduler-poll-at! (mut scheduler) 0))))
+
+(defn scheduler-active-count [(scheduler Scheduler)] (-> i64)
+  (load (field scheduler active)))
+
+(defn scheduler-free! [(scheduler (mut Scheduler))] (-> i64)
+  (do
+    (for [i 0 (al/al-len [ScheduledJob] (load (field scheduler jobs)))]
+      (let [job (al/al-elem [ScheduledJob] (field scheduler jobs) i)]
+        (when (= (load (field job kind)) 3)
+          (let [work (load (field job background))]
+            (do
+              (atomic/atomic-store (field work cancel-requested) 1)
+              (thread/thread-join (field work thread))
+              (free (primitive/cast (ptr i8) work))
+              0)))))
+    (al/al-free! [ScheduledJob] (mut (field scheduler jobs)))
+    (store! (field scheduler active) 0)
+    0))

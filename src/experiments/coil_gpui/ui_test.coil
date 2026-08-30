@@ -23,12 +23,118 @@
 (import "experiments.coil_gpui.entity" :as entity)
 (import "experiments.coil_gpui.reactive" :as reactive)
 (import "experiments.coil_gpui.inspector" :as inspector)
+(import "experiments.coil_gpui.scheduler" :as scheduler)
 
 (extern MTLCreateSystemDefaultDevice :cc c [] (-> (ptr i8)))
 
 (extern objc_getProtocol :cc c [(ptr i8)] (-> (ptr i8)))
 
+(extern usleep :cc c [i64] (-> i32))
+
 (defstruct AccessRect64 [(x f64) (y f64) (w f64) (h f64)])
+
+(defstruct SchedulerProbe [(calls i64) (result i64) (cancelled i64)])
+
+(defn scheduler-test-foreground [(raw (ptr i8))] (-> i64)
+  (let [probe (primitive/cast (ptr SchedulerProbe) raw)]
+    (do
+      (set! (field probe calls) (+ (load (field probe calls)) 1))
+      0)))
+
+(defn scheduler-test-background [(raw (ptr i8)) (cancel (ptr i64))] (-> i64)
+  (let [input (primitive/cast (ptr i64) raw)]
+    (if (scheduler/scheduler-cancel-requested? cancel) -1 (* (load input) 7))))
+
+(defn scheduler-test-cancellable [(raw (ptr i8)) (cancel (ptr i64))] (-> i64)
+  (do
+    (while (not (scheduler/scheduler-cancel-requested? cancel)) 0)
+    9))
+
+(defn scheduler-test-completion [(raw (ptr i8)) (result i64) (cancelled i64)] (-> i64)
+  (let [probe (primitive/cast (ptr SchedulerProbe) raw)]
+    (do
+      (set! (field probe calls) (+ (load (field probe calls)) 1))
+      (set! (field probe result) result)
+      (set! (field probe cancelled) cancelled)
+      0)))
+
+(deftest scheduler-orders-owner-thread-work-and-rejects-stale-handles
+         (let [(mut executor) (scheduler/scheduler-new)
+               probe (primitive/alloc-stack SchedulerProbe)
+               immediate (scheduler/scheduler-dispatch! (mut executor)
+                                                          (primitive/fnptr-of scheduler-test-foreground)
+                                                          (primitive/cast (ptr i8) probe))
+               future (scheduler/scheduler-at! (mut executor)
+                                                200
+                                                (primitive/fnptr-of scheduler-test-foreground)
+                                                (primitive/cast (ptr i8) probe))]
+           (store! probe (primitive/zeroed SchedulerProbe))
+           (assert-eq (scheduler/scheduler-active-count (load executor)) 2)
+           (assert-eq (scheduler/scheduler-poll-at! (mut executor) 100) 1)
+           (assert-eq (load (field probe calls)) 1)
+           (assert (not (scheduler/scheduler-cancel! (mut executor) immediate)))
+           (assert (scheduler/scheduler-cancel! (mut executor) future))
+           (assert-eq (scheduler/scheduler-active-count (load executor)) 0)
+           ;; Reusing the slot increments its generation, so the old handle can
+           ;; never cancel an unrelated successor.
+           (let [successor (scheduler/scheduler-dispatch! (mut executor)
+                                                           (primitive/fnptr-of scheduler-test-foreground)
+                                                           (primitive/cast (ptr i8) probe))]
+             (assert (not (scheduler/scheduler-cancel! (mut executor) future)))
+             (assert (scheduler/scheduler-cancel! (mut executor) successor)))
+           (scheduler/scheduler-free! (mut executor))))
+
+(deftest scheduler-joins-background-work-before-owner-thread-completion
+         (let [(mut executor) (scheduler/scheduler-new)
+               input (primitive/alloc-stack i64)
+               probe (primitive/alloc-stack SchedulerProbe)]
+           (do
+             (store! input 6)
+             (store! probe (primitive/zeroed SchedulerProbe))
+             (let [handle (scheduler/scheduler-spawn! (mut executor)
+                                                      (primitive/fnptr-of scheduler-test-background)
+                                                      (primitive/fnptr-of scheduler-test-completion)
+                                                      (primitive/cast (ptr i8) input)
+                                                      (primitive/cast (ptr i8) probe))
+                   (mut attempts) 0]
+               (do
+                 (assert (>= (load (field handle slot)) 0))
+                 ;; The worker is real pthread work. Polling delivers its result on
+                 ;; this owner thread, and the scheduler joins it before the callback.
+                 (while (and (= (load (field probe calls)) 0) (< (load attempts) 1000))
+                   (do
+                     (scheduler/scheduler-poll-at! (mut executor) 0)
+                     (usleep 1000)
+                     (set! attempts (+ (load attempts) 1))))
+                 (assert-eq (load (field probe calls)) 1)
+                 (assert-eq (load (field probe result)) 42)
+                 (assert-eq (load (field probe cancelled)) 0)
+                 (assert-eq (scheduler/scheduler-active-count (load executor)) 0)
+                 (scheduler/scheduler-free! (mut executor)))))))
+
+(deftest scheduler-cancellation-is-cooperative-and-completion-is-owner-delivered
+         (let [(mut executor) (scheduler/scheduler-new)
+               probe (primitive/alloc-stack SchedulerProbe)]
+           (do
+             (store! probe (primitive/zeroed SchedulerProbe))
+             (let [handle (scheduler/scheduler-spawn! (mut executor)
+                                                      (primitive/fnptr-of scheduler-test-cancellable)
+                                                      (primitive/fnptr-of scheduler-test-completion)
+                                                      (primitive/cast (ptr i8) 0)
+                                                      (primitive/cast (ptr i8) probe))
+                   (mut attempts) 0]
+               (do
+                 (assert (scheduler/scheduler-cancel! (mut executor) handle))
+                 (while (and (= (load (field probe calls)) 0) (< (load attempts) 1000))
+                   (do
+                     (scheduler/scheduler-poll-at! (mut executor) 0)
+                     (usleep 1000)
+                     (set! attempts (+ (load attempts) 1))))
+                 (assert-eq (load (field probe calls)) 1)
+                 (assert-eq (load (field probe result)) 9)
+                 (assert-eq (load (field probe cancelled)) 1)
+                 (assert-eq (scheduler/scheduler-active-count (load executor)) 0)
+                 (scheduler/scheduler-free! (mut executor)))))))
 
 (defn test-keystroke-push! [(strokes (mut (al/ArrayList keymap/KeyStroke)))
                             (key i64)

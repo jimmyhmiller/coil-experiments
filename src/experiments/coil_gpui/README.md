@@ -130,13 +130,22 @@ layer in the runtime path.
   pointer, cycles through occluded candidates with the scroll wheel, reports
   hierarchy depth and scene counts, and overlays selected and parent bounds without
   introducing native inspection views.
+- A Coil-native UI scheduler with generation-checked cancellable handles,
+  owner-thread foreground and monotonic timer queues, and pthread-backed background
+  work. Background control blocks are heap-stable, cross-thread state is atomic,
+  workers receive cooperative cancellation, and every worker is joined before its
+  completion callback or storage release. The demo computes a checksum off-thread
+  and paints its owner-thread completion as a GPU status badge.
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
-  batching, ABI, and allocation-reuse tests.
+  batching, scheduler lifecycle, ABI, and allocation-reuse tests (74 total).
 
 ## Architecture
 
 ```text
 retained application state
+        |
+        v
+foreground/timer queue <- joined background Coil tasks
         |
         v
 flex/grid layout -> component functions rebuild a transient Scene each frame
@@ -226,7 +235,7 @@ translate directly into one draw for all adjacent labels on an atlas page.
 
 The release scene benchmark rebuilds 1,049 paint primitives, emits 99 retained
 paragraph glyph sprites, and advances a 100,000-row virtual list. On the development
-Apple Silicon machine it measured **6,481 ns/frame** across 5,000 frames. This measures
+Apple Silicon machine it measured **6,414 ns/frame** across 5,000 frames. This measures
 Coil scene construction, retained-text recording, and visible-range calculation—not
 GPU presentation or display latency. The benchmark is checked in as `bench.coil` so
 results remain reproducible and comparable.
@@ -281,8 +290,9 @@ application. GPUI parity still requires substantial systems, notably:
   ranges, and accessibility text actions
   (hierarchical capture/target/bubble listeners with stop-propagation, focus
   traversal, and logical actions work);
-- callback-driven entity subscriptions, async executor integration, non-image/
-  remote asset sources, editable style inspection, deterministic UI
+- callback-driven entity subscriptions, structured future/task scopes, a bounded
+  reusable worker pool with work stealing, non-image/remote asset sources,
+  editable style inspection, deterministic UI
   tests, and multiple windows;
 - persistent partial-presentation backing, multi-page texture-atlas eviction,
   and deeper GPU/CPU profiling.
@@ -297,6 +307,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI keymap precedence and matching](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/keymap.rs)
 - [GPUI retained entity map](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/app/entity_map.rs)
 - [GPUI subscriptions](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/subscription.rs)
+- [GPUI foreground/background executor](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/executor.rs)
 - [GPUI text system](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/text_system.rs)
 - [Apple CoreText line API](https://developer.apple.com/documentation/coretext/ctline)
 - [GPUI window, focus, and hitbox model](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/window.rs)
