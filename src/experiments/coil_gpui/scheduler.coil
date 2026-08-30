@@ -9,6 +9,7 @@
 
 (export Scheduler
         JobHandle
+        TaskScope
         scheduler-new
         scheduler-new-with-workers
         scheduler-worker-count
@@ -18,11 +19,21 @@
         scheduler-after!
         scheduler-spawn!
         scheduler-cancel!
+        scheduler-handle-active?
         scheduler-cancel-requested?
         scheduler-poll!
         scheduler-poll-at!
         scheduler-active-count
-        scheduler-free!)
+        scheduler-free!
+        task-scope-new
+        task-scope-dispatch!
+        task-scope-after!
+        task-scope-spawn!
+        task-scope-prune!
+        task-scope-cancel!
+        task-scope-active-count
+        task-scope-closed?
+        task-scope-free!)
 
 (extern malloc :cc c [u64] (-> (ptr i8)))
 (extern free :cc c [(ptr i8)] (-> void))
@@ -31,6 +42,8 @@
 ;; thread. Background work receives a stable pointer to its atomic cancellation
 ;; flag. Completion is likewise delivered only while polling on the owner thread.
 (defstruct JobHandle [(slot i64) (generation i64)])
+
+(defstruct TaskScope [(handles (al/ArrayList JobHandle)) (closed bool)])
 
 (defstruct BackgroundWork
   [(worker (fnptr c [(ptr i8) (ptr i64)] i64))
@@ -315,6 +328,9 @@
               (set! (field scheduler active) (- (load (field scheduler active)) 1))
               true)))))
 
+(defn scheduler-handle-active? [(scheduler (mut Scheduler)) (handle JobHandle)] (-> bool)
+  (!= (primitive/cast i64 (scheduler-job (mut scheduler) handle)) 0))
+
 (defn scheduler-complete-job! [(scheduler (mut Scheduler)) (job (ptr ScheduledJob))] (-> i64)
   (let [generation (load (field job generation))]
     (do
@@ -400,4 +416,88 @@
     (al/al-free! [thread/Thread] (mut (field scheduler workers)))
     (al/al-free! [ScheduledJob] (mut (field scheduler jobs)))
     (store! (field scheduler active) 0)
+    0))
+
+(defn task-scope-new [] (-> TaskScope)
+  (TaskScope :handles (al/al-new [JobHandle] (alloc/malloc-allocator)) :closed false))
+
+(defn invalid-handle [] (-> JobHandle)
+  (JobHandle :slot -1 :generation 0))
+
+(defn task-scope-track! [(scope (mut TaskScope)) (handle JobHandle)] (-> JobHandle)
+  (do
+    (when (>= (load (field handle slot)) 0)
+      (al/al-push! [JobHandle] (mut (field scope handles)) handle))
+    handle))
+
+(defn task-scope-dispatch! [(scope (mut TaskScope))
+                            (scheduler (mut Scheduler))
+                            (callback (fnptr c [(ptr i8)] i64))
+                            (context (ptr i8))] (-> JobHandle)
+  (if (load (field scope closed))
+      (invalid-handle)
+      (task-scope-track! (mut scope)
+                         (scheduler-dispatch! (mut scheduler) callback context))))
+
+(defn task-scope-after! [(scope (mut TaskScope))
+                         (scheduler (mut Scheduler))
+                         (delay-ms i64)
+                         (callback (fnptr c [(ptr i8)] i64))
+                         (context (ptr i8))] (-> JobHandle)
+  (if (load (field scope closed))
+      (invalid-handle)
+      (task-scope-track! (mut scope)
+                         (scheduler-after! (mut scheduler) delay-ms callback context))))
+
+(defn task-scope-spawn! [(scope (mut TaskScope))
+                         (scheduler (mut Scheduler))
+                         (worker (fnptr c [(ptr i8) (ptr i64)] i64))
+                         (completion (fnptr c [(ptr i8) i64 i64] i64))
+                         (worker-context (ptr i8))
+                         (completion-context (ptr i8))] (-> JobHandle)
+  (if (load (field scope closed))
+      (invalid-handle)
+      (task-scope-track! (mut scope)
+                         (scheduler-spawn! (mut scheduler)
+                                           worker
+                                           completion
+                                           worker-context
+                                           completion-context))))
+
+(defn task-scope-prune! [(scope (mut TaskScope)) (scheduler (mut Scheduler))] (-> i64)
+  (let [(mut write) 0
+        count (al/al-len [JobHandle] (load (field scope handles)))]
+    (do
+      (for [read 0 count]
+        (let [handle (al/al-get [JobHandle] (load (field scope handles)) read)]
+          (when (scheduler-handle-active? (mut scheduler) handle)
+            (do
+              (when (!= (load write) read)
+                (al/al-set! [JobHandle] (mut (field scope handles)) (load write) handle))
+              (set! write (+ (load write) 1))))))
+      (store! (field (field scope handles) len) (load write))
+      (load write))))
+
+(defn task-scope-cancel! [(scope (mut TaskScope)) (scheduler (mut Scheduler))] (-> i64)
+  (let [(mut cancelled) 0]
+    (do
+      (store! (field scope closed) true)
+      (for [i 0 (al/al-len [JobHandle] (load (field scope handles)))]
+        (when (scheduler-cancel! (mut scheduler)
+                                 (al/al-get [JobHandle] (load (field scope handles)) i))
+          (set! cancelled (+ (load cancelled) 1))))
+      (al/al-clear! [JobHandle] (mut (field scope handles)))
+      (load cancelled))))
+
+(defn task-scope-active-count [(scope (mut TaskScope))
+                               (scheduler (mut Scheduler))] (-> i64)
+  (task-scope-prune! (mut scope) (mut scheduler)))
+
+(defn task-scope-closed? [(scope TaskScope)] (-> bool)
+  (load (field scope closed)))
+
+(defn task-scope-free! [(scope (mut TaskScope)) (scheduler (mut Scheduler))] (-> i64)
+  (do
+    (task-scope-cancel! (mut scope) (mut scheduler))
+    (al/al-free! [JobHandle] (mut (field scope handles)))
     0))

@@ -140,8 +140,12 @@ layer in the runtime path.
   semaphore, waking both active display pacing and the occluded fallback without
   exposing UI state across threads. The demo computes a checksum off-thread and
   paints its owner-thread completion as a GPU status badge.
+- Structured task scopes group foreground, timed, and background work under one
+  lifecycle. They prune completed generation handles, reject additions after
+  closure, and cooperatively cancel all remaining jobs before releasing their own
+  storage. The demo owns its background checksum through such a scope.
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
-  batching, scheduler lifecycle, ABI, and allocation-reuse tests (76 total).
+  batching, scheduler lifecycle, ABI, and allocation-reuse tests (77 total).
 
 ## Architecture
 
@@ -303,7 +307,7 @@ application. GPUI parity still requires substantial systems, notably:
   ranges, and accessibility text actions
   (hierarchical capture/target/bubble listeners with stop-propagation, focus
   traversal, and logical actions work);
-- callback-driven entity subscriptions, structured future/task scopes, worker-pool
+- callback-driven entity subscriptions, typed future values, worker-pool
   priority lanes and work stealing, non-image/remote asset sources,
   editable style inspection, deterministic UI
   tests, and multiple windows;
