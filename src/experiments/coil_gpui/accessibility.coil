@@ -1,6 +1,8 @@
 (module experiments.coil_gpui.accessibility)
 (import "experiments.coil_gpui.objc" :use *)
 (import "experiments.coil_gpui.ui" :as ui)
+(import "experiments.coil_gpui.text" :as text)
+(import "experiments.coil_gpui.editable" :as editable)
 (import "coil.arraylist" :as al)
 (import "coil.alloc" :as alloc)
 (import "coil.primitive" :as primitive)
@@ -22,6 +24,7 @@
         access-tree-node
         access-node-set-value!
         access-node-set-text!
+        access-node-bind-editable-text!
         access-node-set-focused!
         access-tree-take-action!
         access-tree-free!)
@@ -45,6 +48,8 @@
 (extern NSAccessibilityPostNotification :cc c [(ptr i8) (ptr i8)] (-> void))
 
 (defstruct NSRect [(x f64) (y f64) (w f64) (h f64)])
+(defstruct NSPoint [(x f64) (y f64)])
+(defstruct NSRange [(location u64) (length u64)])
 
 (defn RoleButton [] (-> i32)
   1)
@@ -94,7 +99,11 @@
    (minimum f64)
    (maximum f64)
    (enabled bool)
-   (focused bool)])
+   (focused bool)
+   (text-field (ptr editable/TextField))
+   (text-layout (ptr text/ShapedParagraph))
+   (text-origin-x f32)
+   (text-origin-y f32)])
 
 (defn nsstr [(bytes (ptr i8))] (-> (ptr i8))
   (if (= (primitive/cast i64 bytes) 0)
@@ -193,6 +202,164 @@
         local
         (msg NSRect window (sel c"convertRectToScreen:") [NSRect] local))))
 
+(defn node-has-text? [(node (ptr AccessNode))] (-> bool)
+  (and (!= (primitive/cast i64 (load (field node text-field))) 0)
+       (!= (primitive/cast i64 (load (field node text-layout))) 0)))
+
+(defn node-text-length-utf16 [(node (ptr AccessNode))] (-> i64)
+  (if (not (node-has-text? node)) 0
+      (let [field (load (field node text-field))]
+        (text/utf8-index-to-utf16 (editable/text-field-bytes (load field))
+                                  (editable/text-field-length (load field))))))
+
+(defn clamp-range [(node (ptr AccessNode)) (range NSRange)] (-> NSRange)
+  (let [total (node-text-length-utf16 node)
+        location (let [v (primitive/cast i64 (load (field range location)))]
+                   (cond (< v 0) 0 (> v total) total :else v))
+        requested-end (+ location (primitive/cast i64 (load (field range length))))
+        end (if (> requested-end total) total requested-end)]
+    (NSRange :location (primitive/cast u64 location)
+             :length (primitive/cast u64 (- end location)))))
+
+(defn node-number-of-characters [(self (ptr i8)) (command (ptr i8))] (-> i64)
+  (node-text-length-utf16 (node-state self)))
+
+(defn node-selected-text-range [(self (ptr i8)) (command (ptr i8))] (-> NSRange)
+  (let [node (node-state self)]
+    (if (not (node-has-text? node))
+        (NSRange :location 0 :length 0)
+        (let [field (load (field node text-field))
+              value (load field)
+              bytes (editable/text-field-bytes value)
+              start (text/utf8-index-to-utf16 bytes
+                                               (editable/text-field-selection-start value))
+              end (text/utf8-index-to-utf16 bytes
+                                             (editable/text-field-selection-end value))]
+          (NSRange :location (primitive/cast u64 start)
+                   :length (primitive/cast u64 (- end start)))))))
+
+(defn node-set-selected-text-range [(self (ptr i8))
+                                    (command (ptr i8))
+                                    (location u64)
+                                    (length u64)] (-> void)
+  (let [node (node-state self)
+        requested (NSRange :location location :length length)]
+    (do
+      (if (node-has-text? node)
+          (let [range (clamp-range node requested)
+                field (load (field node text-field))
+                bytes (editable/text-field-bytes (load field))
+                start (text/utf16-index-to-utf8
+                        bytes (primitive/cast i64 (load (field range location))))
+                end (text/utf16-index-to-utf8
+                      bytes (+ (primitive/cast i64 (load (field range location)))
+                               (primitive/cast i64 (load (field range length)))))]
+            (do
+              (editable/text-field-select! field start end)
+              (notify! node c"AXSelectedTextChanged")
+              0))
+          0)
+      0)))
+
+(defn node-string-for-range-value [(node (ptr AccessNode))
+                                   (requested NSRange)] (-> (ptr i8))
+  (if (not (node-has-text? node))
+      (nsstr c"")
+      (let [range (clamp-range node requested)
+            field (load (field node text-field))
+            string (nsstr (editable/text-field-bytes (load field)))]
+        (msg (ptr i8) string (sel c"substringWithRange:") [NSRange] range))))
+
+(defn node-selected-text [(self (ptr i8)) (command (ptr i8))] (-> (ptr i8))
+  (node-string-for-range-value (node-state self) (node-selected-text-range self command)))
+
+(defn node-string-for-range [(self (ptr i8))
+                             (command (ptr i8))
+                             (location u64)
+                             (length u64)] (-> (ptr i8))
+  (node-string-for-range-value (node-state self)
+                               (NSRange :location location :length length)))
+
+(defn node-attributed-string-for-range [(self (ptr i8))
+                                        (command (ptr i8))
+                                        (location u64)
+                                        (length u64)] (-> (ptr i8))
+  (msg (ptr i8)
+       (msg (ptr i8)
+            (msg (ptr i8) (class c"NSAttributedString") (sel c"alloc") [])
+            (sel c"initWithString:") [(ptr i8)]
+            (node-string-for-range-value
+              (node-state self) (NSRange :location location :length length)))
+       (sel c"autorelease") []))
+
+(defn node-screen-frame-for-ui-rect [(node (ptr AccessNode)) (rect ui/Rect)] (-> NSRect)
+  (let [tree (load (field node tree))
+        view (load (field tree view))
+        view-bounds (msg NSRect view (sel c"bounds") [])
+        local (NSRect
+                :x (primitive/cast f64 (load (field rect x)))
+                :y (- (load (field view-bounds h))
+                      (primitive/cast f64 (+ (load (field rect y)) (load (field rect h)))))
+                :w (primitive/cast f64 (load (field rect w)))
+                :h (primitive/cast f64 (load (field rect h))))
+        window (msg (ptr i8) view (sel c"window") [])]
+    (if (= (primitive/cast i64 window) 0) local
+        (msg NSRect window (sel c"convertRectToScreen:") [NSRect] local))))
+
+(defn node-frame-for-range [(self (ptr i8))
+                            (command (ptr i8))
+                            (location u64)
+                            (length u64)] (-> NSRect)
+  (let [node (node-state self)
+        requested (NSRange :location location :length length)]
+    (if (not (node-has-text? node)) (node-frame self command)
+        (let [range (clamp-range node requested)
+              field (load (field node text-field))
+              bytes (editable/text-field-bytes (load field))
+              start (text/utf16-index-to-utf8
+                      bytes (primitive/cast i64 (load (field range location))))
+              end (text/utf16-index-to-utf8
+                    bytes (+ (primitive/cast i64 (load (field range location)))
+                             (primitive/cast i64 (load (field range length)))))
+              bounds (text/shaped-paragraph-selection-bounds
+                       (load (load (field node text-layout))) start end
+                       (load (field node text-origin-x))
+                       (load (field node text-origin-y)))]
+          (node-screen-frame-for-ui-rect node bounds)))))
+
+(defn node-range-for-position [(self (ptr i8))
+                               (command (ptr i8))
+                               (screen-x f64)
+                               (screen-y f64)] (-> NSRange)
+  (let [node (node-state self)
+        screen-point (NSPoint :x screen-x :y screen-y)]
+    (if (not (node-has-text? node)) (NSRange :location 0 :length 0)
+        (let [tree (load (field node tree))
+              view (load (field tree view))
+              window (msg (ptr i8) view (sel c"window") [])
+              screen-rect (NSRect :x (load (field screen-point x))
+                                  :y (load (field screen-point y)) :w 0.0 :h 0.0)
+              window-rect (if (= (primitive/cast i64 window) 0) (load screen-rect)
+                              (msg NSRect window (sel c"convertRectFromScreen:")
+                                   [NSRect] screen-rect))
+              local (msg NSPoint view (sel c"convertPoint:fromView:")
+                         [NSPoint (ptr i8)]
+                         (NSPoint :x (load (field window-rect x))
+                                  :y (load (field window-rect y)))
+                         (primitive/cast (ptr i8) 0))
+              view-bounds (msg NSRect view (sel c"bounds") [])
+              x (- (primitive/cast f32 (load (field local x)))
+                   (load (field node text-origin-x)))
+              y (- (primitive/cast f32 (- (load (field view-bounds h))
+                                            (load (field local y))))
+                   (load (field node text-origin-y)))
+              byte-index (text/shaped-paragraph-index-for-point
+                           (load (load (field node text-layout))) x y)
+              utf16 (text/utf8-index-to-utf16
+                      (editable/text-field-bytes (load (load (field node text-field))))
+                      byte-index)]
+          (NSRange :location (primitive/cast u64 utf16) :length 0)))))
+
 (defn queue-action! [(node (ptr AccessNode)) (action i32)] (-> i64)
   (let [tree (load (field node tree))]
     (do
@@ -270,6 +437,39 @@
                          c"accessibilityFrame"
                          (primitive/cast (ptr i8) (primitive/fnptr-of node-frame))
                          c"{CGRect={CGPoint=dd}{CGSize=dd}}@:")
+            (add-method! element-class
+                         c"accessibilityNumberOfCharacters"
+                         (primitive/cast (ptr i8) (primitive/fnptr-of node-number-of-characters))
+                         c"q@:")
+            (add-method! element-class
+                         c"accessibilitySelectedTextRange"
+                         (primitive/cast (ptr i8) (primitive/fnptr-of node-selected-text-range))
+                         c"{_NSRange=QQ}@:")
+            (add-method! element-class
+                         c"setAccessibilitySelectedTextRange:"
+                         (primitive/cast (ptr i8) (primitive/fnptr-of node-set-selected-text-range))
+                         c"v@:{_NSRange=QQ}")
+            (add-method! element-class
+                         c"accessibilitySelectedText"
+                         (primitive/cast (ptr i8) (primitive/fnptr-of node-selected-text))
+                         c"@@:")
+            (add-method! element-class
+                         c"accessibilityStringForRange:"
+                         (primitive/cast (ptr i8) (primitive/fnptr-of node-string-for-range))
+                         c"@@:{_NSRange=QQ}")
+            (add-method! element-class
+                         c"accessibilityAttributedStringForRange:"
+                         (primitive/cast (ptr i8)
+                                         (primitive/fnptr-of node-attributed-string-for-range))
+                         c"@@:{_NSRange=QQ}")
+            (add-method! element-class
+                         c"accessibilityFrameForRange:"
+                         (primitive/cast (ptr i8) (primitive/fnptr-of node-frame-for-range))
+                         c"{CGRect={CGPoint=dd}{CGSize=dd}}@:{_NSRange=QQ}")
+            (add-method! element-class
+                         c"accessibilityRangeForPosition:"
+                         (primitive/cast (ptr i8) (primitive/fnptr-of node-range-for-position))
+                         c"{_NSRange=QQ}@:{CGPoint=dd}")
             (add-method! element-class
                          c"accessibilityPerformPress"
                          (primitive/cast (ptr i8) (primitive/fnptr-of node-perform-press))
@@ -378,6 +578,18 @@
         (do
           (store! (field node revision) revision)
           (notify! node c"AXValueChanged")))))
+
+(defn access-node-bind-editable-text! [(node (ptr AccessNode))
+                                       (field (ptr editable/TextField))
+                                       (layout (ptr text/ShapedParagraph))
+                                       (origin-x f32)
+                                       (origin-y f32)] (-> i64)
+  (do
+    (store! (field node text-field) field)
+    (store! (field node text-layout) layout)
+    (store! (field node text-origin-x) origin-x)
+    (store! (field node text-origin-y) origin-y)
+    0))
 
 (defn access-node-set-focused! [(node (ptr AccessNode)) (focused bool)] (-> i64)
   (if (= (load (field node focused)) focused)

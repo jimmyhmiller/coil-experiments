@@ -200,6 +200,11 @@ layer in the runtime path.
   subclasses. Components expose native roles, labels, stable identifiers, values,
   ranges, enabled/focused state, screen-space bounds, change notifications, and
   press/increment/decrement actions that return through the Coil action router.
+- Editable accessibility nodes bind directly to the live UTF-8 editor and shaped
+  multiline paragraph. AppKit receives UTF-16 character counts, selected ranges,
+  selected/plain/attributed substrings, range-to-screen geometry, and
+  screen-position-to-range mapping; assistive selection writes convert back to
+  exact UTF-8 boundaries and emit native selection-change notifications.
 - GPU text labels integrated with the reusable scene and demo components.
 - Mouse hover, press, release, checkbox toggling, slider dragging, plus keyboard
   activation and arrow-key slider adjustment.
@@ -237,7 +242,7 @@ layer in the runtime path.
   storage. The demo owns its background checksum through such a scope.
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
   batching, scheduler lifecycle, ABI, allocation-reuse, and deterministic Metal
-  pixel/event replay tests (99 total).
+  pixel/event replay tests (100 total).
 
 ## Architecture
 
@@ -404,8 +409,7 @@ application. GPUI parity still requires substantial systems, notably:
   fills, butt-cap/miter strokes, affine transforms, analytic shadows, linear
   gradients, general raster images, virtual scrolling, and nested rectangular
   GPU clipping work);
-- keymap predicate expressions and source metadata, richer text-area accessibility
-  ranges, and accessibility text actions
+- keymap predicate expressions and source metadata
   (hierarchical capture/target/bubble listeners with stop-propagation, focus
   traversal, and logical actions work);
 - typed future values, worker-pool priority lanes and work stealing,
@@ -447,6 +451,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI test-context input simulation example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/view_example/example_tests.rs)
 - [GPUI text-input grapheme navigation example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/input.rs)
 - [Apple CAMetalLayer documentation](https://developer.apple.com/documentation/QuartzCore/CAMetalLayer)
+- [Apple accessible text range geometry](https://developer.apple.com/documentation/appkit/nsaccessibilitynavigablestatictext/accessibilityframe(for:))
 - [Apple MTLRenderCommandEncoder documentation](https://developer.apple.com/documentation/metal/mtlrendercommandencoder)
 - [Apple MTLBlitCommandEncoder documentation](https://developer.apple.com/documentation/metal/mtlblitcommandencoder)
 - [Apple CTRun documentation](https://developer.apple.com/documentation/coretext/ctrun)
