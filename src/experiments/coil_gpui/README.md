@@ -22,6 +22,10 @@ layer in the runtime path.
   inverse transform and rejects singular transforms.
 - Rounded two-stop linear gradients at arbitrary CSS-compatible angles, mixed
   with solid primitives in exact scene order inside the same instanced draw.
+- GPUI-compatible diagonal slash background patterns with configurable color,
+  line width, transparent gap, and rounded outer bounds. Stripe coverage is
+  analytic in the existing Metal paint fragment, so patterns require neither
+  texture allocation nor extra draw pipelines.
 - Coil-native closed-polygon paths with simple-polygon validation and ear-clipped
   concave tessellation in either winding. Triangle lists are uploaded through the
   shared frame ring and filled by a clipped, affine Metal pipeline; invalid,
@@ -157,7 +161,7 @@ layer in the runtime path.
   closure, and cooperatively cancel all remaining jobs before releasing their own
   storage. The demo owns its background checksum through such a scope.
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
-  batching, scheduler lifecycle, ABI, and allocation-reuse tests (80 total).
+  batching, scheduler lifecycle, ABI, and allocation-reuse tests (81 total).
 
 ## Architecture
 
@@ -255,7 +259,7 @@ translate directly into one draw for all adjacent labels on an atlas page.
 
 The release scene benchmark rebuilds 1,049 paint primitives, emits 99 retained
 paragraph glyph sprites, and advances a 100,000-row virtual list. On the development
-Apple Silicon machine it measured **6,617 ns/frame** across 5,000 frames (median of
+Apple Silicon machine it measured **6,674 ns/frame** across 5,000 frames (median of
 three consecutive runs). This measures
 Coil scene construction, retained-text recording, and visible-range calculation—not
 GPU presentation or display latency. The benchmark is checked in as `bench.coil` so
@@ -344,6 +348,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI retained entity map](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/app/entity_map.rs)
 - [GPUI subscriptions](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/subscription.rs)
 - [GPUI image element](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/elements/img.rs)
+- [GPUI pattern example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/pattern.rs)
 - [GPUI foreground/background executor](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/executor.rs)
 - [GPUI text system](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/text_system.rs)
 - [Apple CoreText line API](https://developer.apple.com/documentation/coretext/ctline)
