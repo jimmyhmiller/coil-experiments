@@ -3,12 +3,15 @@
 (import "coil.arraylist" :as al)
 (import "coil.atomic" :as atomic)
 (import "coil.primitive" :as primitive)
+(import "coil.sync" :as sync)
 (import "coil.thread" :as thread)
 (import "coil.time" :as time)
 
 (export Scheduler
         JobHandle
         scheduler-new
+        scheduler-new-with-workers
+        scheduler-worker-count
         scheduler-set-wake!
         scheduler-dispatch!
         scheduler-at!
@@ -40,8 +43,15 @@
    (result i64)
    (cancel-requested i64)
    (done i64)
-   (thread thread/Thread)
-   (started bool)])
+   (next (ptr BackgroundWork))])
+
+(defstruct WorkerPool
+  [(mutex sync/Mutex)
+   (available sync/Condition)
+   (head (ptr BackgroundWork))
+   (tail (ptr BackgroundWork))
+   (shutdown bool)
+   (initialized bool)])
 
 (defstruct ScheduledJob
   [(generation i64)
@@ -56,7 +66,9 @@
    (active i64)
    (wake (fnptr c [(ptr i8)] i64))
    (wake-context (ptr i8))
-   (wake-enabled bool)])
+   (wake-enabled bool)
+   (pool (ptr WorkerPool))
+   (workers (al/ArrayList thread/Thread))])
 
 (defn null-work [] (-> (ptr BackgroundWork))
   (primitive/cast (ptr BackgroundWork) 0))
@@ -64,17 +76,117 @@
 (defn null-context [] (-> (ptr i8))
   (primitive/cast (ptr i8) 0))
 
+(defn null-pool [] (-> (ptr WorkerPool))
+  (primitive/cast (ptr WorkerPool) 0))
+
 (defn empty-job [(generation i64)] (-> ScheduledJob)
   (let [(mut job) (primitive/zeroed ScheduledJob)]
     (do
       (store! (field job generation) generation)
       (load job))))
 
-(defn scheduler-new [] (-> Scheduler)
+(defn pool-take! [(pool (ptr WorkerPool))] (-> (ptr BackgroundWork))
+  (match (sync/mutex-lock! (field pool mutex))
+    (Err [_] (null-work))
+    (Ok [_]
+      (block :taken
+        (loop
+          (let [head (load (field pool head))]
+            (cond
+              (!= (primitive/cast i64 head) 0)
+                (let [next (load (field head next))]
+                  (do
+                    (store! (field pool head) next)
+                    (when (= (primitive/cast i64 next) 0)
+                      (store! (field pool tail) (null-work)))
+                    (store! (field head next) (null-work))
+                    (sync/mutex-unlock! (field pool mutex))
+                    (return-from :taken head)))
+              (load (field pool shutdown))
+                (do
+                  (sync/mutex-unlock! (field pool mutex))
+                  (return-from :taken (null-work)))
+              :else
+                (match (sync/condition-wait! (field pool available) (field pool mutex))
+                  (Err [_]
+                    (do
+                      (sync/mutex-unlock! (field pool mutex))
+                      (return-from :taken (null-work))))
+                  (Ok [_] 0)))))))))
+
+(defn pool-worker-entry [(raw (ptr i8))] (-> (ptr i8))
+  (let [pool (primitive/cast (ptr WorkerPool) raw)]
+    (block :stopped
+      (loop
+        (let [work (pool-take! pool)]
+          (if (= (primitive/cast i64 work) 0)
+              (return-from :stopped (null-context))
+              (let [result (primitive/call-ptr (load (field work worker))
+                                               (load (field work worker-context))
+                                               (field work cancel-requested))]
+                (do
+                  (atomic/atomic-store (field work result) result)
+                  (when (load (field work wake-enabled))
+                    (primitive/call-ptr (load (field work wake))
+                                        (load (field work wake-context))))
+                  ;; Publish last: after this store the owner may reclaim work.
+                  (atomic/atomic-store (field work done) 1)))))))))
+
+(defn pool-enqueue! [(pool (ptr WorkerPool)) (work (ptr BackgroundWork))] (-> bool)
+  (match (sync/mutex-lock! (field pool mutex))
+    (Err [_] false)
+    (Ok [_]
+      (if (load (field pool shutdown))
+          (do (sync/mutex-unlock! (field pool mutex)) false)
+          (do
+            (if (= (primitive/cast i64 (load (field pool tail))) 0)
+                (store! (field pool head) work)
+                (store! (field (load (field pool tail)) next) work))
+            (store! (field pool tail) work)
+            (sync/condition-notify-one! (field pool available))
+            (sync/mutex-unlock! (field pool mutex))
+            true)))))
+
+(defn scheduler-new-with-workers [(worker-count i64)] (-> Scheduler)
   (let [(mut scheduler) (primitive/zeroed Scheduler)]
     (do
       (store! (field scheduler jobs) (al/al-new [ScheduledJob] (alloc/malloc-allocator)))
-      (load scheduler))))
+      (store! (field scheduler workers) (al/al-new [thread/Thread] (alloc/malloc-allocator)))
+      (let [memory (malloc (primitive/cast u64 (primitive/sizeof WorkerPool)))]
+        (when (!= (primitive/cast i64 memory) 0)
+          (let [pool (primitive/cast (ptr WorkerPool) memory)]
+            (do
+              (store! pool (primitive/zeroed WorkerPool))
+              (match (sync/mutex-init (field pool mutex))
+                (Err [_] (do (free memory) 0))
+                (Ok [_]
+                  (match (sync/condition-init (field pool available))
+                    (Err [_]
+                      (do
+                        (sync/mutex-destroy! (field pool mutex))
+                        (free memory)
+                        0))
+                    (Ok [_]
+                      (do
+                        (store! (field pool initialized) true)
+                        (store! (field scheduler pool) pool)
+                        (for [i 0 (if (< worker-count 1) 1 worker-count)]
+                          (let [handle (primitive/alloc-stack thread/Thread)
+                                status (thread/thread-spawn handle
+                                                            (primitive/fnptr-of pool-worker-entry)
+                                                            memory)]
+                            (when (= status 0)
+                              (al/al-push! [thread/Thread]
+                                           (mut (field scheduler workers))
+                                           (load handle)))))
+                        0))))))))
+      (load scheduler)))))
+
+(defn scheduler-new [] (-> Scheduler)
+  (scheduler-new-with-workers 4))
+
+(defn scheduler-worker-count [(scheduler Scheduler)] (-> i64)
+  (al/al-len [thread/Thread] (load (field scheduler workers))))
 
 ;; The wake callback must be thread-safe: background workers call it only after
 ;; atomically publishing completion. A dispatch semaphore signal is an ideal UI
@@ -147,26 +259,19 @@
                       (context (ptr i8))] (-> JobHandle)
   (scheduler-activate! (mut scheduler) 2 deadline-ms callback context))
 
-(defn background-entry [(raw (ptr i8))] (-> (ptr i8))
-  (let [work (primitive/cast (ptr BackgroundWork) raw)
-        result (primitive/call-ptr (load (field work worker))
-                                   (load (field work worker-context))
-                                   (field work cancel-requested))]
-    (do
-      (atomic/atomic-store (field work result) result)
-      (atomic/atomic-store (field work done) 1)
-      (when (load (field work wake-enabled))
-        (primitive/call-ptr (load (field work wake)) (load (field work wake-context))))
-      (null-context))))
-
 (defn scheduler-spawn! [(scheduler (mut Scheduler))
                          (worker (fnptr c [(ptr i8) (ptr i64)] i64))
                          (completion (fnptr c [(ptr i8) i64 i64] i64))
                          (worker-context (ptr i8))
                          (completion-context (ptr i8))] (-> JobHandle)
-  (let [memory (malloc (primitive/cast u64 (primitive/sizeof BackgroundWork)))]
-    (if (= (primitive/cast i64 memory) 0)
-        (JobHandle :slot -1 :generation 0)
+  (let [memory (malloc (primitive/cast u64 (primitive/sizeof BackgroundWork)))
+        pool (load (field scheduler pool))]
+    (if (or (= (primitive/cast i64 memory) 0)
+            (or (= (primitive/cast i64 pool) 0)
+                (= (al/al-len [thread/Thread] (load (field scheduler workers))) 0)))
+        (do
+          (when (!= (primitive/cast i64 memory) 0) (do (free memory) 0))
+          (JobHandle :slot -1 :generation 0))
         (let [work (primitive/cast (ptr BackgroundWork) memory)
               handle (scheduler-slot! (mut scheduler))
               job (al/al-elem [ScheduledJob] (field scheduler jobs) (load (field handle slot)))]
@@ -182,20 +287,17 @@
             (atomic/atomic-store (field work result) 0)
             (atomic/atomic-store (field work cancel-requested) 0)
             (atomic/atomic-store (field work done) 0)
-            (let [status (thread/thread-spawn (field work thread)
-                                               (primitive/fnptr-of background-entry)
-                                               memory)]
-              (if (= status 0)
-                  (do
-                    (store! (field work started) true)
-                    (store! (field job kind) 3)
-                    (store! (field job background) work)
-                    (set! (field scheduler active) (+ (load (field scheduler active)) 1))
-                    handle)
-                  (do
-                    (store! job (empty-job (load (field handle generation))))
-                    (free memory)
-                    (JobHandle :slot -1 :generation 0)))))))))
+            (store! (field work next) (null-work))
+            (store! (field job kind) 3)
+            (store! (field job background) work)
+            (set! (field scheduler active) (+ (load (field scheduler active)) 1))
+            (if (pool-enqueue! pool work)
+                handle
+                (do
+                  (set! (field scheduler active) (- (load (field scheduler active)) 1))
+                  (store! job (empty-job (load (field handle generation))))
+                  (free memory)
+                  (JobHandle :slot -1 :generation 0))))))))
 
 (defn scheduler-cancel-requested? [(flag (ptr i64))] (-> bool)
   (!= (atomic/atomic-load flag) 0))
@@ -247,7 +349,6 @@
                         result (atomic/atomic-load (field work result))
                         cancelled (atomic/atomic-load (field work cancel-requested))]
                     (do
-                      (thread/thread-join (field work thread))
                       (scheduler-complete-job! (mut scheduler) job)
                       (primitive/call-ptr completion context result cancelled)
                       (free (primitive/cast (ptr i8) work))
@@ -271,9 +372,32 @@
           (let [work (load (field job background))]
             (do
               (atomic/atomic-store (field work cancel-requested) 1)
-              (thread/thread-join (field work thread))
-              (free (primitive/cast (ptr i8) work))
               0)))))
+    (let [pool (load (field scheduler pool))]
+      (when (!= (primitive/cast i64 pool) 0)
+        (do
+          (match (sync/mutex-lock! (field pool mutex))
+            (Err [_] 0)
+            (Ok [_]
+              (do
+                (store! (field pool shutdown) true)
+                (sync/condition-notify-all! (field pool available))
+                (sync/mutex-unlock! (field pool mutex))
+                0)))
+          (for [i 0 (al/al-len [thread/Thread] (load (field scheduler workers)))]
+            (thread/thread-join (al/al-elem [thread/Thread] (field scheduler workers) i)))
+          (for [i 0 (al/al-len [ScheduledJob] (load (field scheduler jobs)))]
+            (let [job (al/al-elem [ScheduledJob] (field scheduler jobs) i)]
+              (when (= (load (field job kind)) 3)
+                (do
+                  (free (primitive/cast (ptr i8) (load (field job background))))
+                  0))))
+          (sync/condition-destroy! (field pool available))
+          (sync/mutex-destroy! (field pool mutex))
+          (free (primitive/cast (ptr i8) pool))
+          (store! (field scheduler pool) (null-pool))
+          0)))
+    (al/al-free! [thread/Thread] (mut (field scheduler workers)))
     (al/al-free! [ScheduledJob] (mut (field scheduler jobs)))
     (store! (field scheduler active) 0)
     0))

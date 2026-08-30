@@ -36,6 +36,8 @@
 
 (defstruct SchedulerProbe [(calls i64) (result i64) (cancelled i64)])
 
+(defstruct SchedulerBatchProbe [(completed i64) (sum i64)])
+
 (defn scheduler-test-foreground [(raw (ptr i8))] (-> i64)
   (let [probe (primitive/cast (ptr SchedulerProbe) raw)]
     (do
@@ -61,6 +63,16 @@
 
 (defn scheduler-test-wake [(raw (ptr i8))] (-> i64)
   (atomic/atomic-add (primitive/cast (ptr i64) raw) 1))
+
+(defn scheduler-test-pool-worker [(raw (ptr i8)) (cancel (ptr i64))] (-> i64)
+  (atomic/atomic-add (primitive/cast (ptr i64) raw) 1))
+
+(defn scheduler-test-pool-completion [(raw (ptr i8)) (result i64) (cancelled i64)] (-> i64)
+  (let [probe (primitive/cast (ptr SchedulerBatchProbe) raw)]
+    (do
+      (set! (field probe completed) (+ (load (field probe completed)) 1))
+      (set! (field probe sum) (+ (load (field probe sum)) result))
+      0)))
 
 (deftest scheduler-orders-owner-thread-work-and-rejects-stale-handles
          (let [(mut executor) (scheduler/scheduler-new)
@@ -145,6 +157,51 @@
                  (assert-eq (load (field probe cancelled)) 1)
                  (assert-eq (scheduler/scheduler-active-count (load executor)) 0)
                  (scheduler/scheduler-free! (mut executor)))))))
+
+(deftest scheduler-bounded-pool-reuses-workers-and-delivers-every-result
+         (let [(mut executor) (scheduler/scheduler-new-with-workers 2)
+               sequence (primitive/alloc-stack i64)
+               probe (primitive/alloc-stack SchedulerBatchProbe)
+               (mut attempts) 0]
+           (do
+             (atomic/atomic-store sequence 0)
+             (store! probe (primitive/zeroed SchedulerBatchProbe))
+             (assert-eq (scheduler/scheduler-worker-count executor) 2)
+             (for [i 0 64]
+               (let [handle (scheduler/scheduler-spawn! (mut executor)
+                                                        (primitive/fnptr-of scheduler-test-pool-worker)
+                                                        (primitive/fnptr-of scheduler-test-pool-completion)
+                                                        (primitive/cast (ptr i8) sequence)
+                                                        (primitive/cast (ptr i8) probe))]
+                 (assert (>= (load (field handle slot)) 0))))
+             (while (and (< (load (field probe completed)) 64) (< (load attempts) 2000))
+               (do
+                 (scheduler/scheduler-poll-at! (mut executor) 0)
+                 (usleep 1000)
+                 (set! attempts (+ (load attempts) 1))))
+             (assert-eq (load (field probe completed)) 64)
+             (assert-eq (load (field probe sum)) 2016)
+             (assert-eq (atomic/atomic-load sequence) 64)
+             (assert-eq (scheduler/scheduler-active-count executor) 0)
+             (scheduler/scheduler-free! (mut executor)))))
+
+(deftest scheduler-pool-shutdown-cancels-running-and-queued-work-before-join
+         (let [(mut executor) (scheduler/scheduler-new-with-workers 1)
+               probe (primitive/alloc-stack SchedulerProbe)]
+           (do
+             (store! probe (primitive/zeroed SchedulerProbe))
+             (for [i 0 2]
+               (let [handle (scheduler/scheduler-spawn! (mut executor)
+                                                        (primitive/fnptr-of scheduler-test-cancellable)
+                                                        (primitive/fnptr-of scheduler-test-completion)
+                                                        (primitive/cast (ptr i8) 0)
+                                                        (primitive/cast (ptr i8) probe))]
+                 (assert (>= (load (field handle slot)) 0))))
+             ;; Teardown requests cancellation for both the running and queued
+             ;; blocks, drains the queue, and joins the sole reusable worker.
+             (scheduler/scheduler-free! (mut executor))
+             (assert-eq (load (field probe calls)) 0)
+             (assert-eq (scheduler/scheduler-active-count executor) 0))))
 
 (defn test-keystroke-push! [(strokes (mut (al/ArrayList keymap/KeyStroke)))
                             (key i64)

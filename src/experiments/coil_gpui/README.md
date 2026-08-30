@@ -132,14 +132,16 @@ layer in the runtime path.
   introducing native inspection views.
 - A Coil-native UI scheduler with generation-checked cancellable handles,
   owner-thread foreground and monotonic timer queues, and pthread-backed background
-  work. Background control blocks are heap-stable, cross-thread state is atomic,
-  workers receive cooperative cancellation, and every worker is joined before its
-  completion callback or storage release. Completion publication signals the frame
+  work on a bounded reusable pool (four workers by default, configurable at
+  construction). A mutex/condition FIFO feeds heap-stable control blocks to the
+  pool; cross-thread result state is atomic, workers receive cooperative
+  cancellation, and pool threads are joined before synchronization or job storage
+  is released. Completion publication signals the frame
   semaphore, waking both active display pacing and the occluded fallback without
   exposing UI state across threads. The demo computes a checksum off-thread and
   paints its owner-thread completion as a GPU status badge.
 - Headless geometry, flex, clipping, focus/actions, scene ordering, component
-  batching, scheduler lifecycle, ABI, and allocation-reuse tests (74 total).
+  batching, scheduler lifecycle, ABI, and allocation-reuse tests (76 total).
 
 ## Architecture
 
@@ -237,7 +239,8 @@ translate directly into one draw for all adjacent labels on an atlas page.
 
 The release scene benchmark rebuilds 1,049 paint primitives, emits 99 retained
 paragraph glyph sprites, and advances a 100,000-row virtual list. On the development
-Apple Silicon machine it measured **6,414 ns/frame** across 5,000 frames. This measures
+Apple Silicon machine it measured **6,454 ns/frame** across 5,000 frames (median of
+three consecutive runs). This measures
 Coil scene construction, retained-text recording, and visible-range calculation—not
 GPU presentation or display latency. The benchmark is checked in as `bench.coil` so
 results remain reproducible and comparable.
@@ -271,6 +274,14 @@ painting pins each referenced texture for the new frame. Loads with the same pat
 reuse one Metal texture, while budget pressure evicts only unpinned least-recently-
 used entries. Asset generations make cached handles safe across slot recycling.
 
+Background work does not create one operating-system thread per task. Scheduler
+construction starts a fixed worker set; tasks enter a condition-variable FIFO and
+reuse those threads. Result and cancellation publication use sequentially consistent
+atomics, while queue ownership stays under one mutex. Polling reclaims a completed
+block only after the worker's final `done` store. Teardown first marks every live
+block cancelled, then drains queued work, joins all workers, and finally destroys
+the queue and its synchronization objects.
+
 ## Capability roadmap
 
 The current milestone proves the complete Coil-to-Metal path and a real component
@@ -292,8 +303,8 @@ application. GPUI parity still requires substantial systems, notably:
   ranges, and accessibility text actions
   (hierarchical capture/target/bubble listeners with stop-propagation, focus
   traversal, and logical actions work);
-- callback-driven entity subscriptions, structured future/task scopes, a bounded
-  reusable worker pool with work stealing, non-image/remote asset sources,
+- callback-driven entity subscriptions, structured future/task scopes, worker-pool
+  priority lanes and work stealing, non-image/remote asset sources,
   editable style inspection, deterministic UI
   tests, and multiple windows;
 - persistent partial-presentation backing, multi-page texture-atlas eviction,
