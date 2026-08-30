@@ -218,8 +218,11 @@ layer in the runtime path.
   bounded column resizing, horizontal and vertical scrolling, zebra and selected
   row paint, stable header/row hitboxes, and keyboard selection that keeps its row
   visible. Callers receive exact header, row, and cell rectangles for custom
-  content. The independent demo window renders a live three-column table over one
-  million logical rows while scene work remains proportional to the viewport.
+  content. The independent 980×700 data-explorer window renders a live
+  three-column table over one million logical rows while scene work remains
+  proportional to the viewport. Wheel/trackpad scrolling, pointer selection,
+  sortable headers, draggable column dividers, and Arrow/Home/End/Page navigation
+  are routed directly to its retained state.
 - A retained GPU tree accepts batched parent-before-child nodes, publishes
   hierarchy visibility in one linear pass, and virtualizes only flattened visible
   rows plus overscan. Expansion, collapse, disclosure hit testing, indentation
