@@ -93,6 +93,11 @@ layer in the runtime path.
   four FFI calls per glyph. CTFont supplies exact per-glyph raster bounds.
   Individual glyph rasters are cached by font, glyph ID, and 4x2 subpixel variant,
   then colored and composited as ordered Metal atlas sprites.
+- Text fields and multiline editors navigate, extend selections, backspace, and
+  forward-delete by Foundation extended grapheme clusters. UTF-8 byte offsets
+  are bridged exactly to macOS UTF-16 composed-character ranges, so combining
+  marks, emoji skin-tone modifiers, ZWJ families, and regional-indicator flags
+  remain atomic while public editor and layout indices stay UTF-8 based.
 - Width-dependent single-line end, start, and middle truncation copies complete
   shaped glyphs and inserts a cached Unicode ellipsis while preserving the
   requested portions of the line. Each result owns its glyph list and leaves the
@@ -359,8 +364,7 @@ the queue and its synchronization objects.
 The current milestone proves the complete Coil-to-Metal path and a real component
 application. GPUI parity still requires substantial systems, notably:
 
-- grapheme-aware navigation and richer shaped-layout
-  caching (editable selection/caret measurement,
+- richer shaped-layout caching (editable selection/caret measurement,
   UTF-8/CoreText cluster conversion, glyph-run extraction, subpixel glyph caching,
   bounded atlas allocation, and GPU mask composition work now);
 - intrinsic text/image measurement (flex and constrained grid layout work);
@@ -409,6 +413,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI entity transfer between windows](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/move_entity_between_windows.rs)
 - [GPUI macOS Metal renderer](https://github.com/zed-industries/zed/blob/main/crates/gpui_macos/src/metal_renderer.rs)
 - [GPUI macOS Metal atlas](https://github.com/zed-industries/zed/blob/main/crates/gpui_macos/src/metal_atlas.rs)
+- [GPUI text-input grapheme navigation example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/input.rs)
 - [Apple CAMetalLayer documentation](https://developer.apple.com/documentation/QuartzCore/CAMetalLayer)
 - [Apple MTLRenderCommandEncoder documentation](https://developer.apple.com/documentation/metal/mtlrendercommandencoder)
 - [Apple CTRun documentation](https://developer.apple.com/documentation/coretext/ctrun)
