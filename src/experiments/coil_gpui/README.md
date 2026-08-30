@@ -65,6 +65,10 @@ layer in the runtime path.
   while cropping normalized source UVs. An optional dedicated Metal fragment
   pipeline converts sampled color to luminance on the GPU; grayscale images remain
   batchable by texture and mode with no CPU pixel rewrite.
+- Fitted images support a clamped corner radius carried in the shared sprite ABI.
+  Color and grayscale fragment pipelines compute antialiased rounded coverage from
+  local quad coordinates; text sprites keep radius zero and share the same upload
+  and batching machinery without an additional mask texture.
 - Buffered, instanced texture sprites: adjacent text/image records sharing a
   texture and pipeline collapse into one draw without changing paint order.
 - Reusable scene allocation across frames.
@@ -251,7 +255,7 @@ translate directly into one draw for all adjacent labels on an atlas page.
 
 The release scene benchmark rebuilds 1,049 paint primitives, emits 99 retained
 paragraph glyph sprites, and advances a 100,000-row virtual list. On the development
-Apple Silicon machine it measured **6,454 ns/frame** across 5,000 frames (median of
+Apple Silicon machine it measured **6,617 ns/frame** across 5,000 frames (median of
 three consecutive runs). This measures
 Coil scene construction, retained-text recording, and visible-range calculation—not
 GPU presentation or display latency. The benchmark is checked in as `bench.coil` so
@@ -272,7 +276,8 @@ Image fitting is resolved before recording the sprite. `contain` changes quad bo
 `cover` keeps the component bounds and records the centered visible UV fraction. This
 avoids oversized quads and redundant clip pushes. Color and grayscale use separate
 Metal pipelines, while the existing run builder keeps adjacent records batched only
-when texture and mode are compatible.
+when texture and mode are compatible. Each sprite is 112 bytes after adding the
+clamped image radius and explicit ABI padding.
 
 Retained paragraphs use CoreText's Unicode line breaker with explicit wrap width,
 line height, and optional line clamp. Each visual line owns byte-accurate UTF-8 source
