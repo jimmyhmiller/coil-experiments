@@ -8,6 +8,9 @@ layer in the runtime path.
 ## What works
 
 - Native resizable AppKit window with a triple-buffered `CAMetalLayer`.
+- CoreVideo display-link pacing with coalesced refresh ticks, bounded recovery
+  from display reconfiguration, and occlusion-aware suspension of scene rebuilds
+  and Metal submission.
 - Runtime-compiled Metal vertex and fragment shaders.
 - Instanced draw runs for adjacent box primitives, interleaved with ordered
   vector-path draws without changing scene submission order.
@@ -242,8 +245,8 @@ application. GPUI parity still requires substantial systems, notably:
   traversal, and logical actions work);
 - weak/strong retained handles, dependency-tracked observation, async executor
   integration, assets, inspector support, deterministic UI tests, and multiple windows;
-- damage tracking, frame pacing, occlusion handling, multi-page texture-atlas eviction,
-  and GPU/CPU profiling.
+- persistent partial-presentation backing, multi-page texture-atlas eviction,
+  and deeper GPU/CPU profiling.
 
 These are explicit missing capabilities, not features claimed by the prototype.
 

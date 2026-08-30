@@ -1,0 +1,146 @@
+(module experiments.coil_gpui.frame_clock)
+(import "coil.primitive" :as primitive)
+
+(export FrameClock
+        frame-clock-new
+        frame-clock-available?
+        frame-clock-active?
+        frame-clock-set-active!
+        frame-clock-wait!
+        frame-clock-free!)
+
+(extern CVDisplayLinkCreateWithActiveCGDisplays :cc c [(ptr (ptr i8))] (-> i32))
+
+(extern CVDisplayLinkSetOutputCallback :cc c [(ptr i8) (ptr i8) (ptr i8)] (-> i32))
+
+(extern CVDisplayLinkStart :cc c [(ptr i8)] (-> i32))
+
+(extern CVDisplayLinkStop :cc c [(ptr i8)] (-> i32))
+
+(extern CVDisplayLinkRelease :cc c [(ptr i8)] (-> i32))
+
+(extern dispatch_semaphore_create :cc c [i64] (-> (ptr i8)))
+
+(extern dispatch_semaphore_signal :cc c [(ptr i8)] (-> i64))
+
+(extern dispatch_semaphore_wait :cc c [(ptr i8) u64] (-> i64))
+
+(extern dispatch_time :cc c [u64 i64] (-> u64))
+
+(extern dispatch_release :cc c [(ptr i8)] (-> void))
+
+(extern usleep :cc c [i64] (-> i32))
+
+(defstruct FrameClock
+  [(link (ptr i8))
+   (semaphore (ptr i8))
+   (available bool)
+   (active bool)])
+
+;; CoreVideo invokes this on its private high-priority thread. Signaling a dispatch
+;; semaphore is the only cross-thread operation: the callback never observes or
+;; mutates the renderer, scene, window, or any Coil-owned application state.
+(defn display-link-step [(link (ptr i8))
+                         (now (ptr i8))
+                         (output-time (ptr i8))
+                         (flags-in u64)
+                         (flags-out (ptr u64))
+                         (context (ptr i8))] (-> i32)
+  (do
+    (dispatch_semaphore_signal context)
+    0))
+
+(defn frame-clock-new [] (-> FrameClock)
+  (let [(mut clock) (primitive/zeroed FrameClock)
+        semaphore (dispatch_semaphore_create 0)
+        (mut link) (primitive/cast (ptr i8) 0)
+        created (CVDisplayLinkCreateWithActiveCGDisplays (mut link))]
+    (do
+      (store! (field clock semaphore) semaphore)
+      (if (= created 0)
+          (let [configured
+                  (CVDisplayLinkSetOutputCallback (load link)
+                                                  (primitive/cast (ptr i8) (primitive/fnptr-of display-link-step))
+                                                  semaphore)]
+            (if (= configured 0)
+                (do
+                  (store! (field clock link) (load link))
+                  (store! (field clock available) true)
+                  0)
+                (do
+                  (CVDisplayLinkRelease (load link))
+                  0)))
+          0)
+      (load clock))))
+
+(defn frame-clock-available? [(clock FrameClock)] (-> bool)
+  (load (field clock available)))
+
+(defn frame-clock-active? [(clock FrameClock)] (-> bool)
+  (load (field clock active)))
+
+(defn drain-signal! [(semaphore (ptr i8))] (-> i64)
+  (let [(mut drained) 0]
+    (do
+      (while (= (dispatch_semaphore_wait semaphore (dispatch_time 0 0)) 0)
+        (store! drained (+ (load drained) 1)))
+      (load drained))))
+
+(defn frame-clock-set-active! [(clock (mut FrameClock)) (active bool)] (-> bool)
+  (if (= (load (field clock active)) active)
+      active
+      (if (not (load (field clock available)))
+          (do
+            (store! (field clock active) active)
+            active)
+          (if active
+              (do
+                (drain-signal! (load (field clock semaphore)))
+                (if (= (CVDisplayLinkStart (load (field clock link))) 0)
+                    (store! (field clock active) true)
+                    (store! (field clock active) false))
+                (load (field clock active)))
+              (do
+                (CVDisplayLinkStop (load (field clock link)))
+                (store! (field clock active) false)
+                false)))))
+
+(defn frame-clock-wait! [(clock FrameClock)] (-> bool)
+  (if (and (load (field clock available)) (load (field clock active)))
+      (let [semaphore (load (field clock semaphore))]
+        ;; Coalesce accumulated display ticks. A slow frame should schedule one
+        ;; immediate successor, never a burst replay of obsolete refresh periods.
+        (if (= (dispatch_semaphore_wait semaphore (dispatch_time 0 0)) 0)
+            (do
+              (drain-signal! semaphore)
+              true)
+            ;; A finite deadline prevents display reconfiguration or sleep from
+            ;; wedging AppKit before it can deliver its next event.
+            (= (dispatch_semaphore_wait semaphore (dispatch_time 0 100000000)) 0)))
+      (do
+        ;; CoreVideo can be unavailable while the screen is locked or displays are
+        ;; reconfigured. The low-frequency fallback preserves event processing.
+        (usleep 100000)
+        false)))
+
+(defn frame-clock-free! [(clock (mut FrameClock))] (-> i64)
+  (do
+    (if (load (field clock active))
+        (do
+          (CVDisplayLinkStop (load (field clock link)))
+          (store! (field clock active) false)
+          0)
+        0)
+    (if (load (field clock available))
+        (do
+          (CVDisplayLinkRelease (load (field clock link)))
+          (store! (field clock available) false)
+          0)
+        0)
+    (if (!= (primitive/cast i64 (load (field clock semaphore))) 0)
+        (do
+          (dispatch_release (load (field clock semaphore)))
+          (store! (field clock semaphore) (primitive/cast (ptr i8) 0))
+          0)
+        0)
+    0))
