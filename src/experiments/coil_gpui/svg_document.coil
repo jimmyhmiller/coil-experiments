@@ -41,6 +41,13 @@
    (bounds path/PathBounds)
    (valid bool)])
 
+(defstruct SvgGeometry
+  [(x f32) (y f32) (width f32) (height f32)
+   (rx f32) (ry f32) (have-rx bool) (have-ry bool)
+   (cx f32) (cy f32) (r f32)
+   (x1 f32) (y1 f32) (x2 f32) (y2 f32)
+   (points (ptr i8))])
+
 (defn byte-at [(pointer (ptr u8)) (index i64)] (-> u8)
   (load (primitive/index pointer index)))
 
@@ -313,6 +320,20 @@
       (if (!= (primitive/cast i64 copy) 0) (do (free copy) 0) 0)
       (if (and (load valid) (> number 0.0)) number -1.0))))
 
+(defn parse-number-value [(value XmlSlice) (valid (mut bool))] (-> f32)
+  (let [copy (slice-copy value)
+        (mut cursor) (primitive/cast (ptr u8) copy)
+        (mut parsed-valid) (!= (primitive/cast i64 copy) 0)
+        number (number-read! (mut cursor) (mut parsed-valid))]
+    (do
+      (number-skip! (mut cursor))
+      (if (not (= (load (load cursor)) (primitive/cast u8 0)))
+          (store! parsed-valid false)
+          0)
+      (if (not (load parsed-valid)) (store! valid false) 0)
+      (if (!= (primitive/cast i64 copy) 0) (do (free copy) 0) 0)
+      number)))
+
 (defn parse-stroke-color! [(style (mut SvgStyle)) (value XmlSlice)] (-> bool)
   (let [(mut parsed) (primitive/zeroed SvgStyle)]
     (do
@@ -483,6 +504,257 @@
     (set! (.valid document) false)
     0))
 
+(defn style-fill-color [(style SvgStyle)] (-> ui/Color)
+  (ui/rgba (load (field (field style fill) r))
+           (load (field (field style fill) g))
+           (load (field (field style fill) b))
+           (* (load (field (field style fill) a)) (load (field style fill-opacity)))))
+
+(defn style-stroke-color [(style SvgStyle)] (-> ui/Color)
+  (ui/rgba (load (field (field style stroke) r))
+           (load (field (field style stroke) g))
+           (load (field (field style stroke) b))
+           (* (load (field (field style stroke) a)) (load (field style stroke-opacity)))))
+
+(defn append-painted-vector! [(document (mut SvgDocument))
+                              (vector svg/SvgVector)
+                              (color ui/Color)
+                              (transform ui/Affine)] (-> i64)
+  (do
+    (al/al-push! [SvgDocumentShape]
+                 (mut (.shapes document))
+                 (SvgDocumentShape :vector vector :fill color :transform transform))
+    (extend-document-bounds! (mut document) (load (field vector bounds)) transform)))
+
+(defn document-add-path-data! [(document (mut SvgDocument))
+                               (source (ptr i8))
+                               (style SvgStyle)
+                               (tolerance f32)] (-> bool)
+  (let [(mut valid) true]
+    (do
+      (if (load (field style fill-enabled))
+          (let [(mut vector) (svg/svg-vector-new-with-fill-rule
+                               source tolerance (load (field style fill-rule)))]
+            (if (svg/svg-vector-valid? vector)
+                (append-painted-vector! (mut document)
+                                        (load vector)
+                                        (style-fill-color style)
+                                        (load (field style transform)))
+                (do (svg/svg-vector-free! (mut vector)) (store! valid false))))
+          0)
+      (if (and (load valid) (load (field style stroke-enabled)))
+          (let [(mut vector) (svg/svg-stroke-vector-new
+                               source tolerance
+                               (load (field style stroke-width))
+                               (load (field style stroke-miter-limit))
+                               (load (field style stroke-cap))
+                               (load (field style stroke-join)))]
+            (if (svg/svg-vector-valid? vector)
+                (append-painted-vector! (mut document)
+                                        (load vector)
+                                        (style-stroke-color style)
+                                        (load (field style transform)))
+                (do (svg/svg-vector-free! (mut vector)) (store! valid false))))
+          0)
+      (load valid))))
+
+(defn document-add-path! [(document (mut SvgDocument))
+                          (source path/Path)
+                          (style SvgStyle)
+                          (tolerance f32)] (-> bool)
+  (let [(mut valid) true]
+    (do
+      (if (and (load (field source closed)) (load (field style fill-enabled)))
+          (let [(mut vector) (svg/svg-vector-new-from-path source (load (field style fill-rule)))]
+            (if (svg/svg-vector-valid? vector)
+                (append-painted-vector! (mut document)
+                                        (load vector)
+                                        (style-fill-color style)
+                                        (load (field style transform)))
+                (do (svg/svg-vector-free! (mut vector)) (store! valid false))))
+          0)
+      (if (and (load valid) (load (field style stroke-enabled)))
+          (let [(mut vector) (svg/svg-stroke-vector-new-from-path
+                               source tolerance
+                               (load (field style stroke-width))
+                               (load (field style stroke-miter-limit))
+                               (load (field style stroke-cap))
+                               (load (field style stroke-join)))]
+            (if (svg/svg-vector-valid? vector)
+                (append-painted-vector! (mut document)
+                                        (load vector)
+                                        (style-stroke-color style)
+                                        (load (field style transform)))
+                (do (svg/svg-vector-free! (mut vector)) (store! valid false))))
+          0)
+      (load valid))))
+
+(defn close-generated-path! [(value (mut path/Path))] (-> i64)
+  (let [points (load (field value points)) count (al/al-len [path/PathPoint] points)]
+    (do
+      (if (> count 1)
+          (let [first (al/al-get [path/PathPoint] points 0)
+                last (al/al-get [path/PathPoint] points (- count 1))
+                dx (- (load (field last x)) (load (field first x)))
+                dy (- (load (field last y)) (load (field first y)))]
+            (if (< (+ (* dx dx) (* dy dy)) 0.000001)
+                (do (al/al-pop! [path/PathPoint] (mut (.points value))) 0)
+                0))
+          0)
+      (path/path-close! (mut value)))))
+
+(defn geometry-path [(kind i32) (geometry SvgGeometry) (tolerance f32)] (-> path/Path)
+  (let [(mut result) (path/path-new)]
+    (do
+      (cond
+        (= kind (primitive/cast i32 4))
+          (let [x (load (field geometry x)) y (load (field geometry y))
+                width (load (field geometry width)) height (load (field geometry height))
+                raw-rx (if (load (field geometry have-rx))
+                           (load (field geometry rx)) (load (field geometry ry)))
+                raw-ry (if (load (field geometry have-ry))
+                           (load (field geometry ry)) (load (field geometry rx)))
+                rx (if (> raw-rx (* width 0.5)) (* width 0.5) raw-rx)
+                ry (if (> raw-ry (* height 0.5)) (* height 0.5) raw-ry)]
+            (if (and (> width 0.0) (> height 0.0))
+                (if (and (> rx 0.0) (> ry 0.0))
+                    (do
+                      (path/path-move-to! (mut result) (+ x rx) y)
+                      (path/path-line-to! (mut result) (+ x (- width rx)) y)
+                      (path/path-svg-arc-to! (mut result) rx ry 0.0 false true
+                                             (+ x width) (+ y ry) tolerance)
+                      (path/path-line-to! (mut result) (+ x width) (+ y (- height ry)))
+                      (path/path-svg-arc-to! (mut result) rx ry 0.0 false true
+                                             (+ x (- width rx)) (+ y height) tolerance)
+                      (path/path-line-to! (mut result) (+ x rx) (+ y height))
+                      (path/path-svg-arc-to! (mut result) rx ry 0.0 false true
+                                             x (+ y (- height ry)) tolerance)
+                      (path/path-line-to! (mut result) x (+ y ry))
+                      (path/path-svg-arc-to! (mut result) rx ry 0.0 false true
+                                             (+ x rx) y tolerance)
+                      (close-generated-path! (mut result)))
+                    (do
+                      (path/path-move-to! (mut result) x y)
+                      (path/path-line-to! (mut result) (+ x width) y)
+                      (path/path-line-to! (mut result) (+ x width) (+ y height))
+                      (path/path-line-to! (mut result) x (+ y height))
+                      (close-generated-path! (mut result))))
+                0))
+        (= kind (primitive/cast i32 5))
+          (if (> (load (field geometry r)) 0.0)
+              (do
+                (path/path-arc! (mut result)
+                                (load (field geometry cx)) (load (field geometry cy))
+                                (load (field geometry r)) (load (field geometry r))
+                                0.0 360.0 tolerance)
+                (close-generated-path! (mut result)))
+              0)
+        (= kind (primitive/cast i32 6))
+          (if (and (> (load (field geometry rx)) 0.0) (> (load (field geometry ry)) 0.0))
+              (do
+                (path/path-arc! (mut result)
+                                (load (field geometry cx)) (load (field geometry cy))
+                                (load (field geometry rx)) (load (field geometry ry))
+                                0.0 360.0 tolerance)
+                (close-generated-path! (mut result)))
+              0)
+        (= kind (primitive/cast i32 7))
+          (do
+            (path/path-move-to! (mut result) (load (field geometry x1)) (load (field geometry y1)))
+            (path/path-line-to! (mut result) (load (field geometry x2)) (load (field geometry y2))))
+        :else
+          (let [copy (load (field geometry points))
+                (mut cursor) (primitive/cast (ptr u8) copy)
+                (mut valid) (!= (primitive/cast i64 copy) 0)
+                (mut first) true]
+            (do
+              (number-skip! (mut cursor))
+              (while (and (load valid) (!= (load (load cursor)) (primitive/cast u8 0)))
+                (let [x (number-read! (mut cursor) (mut valid))
+                      y (number-read! (mut cursor) (mut valid))]
+                  (do
+                    (if (load first)
+                        (do (path/path-move-to! (mut result) x y) (store! first false))
+                        (path/path-line-to! (mut result) x y))
+                    (number-skip! (mut cursor)))))
+              (if (and (load valid) (= kind (primitive/cast i32 8)))
+                  (close-generated-path! (mut result))
+                  0))))
+      (load result))))
+
+(defn element-kind [(name XmlSlice)] (-> i32)
+  (cond
+    (slice-equals? name c"svg") (primitive/cast i32 1)
+    (slice-equals? name c"g") (primitive/cast i32 2)
+    (slice-equals? name c"path") (primitive/cast i32 3)
+    (slice-equals? name c"rect") (primitive/cast i32 4)
+    (slice-equals? name c"circle") (primitive/cast i32 5)
+    (slice-equals? name c"ellipse") (primitive/cast i32 6)
+    (slice-equals? name c"line") (primitive/cast i32 7)
+    (slice-equals? name c"polygon") (primitive/cast i32 8)
+    (slice-equals? name c"polyline") (primitive/cast i32 9)
+    :else (primitive/cast i32 0)))
+
+(defn geometry-attribute? [(name XmlSlice)] (-> bool)
+  (or (slice-equals? name c"x")
+      (or (slice-equals? name c"y")
+          (or (slice-equals? name c"width")
+              (or (slice-equals? name c"height")
+                  (or (slice-equals? name c"rx")
+                      (or (slice-equals? name c"ry")
+                          (or (slice-equals? name c"cx")
+                              (or (slice-equals? name c"cy")
+                                  (or (slice-equals? name c"r")
+                                      (or (slice-equals? name c"x1")
+                                          (or (slice-equals? name c"y1")
+                                              (or (slice-equals? name c"x2")
+                                                  (or (slice-equals? name c"y2")
+                                                      (slice-equals? name c"points")))))))))))))))
+
+(defn apply-geometry-attribute! [(geometry (mut SvgGeometry))
+                                 (name XmlSlice)
+                                 (value XmlSlice)
+                                 (valid (mut bool))] (-> i64)
+  (cond
+    (slice-equals? name c"x")
+      (set! (.x geometry) (parse-number-value value (mut valid)))
+    (slice-equals? name c"y")
+      (set! (.y geometry) (parse-number-value value (mut valid)))
+    (slice-equals? name c"width")
+      (set! (.width geometry) (parse-number-value value (mut valid)))
+    (slice-equals? name c"height")
+      (set! (.height geometry) (parse-number-value value (mut valid)))
+    (slice-equals? name c"rx")
+      (do
+        (set! (.rx geometry) (parse-number-value value (mut valid)))
+        (set! (.have-rx geometry) true))
+    (slice-equals? name c"ry")
+      (do
+        (set! (.ry geometry) (parse-number-value value (mut valid)))
+        (set! (.have-ry geometry) true))
+    (slice-equals? name c"cx")
+      (set! (.cx geometry) (parse-number-value value (mut valid)))
+    (slice-equals? name c"cy")
+      (set! (.cy geometry) (parse-number-value value (mut valid)))
+    (slice-equals? name c"r")
+      (set! (.r geometry) (parse-number-value value (mut valid)))
+    (slice-equals? name c"x1")
+      (set! (.x1 geometry) (parse-number-value value (mut valid)))
+    (slice-equals? name c"y1")
+      (set! (.y1 geometry) (parse-number-value value (mut valid)))
+    (slice-equals? name c"x2")
+      (set! (.x2 geometry) (parse-number-value value (mut valid)))
+    (slice-equals? name c"y2")
+      (set! (.y2 geometry) (parse-number-value value (mut valid)))
+    (slice-equals? name c"points")
+      (if (= (primitive/cast i64 (load (field geometry points))) 0)
+          (let [copy (slice-copy value)]
+            (do
+              (set! (.points geometry) copy)
+              (if (= (primitive/cast i64 copy) 0) (store! valid false) 0)))
+          (store! valid false))
+    :else 0))
+
 ;;; Parse the structural SVG subset used by UI assets: nested svg/g containers
 ;;; and path elements with inherited fill, fill-rule, and affine transforms.
 (defn svg-document-new [(source (ptr i8)) (tolerance f32)] (-> SvgDocument)
@@ -518,13 +790,7 @@
                         (if (> (al/al-len [i32] (load tags)) 0)
                             (let [expected (al/al-get [i32] (load tags)
                                                       (- (al/al-len [i32] (load tags)) 1))
-                                  actual (if (slice-equals? name c"svg")
-                                             (primitive/cast i32 1)
-                                             (if (slice-equals? name c"g")
-                                                 (primitive/cast i32 2)
-                                                 (if (slice-equals? name c"path")
-                                                     (primitive/cast i32 3)
-                                                     (primitive/cast i32 0))))]
+                                  actual (element-kind name)]
                               (if (= expected actual)
                                   (do
                                     (al/al-pop! [i32] (mut tags))
@@ -533,14 +799,12 @@
                                   (set! (.valid reader) false)))
                             (set! (.valid reader) false)))))
                   (let [name (read-name! (mut reader))
-                        kind (if (slice-equals? name c"svg") (primitive/cast i32 1)
-                                 (if (slice-equals? name c"g") (primitive/cast i32 2)
-                                     (if (slice-equals? name c"path")
-                                         (primitive/cast i32 3)
-                                         (primitive/cast i32 0))))
+                        kind (element-kind name)
                         parent (al/al-get [SvgStyle] (load styles)
                                           (- (al/al-len [SvgStyle] (load styles)) 1))
                         (mut style) (primitive/zeroed SvgStyle)
+                        (mut geometry) (primitive/zeroed SvgGeometry)
+                        (mut geometry-valid) true
                         (mut path-data) (primitive/cast (ptr i8) 0)
                         (mut self-closing) false]
                     (do
@@ -558,18 +822,28 @@
                                     attribute-value (read-value! (mut reader))]
                                 (if (and (= kind 3) (slice-equals? attribute-name c"d"))
                                     (store! path-data (slice-copy attribute-value))
-                                    (if (and (= kind (primitive/cast i32 1))
-                                             (slice-equals? attribute-name c"viewBox"))
+                                    (if (and (>= kind (primitive/cast i32 4))
+                                             (geometry-attribute? attribute-name))
                                         (do
-                                          (store! declared-bounds (parse-view-box attribute-value))
-                                          (if (not (load (field declared-bounds valid)))
+                                          (apply-geometry-attribute! (mut geometry)
+                                                                     attribute-name
+                                                                     attribute-value
+                                                                     (mut geometry-valid))
+                                          (if (not (load geometry-valid))
                                               (set! (.valid reader) false)
                                               0))
-                                        (if (not (apply-attribute! (mut style)
-                                                                   attribute-name
-                                                                   attribute-value))
-                                            (set! (.valid reader) false)
-                                            0)))))))
+                                        (if (and (= kind (primitive/cast i32 1))
+                                                 (slice-equals? attribute-name c"viewBox"))
+                                            (do
+                                              (store! declared-bounds (parse-view-box attribute-value))
+                                              (if (not (load (field declared-bounds valid)))
+                                                  (set! (.valid reader) false)
+                                                  0))
+                                            (if (not (apply-attribute! (mut style)
+                                                                       attribute-name
+                                                                       attribute-value))
+                                                (set! (.valid reader) false)
+                                                0))))))))
                       (skip-space! (mut reader))
                       (if (= (reader-byte (load reader)) (primitive/cast u8 47))
                           (do (store! self-closing true) (reader-advance! (mut reader))) 0)
@@ -577,70 +851,33 @@
                           (reader-advance! (mut reader))
                           (set! (.valid reader) false))
                       (if (= kind (primitive/cast i32 3))
-                          (if (and (load (field reader valid))
-                                   (!= (primitive/cast i64 (load path-data)) 0)
-                                   (load (field style fill-enabled)))
-                              (let [(mut vector)
-                                      (svg/svg-vector-new-with-fill-rule
-                                        (load path-data) tolerance (load (field style fill-rule)))]
-                                (if (svg/svg-vector-valid? vector)
-                                    (do
-                                      (al/al-push! [SvgDocumentShape]
-                                                   (mut (.shapes document))
-                                                   (SvgDocumentShape
-                                                     :vector (load vector)
-                                                     :fill
-                                                       (ui/rgba
-                                                         (load (field (field style fill) r))
-                                                         (load (field (field style fill) g))
-                                                         (load (field (field style fill) b))
-                                                         (* (load (field (field style fill) a))
-                                                            (load (field style fill-opacity))))
-                                                     :transform (load (field style transform))))
-                                      (extend-document-bounds! (mut document)
-                                                               (load (field vector bounds))
-                                                               (load (field style transform))))
-                                    (do
-                                      (svg/svg-vector-free! (mut vector))
-                                      (set! (.valid reader) false))))
-                              (if (and (!= (primitive/cast i64 (load path-data)) 0)
-                                       (not (load (field style fill-enabled))))
-                                  0
-                                  (set! (.valid reader) false)))
-                          0)
-                      (if (and (= kind (primitive/cast i32 3))
-                               (and (load (field reader valid))
-                                    (load (field style stroke-enabled))))
                           (if (!= (primitive/cast i64 (load path-data)) 0)
-                              (let [(mut stroke-vector)
-                                      (svg/svg-stroke-vector-new
-                                        (load path-data)
-                                        tolerance
-                                        (load (field style stroke-width))
-                                        (load (field style stroke-miter-limit))
-                                        (load (field style stroke-cap))
-                                        (load (field style stroke-join)))]
-                                (if (svg/svg-vector-valid? stroke-vector)
-                                    (do
-                                      (al/al-push! [SvgDocumentShape]
-                                                   (mut (.shapes document))
-                                                   (SvgDocumentShape
-                                                     :vector (load stroke-vector)
-                                                     :fill
-                                                       (ui/rgba
-                                                         (load (field (field style stroke) r))
-                                                         (load (field (field style stroke) g))
-                                                         (load (field (field style stroke) b))
-                                                         (* (load (field (field style stroke) a))
-                                                            (load (field style stroke-opacity))))
-                                                     :transform (load (field style transform))))
-                                      (extend-document-bounds! (mut document)
-                                                               (load (field stroke-vector bounds))
-                                                               (load (field style transform))))
-                                    (do
-                                      (svg/svg-vector-free! (mut stroke-vector))
-                                      (set! (.valid reader) false))))
+                              (if (not (document-add-path-data! (mut document)
+                                                                 (load path-data)
+                                                                 (load style)
+                                                                 tolerance))
+                                  (set! (.valid reader) false)
+                                  0)
                               (set! (.valid reader) false))
+                          0)
+                      (if (and (>= kind (primitive/cast i32 4))
+                               (<= kind (primitive/cast i32 9)))
+                          (let [(mut generated) (geometry-path kind (load geometry) tolerance)
+                                count (path/path-point-count (load generated))
+                                minimum (if (= kind (primitive/cast i32 7))
+                                            (primitive/cast i64 2)
+                                            (if (= kind (primitive/cast i32 9))
+                                                (primitive/cast i64 2)
+                                                (primitive/cast i64 3)))]
+                            (do
+                              (if (or (< count minimum)
+                                      (not (document-add-path! (mut document)
+                                                               (load generated)
+                                                               (load style)
+                                                               tolerance)))
+                                  (set! (.valid reader) false)
+                                  0)
+                              (path/path-free! (mut generated))))
                           0)
                       (if (not (load self-closing))
                           (do
@@ -649,6 +886,9 @@
                           0)
                       (if (!= (primitive/cast i64 (load path-data)) 0)
                           (do (free (load path-data)) 0)
+                          0)
+                      (if (!= (primitive/cast i64 (load (field geometry points))) 0)
+                          (do (free (load (field geometry points))) 0)
                           0)))))))
       (if (or (not (load (field reader valid)))
               (or (!= (al/al-len [i32] (load tags)) 0)
