@@ -1,0 +1,233 @@
+(module experiments.coil_gpui.grid)
+(import "experiments.coil_gpui.ui" :as ui)
+(import "coil.arraylist" :as al)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+
+(export GridTrack
+        GridPlacement
+        GridLayout
+        grid-new
+        grid-clear!
+        grid-free!
+        grid-fixed-track!
+        grid-fraction-track!
+        grid-place!
+        grid-compute!
+        grid-rect)
+
+;;; A track starts at its hard minimum and receives a weighted share of free
+;;; space until its optional maximum freezes it. A zero fraction is fixed.
+(defstruct GridTrack [(minimum f32) (maximum f32) (fraction f32) (size f32)])
+
+(defstruct GridPlacement [(column i64) (row i64) (column-span i64) (row-span i64)])
+
+(defstruct GridLayout
+  [(columns (al/ArrayList GridTrack))
+   (rows (al/ArrayList GridTrack))
+   (placements (al/ArrayList GridPlacement))
+   (rects (al/ArrayList ui/Rect))])
+
+(defn grid-new [] (-> GridLayout)
+  (let [allocator (alloc/malloc-allocator)]
+    (GridLayout
+      :columns (al/al-new [GridTrack] allocator)
+      :rows (al/al-new [GridTrack] allocator)
+      :placements (al/al-new [GridPlacement] allocator)
+      :rects (al/al-new [ui/Rect] allocator))))
+
+(defn grid-clear! [(layout (mut GridLayout))] (-> i64)
+  (do
+    (al/al-clear! [GridTrack] (mut (.columns layout)))
+    (al/al-clear! [GridTrack] (mut (.rows layout)))
+    (al/al-clear! [GridPlacement] (mut (.placements layout)))
+    (al/al-clear! [ui/Rect] (mut (.rects layout)))))
+
+(defn grid-free! [(layout (mut GridLayout))] (-> i64)
+  (do
+    (al/al-free! [GridTrack] (mut (.columns layout)))
+    (al/al-free! [GridTrack] (mut (.rows layout)))
+    (al/al-free! [GridPlacement] (mut (.placements layout)))
+    (al/al-free! [ui/Rect] (mut (.rects layout)))))
+
+(defn grid-track-push! [(tracks (mut (al/ArrayList GridTrack)))
+                        (minimum f32)
+                        (maximum f32)
+                        (fraction f32)] (-> i64)
+  (let [min-size (if (> minimum 0.0) minimum 0.0)
+        max-size (if (and (> maximum 0.0) (< maximum min-size)) min-size maximum)]
+    (al/al-push! [GridTrack]
+                 (mut tracks)
+                 (GridTrack
+                   :minimum min-size
+                   :maximum max-size
+                   :fraction (if (> fraction 0.0) fraction 0.0)
+                   :size min-size))))
+
+(defn grid-fixed-track! [(layout (mut GridLayout)) (column bool) (size f32)] (-> i64)
+  (if column
+      (grid-track-push! (mut (.columns layout)) size size 0.0)
+      (grid-track-push! (mut (.rows layout)) size size 0.0)))
+
+(defn grid-fraction-track! [(layout (mut GridLayout))
+                            (column bool)
+                            (minimum f32)
+                            (fraction f32)
+                            (maximum f32)] (-> i64)
+  (if column
+      (grid-track-push! (mut (.columns layout)) minimum maximum fraction)
+      (grid-track-push! (mut (.rows layout)) minimum maximum fraction)))
+
+(defn grid-place! [(layout (mut GridLayout))
+                   (column i64)
+                   (row i64)
+                   (column-span i64)
+                   (row-span i64)] (-> i64)
+  (al/al-push! [GridPlacement]
+               (mut (.placements layout))
+               (GridPlacement
+                 :column (if (< column 0) 0 column)
+                 :row (if (< row 0) 0 row)
+                 :column-span (if (> column-span 0) column-span 1)
+                 :row-span (if (> row-span 0) row-span 1))))
+
+(defn track-active? [(track GridTrack)] (-> bool)
+  (and (> (load (field track fraction)) 0.0)
+       (or (<= (load (field track maximum)) 0.0)
+           (< (load (field track size)) (- (load (field track maximum)) 0.0001)))))
+
+;;; Resolve one axis using iterative freeze-and-redistribute. When a track hits
+;;; max, its unused share is redistributed among remaining fractional tracks.
+(defn grid-solve-axis! [(tracks (mut (al/ArrayList GridTrack)))
+                        (available f32)
+                        (gap f32)] (-> f32)
+  (let [count (al/al-len [GridTrack] (load tracks))
+        gap-total
+          (* (if (> gap 0.0) gap 0.0)
+             (primitive/cast f32 (if (> count 0) (- count 1) 0)))
+        (mut minimum-total) (primitive/cast f32 0.0)]
+    (do
+      (for [i 0 count]
+        (let [(mut track) (al/al-get [GridTrack] (load tracks) i)]
+          (do
+            (set! (.size track) (load (field track minimum)))
+            (store! minimum-total (+ (load minimum-total) (load (field track minimum))))
+            (al/al-set! [GridTrack] (mut tracks) i (load track)))))
+      (let [(mut remaining) (- available (+ gap-total (load minimum-total)))
+            (mut keep-solving) true]
+        (do
+          (while (and (> (load remaining) 0.0001) (load keep-solving))
+            (let [(mut fraction-total) (primitive/cast f32 0.0)]
+              (do
+                (for [i 0 count]
+                  (let [track (al/al-get [GridTrack] (load tracks) i)]
+                    (if (track-active? track)
+                        (store! fraction-total
+                                (+ (load fraction-total)
+                                   (load (field track fraction))))
+                        0)))
+                (if (<= (load fraction-total) 0.0)
+                    (store! keep-solving false)
+                    (let [(mut distributed) (primitive/cast f32 0.0)
+                          pass-space (load remaining)]
+                      (do
+                        (for [i 0 count]
+                          (let [(mut track) (al/al-get [GridTrack] (load tracks) i)]
+                            (if (track-active? (load track))
+                                (let [share
+                                        (* pass-space
+                                           (/ (load (field track fraction))
+                                              (load fraction-total)))
+                                      maximum (load (field track maximum))
+                                      room
+                                        (if (> maximum 0.0)
+                                            (- maximum (load (field track size)))
+                                            share)
+                                      addition (if (< room share) room share)]
+                                  (do
+                                    (set! (.size track) (+ (load (field track size)) addition))
+                                    (store! distributed (+ (load distributed) addition))
+                                    (al/al-set! [GridTrack] (mut tracks) i (load track))))
+                                0)))
+                        (store! remaining (- (load remaining) (load distributed)))
+                        (if (<= (load distributed) 0.0001)
+                            (store! keep-solving false)
+                            0)))))))
+          (let [(mut used) gap-total]
+            (do
+              (for [i 0 count]
+                (let [track (al/al-get [GridTrack] (load tracks) i)]
+                  (store! used (+ (load used) (load (field track size))))))
+              (load used))))))))
+
+(defn grid-axis-origin [(tracks (al/ArrayList GridTrack))
+                        (index i64)
+                        (origin f32)
+                        (gap f32)] (-> f32)
+  (let [(mut result) origin
+        limit (if (< index (al/al-len [GridTrack] tracks)) index (al/al-len [GridTrack] tracks))]
+    (do
+      (for [i 0 limit]
+        (let [track (al/al-get [GridTrack] tracks i)]
+          (store! result (+ (load result) (+ (load (field track size)) gap)))))
+      (load result))))
+
+(defn grid-axis-span [(tracks (al/ArrayList GridTrack))
+                      (start i64)
+                      (span i64)
+                      (gap f32)] (-> f32)
+  (let [count (al/al-len [GridTrack] tracks)
+        end (let [requested (+ start span)] (if (< requested count) requested count))
+        (mut result) (primitive/cast f32 0.0)]
+    (do
+      (for [i start end]
+        (let [track (al/al-get [GridTrack] tracks i)]
+          (do
+            (store! result (+ (load result) (load (field track size))))
+            (if (< (+ i 1) end) (store! result (+ (load result) gap)) 0))))
+      (load result))))
+
+(defn grid-compute! [(layout (mut GridLayout))
+                     (bounds ui/Rect)
+                     (column-gap f32)
+                     (row-gap f32)
+                     (padding ui/EdgeInsets)] (-> i64)
+  (let [inner (ui/inset bounds padding)
+        columns (load (field layout columns))
+        rows (load (field layout rows))
+        column-count (al/al-len [GridTrack] columns)
+        row-count (al/al-len [GridTrack] rows)
+        placements (load (field layout placements))
+        count (al/al-len [GridPlacement] placements)]
+    (do
+      (grid-solve-axis! (mut (.columns layout)) (load (field inner w)) column-gap)
+      (grid-solve-axis! (mut (.rows layout)) (load (field inner h)) row-gap)
+      (al/al-clear! [ui/Rect] (mut (.rects layout)))
+      (for [i 0 count]
+        (let [placement (al/al-get [GridPlacement] placements i)
+              column (load (field placement column))
+              row (load (field placement row))]
+          (if (or (>= column column-count) (>= row row-count))
+              (al/al-push! [ui/Rect] (mut (.rects layout)) (ui/rect 0.0 0.0 0.0 0.0))
+              (al/al-push! [ui/Rect]
+                           (mut (.rects layout))
+                           (ui/rect (grid-axis-origin (load (field layout columns))
+                                                      column
+                                                      (load (field inner x))
+                                                      column-gap)
+                                    (grid-axis-origin (load (field layout rows))
+                                                      row
+                                                      (load (field inner y))
+                                                      row-gap)
+                                    (grid-axis-span (load (field layout columns))
+                                                    column
+                                                    (load (field placement column-span))
+                                                    column-gap)
+                                    (grid-axis-span (load (field layout rows))
+                                                    row
+                                                    (load (field placement row-span))
+                                                    row-gap))))))
+      count)))
+
+(defn grid-rect [(layout GridLayout) (index i64)] (-> ui/Rect)
+  (al/al-get [ui/Rect] (load (field layout rects)) index))

@@ -33,6 +33,9 @@ layer in the runtime path.
 - Immediate element reconstruction over retained application/component state.
 - Reusable flex row/column solving with basis, grow, weighted shrink, gaps,
   padding, main-axis justification, cross-axis alignment, and hard min/max clamps.
+- Responsive grid solving with fixed and weighted fractional rows/columns,
+  hard min/max tracks, iterative cap-and-redistribute behavior, gaps, padding,
+  and row/column spanning placements.
 - Nested clipping propagated to both GPU paint records and hitboxes.
 - A separate reverse-painted hitbox list with stable component IDs; decorative
   paint no longer accidentally participates in input.
@@ -57,7 +60,7 @@ layer in the runtime path.
 retained application state
         |
         v
-flex layout -> component functions rebuild a transient Scene each frame
+flex/grid layout -> component functions rebuild a transient Scene each frame
         |
         v
 paint list + clipped inverse-transform hitbox/focus list + texture-sprite list
@@ -79,7 +82,7 @@ This follows GPUI's hybrid model: long-lived state owns focus, component values,
 layout buffers, GPU resources, and text caches, while the root
 view produces a short-lived element tree every frame. GPUI's elements pass through
 request-layout, prepaint, and paint. The Coil library mirrors those responsibilities
-with `layout.coil`, clipped hitbox registration in `ui.coil`, retained routing in
+with `layout.coil`/`grid.coil`, clipped hitbox registration in `ui.coil`, retained routing in
 `input.coil`, and batched GPU painting in `metal.coil`. Paint primitives and hitboxes
 are intentionally independent.
 
@@ -167,7 +170,7 @@ application. GPUI parity still requires substantial systems, notably:
 
 - glyph-run extraction, editable text measurement, and atlas-page eviction
   (whole-label shaping, bounded atlas allocation, and GPU mask composition work now);
-- grid and intrinsic text/image measurement (flex layout works);
+- intrinsic text/image measurement (flex and constrained grid layout work);
 - SVG and arbitrary paths (affine transforms, analytic shadows, linear gradients,
   general raster images, uniform and variable-height virtual scrolling, and nested
   rectangular GPU clipping work);
@@ -187,6 +190,7 @@ These are explicit missing capabilities, not features claimed by the prototype.
 - [GPUI key dispatch](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/key_dispatch.rs)
 - [GPUI window, focus, and hitbox model](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/window.rs)
 - [GPUI list example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/list_example.rs)
+- [GPUI responsive grid example](https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/grid_layout.rs)
 - [Apple CAMetalLayer documentation](https://developer.apple.com/documentation/QuartzCore/CAMetalLayer)
 - [Apple MTLRenderCommandEncoder documentation](https://developer.apple.com/documentation/metal/mtlrendercommandencoder)
 - [Apple CTRun documentation](https://developer.apple.com/documentation/coretext/ctrun)
