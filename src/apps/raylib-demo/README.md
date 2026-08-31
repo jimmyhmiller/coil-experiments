@@ -11,8 +11,8 @@ Everything needed to understand and configure the demo is in this directory:
 - `main.coil` imports and uses Raylib.
 - `Coil.toml` maps the import to `raylib.h`, lists the implementation `.c`
   files, configures the C frontend, and declares the native libraries.
-- Raylib's pinned upstream source remains in the repository's shared
-  `vendor/raylib` directory.
+- `vendor/raylib` contains the complete pinned upstream Raylib source used by
+  the demo.
 
 Run it as an ordinary standalone Coil project:
 
