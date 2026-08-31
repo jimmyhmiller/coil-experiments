@@ -1,8 +1,9 @@
 # Raylib imported from C source
 
 The demo imports `experiments.raylib-demo.raylib` like an ordinary Coil module.
-Its `.cmod` source anchor selects `[c.raylib]` in the workspace `Coil.toml`; the
-C reader preprocesses and lowers Raylib's seven translation units in memory.
+That namespace maps to Raylib's real public header, `vendor/raylib/src/raylib.h`.
+The C reader uses its declarations as the module's public interface and lowers
+Raylib's seven implementation translation units from `[c.raylib]` in memory.
 There is no generated `raylib.coil` to update or check in.
 
 Run it directly from the repository root:
