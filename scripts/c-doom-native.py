@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build Doom Generic with the native C frontend, with no Clang in the pipeline.
 
-Every translation unit is handed to src/dialects/c/cc.coil at once, which lowers
+Every translation unit is handed to src/dialects/c/cc_main.coil at once, which lowers
 the whole program to one Coil module; `coil build` turns that into the
 executable. Clang is not involved in reading a single line of C -- it only links
 the object file `coil build` produces.
@@ -147,7 +147,7 @@ def main() -> int:
     # The frontend is a Coil program like any other: it is built once and then
     # run, which is what `coil run` does and saves repeating for every build.
     cc = doom.CACHE / "cc"
-    built = subprocess.run([args.compiler, "build", str(ROOT / "src/dialects/c/cc.coil"),
+    built = subprocess.run([args.compiler, "build", str(ROOT / "src/dialects/c/cc_main.coil"),
                             "-O2", "-o", str(cc)], cwd=ROOT)
     if built.returncode != 0:
         return 1

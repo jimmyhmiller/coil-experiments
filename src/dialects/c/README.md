@@ -9,7 +9,7 @@ Ueyama; see [ATTRIBUTION.md](ATTRIBUTION.md).
 The output is ordinary Coil, which Coil's own backend compiles.
 
 ```sh
-coil run src/dialects/c/cc.coil -- -o out.coil a.c b.c \
+coil run src/dialects/c/cc_main.coil -- -o out.coil a.c b.c \
   -include src/dialects/c/target/darwin-arm64.h \
   -include src/dialects/c/target/builtins.h \
   -I"$(xcrun --show-sdk-path)/usr/include" \
@@ -26,7 +26,8 @@ coil build out.coil -O2 -o program
 | `node.coil` | the typed AST |
 | `parse.coil` | the parser and the semantics: conversions, initialisers, constant expressions |
 | `emit.coil` | lowering to Coil |
-| `cc.coil` | the driver |
+| `cc.coil` | the reusable compiler pipeline used by readers and tools |
+| `cc_main.coil` | the command-line entry point |
 | `target/` | the target's predefined macros, and the builtins the system headers expect |
 
 ## Many translation units, one module
@@ -39,13 +40,38 @@ definition in another without any linker of ours in between. See
 [MULTI-UNIT.md](MULTI-UNIT.md) for what that costs, what it buys, and what the
 commands and intermediate files actually look like.
 
+The same frontend can be used directly as a project reader, so generated Coil
+does not need to be stored on disk:
+
+```toml
+[manifest.providers]
+c = "experiments.c.reader"
+
+[readers]
+".cmod" = "experiments.c.reader"
+
+[modules]
+"myapp.raylib" = "vendor/raylib.cmod"
+
+[c.raylib]
+sources = ["vendor/raylib/src/rcore.c", "vendor/raylib/src/rshapes.c"]
+include-paths = ["vendor/raylib/src"]
+defines = ["PLATFORM_DESKTOP_SDL", "GRAPHICS_API_OPENGL_33"]
+prefixes = ["src/dialects/c/target/darwin-arm64.h"]
+```
+
+Import `"myapp.raylib"` like any other module. The `.cmod` file is the module
+anchor; its basename selects `[c.raylib]`. The reader preprocesses every source
+as an independent C translation unit and returns one in-memory Coil module.
+
 ## How C constructs are represented
 
-A record becomes a blob whose size and alignment are C's own: an array whose
-element type carries the required alignment, with members reached by byte offset.
-Handing records to Coil's struct layout instead would mean two independent sets
-of layout rules had to agree, and they need not. It is also what makes bitfields
-and `__attribute__((packed))` expressible at all.
+A complete, nameable C record becomes an explicit-layout Coil `defstruct`, with
+the C frontend supplying every field offset plus the record's size and alignment.
+This gives callers ordinary constructors such as `(Color :r 17 :g 34 :b 51
+:a 255)` while preserving C layout. Opaque/incomplete records remain raw storage;
+bitfields and anonymous members use byte-offset access where a Coil field cannot
+express the C operation.
 
 Every expression has two forms, its value and its address. Assignment, `&`, and
 member access all fall out of that rather than being special-cased, and an
@@ -75,18 +101,13 @@ functions use Coil's native `...` and the platform convention.
 constructors after the static initialisers, destructors through `atexit`, so that
 they still run when the program calls `exit`.
 
-## Records do not cross a foreign call boundary by value
+## Records across a foreign call boundary
 
-A record is lowered as a blob with C's size and alignment, and passed between
-this program's own functions as that blob. Both sides agree, so struct arguments
-and struct returns work -- `tests/c/native/structs.c` matches Clang.
-
-They do not agree with anybody else. The platform's own convention classifies a
-record by what is in it: on arm64 a struct of four `double`s is a homogeneous
-floating aggregate and travels in `v0..v3`, a small integer struct travels in
-`x` registers, and a large one travels behind a hidden pointer. None of that is
-implemented, so passing a record by value to a function this compiler did not
-build is wrong, and passing one to a variadic foreign function crashes.
+The emitted explicit-layout structs preserve the layout and field types needed
+by Coil's native ABI classifier. Struct arguments and returns work both between
+translated functions and for foreign calls such as Raylib's `Color` and
+`Vector2` APIs; `tests/c/native/structs.c` checks translated calls against Clang
+and the Raylib reader demo exercises the external boundary.
 
 `src/apps/doom/cocoa.c` is the only place in this repo that would do it -- a
 `CGRect` to `objc_msgSend` -- and it sends the four doubles as four arguments
@@ -95,11 +116,13 @@ instead, which this target puts in exactly the same registers.
 ## What is not implemented
 
 `_Float16` and `__int128` exist so that a system header declaring one lays out
-correctly; arithmetic on either is reported rather than narrowed. Statement
-expressions, generic selection, compound literals, VLAs, atomics, complex
-numbers, thread-local storage, and inline assembly are not implemented. Implicit
-function declarations are rejected, as C99 and Clang reject them. Each of these
-reports where it appeared instead of quietly producing something else.
+correctly; arithmetic on either is reported rather than narrowed. Generic
+selection, VLAs, C11 `_Atomic` types/operations, complex numbers, thread-local
+storage, and general inline assembly are not implemented. GCC `__sync_*`
+integer atomics and empty GNU asm compiler barriers are supported. Implicit
+function declarations are rejected, as C99 and Clang reject them. Each
+unsupported construct reports where it appeared instead of quietly producing
+something else.
 
 ## Validation
 

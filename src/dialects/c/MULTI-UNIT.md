@@ -29,7 +29,7 @@ deliberately awkward:
 One command. Every `.c` on the line, one `-o`:
 
 ```sh
-coil run src/dialects/c/cc.coil -- \
+coil run src/dialects/c/cc_main.coil -- \
   -o /tmp/mu.coil \
   tests/c/multi-unit/alpha.c tests/c/multi-unit/beta.c \
   -Itests/c/multi-unit \
@@ -70,11 +70,11 @@ two sources. It is meant to be read.
 (extern atexit :cc c [(fnptr c [] i64)] (-> i32))
 (extern printf :cc c [(ptr i8) ...] (-> i32))
 (extern __swbuf :cc c [i32 (ptr i8)] (-> i32))
-(defn c_g_counter_alpha [] (-> (ptr i32)) (primitive/alloc-static i32))
-(defn c_g_shared [] (-> (ptr i32)) (primitive/alloc-static i32))
-(defn c_g_initialized [] (-> (ptr i32)) (primitive/alloc-static i32))
+(defn counter_alpha [] (-> (ptr i32)) (primitive/alloc-static i32))
+(defn shared [] (-> (ptr i32)) (primitive/alloc-static i32))
+(defn initialized [] (-> (ptr i32)) (primitive/alloc-static i32))
 ...
-(defn c_g_counter_beta [] (-> (ptr i32)) (primitive/alloc-static i32))
+(defn counter_beta [] (-> (ptr i32)) (primitive/alloc-static i32))
 ```
 
 Four kinds of thing appear, in this order:
@@ -87,7 +87,7 @@ Four kinds of thing appear, in this order:
 2. **A zero-argument accessor per global**, returning its address. That is how a
    C object with static storage is spelled: `(primitive/alloc-static T)` gives
    one cell per call site, and the call site is inside the accessor, so every
-   reader of `c_g_shared` gets the same cell. A global that is declared but
+   reader of `shared` gets the same cell. A global that is declared but
    never defined anywhere in the program gets an accessor over a real external
    symbol instead.
 3. **The function bodies**, one `defn` each.
@@ -103,12 +103,12 @@ name that belongs to one file only:
 
 | C declaration | in the AST | in the emitted Coil |
 | --- | --- | --- |
-| `static int counter;` in `alpha.c` | `counter$alpha` | `c_g_counter_alpha` |
-| `static int counter;` in `beta.c` | `counter$beta` | `c_g_counter_beta` |
-| `int shared;` (either file) | `shared` | `c_g_shared` |
-| `static int increment(int)` in `alpha.c` | `increment$alpha` | `c_fn_increment_alpha` |
-| `int from_alpha(struct Pair *)` | `from_alpha` | `c_fn_from_alpha` |
-| a string literal, twelfth in `alpha.c` | `.Lstr.12$alpha` | `c_g__Lstr_12_alpha` |
+| `static int counter;` in `alpha.c` | `counter$alpha` | `counter_alpha` |
+| `static int counter;` in `beta.c` | `counter$beta` | `counter_beta` |
+| `int shared;` (either file) | `shared` | `shared` |
+| `static int increment(int)` in `alpha.c` | `increment$alpha` | `increment_alpha` |
+| `int from_alpha(struct Pair *)` | `from_alpha` | `from_alpha` |
+| a string literal, twelfth in `alpha.c` | `.Lstr.12$alpha` | `_Lstr_12_alpha` |
 
 The name the source used stays bound in the file's own scope, so `counter` inside
 `alpha.c` finds `counter$alpha` and nothing else. The `$` is only in the AST;
@@ -130,7 +130,7 @@ They do not, in the sense a linker means. Nothing resolves anything.
 an object named `from_alpha` with no body. `alpha.c` defines a function with the
 same name. Both objects end up in one list, and before emitting anything the
 lowerer walks that list once and records which names have a definition somewhere.
-A call then emits `(c_fn_from_alpha ...)` if the name is defined in the program,
+A call then emits `(from_alpha ...)` if the name is defined in the program,
 and `(from_alpha ...)` — a call to an external symbol — if it is not. That single
 pass is the whole of "linking".
 
@@ -157,12 +157,12 @@ call and every definition at once. A disagreement is caught there.
 ```sh
 printf 'int mismatch(int x) { return x; }\n'                       > /tmp/l.c
 printf 'double mismatch(double);\nint main(void){return (int)mismatch(1.5);}\n' > /tmp/r.c
-# ... cc.coil -o /tmp/bad.coil /tmp/l.c /tmp/r.c ...
+# ... cc_main.coil -o /tmp/bad.coil /tmp/l.c /tmp/r.c ...
 coil build /tmp/bad.coil -O0 -o /tmp/bad
 ```
 
 ```text
-error: in 'c_program.c_fn_main': argument 1 to 'c_program.c_fn_mismatch'
+error: in 'c_program.c-main': argument 1 to 'c_program.mismatch'
        has type f64 but expected i32
 ```
 
@@ -190,14 +190,14 @@ unit by unit:
   (do
     (do ...alpha.c's initialisers...)
     (do ...beta.c's initialisers...)
-    (atexit (primitive/fnptr-of c_fn_alpha_stop_alpha))
-    (atexit (primitive/fnptr-of c_fn_beta_stop_beta))
-    (c_fn_alpha_start_alpha)
-    (c_fn_beta_start_beta)
+    (atexit (primitive/fnptr-of alpha_stop_alpha))
+    (atexit (primitive/fnptr-of beta_stop_beta))
+    (alpha_start_alpha)
+    (beta_start_beta)
     0))
 
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i32)
-  (do (c_init_statics) (primitive/cast i32 (c_fn_main argc argv))))
+  (do (c-init-statics) (primitive/cast i32 (c-main argc argv))))
 ```
 
 Most of what a C program initialises never reaches that function. An object with

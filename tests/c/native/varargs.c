@@ -41,6 +41,20 @@ static const char *pick(int which, ...) {
     return s;
 }
 
+static int sum_list(int count, va_list ap) {
+    int total = 0;
+    for (int i = 0; i < count; i++) total += va_arg(ap, int);
+    return total;
+}
+
+static int forward_sum(int count, ...) {
+    va_list ap;
+    va_start(ap, count);
+    int total = sum_list(count, ap);
+    va_end(ap);
+    return total;
+}
+
 int main(void) {
     int total = 0;
     total += sum_ints(4, 1, 2, 3, 4);
@@ -53,6 +67,7 @@ int main(void) {
     total += buf[0] + buf[3];
 
     total += pick(2, "one", "two", "three")[0];
+    total += forward_sum(3, 7, 8, 9);
 
     printf("%s\n", buf);
     return total & 0x7f;

@@ -1,6 +1,8 @@
 ;; The native C compiler driver: tokenize, preprocess, parse, lower.
+
 ;;
 ;;   coil run src/dialects/c/cc.coil -- -o out.coil a.c b.c ... \
+;;     [--library --module NAME] \
 ;;     [-Ipath ...] [-Fpath ...] [-Dname[=value] ...] [-include path ...]
 ;;
 ;; Every translation unit is preprocessed and parsed on its own -- a macro
@@ -16,7 +18,6 @@
 ;; Clang is not involved at any point. The result is ordinary Coil, which
 ;; `coil build` turns into an executable.
 (module experiments.c.cc)
-
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :as al)
@@ -32,6 +33,8 @@
 (import "experiments.c.parse" :as ps)
 (import "experiments.c.emit" :as em)
 
+(export Options setup-pp! compile-unit! lower-text run-cli)
+
 (defstruct Options
   [(inputs (al/ArrayList (slice u8)))
    (output (slice u8))
@@ -39,7 +42,9 @@
    (defines (al/ArrayList (slice u8)))
    ;; Headers read ahead of every translation unit, as `-include` does. This is
    ;; how the target description reaches the preprocessor.
-   (prefixes (al/ArrayList (slice u8)))])
+   (prefixes (al/ArrayList (slice u8)))
+   (library bool)
+   (module-name (slice u8))])
 
 (defn report [(stage (slice u8))
               (message (slice u8))
@@ -86,8 +91,9 @@
                   (Ok [text]
                       (let [pre (pp/pp-read-prefix (mut p) path text)]
                         (if (!= (.failed pre) 0)
-                            (do (report "preprocessor" (.message pre) (.file pre) (.line pre))
-                                (store! bad 1))
+                            (do
+                              (report "preprocessor" (.message pre) (.file pre) (.line pre))
+                              (store! bad 1))
                             0))))
                 (store! i (+ (load i) 1)))))
     (load bad)))
@@ -100,13 +106,15 @@
         (mut i) 0]
     (loop (if (>= (load i) n)
               (break)
-              (do (pp/pp-add-include-path (mut p) (al/al-get [(slice u8)] includes (load i)))
-                  (store! i (+ (load i) 1)))))
+              (do
+                (pp/pp-add-include-path (mut p) (al/al-get [(slice u8)] includes (load i)))
+                (store! i (+ (load i) 1)))))
     (store! i 0)
     (loop (if (>= (load i) dn)
               (break)
-              (do (pp/pp-define-text (mut p) (al/al-get [(slice u8)] defines (load i)))
-                  (store! i (+ (load i) 1)))))
+              (do
+                (pp/pp-define-text (mut p) (al/al-get [(slice u8)] defines (load i)))
+                (store! i (+ (load i) 1)))))
     (read-prefixes! (mut p) a (.prefixes opts))))
 
 ;;; Parses one unit and appends what it declared to the whole program.
@@ -133,10 +141,11 @@
                                 (mut i) 0]
                             (loop (if (>= (load i) n)
                                       (break)
-                                      (do (al/al-push! [(ptr nd/Obj)]
-                                                       (mut globals)
-                                                       (al/al-get [(ptr nd/Obj)] own (load i)))
-                                          (store! i (+ (load i) 1)))))
+                                      (do
+                                        (al/al-push! [(ptr nd/Obj)]
+                                                     (mut globals)
+                                                     (al/al-get [(ptr nd/Obj)] own (load i)))
+                                        (store! i (+ (load i) 1)))))
                             (nd/push-body! init (.init parsed))
                             0))))))))))
 
@@ -150,20 +159,56 @@
     (loop (if (or (>= (load i) n) (!= (load bad) 0))
               (break)
               (do
-                (store! bad (compile-unit! a
-                                           opts
-                                           (al/al-get [(slice u8)] inputs (load i))
-                                           (mut globals)
-                                           init))
+                (store! bad
+                        (compile-unit! a
+                                       opts
+                                       (al/al-get [(slice u8)] inputs (load i))
+                                       (mut globals)
+                                       init))
                 (store! i (+ (load i) 1)))))
     (if (!= (load bad) 0)
         1
-        (let [emitted (em/emit-program a (load (mut globals)) init)]
+        (let [emitted
+                (em/emit-module a
+                                (load (mut globals))
+                                init
+                                (.module-name opts)
+                                (not (.library opts)))]
           (if (!= (.failed emitted) 0)
               (do (report "error" (.message emitted) (.file emitted) (.line emitted)) 1)
               (match (fs/write-file a (.output opts) (.text emitted))
                 (Err [_] (do (println "cannot write {s}" (.output opts)) 1))
                 (Ok [_] 0)))))))
+
+;;; In-memory entry used by source readers. It is the same multi-translation-unit
+;;; pipeline as the command-line driver, without materializing generated Coil.
+(defn lower-text [(a (dyn alloc/Allocator)) (opts Options)] (-> (slice u8))
+  (let [(mut globals) (al/al-new [(ptr nd/Obj)] a)
+        init (nd/node-new a nd/ND-BLOCK (lex/token-none))
+        inputs (.inputs opts)
+        n (al/al-len [(slice u8)] inputs)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (if (!= (compile-unit! a
+                                       opts
+                                       (al/al-get [(slice u8)] inputs (load i))
+                                       (mut globals)
+                                       init)
+                        0)
+                    (primitive/error "C module compilation failed")
+                    0)
+                (store! i (+ (load i) 1)))))
+    (let [emitted
+            (em/emit-module a
+                            (load (mut globals))
+                            init
+                            (.module-name opts)
+                            (not (.library opts)))]
+      (if (!= (.failed emitted) 0)
+          (primitive/error (.message emitted))
+          (.text emitted)))))
 
 ;;; True when `arg` begins with the one-letter flag `letter`, which is how the C
 ;;; compiler flags that take an attached value are spelled.
@@ -178,39 +223,51 @@
 (defn arg-at [(argv (ptr (ptr i8))) (i i64)] (-> (slice u8))
   (str/cstr->str (load (primitive/index argv i))))
 
-(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+(defn run-cli [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
   (let [a (alloc/malloc-allocator)
         (mut inputs) (al/al-new [(slice u8)] a)
         (mut includes) (al/al-new [(slice u8)] a)
         (mut defines) (al/al-new [(slice u8)] a)
         (mut prefixes) (al/al-new [(slice u8)] a)
         (mut output) ""
+        (mut library) false
+        (mut module-name) "c_program"
         (mut i) 1
         n (primitive/cast i64 argc)]
-    (loop
-      (if (>= (load i) n)
-          (break)
-          (let [arg (arg-at argv (load i))]
-            (cond
-              (str/str-eq arg "-include")
-                (do (store! i (+ (load i) 1))
-                    (if (< (load i) n)
-                        (al/al-push! [(slice u8)] (mut prefixes) (arg-at argv (load i)))
-                        0))
-              (str/str-eq arg "-o")
-                (do (store! i (+ (load i) 1))
-                    (if (< (load i) n) (store! output (arg-at argv (load i))) 0))
-              (flag? arg 73) (al/al-push! [(slice u8)] (mut includes) (flag-value arg))
-              (flag? arg 70) (al/al-push! [(slice u8)] (mut includes) (flag-value arg))
-              (flag? arg 68) (al/al-push! [(slice u8)] (mut defines) (flag-value arg))
-              :else (al/al-push! [(slice u8)] (mut inputs) arg))
-            (store! i (+ (load i) 1)))))
+    (loop (if (>= (load i) n)
+              (break)
+              (let [arg (arg-at argv (load i))]
+                (cond (str/str-eq arg "-include")
+                        (do
+                          (store! i (+ (load i) 1))
+                          (if (< (load i) n)
+                              (al/al-push! [(slice u8)] (mut prefixes) (arg-at argv (load i)))
+                              0))
+                      (str/str-eq arg "-o")
+                        (do
+                          (store! i (+ (load i) 1))
+                          (if (< (load i) n) (store! output (arg-at argv (load i))) 0))
+                      (str/str-eq arg "--library") (store! library true)
+                      (str/str-eq arg "--module")
+                        (do
+                          (store! i (+ (load i) 1))
+                          (if (< (load i) n) (store! module-name (arg-at argv (load i))) 0))
+                      (flag? arg 73) (al/al-push! [(slice u8)] (mut includes) (flag-value arg))
+                      (flag? arg 70) (al/al-push! [(slice u8)] (mut includes) (flag-value arg))
+                      (flag? arg 68) (al/al-push! [(slice u8)] (mut defines) (flag-value arg))
+                      :else (al/al-push! [(slice u8)] (mut inputs) arg))
+                (store! i (+ (load i) 1)))))
     (if (or (= (al/al-len [(slice u8)] (load (mut inputs))) 0)
             (= (slice-len (load output)) 0))
-        (do (println "usage: cc -o OUT.coil IN.c... [-Ipath] [-Fpath] [-Dname=value] [-include path]") 2)
+        (do
+          (println "usage: cc -o OUT.coil IN.c... [--library --module NAME] [-Ipath] [-Fpath] [-Dname=value] [-include path]")
+          2)
         (compile a
-                 (load (Options :inputs (load (mut inputs))
+                 (load (Options
+                         :inputs (load (mut inputs))
                          :output (load output)
                          :includes (load (mut includes))
                          :defines (load (mut defines))
-                         :prefixes (load (mut prefixes))))))))
+                         :prefixes (load (mut prefixes))
+                         :library (load library)
+                         :module-name (load module-name)))))))

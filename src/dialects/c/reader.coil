@@ -1,0 +1,153 @@
+(module experiments.c.reader)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+(import "coil.fs" :as fs)
+(import "coil.result" :use *)
+(import "experiments.c.cc" :as cc)
+
+(reader-provider "experiments.c.reader" read-c-module)
+
+(extern getenv :cc c [(ptr i8)] (-> (ptr i8)))
+
+(defstruct CModuleConfig
+  [(sources (al/ArrayList (slice u8)))
+   (includes (al/ArrayList (slice u8)))
+   (defines (al/ArrayList (slice u8)))
+   (prefixes (al/ArrayList (slice u8)))])
+
+(defn trim [(s (slice u8))] (-> (slice u8))
+  (let [(mut lo) 0
+        (mut hi) (slice-len s)]
+    (loop (if (and (< (load lo) (load hi))
+                   (or (= (primitive/cast i64 (slice-get s (load lo))) 32)
+                       (= (primitive/cast i64 (slice-get s (load lo))) 9)))
+              (store! lo (+ (load lo) 1))
+              (break)))
+    (loop (if (and (> (load hi) (load lo))
+                   (or (= (primitive/cast i64 (slice-get s (- (load hi) 1))) 32)
+                       (= (primitive/cast i64 (slice-get s (- (load hi) 1))) 9)))
+              (store! hi (- (load hi) 1))
+              (break)))
+    (subslice s (load lo) (load hi))))
+
+(defn byte-index [(s (slice u8)) (wanted i64)] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (loop (if (>= (load i) (slice-len s))
+              (break)
+              (if (= (primitive/cast i64 (slice-get s (load i))) wanted)
+                  (do (store! found (load i)) (break))
+                  (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn basename-without-extension [(path (slice u8))] (-> (slice u8))
+  (let [n (slice-len path)
+        (mut start) 0
+        (mut end) n
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [c (primitive/cast i64 (slice-get path (load i)))]
+                (if (= c 47) (do (store! start (+ (load i) 1)) (store! end n)) 0)
+                (if (= c 46) (store! end (load i)) 0)
+                (store! i (+ (load i) 1)))))
+    (subslice path (load start) (load end))))
+
+(defn quoted-values! [(line (slice u8))
+                      (target (mut (al/ArrayList (slice u8))))] (-> i64)
+  (let [n (slice-len line)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (if (= (primitive/cast i64 (slice-get line (load i))) 34)
+                  (let [start (+ (load i) 1)
+                        (mut j) start]
+                    (loop (if (or (>= (load j) n)
+                                  (= (primitive/cast i64 (slice-get line (load j))) 34))
+                              (break)
+                              (store! j (+ (load j) 1))))
+                    (if (< (load j) n)
+                        (do
+                          (al/al-push! [(slice u8)] (mut target) (subslice line start (load j)))
+                          (store! i (+ (load j) 1)))
+                        (store! i n)))
+                  (store! i (+ (load i) 1)))))
+    0))
+
+(defn parse-config [(a (dyn alloc/Allocator))
+                    (text (slice u8))
+                    (name (slice u8))] (-> CModuleConfig)
+  (let [(mut sources) (al/al-new [(slice u8)] a)
+        (mut includes) (al/al-new [(slice u8)] a)
+        (mut defines) (al/al-new [(slice u8)] a)
+        (mut prefixes) (al/al-new [(slice u8)] a)
+        lines (str/str-split a text "\n")
+        (mut active) false
+        (mut collecting) 0
+        (mut i) 0
+        (mut header) (str/sb-new a)]
+    (str/sb-push-str! (mut header) "c.")
+    (str/sb-push-str! (mut header) name)
+    (let [wanted (str/sb-str (load (mut header)))]
+      (loop (if (>= (load i) (al/al-len [(slice u8)] lines))
+                (break)
+                (let [line (trim (al/al-get [(slice u8)] lines (load i)))]
+                  (if (and (> (slice-len line) 1)
+                           (= (primitive/cast i64 (slice-get line 0)) 91))
+                      (let [close (byte-index line 93)]
+                        (store! active
+                                (and (> close 1)
+                                     (str/str-eq (trim (subslice line 1 close)) wanted)))
+                        (store! collecting 0))
+                      (if (load active)
+                          (let [eq (byte-index line 61)]
+                            (if (>= eq 0)
+                                (let [key (trim (subslice line 0 eq))]
+                                  (cond (str/str-eq key "sources") (store! collecting 1)
+                                        (str/str-eq key "include-paths") (store! collecting 2)
+                                        (str/str-eq key "defines") (store! collecting 3)
+                                        (str/str-eq key "prefixes") (store! collecting 4)
+                                        :else (store! collecting 0)))
+                                0)
+                            (cond (= (load collecting) 1) (quoted-values! line (mut sources))
+                                  (= (load collecting) 2) (quoted-values! line (mut includes))
+                                  (= (load collecting) 3) (quoted-values! line (mut defines))
+                                  (= (load collecting) 4) (quoted-values! line (mut prefixes))
+                                  :else 0)
+                            (if (>= (byte-index line 93) 0) (store! collecting 0) 0))
+                          0))
+                  (store! i (+ (load i) 1)))))
+      (if (= (al/al-len [(slice u8)] (load (mut sources))) 0)
+          (primitive/error "C manifest module has no sources")
+          0)
+      (load (CModuleConfig
+              :sources (load (mut sources))
+              :includes (load (mut includes))
+              :defines (load (mut defines))
+              :prefixes (load (mut prefixes)))))))
+
+(defn read-c-module [(context Code)] (-> Code)
+  (let [a (alloc/malloc-allocator)
+        path (primitive/code-str (primitive/code-nth context 1))
+        env (getenv c"COIL_MANIFEST_PATH")]
+    (if (= (primitive/cast i64 env) 0)
+        (primitive/error "C reader requires a Coil.toml manifest")
+        (let [manifest
+                (match (fs/read-file a (str/cstr->str env))
+                  (Ok [text] text)
+                  (Err [_] (primitive/error "C reader cannot read Coil.toml")))
+              config (parse-config a manifest (basename-without-extension path))
+              opts
+                (load (cc/Options
+                        :inputs (.sources config)
+                        :output ""
+                        :includes (.includes config)
+                        :defines (.defines config)
+                        :prefixes (.prefixes config)
+                        :library true
+                        :module-name ""))
+              generated (cc/lower-text a opts)]
+          (primitive/code-read generated `(reader-config))))))

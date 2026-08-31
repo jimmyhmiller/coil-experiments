@@ -29,6 +29,15 @@ static int no_default(int n) {
     return r;
 }
 
+static int assertion_failure_ran = 0;
+
+static void assertion_failure(void) {
+    assertion_failure_ran = 1;
+}
+
+#define CHECK(expression) \
+    (__builtin_expect(!(expression), 0) ? assertion_failure() : (void)0)
+
 int main(void) {
     int total = 0;
     for (int i = 0; i < 11; i++) {
@@ -69,6 +78,11 @@ int main(void) {
         d += k;
     } while (k < 6);
     total += d;
+
+    /* A discarded conditional may have void/differently represented arms.
+       Darwin's assert macro has this exact shape. */
+    CHECK(total != 0);
+    total += assertion_failure_ran;
 
     return total & 0x7f;
 }

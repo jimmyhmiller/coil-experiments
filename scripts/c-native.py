@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Differential gate for the C frontend written in Coil.
 
-Each case is compiled twice -- once by Clang, once by src/dialects/c/cc.coil --
+Each case is compiled twice -- once by Clang, once by src/dialects/c/cc_main.coil --
 and both binaries are run. The two must agree on exit status and output. Clang is
 the oracle here and nothing else: it takes no part in the build being tested.
 """
@@ -76,7 +76,7 @@ def frontend(coil, work) -> str:
     the same thing as `coil run` and does not repeat the build for every case.
     """
     binary = work / "cc"
-    built = run([coil, "build", str(ROOT / "src/dialects/c/cc.coil"), "-O2",
+    built = run([coil, "build", str(ROOT / "src/dialects/c/cc_main.coil"), "-O2",
                  "-o", str(binary)])
     if built.returncode:
         raise SystemExit(f"could not build the C frontend:\n{built.stdout}{built.stderr}")
