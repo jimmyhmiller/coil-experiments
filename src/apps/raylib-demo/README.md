@@ -6,10 +6,19 @@ The C reader uses its declarations as the module's public interface and lowers
 Raylib's seven implementation translation units from `[c.raylib]` in memory.
 There is no generated `raylib.coil` to update or check in.
 
-Run it directly from the repository root:
+Everything needed to understand and configure the demo is in this directory:
+
+- `main.coil` imports and uses Raylib.
+- `Coil.toml` maps the import to `raylib.h`, lists the implementation `.c`
+  files, configures the C frontend, and declares the native libraries.
+- Raylib's pinned upstream source remains in the repository's shared
+  `vendor/raylib` directory.
+
+Run it as an ordinary standalone Coil project:
 
 ```sh
-coil run src/apps/raylib-demo/main.coil
+cd src/apps/raylib-demo
+coil run
 ```
 
 The pinned Raylib implementation is in `vendor/raylib`, so this command needs
