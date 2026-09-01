@@ -117,12 +117,12 @@ instead, which this target puts in exactly the same registers.
 
 `_Float16` and `__int128` exist so that a system header declaring one lays out
 correctly; arithmetic on either is reported rather than narrowed. Generic
-selection, VLAs, C11 `_Atomic` types/operations, complex numbers, thread-local
-storage, and general inline assembly are not implemented. GCC `__sync_*`
-integer atomics and empty GNU asm compiler barriers are supported. Implicit
-function declarations are rejected, as C99 and Clang reject them. Each
-unsupported construct reports where it appeared instead of quietly producing
-something else.
+selection, VLAs, complex numbers, thread-local storage, and general inline
+assembly are not implemented. C11 `_Atomic(T)` plus the exchange/load/store
+builtins, GCC `__sync_*` integer atomics, empty GNU asm compiler barriers, and
+the AArch64 `yield` hint are supported. Implicit function declarations are
+rejected, as C99 and Clang reject them. Each unsupported construct reports where
+it appeared instead of quietly producing something else.
 
 ## Validation
 

@@ -479,7 +479,10 @@
               ;; are.
               (= k nd/ND-COND)
                 (let [then (nd/nd-then n)
-                      els (nd/nd-else n)
+                      els (nd/nd-else n)]
+                  (add-type! (mut p) then)
+                  (add-type! (mut p) els)
+                  (let [
                       yes (nd/nd-type then)
                       no (nd/nd-type els)]
                   (cond (and (not (null-type? yes))
@@ -503,15 +506,21 @@
                             (nd/set-type! n no))
                         (and (ct/pointer-like? yes) (ct/pointer-like? no))
                           (let [common
-                                  (if (= (ct/ty-kind (ct/ty-base yes)) ct/TY-VOID)
-                                      yes
-                                      (if (= (ct/ty-kind (ct/ty-base no)) ct/TY-VOID)
+                                  (cond (and (= (ct/ty-kind (ct/ty-base yes)) ct/TY-VOID)
+                                             (and (constant-node? then)
+                                                  (= (eval-const (mut p) then) 0)))
                                           no
-                                          yes))]
+                                        (and (= (ct/ty-kind (ct/ty-base no)) ct/TY-VOID)
+                                             (and (constant-node? els)
+                                                  (= (eval-const (mut p) els) 0)))
+                                          yes
+                                        (= (ct/ty-kind (ct/ty-base yes)) ct/TY-VOID) yes
+                                        (= (ct/ty-kind (ct/ty-base no)) ct/TY-VOID) no
+                                        :else yes)]
                             (nd/set-then! n (convert-to (mut p) then common))
                             (nd/set-else! n (convert-to (mut p) els common))
                             (nd/set-type! n common))
-                        :else (nd/set-type! n yes)))
+                        :else (nd/set-type! n yes))))
               :else 0))))
 
 ;; ------------------------------------------------------------- literals
@@ -1267,6 +1276,13 @@
                       (word? (mut p) "typedef") (do (advance! (mut p)) (store! is-typedef 1))
                       (word? (mut p) "static") (do (advance! (mut p)) (store! is-static 1))
                       (word? (mut p) "extern") (do (advance! (mut p)) (store! is-extern 1))
+                      (and (word? (mut p) "_Atomic")
+                           (text=? (lex/token-text (peek-at (mut p) 1)) "("))
+                        (do
+                          (advance! (mut p))
+                          (expect! (mut p) "(")
+                          (store! ty (parse-typename (mut p)))
+                          (expect! (mut p) ")"))
                       (qualifier-word? (mut p)) (do (advance! (mut p)) 0)
                       (word? (mut p) "_Alignas")
                         (do
@@ -1790,12 +1806,15 @@
 
 (defn member-access [(p (mut Parser)) (base (ptr nd/Node)) (name-tok lex/Token) (tok lex/Token)] (-> (ptr nd/Node))
   (let [object
-          (if (and (ct/record? (nd/nd-type base)) (not (c-lvalue? base)))
+          (if (and (not (null-type? (nd/nd-type base)))
+                   (and (ct/record? (nd/nd-type base)) (not (c-lvalue? base))))
               (materialize-record-value (mut p) base tok)
               base)
         found (member-access-find (mut p) object name-tok tok)]
     (if (null-node? found)
-        (do (fail-at! (mut p) "no such member" name-tok) base)
+        (do
+          (fail-at! (mut p) "no such member" name-tok)
+          base)
         found)))
 
 ;;; What a parameter of this declared type actually receives. An array or a
@@ -1889,6 +1908,11 @@
                           (or (text=? name "__sync_fetch_and_xor")
                               (text=? name "__sync_fetch_and_and")))))))))
 
+(defn c11-atomic-builtin? [(name (slice u8))] (-> bool)
+  (or (text=? name "__c11_atomic_exchange")
+      (or (text=? name "__c11_atomic_load")
+          (text=? name "__c11_atomic_store"))))
+
 (defn parse-sync-builtin [(p (mut Parser))] (-> (ptr nd/Node))
   (let [a (load (field p a))
         tok (advance! (mut p))
@@ -1928,6 +1952,19 @@
                   (nd/set-type! n (ty-int-of (mut p))))))))
     n))
 
+(defn parse-c11-atomic-builtin [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [n (parse-sync-builtin (mut p))
+        name (nd/nd-label n)]
+    ;; The final memory-order argument controls ordering, not the stored value's
+    ;; width. Emission currently uses seq_cst, which is valid for weaker requests.
+    (when (> (al/al-len [(ptr nd/Node)] (nd/nd-args n)) 1)
+      (al/al-pop! [(ptr nd/Node)] (mut (field n args)))
+      0)
+    (cond (text=? name "__c11_atomic_exchange") (nd/set-label! n "__sync_lock_test_and_set")
+          (text=? name "__c11_atomic_load") (nd/set-label! n "__c11_atomic_load")
+          :else (nd/set-label! n "__c11_atomic_store"))
+    n))
+
 (defn parse-builtin-alloca [(p (mut Parser))] (-> (ptr nd/Node))
   (let [a (load (field p a))
         tok (advance! (mut p))
@@ -1937,6 +1974,23 @@
     (expect! (mut p) ")")
     (nd/set-label! n "__builtin_alloca")
     (nd/set-type! n (ct/ty-pointer-to a (ty-void-of (mut p))))
+    n))
+
+(defn parse-builtin-bit-count [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [a (load (field p a))
+        tok (advance! (mut p))
+        n (nd/node-new a nd/ND-ATOMIC tok)]
+    (expect! (mut p) "(")
+    (let [operand (decay (mut p) (parse-assign (mut p)))]
+      (nd/push-arg! n operand)
+      (nd/set-type! n
+                    (if (or (text=? (lex/token-text tok) "__builtin_bswap16")
+                            (or (text=? (lex/token-text tok) "__builtin_bswap32")
+                                (text=? (lex/token-text tok) "__builtin_bswap64")))
+                        (nd/nd-type operand)
+                        (ty-int-of (mut p)))))
+    (expect! (mut p) ")")
+    (nd/set-label! n (lex/token-text tok))
     n))
 
 ;;; `va_start(ap, last)` points `ap` at the caller's variadic arguments. The
@@ -2050,7 +2104,20 @@
                   (add-type! (mut p) n)
                   n)))
           (sync-builtin? (lex/token-text t)) (parse-sync-builtin (mut p))
+          (c11-atomic-builtin? (lex/token-text t)) (parse-c11-atomic-builtin (mut p))
           (word? (mut p) "__builtin_alloca") (parse-builtin-alloca (mut p))
+          (or (word? (mut p) "__builtin_popcount")
+              (or (word? (mut p) "__builtin_popcountl")
+                  (word? (mut p) "__builtin_popcountll")))
+            (parse-builtin-bit-count (mut p))
+          (or (word? (mut p) "__builtin_ctz")
+              (or (word? (mut p) "__builtin_ctzl")
+                  (word? (mut p) "__builtin_ctzll")))
+            (parse-builtin-bit-count (mut p))
+          (or (word? (mut p) "__builtin_bswap16")
+              (or (word? (mut p) "__builtin_bswap32")
+                  (word? (mut p) "__builtin_bswap64")))
+            (parse-builtin-bit-count (mut p))
           (or (word? (mut p) "__func__") (word? (mut p) "__FUNCTION__"))
             (let [tok (advance! (mut p))
                   f (load (field p current-fn))]
@@ -2576,6 +2643,7 @@
   (let [a (load (field p a))
         tok (advance! (mut p))
         (mut nonempty) false
+        (mut template) ""
         (mut depth) 0]
     (loop (if (or (word? (mut p) "volatile") (word? (mut p) "__volatile__"))
               (advance! (mut p))
@@ -2583,8 +2651,9 @@
     (expect! (mut p) "(")
     (store! depth 1)
     (if (= (lex/token-kind (peek (mut p))) lex/TK-STRING)
-        (let [template (read-string-bytes! (mut p) (advance! (mut p)))]
-          (if (> (slice-len template) 0) (store! nonempty true) 0))
+        (do
+          (store! template (read-string-bytes! (mut p) (advance! (mut p))))
+          (if (> (slice-len (load template)) 0) (store! nonempty true) 0))
         (store! nonempty true))
     (loop (if (or (= (load depth) 0) (at-eof? (mut p)))
               (break)
@@ -2593,8 +2662,16 @@
                 (if (punct? (mut p) ")") (store! depth (- (load depth) 1)) 0)
                 (advance! (mut p)))))
     (expect! (mut p) ";")
-    (if (load nonempty) (fail-at! (mut p) "nonempty inline assembly is unsupported" tok) 0)
-    (nd/node-new a nd/ND-NULL tok)))
+    (if (not (load nonempty))
+        (nd/node-new a nd/ND-NULL tok)
+        (if (text=? (load template) "yield")
+            (let [n (nd/node-new a nd/ND-ATOMIC tok)]
+              (nd/set-label! n "__asm_aarch64_yield")
+              (nd/set-type! n (ty-int-of (mut p)))
+              n)
+            (do
+              (fail-at! (mut p) "unsupported inline assembly template" tok)
+              (nd/node-new a nd/ND-NULL tok))))))
 
 (defn return-type [(p (mut Parser))] (-> (ptr ct/Type))
   (let [f (load (field p current-fn))]
@@ -2786,7 +2863,17 @@
                                 (if (punct? (mut p) ",")
                                     (do (advance! (mut p)) 0)
                                     (do (expect! (mut p) ";") (store! more 0))))
-                            (= (ct/ty-kind (.ty d)) ct/TY-FUNC) (do (parse-function! (mut p) spec d) (store! more 0))
+                            (= (ct/ty-kind (.ty d)) ct/TY-FUNC)
+                              (if (punct? (mut p) "{")
+                                  (do (parse-function! (mut p) spec d) (store! more 0))
+                                  (let [f (new-global-of! (mut p)
+                                                          (.name d)
+                                                          (.ty d)
+                                                          (!= (.is-static spec) 0))]
+                                    (nd/set-obj-asm-name! f (.asm-name d))
+                                    (if (punct? (mut p) ",")
+                                        (do (advance! (mut p)) 0)
+                                        (do (expect! (mut p) ";") (store! more 0)))))
                             :else
                               (let [g (new-global-of! (mut p) (.name d) (.ty d) (!= (.is-static spec) 0))]
                                 (nd/set-obj-asm-name! g (.asm-name d))
