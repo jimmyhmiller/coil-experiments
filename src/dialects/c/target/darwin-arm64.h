@@ -16,6 +16,7 @@
 /* This compiler is C11, and close enough to GCC for the headers' purposes. */
 #define __STDC__ 1
 #define __STDC_VERSION__ 201112L
+#define __STDC_NO_VLA__ 1
 #define __STDC_HOSTED__ 1
 #define __GNUC__ 4
 #define __GNUC_MINOR__ 2

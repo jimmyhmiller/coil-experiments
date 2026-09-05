@@ -999,6 +999,8 @@
         (text=? w "__int128") true
         (text=? w "_Float16") true
         (text=? w "_Alignas") true
+        (text=? w "typeof") true
+        (text=? w "__typeof__") true
         :else false))
 
 ;;; A name only starts a type if it is a type keyword or a typedef that is
@@ -1186,6 +1188,17 @@
 
 ;;; Folds the constant expressions C requires to be folded: array bounds, enum
 ;;; values, case labels, and bitfield widths.
+(defn eval-const-address [(p (mut Parser)) (n (ptr nd/Node))] (-> i64)
+  (let [k (nd/nd-kind n)]
+    (cond (= k nd/ND-DEREF) (eval-const (mut p) (nd/nd-lhs n))
+          (= k nd/ND-MEMBER)
+            (+ (eval-const-address (mut p) (nd/nd-lhs n))
+               (nd/nd-member-offset n))
+          :else
+            (do
+              (fail-at! (mut p) "address is not an integer constant expression" (nd/nd-token n))
+              0))))
+
 (defn eval-const [(p (mut Parser)) (n (ptr nd/Node))] (-> i64)
   (if (null-node? n)
       0
@@ -1194,6 +1207,7 @@
             r (nd/nd-rhs n)]
         (cond (= k nd/ND-NUM) (nd/nd-value n)
               (= k nd/ND-CAST) (eval-const (mut p) l)
+              (= k nd/ND-ADDR) (eval-const-address (mut p) l)
               (= k nd/ND-ADD) (+ (eval-const (mut p) l) (eval-const (mut p) r))
               (= k nd/ND-SUB) (- (eval-const (mut p) l) (eval-const (mut p) r))
               (= k nd/ND-MUL) (* (eval-const (mut p) l) (eval-const (mut p) r))
@@ -1210,11 +1224,26 @@
               (= k nd/ND-BITOR) (primitive/ior (eval-const (mut p) l) (eval-const (mut p) r))
               (= k nd/ND-BITXOR) (primitive/ixor (eval-const (mut p) l) (eval-const (mut p) r))
               (= k nd/ND-SHL) (primitive/ishl (eval-const (mut p) l) (eval-const (mut p) r))
-              (= k nd/ND-SHR) (primitive/ishr (eval-const (mut p) l) (eval-const (mut p) r))
+              (= k nd/ND-SHR)
+                (if (ct/ty-unsigned? (nd/nd-type l))
+                    (primitive/llvm-ir i64
+                                       [(eval-const (mut p) l) (eval-const (mut p) r)]
+                                       "%r = lshr i64 $0, $1\nret i64 %r")
+                    (primitive/ishr (eval-const (mut p) l) (eval-const (mut p) r)))
               (= k nd/ND-EQ) (if (= (eval-const (mut p) l) (eval-const (mut p) r)) 1 0)
               (= k nd/ND-NE) (if (!= (eval-const (mut p) l) (eval-const (mut p) r)) 1 0)
-              (= k nd/ND-LT) (if (< (eval-const (mut p) l) (eval-const (mut p) r)) 1 0)
-              (= k nd/ND-LE) (if (<= (eval-const (mut p) l) (eval-const (mut p) r)) 1 0)
+              (= k nd/ND-LT)
+                (if (ct/ty-unsigned? (nd/nd-type l))
+                    (primitive/llvm-ir i64
+                                       [(eval-const (mut p) l) (eval-const (mut p) r)]
+                                       "%c = icmp ult i64 $0, $1\n%r = zext i1 %c to i64\nret i64 %r")
+                    (if (< (eval-const (mut p) l) (eval-const (mut p) r)) 1 0))
+              (= k nd/ND-LE)
+                (if (ct/ty-unsigned? (nd/nd-type l))
+                    (primitive/llvm-ir i64
+                                       [(eval-const (mut p) l) (eval-const (mut p) r)]
+                                       "%c = icmp ule i64 $0, $1\n%r = zext i1 %c to i64\nret i64 %r")
+                    (if (<= (eval-const (mut p) l) (eval-const (mut p) r)) 1 0))
               (= k nd/ND-LOGAND) (if (and (!= (eval-const (mut p) l) 0) (!= (eval-const (mut p) r) 0)) 1 0)
               (= k nd/ND-LOGOR) (if (or (!= (eval-const (mut p) l) 0) (!= (eval-const (mut p) r) 0)) 1 0)
               (= k nd/ND-COND)
@@ -1289,6 +1318,15 @@
                           (advance! (mut p))
                           (expect! (mut p) "(")
                           (store! requested-align (parse-const-expr (mut p)))
+                          (expect! (mut p) ")"))
+                      (or (word? (mut p) "typeof") (word? (mut p) "__typeof__"))
+                        (do
+                          (advance! (mut p))
+                          (expect! (mut p) "(")
+                          (if (type-start? (mut p))
+                              (store! ty (parse-typename (mut p)))
+                              (let [operand (parse-expr (mut p))]
+                                (store! ty (nd/nd-type operand))))
                           (expect! (mut p) ")"))
                       ;; On this target a `va_list` is a plain `char *`; the calling
                       ;; convention puts the variadic arguments in a contiguous area and
@@ -1566,7 +1604,9 @@
             (if (or (!= (load (field p failed)) 0)
                     (or (punct? (mut p) "}") (at-eof? (mut p))))
                 (break)
-                (let [spec (parse-declspec (mut p))
+                (if (static-assert? (mut p))
+                    (parse-static-assert! (mut p))
+                    (let [spec (parse-declspec (mut p))
                       (mut more) 1]
                   (if (punct? (mut p) ";")
                       (do
@@ -1583,11 +1623,10 @@
                                     (if (punct? (mut p) ":")
                                         (do (advance! (mut p)) (parse-const-expr (mut p)))
                                         -1)]
-                              (validate-decl-align! (mut p) spec (.ty d))
-                              (ct/add-member! ty (.name d) (.ty d) width)
+                              (ct/add-aligned-member! ty (.name d) (.ty d) width (.alignas spec))
                               (if (punct? (mut p) ",")
                                   (do (advance! (mut p)) 0)
-                                  (do (expect! (mut p) ";") (store! more 0)))))))))
+                                  (do (expect! (mut p) ";") (store! more 0))))))))))
           (expect! (mut p) "}")
           ;; `struct { ... } __attribute__((packed)) name;` puts it here
           ;; instead, so both positions are collected before the layout runs.
@@ -1993,6 +2032,16 @@
     (nd/set-label! n (lex/token-text tok))
     n))
 
+(defn parse-builtin-terminator [(p (mut Parser))] (-> (ptr nd/Node))
+  (let [a (load (field p a))
+        tok (advance! (mut p))
+        n (nd/node-new a nd/ND-ATOMIC tok)]
+    (expect! (mut p) "(")
+    (expect! (mut p) ")")
+    (nd/set-label! n (lex/token-text tok))
+    (nd/set-type! n (ct/ty-void a))
+    n))
+
 ;;; `va_start(ap, last)` points `ap` at the caller's variadic arguments. The
 ;;; named parameter it is given exists only to say where they begin, which the
 ;;; lowerer knows from the function it is emitting, so it is parsed and dropped.
@@ -2023,7 +2072,21 @@
 (defn parse-primary [(p (mut Parser))] (-> (ptr nd/Node))
   (let [a (load (field p a))
         t (peek (mut p))]
-    (cond (punct? (mut p) "(")
+    (cond (and (punct? (mut p) "(") (is-punct-at? (mut p) 1 "{"))
+            (let [tok (advance! (mut p))
+                  block (parse-compound (mut p))
+                  forms (nd/nd-body block)
+                  count (al/al-len [(ptr nd/Node)] forms)
+                  n (nd/node-unary a nd/ND-GNU-STMT-EXPR block tok)]
+              (expect! (mut p) ")")
+              (if (> count 0)
+                  (let [last (al/al-get [(ptr nd/Node)] forms (- count 1))]
+                    (if (= (nd/nd-kind last) nd/ND-EXPR-STMT)
+                        (nd/set-type! n (nd/nd-type (nd/nd-lhs last)))
+                        (nd/set-type! n (ct/ty-void a))))
+                  (nd/set-type! n (ct/ty-void a)))
+              n)
+          (punct? (mut p) "(")
             (do
               (advance! (mut p))
               (let [n (parse-expr (mut p))] (expect! (mut p) ")") n))
@@ -2106,6 +2169,9 @@
           (sync-builtin? (lex/token-text t)) (parse-sync-builtin (mut p))
           (c11-atomic-builtin? (lex/token-text t)) (parse-c11-atomic-builtin (mut p))
           (word? (mut p) "__builtin_alloca") (parse-builtin-alloca (mut p))
+          (or (word? (mut p) "__builtin_trap")
+              (word? (mut p) "__builtin_unreachable"))
+            (parse-builtin-terminator (mut p))
           (or (word? (mut p) "__builtin_popcount")
               (or (word? (mut p) "__builtin_popcountl")
                   (word? (mut p) "__builtin_popcountll")))
@@ -2268,6 +2334,24 @@
                 (store! i (+ (load i) 1))))))
   0)
 
+;;; Copies the values of an initializer tree while preserving the destination's
+;;; offsets. GNU range designators evaluate their initializer once and apply
+;;; that value to every selected element; sharing expression nodes preserves
+;;; that single source expression through lowering.
+(defn copy-init-values! [(p (mut Parser)) (dst (ptr Init)) (src (ptr Init))] (-> i64)
+  (store! (field dst expr) (load (field src expr)))
+  (let [source-kids (load (field src children))
+        count (al/al-len [(ptr Init)] source-kids)
+        (mut i) 0]
+    (loop (if (>= (load i) count)
+              (break)
+              (do
+                (copy-init-values! (mut p)
+                                   (init-child (mut p) dst (load i))
+                                   (al/al-get [(ptr Init)] source-kids (load i)))
+                (store! i (+ (load i) 1))))))
+  0)
+
 (defn array-initializer1! [(p (mut Parser)) (n (ptr Init))] (-> i64)
   (expect! (mut p) "{")
   (let [(mut i) 0
@@ -2281,16 +2365,35 @@
                     (if (not (eat! (mut p) ",")) (fail! (mut p) "expected `,` in braced array initializer") 0)
                     0)
                 (store! first 0)
-                ;; `[2] = v` moves the cursor.
+                ;; `[2] = v` moves the cursor. GNU `[2 ... 5] = v` initializes
+                ;; the entire inclusive range from one parsed value.
+                (let [(mut range-end) -1]
                 (if (punct? (mut p) "[")
                     (do
                       (advance! (mut p))
                       (store! i (parse-const-expr (mut p)))
+                      (if (punct? (mut p) "...")
+                          (do
+                            (advance! (mut p))
+                            (store! range-end (parse-const-expr (mut p))))
+                          0)
                       (expect! (mut p) "]")
                       (expect! (mut p) "="))
                     0)
                 (parse-initializer2! (mut p) (init-child (mut p) n (load i)))
-                (store! i (+ (load i) 1))
+                (if (>= (load range-end) 0)
+                    (if (< (load range-end) (load i))
+                        (fail! (mut p) "array designator range ends before it starts")
+                        (let [(mut j) (+ (load i) 1)]
+                          (loop (if (> (load j) (load range-end))
+                                    (break)
+                                    (do
+                                      (copy-init-values! (mut p)
+                                                         (init-child (mut p) n (load j))
+                                                         (init-child (mut p) n (load i)))
+                                      (store! j (+ (load j) 1)))))
+                          (store! i (+ (load range-end) 1))))
+                    (store! i (+ (load i) 1))))
                 (if (eat-init-end! (mut p)) (store! done 1) 0)))))
   0)
 

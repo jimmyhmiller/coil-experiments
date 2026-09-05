@@ -59,6 +59,7 @@ of the Coil compiler through one `--use experiments.rust-like.lang`. See
 [`src/dialects/rust-like/README.md`](src/dialects/rust-like/README.md).
 
 ### `src/apps/` — applications
+- `emacs/` — GNU Emacs compiled as one whole program by the Coil C reader
 - `chip8/` — CHIP-8 emulator with an AppKit GUI
 - `clox/` — the Crafting Interpreters bytecode VM, at rough parity with `-O2` C
 - `invaders/` — an 8080 emulator running Space Invaders
