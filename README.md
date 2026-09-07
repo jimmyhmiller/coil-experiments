@@ -77,6 +77,8 @@ of the Coil compiler through one `--use experiments.rust-like.lang`. See
 - `image/` — Smalltalk/Lisp-style images as a metaprogram over the live runtime;
   design in [`docs/IMAGE_METAPROGRAM.md`](docs/IMAGE_METAPROGRAM.md), phase A
   (container format and generated adapters) implemented
+- `live-repl/` — native nREPL-compatible editor/agent transport over the retained
+  live JIT session; see [`docs/LIVE_REPL.md`](docs/LIVE_REPL.md)
 
 The three concurrency dialects include runnable business-shaped examples and a
 design/tradeoff discussion in
