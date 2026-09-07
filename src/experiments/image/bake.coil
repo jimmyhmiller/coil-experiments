@@ -1,0 +1,104 @@
+(module experiments.image.bake)
+
+; Baked executables: append an image container to a copy of the program binary,
+; with a trailer that the boot path finds when the program is run with no image
+; argument. The result is a single self-booting executable — Coil's answer to
+; `save-lisp-and-die :executable t`.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.mem" :use *)
+(import "coil.fs" :as fs)
+(import "experiments.image.image" :as image)
+
+(extern chmod :cc c [(ptr i8) i32] (-> i32))
+
+(const BAKE-MAGIC "COILBAKE")
+(const BAKE-TRAILER-BYTES 16)
+
+(defn bake-store-le64! [(p (ptr u8)) (v i64)] (-> i64)
+  (for [i 0 8]
+    (store! (primitive/index p i)
+            (primitive/cast u8 (primitive/iand (primitive/ishr v (* i 8)) 255))))
+  0)
+
+(defn bake-load-le64 [(p (ptr u8))] (-> i64)
+  (let [(mut v) 0]
+    (for [i 0 8]
+      (set! v (primitive/ior (load v)
+                (primitive/ishl (primitive/cast i64 (load (primitive/index p i))) (* i 8)))))
+    (load v)))
+
+(defn bake-bytes=? [(x (slice u8)) (y (slice u8))] (-> bool)
+  (if (!= (slice-len x) (slice-len y)) false
+      (let [(mut ok) true]
+        (for [i 0 (slice-len x)]
+          (if (!= (slice-get x i) (slice-get y i)) (set! ok false) 0))
+        (load ok))))
+
+;;; Concatenate the program binary at `binary-path` with the image container at
+;;; `image-path`, append a trailer, write `out-path`, and mark it executable.
+(defn image-bake! [(a (dyn alloc/Allocator)) (binary-path (slice u8))
+                   (image-path (slice u8)) (out-path (slice u8))] (-> i64)
+  (match (fs/read-file a binary-path)
+    (Err [_] -1)
+    (Ok [binary]
+      (match (fs/read-file a image-path)
+        (Err [_] -2)
+        (Ok [img]
+          (let [total (+ (+ (slice-len binary) (slice-len img)) BAKE-TRAILER-BYTES)]
+            (match (alloc/alloc-bytes a total 8)
+              (None [] -3)
+              (Some [out]
+                (let [data (slice-data out)]
+                  (memcpy (primitive/cast (ptr i8) data)
+                          (primitive/cast (ptr i8) (slice-data binary))
+                          (primitive/cast isize (slice-len binary)))
+                  (memcpy (primitive/cast (ptr i8) (primitive/index data (slice-len binary)))
+                          (primitive/cast (ptr i8) (slice-data img))
+                          (primitive/cast isize (slice-len img)))
+                  (let [trailer (primitive/index data (+ (slice-len binary) (slice-len img)))]
+                    (memcpy (primitive/cast (ptr i8) trailer)
+                            (primitive/cast (ptr i8) (slice-data BAKE-MAGIC))
+                            (primitive/cast isize 8))
+                    (bake-store-le64! (primitive/index trailer 8) (slice-len img)))
+                  (match (fs/write-file a out-path out)
+                    (Err [_] -4)
+                    (Ok [_]
+                      (do (chmod (bake-cstr a out-path) (primitive/cast i32 493)) 0))))))))))))
+
+(defn bake-cstr [(a (dyn alloc/Allocator)) (s (slice u8))] (-> (ptr i8))
+  (match (alloc/alloc-bytes a (+ (slice-len s) 1) 1)
+    (None [] (primitive/cast (ptr i8) 0))
+    (Some [buf]
+      (do (for [i 0 (slice-len s)] (store! (primitive/index (slice-data buf) i) (slice-get s i)))
+          (store! (primitive/index (slice-data buf) (slice-len s)) (primitive/cast u8 0))
+          (primitive/cast (ptr i8) (slice-data buf))))))
+
+;;; True if `path` carries a baked image trailer.
+(defn image-baked? [(a (dyn alloc/Allocator)) (path (slice u8))] (-> bool)
+  (match (fs/read-file a path)
+    (Err [_] false)
+    (Ok [file]
+      (and (>= (slice-len file) BAKE-TRAILER-BYTES)
+           (bake-bytes=? (subslice file (- (slice-len file) BAKE-TRAILER-BYTES)
+                           (+ (- (slice-len file) BAKE-TRAILER-BYTES) 8))
+                         BAKE-MAGIC)))))
+
+;;; Like image-boot-baked! but a fast data reload (schemas + graph only, no
+;;; ledger replay). Use when the program's code is compiled into the binary and
+;;; only the heap state comes from the image — this is the instant path.
+(defn image-boot-baked-data! [(self-path (slice u8))] (-> i64)
+  (let [a (alloc/malloc-allocator)]
+    (match (fs/read-file a self-path)
+      (Err [_] -1)
+      (Ok [file]
+        (if (< (slice-len file) BAKE-TRAILER-BYTES) -2
+            (let [trailer-at (- (slice-len file) BAKE-TRAILER-BYTES)]
+              (if (not (bake-bytes=? (subslice file trailer-at (+ trailer-at 8)) BAKE-MAGIC)) -2
+                  (let [img-len (bake-load-le64 (primitive/index (slice-data file) (+ trailer-at 8)))
+                        img-start (- trailer-at img-len)]
+                    (if (or (< img-start 0) (> img-len (slice-len file))) -3
+                        (image/image-load-data-bytes! a (subslice file img-start trailer-at)))))))))))

@@ -1,0 +1,727 @@
+(module experiments.image.runtime)
+
+; The image runtime: the adapter registry generated code registers into, the
+; writer that turns a registered object graph into an `Image`, and the reader
+; that materializes an `Image` back into memory. Every pointer the generated
+; adapters hand this module is resolved through explicit tables; a pointer
+; that resolves nowhere is a blocker, never a guess.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.mem" :use *)
+(import "experiments.image.format" :use *)
+
+; ---- blockers ---------------------------------------------------------------
+
+(const IMAGE-BLOCK-NONE 0)
+(const IMAGE-BLOCK-UNTRACKED-POINTER 1)
+(const IMAGE-BLOCK-UNTRACKED-SLICE 2)
+(const IMAGE-BLOCK-UNKNOWN-HANDLE 3)
+(const IMAGE-BLOCK-UNKNOWN-FUNCTION 4)
+(const IMAGE-BLOCK-FOREIGN-WITHOUT-RESTORE 5)
+(const IMAGE-BLOCK-UNREGISTERED-SCHEMA 6)
+(const IMAGE-BLOCK-TYPE-MISMATCH 7)
+(const IMAGE-BLOCK-SCHEMA-MISMATCH 8)
+(const IMAGE-BLOCK-BAD-RELOCATION 9)
+(const IMAGE-BLOCK-ALLOCATION-FAILED 10)
+(const IMAGE-BLOCK-DUPLICATE-OBJECT 11)
+(const IMAGE-BLOCK-BAD-TAG 12)
+(const IMAGE-BLOCK-PAYLOAD-OVERFLOW 13)
+(const IMAGE-BLOCK-BAD-OBJECT 14)
+
+;;; Why a save or load stopped. `site` is the generated "Type.field" text of
+;;; the field that could not be written or read; `address` is the offending
+;;; native address (or the fingerprint for schema mismatches).
+(defstruct ImageBlocker
+  [(kind i64)
+   (runtime-id i64)
+   (offset i64)
+   (address i64)
+   (site (slice u8))])
+
+(defn image-blocker-fill! [(b (ptr ImageBlocker)) (kind i64) (runtime-id i64)
+                           (offset i64) (address i64) (site (slice u8))] (-> i64)
+  (if (= (.kind b) IMAGE-BLOCK-NONE)
+      (do
+        (set! (.kind b) kind)
+        (set! (.runtime-id b) runtime-id)
+        (set! (.offset b) offset)
+        (set! (.address b) address)
+        (set! (.site b) site)
+        0)
+      0)
+  -1)
+
+(defn image-blocker-name [(kind i64)] (-> (slice u8))
+  (cond
+    (= kind IMAGE-BLOCK-NONE) "none"
+    (= kind IMAGE-BLOCK-UNTRACKED-POINTER) "untracked-pointer"
+    (= kind IMAGE-BLOCK-UNTRACKED-SLICE) "untracked-slice"
+    (= kind IMAGE-BLOCK-UNKNOWN-HANDLE) "unknown-handle"
+    (= kind IMAGE-BLOCK-UNKNOWN-FUNCTION) "unknown-function"
+    (= kind IMAGE-BLOCK-FOREIGN-WITHOUT-RESTORE) "foreign-without-restore"
+    (= kind IMAGE-BLOCK-UNREGISTERED-SCHEMA) "unregistered-schema"
+    (= kind IMAGE-BLOCK-TYPE-MISMATCH) "type-mismatch"
+    (= kind IMAGE-BLOCK-SCHEMA-MISMATCH) "schema-mismatch"
+    (= kind IMAGE-BLOCK-BAD-RELOCATION) "bad-relocation"
+    (= kind IMAGE-BLOCK-ALLOCATION-FAILED) "allocation-failed"
+    (= kind IMAGE-BLOCK-DUPLICATE-OBJECT) "duplicate-object"
+    (= kind IMAGE-BLOCK-BAD-TAG) "bad-tag"
+    (= kind IMAGE-BLOCK-PAYLOAD-OVERFLOW) "payload-overflow"
+    (= kind IMAGE-BLOCK-BAD-OBJECT) "bad-object"
+    :else "unknown"))
+
+; ---- adapter registry -------------------------------------------------------
+
+;;; One registered schema version: how to write a native value of it into an
+;;; object payload, how to rebuild it from a staged payload, how to describe it,
+;;; and (optionally) how to restore its transient/foreign fields after a load.
+(defstruct ImageSchemaAdapter
+  [(runtime-id i64)
+   (fingerprint i64)
+   (name (slice u8))
+   (kind i64)
+   (native-size i64)
+   (native-align i64)
+   (stride i64)
+   (write (fnptr c [(ptr ImageWriter) (ptr ImageObject) (ptr i8) i64] i64))
+   (read (fnptr c [(ptr ImageReader) (ptr i8) (ptr i8)] i64))
+   (describe (fnptr c [(ptr ImageWriter) (ptr ImageSchema)] i64))
+   (restore (fnptr c [(ptr i8)] i64))
+   (has-restore bool)])
+
+(defstruct ImageRegistry
+  [(ready bool)
+   (adapters (ArrayList ImageSchemaAdapter))])
+
+(defn image-registry [] (-> (ptr ImageRegistry))
+  (let [r (primitive/alloc-static ImageRegistry)]
+    (if (not (.ready r))
+        (do
+          (set! (.adapters r) (al-new [ImageSchemaAdapter] (alloc/malloc-allocator)))
+          (set! (.ready r) true)
+          0)
+        0)
+    r))
+
+(defn image-find-adapter-index [(runtime-id i64) (fingerprint i64)] (-> i64)
+  (let [r (image-registry) (mut found) -1]
+    (for [i 0 (al-len (.adapters r))]
+      (let [ad (al-elem (field r adapters) i)]
+        (if (and (< (load found) 0)
+                 (and (= (.runtime-id ad) runtime-id)
+                      (= (.fingerprint ad) fingerprint)))
+            (set! found i)
+            0)))
+    (load found)))
+
+(defn image-adapter-at [(index i64)] (-> (ptr ImageSchemaAdapter))
+  (let [r (image-registry)]
+    (if (or (< index 0) (>= index (al-len (.adapters r))))
+        (primitive/cast (ptr ImageSchemaAdapter) 0)
+        (al-elem (field r adapters) index))))
+
+;;; The adapter for an exact schema version, or null.
+(defn image-find-adapter [(runtime-id i64) (fingerprint i64)] (-> (ptr ImageSchemaAdapter))
+  (image-adapter-at (image-find-adapter-index runtime-id fingerprint)))
+
+;;; The most recently registered adapter for a nominal identity, or null.
+(defn image-find-current-adapter [(runtime-id i64)] (-> (ptr ImageSchemaAdapter))
+  (let [r (image-registry) (mut found) -1]
+    (for [i 0 (al-len (.adapters r))]
+      (let [ad (al-elem (field r adapters) i)]
+        (if (= (.runtime-id ad) runtime-id) (set! found i) 0)))
+    (image-adapter-at (load found))))
+
+;;; Register a schema version. Re-registering the same (runtime-id,
+;;; fingerprint) is idempotent and returns the existing index.
+(defn image-register-adapter! [(adapter ImageSchemaAdapter)] (-> i64)
+  (let [ap (primitive/alloc-stack ImageSchemaAdapter)]
+    (store! ap adapter)
+    (let [existing (image-find-adapter-index (.runtime-id ap) (.fingerprint ap))]
+      (if (>= existing 0)
+          existing
+          (let [r (image-registry)]
+            (al-push! (mut (.adapters r)) (load ap))
+            (- (al-len (.adapters r)) 1))))))
+
+(defn image-adapter-count [] (-> i64)
+  (al-len (.adapters (image-registry))))
+
+; ---- writer -----------------------------------------------------------------
+
+;;; One registered native address range and the image object it became.
+(defstruct ImageForward
+  [(address i64)
+   (bytes i64)
+   (object i64)
+   (runtime-id i64)
+   (native-size i64)])
+
+(defstruct ImageHandleEntry
+  [(address i64)
+   (id i64)])
+
+;;; Save-side state. Objects are registered first (`image-writer-add-object!`
+;;; for every live payload/managed object, `image-writer-add-handle!` for every
+;;; stable handle, `image-writer-add-root!` for every root), then
+;;; `image-writer-write-objects!` runs every schema adapter, which resolves
+;;; each reference through the forward and handle tables.
+(defstruct ImageWriter
+  [(a (dyn alloc/Allocator))
+   (image (ptr Image))
+   (forwards (ArrayList ImageForward))
+   (handles (ArrayList ImageHandleEntry))
+   (blocker ImageBlocker)
+   (ctx (ptr i8))
+   ; Resolve a native function address to a stable definition identity and
+   ; ABI lineage. Returns 0 when known, nonzero when not.
+   (function-identity (fnptr c [(ptr i8) (ptr i8) (ptr ImageFunctionValue)] i64))])
+
+(defn image-writer-init! [(w (ptr ImageWriter))
+                          (a (dyn alloc/Allocator))
+                          (image (ptr Image))
+                          (ctx (ptr i8))
+                          (function-identity
+                            (fnptr c [(ptr i8) (ptr i8) (ptr ImageFunctionValue)] i64))]
+  (-> i64)
+  (set! (.a w) a)
+  (set! (.image w) image)
+  (set! (.forwards w) (al-new [ImageForward] a))
+  (set! (.handles w) (al-new [ImageHandleEntry] a))
+  (set! (.blocker w) (primitive/zeroed ImageBlocker))
+  (set! (.ctx w) ctx)
+  (set! (.function-identity w) function-identity)
+  0)
+
+(defn image-writer-block! [(w (ptr ImageWriter)) (kind i64) (runtime-id i64)
+                           (offset i64) (address i64) (site (slice u8))] (-> i64)
+  (image-blocker-fill! (field w blocker) kind runtime-id offset address site))
+
+(defn image-writer-blocked? [(w (ptr ImageWriter))] (-> bool)
+  (!= (.kind (field w blocker)) IMAGE-BLOCK-NONE))
+
+;;; Index of the forward entry whose native range contains `address`, or -1.
+(defn image-writer-forward [(w (ptr ImageWriter)) (address i64)] (-> i64)
+  (let [(mut found) -1]
+    (for [i 0 (al-len (.forwards w))]
+      (let [f (al-elem (field w forwards) i)]
+        (if (and (< (load found) 0)
+                 (and (>= address (.address f))
+                      (< address (+ (.address f) (.bytes f)))))
+            (set! found i)
+            0)))
+    (load found)))
+
+(defn image-writer-schema-version [(w (ptr ImageWriter)) (runtime-id i64)] (-> i64)
+  (let [(mut n) 0]
+    (for [i 0 (al-len (.schemas (.image w)))]
+      (if (= (.runtime-id (al-elem (field (.image w) schemas) i)) runtime-id)
+          (set! n (+ (load n) 1))
+          0))
+    (+ (load n) 1)))
+
+;;; Record the schema an adapter describes, once per (runtime-id, fingerprint).
+(defn image-writer-ensure-schema! [(w (ptr ImageWriter))
+                                   (adapter (ptr ImageSchemaAdapter))] (-> i64)
+  (let [(mut found) false]
+    (for [i 0 (al-len (.schemas (.image w)))]
+      (let [s (al-elem (field (.image w) schemas) i)]
+        (if (and (= (.runtime-id s) (.runtime-id adapter))
+                 (= (.fingerprint s) (.fingerprint adapter)))
+            (set! found true)
+            0)))
+    (if (load found)
+        0
+        (let [sp (primitive/alloc-stack ImageSchema)]
+          (store! sp (primitive/zeroed ImageSchema))
+          (set! (.runtime-id sp) (.runtime-id adapter))
+          (set! (.name sp) (.name adapter))
+          (set! (.version sp) (image-writer-schema-version w (.runtime-id adapter)))
+          (set! (.fingerprint sp) (.fingerprint adapter))
+          (set! (.kind sp) (.kind adapter))
+          (set! (.size sp) (.native-size adapter))
+          (set! (.align sp) (.native-align adapter))
+          (set! (.stride sp) (.stride adapter))
+          (set! (.declaration sp) "")
+          (set! (.fields sp) (al-new [ImageField] (.a w)))
+          (set! (.variants sp) (al-new [ImageVariant] (.a w)))
+          (set! (.references sp) (al-new [ImageReference] (.a w)))
+          (set! (.edges sp) (al-new [i64] (.a w)))
+          (let [status (primitive/call-ptr (.describe adapter) w sp)]
+            (if (!= status 0)
+                (image-writer-block! w IMAGE-BLOCK-UNREGISTERED-SCHEMA
+                  (.runtime-id adapter) 0 (.fingerprint adapter) (.name adapter))
+                (do
+                  (al-push! (mut (.schemas (.image w))) (load sp))
+                  0)))))))
+
+;;; Register one native object (`count` consecutive elements of the type whose
+;;; current adapter is `runtime-id`). Returns the object id (1-based) or 0
+;;; with the blocker set.
+(defn image-writer-add-object! [(w (ptr ImageWriter)) (address (ptr i8))
+                                (runtime-id i64) (count i64)] (-> i64)
+  (let [adapter (image-find-current-adapter runtime-id)
+        raw (primitive/cast i64 address)]
+    (cond
+      (= (primitive/cast i64 adapter) 0)
+        (do (image-writer-block! w IMAGE-BLOCK-UNREGISTERED-SCHEMA runtime-id 0 raw "")
+            0)
+      (or (= raw 0) (<= count 0))
+        (do (image-writer-block! w IMAGE-BLOCK-BAD-OBJECT runtime-id 0 raw "")
+            0)
+      (>= (image-writer-forward w raw) 0)
+        (do (image-writer-block! w IMAGE-BLOCK-DUPLICATE-OBJECT runtime-id 0 raw "")
+            0)
+      (!= (image-writer-ensure-schema! w adapter) 0)
+        0
+      :else
+        (let [stride (.stride adapter)
+              bytes (* stride count)]
+          (match (alloc/alloc-bytes (.a w) bytes 8)
+            (None []
+              (do (image-writer-block! w IMAGE-BLOCK-ALLOCATION-FAILED runtime-id 0 raw "")
+                  0))
+            (Some [payload]
+              (do
+                (memset (primitive/cast (ptr i8) (slice-data payload))
+                        (primitive/cast i32 0) (primitive/cast isize bytes))
+                (let [id (+ (al-len (.objects (.image w))) 1)
+                      op (primitive/alloc-stack ImageObject)]
+                  (store! op (primitive/zeroed ImageObject))
+                  (set! (.id op) id)
+                  (set! (.runtime-id op) runtime-id)
+                  (set! (.fingerprint op) (.fingerprint adapter))
+                  (set! (.kind op) (.kind adapter))
+                  (set! (.count op) count)
+                  (set! (.stride op) stride)
+                  (set! (.bytes op) bytes)
+                  (set! (.align op) (.native-align adapter))
+                  (set! (.payload op) (ImageBytes :data payload))
+                  (set! (.relocations op) (al-new [ImageRelocation] (.a w)))
+                  (set! (.functions op) (al-new [ImageFunctionValue] (.a w)))
+                  (set! (.transient op) (al-new [i64] (.a w)))
+                  (al-push! (mut (.objects (.image w))) (load op))
+                  (al-push! (mut (.forwards w))
+                    (ImageForward :address raw
+                                  :bytes (* (.native-size adapter) count)
+                                  :object id
+                                  :runtime-id runtime-id
+                                  :native-size (.native-size adapter)))
+                  id))))))))
+
+;;; Register a stable handle record whose payload is object `object`.
+;;; Returns the handle id (1-based).
+(defn image-writer-add-handle! [(w (ptr ImageWriter)) (handle-address (ptr i8))
+                                (object i64) (refs i64) (root i64)] (-> i64)
+  (let [raw (primitive/cast i64 handle-address)]
+    (if (or (= raw 0) (or (<= object 0) (> object (al-len (.objects (.image w))))))
+        (do (image-writer-block! w IMAGE-BLOCK-BAD-OBJECT 0 0 raw "")
+            0)
+        (let [id (+ (al-len (.handles (.image w))) 1)]
+          (al-push! (mut (.handles (.image w)))
+            (ImageHandle :id id :object object :refs refs :root root))
+          (al-push! (mut (.handles w)) (ImageHandleEntry :address raw :id id))
+          id))))
+
+(defn image-writer-add-root! [(w (ptr ImageWriter)) (name (slice u8))
+                              (runtime-id i64) (handle i64) (object i64)] (-> i64)
+  (let [fingerprint
+          (if (and (> object 0) (<= object (al-len (.objects (.image w)))))
+              (.fingerprint (al-elem (field (.image w) objects) (- object 1)))
+              0)]
+    (al-push! (mut (.roots (.image w)))
+      (ImageRoot :name name :runtime-id runtime-id :fingerprint fingerprint
+                 :handle handle :object object))
+    (- (al-len (.roots (.image w))) 1)))
+
+;;; Run every registered object's write adapter. Returns 0, or -1 with the
+;;; blocker describing the first unresolvable reference.
+(defn image-writer-write-objects! [(w (ptr ImageWriter))] (-> i64)
+  (let [(mut status) 0]
+    (for [i 0 (al-len (.objects (.image w)))]
+      (if (= (load status) 0)
+          (let [obj (al-elem (field (.image w) objects) i)
+                fwd (al-elem (field w forwards) i)
+                adapter (image-find-adapter (.runtime-id obj) (.fingerprint obj))]
+            (if (= (primitive/cast i64 adapter) 0)
+                (set! status (image-writer-block! w IMAGE-BLOCK-UNREGISTERED-SCHEMA
+                               (.runtime-id obj) 0 (.fingerprint obj) ""))
+                (for [e 0 (.count obj)]
+                  (if (= (load status) 0)
+                      (set! status
+                        (primitive/call-ptr (.write adapter) w obj
+                          (primitive/cast (ptr i8)
+                            (+ (.address fwd) (* e (.native-size fwd))))
+                          (* e (.stride obj))))
+                      0))))
+          0))
+    (if (and (= (load status) 0) (image-writer-blocked? w)) -1 (load status))))
+
+; ---- writer helpers called by generated adapters ----------------------------
+
+(defn image-payload-ptr [(obj (ptr ImageObject)) (offset i64) (size i64)] (-> (ptr u8))
+  (if (or (< offset 0) (or (< size 0) (> (+ offset size) (.bytes obj))))
+      (primitive/cast (ptr u8) 0)
+      (primitive/index (slice-data (.data (field obj payload))) offset)))
+
+(defn image-push-relocation! [(obj (ptr ImageObject)) (offset i64) (kind i64)
+                              (target i64) (interior i64) (length i64)] (-> i64)
+  (al-push! (mut (.relocations obj))
+    (ImageRelocation :offset offset :kind kind :target target
+                     :interior interior :length length))
+  0)
+
+;;; Copy `size` native bytes into the payload at `offset`.
+(defn image-write-bytes! [(w (ptr ImageWriter)) (obj (ptr ImageObject))
+                          (offset i64) (src (ptr i8)) (size i64)] (-> i64)
+  (let [dst (image-payload-ptr obj offset size)]
+    (if (= (primitive/cast i64 dst) 0)
+        (image-writer-block! w IMAGE-BLOCK-PAYLOAD-OVERFLOW (.runtime-id obj)
+          offset (primitive/cast i64 src) "")
+        (do (memcpy (primitive/cast (ptr i8) dst) src (primitive/cast isize size))
+            0))))
+
+;;; Store a sum's variant tag at `offset`.
+(defn image-write-tag! [(w (ptr ImageWriter)) (obj (ptr ImageObject))
+                        (offset i64) (tag i64)] (-> i64)
+  (let [dst (image-payload-ptr obj offset 8)]
+    (if (= (primitive/cast i64 dst) 0)
+        (image-writer-block! w IMAGE-BLOCK-PAYLOAD-OVERFLOW (.runtime-id obj) offset tag "")
+        (do (store! (primitive/cast (ptr i64) dst) tag) 0))))
+
+;;; A typed pointer to an object of nominal identity `expected`. Element
+;;; pointers into an array object are allowed; anything else that is not the
+;;; start of an element is a type mismatch.
+(defn image-write-object-ref! [(w (ptr ImageWriter)) (obj (ptr ImageObject))
+                               (offset i64) (address i64) (expected i64)
+                               (site (slice u8))] (-> i64)
+  (if (= address 0)
+      0
+      (let [fi (image-writer-forward w address)]
+        (if (< fi 0)
+            (image-writer-block! w IMAGE-BLOCK-UNTRACKED-POINTER (.runtime-id obj)
+              offset address site)
+            (let [fwd (al-elem (field w forwards) fi)
+                  interior (- address (.address fwd))]
+              (cond
+                (!= (.runtime-id fwd) expected)
+                  (image-writer-block! w IMAGE-BLOCK-TYPE-MISMATCH (.runtime-id obj)
+                    offset address site)
+                (!= (% interior (.native-size fwd)) 0)
+                  (image-writer-block! w IMAGE-BLOCK-TYPE-MISMATCH (.runtime-id obj)
+                    offset address site)
+                :else
+                  (image-push-relocation! obj offset IMAGE-REF-OBJECT (.object fwd)
+                    (/ interior (.native-size fwd)) 0)))))))
+
+;;; An untyped pointer anywhere inside a registered object.
+(defn image-write-interior-ref! [(w (ptr ImageWriter)) (obj (ptr ImageObject))
+                                 (offset i64) (address i64) (site (slice u8))] (-> i64)
+  (if (= address 0)
+      0
+      (let [fi (image-writer-forward w address)]
+        (if (< fi 0)
+            (image-writer-block! w IMAGE-BLOCK-UNTRACKED-POINTER (.runtime-id obj)
+              offset address site)
+            (let [fwd (al-elem (field w forwards) fi)]
+              (image-push-relocation! obj offset IMAGE-REF-INTERIOR (.object fwd)
+                (- address (.address fwd)) 0))))))
+
+;;; A slice whose data must lie entirely inside one registered object.
+(defn image-write-slice! [(w (ptr ImageWriter)) (obj (ptr ImageObject))
+                          (offset i64) (data i64) (length i64) (elem-size i64)
+                          (site (slice u8))] (-> i64)
+  (if (= data 0)
+      (if (= length 0)
+          0
+          (image-writer-block! w IMAGE-BLOCK-UNTRACKED-SLICE (.runtime-id obj)
+            offset data site))
+      (let [fi (image-writer-forward w data)]
+        (if (< fi 0)
+            (image-writer-block! w IMAGE-BLOCK-UNTRACKED-SLICE (.runtime-id obj)
+              offset data site)
+            (let [fwd (al-elem (field w forwards) fi)
+                  end (+ data (* length elem-size))]
+              (if (or (< length 0) (> end (+ (.address fwd) (.bytes fwd))))
+                  (image-writer-block! w IMAGE-BLOCK-UNTRACKED-SLICE (.runtime-id obj)
+                    offset data site)
+                  (image-push-relocation! obj offset IMAGE-REF-SLICE (.object fwd)
+                    (- data (.address fwd)) length)))))))
+
+;;; A pointer to a registered stable handle record.
+(defn image-write-handle! [(w (ptr ImageWriter)) (obj (ptr ImageObject))
+                           (offset i64) (address i64) (site (slice u8))] (-> i64)
+  (if (= address 0)
+      0
+      (let [(mut found) 0]
+        (for [i 0 (al-len (.handles w))]
+          (let [h (al-elem (field w handles) i)]
+            (if (= (.address h) address) (set! found (.id h)) 0)))
+        (if (= (load found) 0)
+            (image-writer-block! w IMAGE-BLOCK-UNKNOWN-HANDLE (.runtime-id obj)
+              offset address site)
+            (image-push-relocation! obj offset IMAGE-REF-HANDLE (load found) 0 0)))))
+
+;;; A function value, resolved to a stable identity by the writer's callback.
+(defn image-write-function! [(w (ptr ImageWriter)) (obj (ptr ImageObject))
+                             (offset i64) (address i64) (site (slice u8))] (-> i64)
+  (if (= address 0)
+      0
+      (let [fv (primitive/alloc-stack ImageFunctionValue)]
+        (store! fv (primitive/zeroed ImageFunctionValue))
+        (if (!= (primitive/call-ptr (.function-identity w) (.ctx w)
+                  (primitive/cast (ptr i8) address) fv)
+                0)
+            (image-writer-block! w IMAGE-BLOCK-UNKNOWN-FUNCTION (.runtime-id obj)
+              offset address site)
+            (do
+              (set! (.offset fv) offset)
+              (al-push! (mut (.functions obj)) (load fv))
+              0)))))
+
+;;; A transient field: left zero in the payload and recorded for restore.
+(defn image-write-transient! [(w (ptr ImageWriter)) (obj (ptr ImageObject))
+                              (offset i64) (size i64)] (-> i64)
+  (if (= (primitive/cast i64 (image-payload-ptr obj offset size)) 0)
+      (image-writer-block! w IMAGE-BLOCK-PAYLOAD-OVERFLOW (.runtime-id obj) offset size "")
+      (do (al-push! (mut (.transient obj)) offset) 0)))
+
+;;; A foreign field: transient, but only when the type registered a restore
+;;; adapter that can rebuild it.
+(defn image-write-foreign! [(w (ptr ImageWriter)) (obj (ptr ImageObject))
+                            (offset i64) (size i64) (site (slice u8))] (-> i64)
+  (let [adapter (image-find-adapter (.runtime-id obj) (.fingerprint obj))]
+    (if (or (= (primitive/cast i64 adapter) 0) (not (.has-restore adapter)))
+        (image-writer-block! w IMAGE-BLOCK-FOREIGN-WITHOUT-RESTORE (.runtime-id obj)
+          offset 0 site)
+        (image-write-transient! w obj offset size))))
+
+; ---- reader -----------------------------------------------------------------
+
+;;; Load-side state. `allocate` provides storage for each object,
+;;; `handle-address` creates or finds the stable handle record for a handle
+;;; entry (given the address of its payload object), and `function-address`
+;;; resolves a stable function identity to a callable address.
+(defstruct ImageReader
+  [(a (dyn alloc/Allocator))
+   (image (ptr Image))
+   (addresses (ArrayList i64))
+   (native-sizes (ArrayList i64))
+   (handle-addresses (ArrayList i64))
+   (blocker ImageBlocker)
+   (ctx (ptr i8))
+   (allocate (fnptr c [(ptr i8) i64 i64] (ptr i8)))
+   (handle-address (fnptr c [(ptr i8) i64 (ptr i8)] (ptr i8)))
+   (function-address (fnptr c [(ptr i8) (ptr ImageFunctionValue)] (ptr i8)))])
+
+(defn image-reader-init! [(r (ptr ImageReader))
+                          (a (dyn alloc/Allocator))
+                          (image (ptr Image))
+                          (ctx (ptr i8))
+                          (allocate (fnptr c [(ptr i8) i64 i64] (ptr i8)))
+                          (handle-address (fnptr c [(ptr i8) i64 (ptr i8)] (ptr i8)))
+                          (function-address
+                            (fnptr c [(ptr i8) (ptr ImageFunctionValue)] (ptr i8)))]
+  (-> i64)
+  (set! (.a r) a)
+  (set! (.image r) image)
+  (set! (.addresses r) (al-new [i64] a))
+  (set! (.native-sizes r) (al-new [i64] a))
+  (set! (.handle-addresses r) (al-new [i64] a))
+  (set! (.blocker r) (primitive/zeroed ImageBlocker))
+  (set! (.ctx r) ctx)
+  (set! (.allocate r) allocate)
+  (set! (.handle-address r) handle-address)
+  (set! (.function-address r) function-address)
+  0)
+
+(defn image-reader-block! [(r (ptr ImageReader)) (kind i64) (runtime-id i64)
+                           (offset i64) (address i64) (site (slice u8))] (-> i64)
+  (image-blocker-fill! (field r blocker) kind runtime-id offset address site))
+
+;;; Address of materialized object `id` (1-based), or null.
+(defn image-reader-object-address [(r (ptr ImageReader)) (id i64)] (-> (ptr i8))
+  (if (or (<= id 0) (> id (al-len (.addresses r))))
+      (primitive/cast (ptr i8) 0)
+      (primitive/cast (ptr i8) (al-get (.addresses r) (- id 1)))))
+
+;;; Address of handle record `id` (1-based), or null.
+(defn image-reader-handle-address [(r (ptr ImageReader)) (id i64)] (-> (ptr i8))
+  (if (or (<= id 0) (> id (al-len (.handle-addresses r))))
+      (primitive/cast (ptr i8) 0)
+      (primitive/cast (ptr i8) (al-get (.handle-addresses r) (- id 1)))))
+
+;;; Called by generated sum readers for a tag the current declaration has no
+;;; variant for.
+(defn image-reader-bad-tag! [(r (ptr ImageReader)) (runtime-id i64) (tag i64)] (-> i64)
+  (image-reader-block! r IMAGE-BLOCK-BAD-TAG runtime-id 0 tag ""))
+
+(defn image-reader-allocate-objects! [(r (ptr ImageReader))] (-> i64)
+  (let [(mut status) 0]
+    (for [i 0 (al-len (.objects (.image r)))]
+      (if (= (load status) 0)
+          (let [obj (al-elem (field (.image r) objects) i)
+                adapter (image-find-adapter (.runtime-id obj) (.fingerprint obj))]
+            (cond
+              (= (primitive/cast i64 adapter) 0)
+                (set! status (image-reader-block! r IMAGE-BLOCK-SCHEMA-MISMATCH
+                               (.runtime-id obj) 0 (.fingerprint obj) ""))
+              (or (<= (.count obj) 0)
+                  (or (!= (.bytes obj) (* (.stride obj) (.count obj)))
+                      (or (!= (.stride obj) (.stride adapter))
+                          (!= (slice-len (.data (field obj payload))) (.bytes obj)))))
+                (set! status (image-reader-block! r IMAGE-BLOCK-BAD-OBJECT
+                               (.runtime-id obj) 0 (.id obj) ""))
+              :else
+                (let [bytes (* (.native-size adapter) (.count obj))
+                      storage (primitive/call-ptr (.allocate r) (.ctx r) bytes
+                                (.native-align adapter))]
+                  (if (= (primitive/cast i64 storage) 0)
+                      (set! status (image-reader-block! r IMAGE-BLOCK-ALLOCATION-FAILED
+                                     (.runtime-id obj) 0 bytes ""))
+                      (do
+                        (memset storage (primitive/cast i32 0) (primitive/cast isize bytes))
+                        (al-push! (mut (.addresses r)) (primitive/cast i64 storage))
+                        (al-push! (mut (.native-sizes r)) (.native-size adapter))
+                        0)))))
+          0))
+    (load status)))
+
+(defn image-reader-create-handles! [(r (ptr ImageReader))] (-> i64)
+  (let [(mut status) 0]
+    (for [i 0 (al-len (.handles (.image r)))]
+      (if (= (load status) 0)
+          (let [h (al-elem (field (.image r) handles) i)
+                object (image-reader-object-address r (.object h))]
+            (if (= (primitive/cast i64 object) 0)
+                (set! status (image-reader-block! r IMAGE-BLOCK-BAD-OBJECT 0 0 (.object h) ""))
+                (let [address (primitive/call-ptr (.handle-address r) (.ctx r) i object)]
+                  (if (= (primitive/cast i64 address) 0)
+                      (set! status (image-reader-block! r IMAGE-BLOCK-UNKNOWN-HANDLE 0 0
+                                     (.id h) ""))
+                      (do (al-push! (mut (.handle-addresses r)) (primitive/cast i64 address))
+                          0)))))
+          0))
+    (load status)))
+
+(defn image-store-word! [(staged (ptr u8)) (bytes i64) (offset i64) (value i64)] (-> bool)
+  (if (or (< offset 0) (> (+ offset 8) bytes))
+      false
+      (do (store! (primitive/cast (ptr i64) (primitive/index staged offset)) value)
+          true)))
+
+(defn image-reader-apply-relocation! [(r (ptr ImageReader)) (obj (ptr ImageObject))
+                                      (staged (ptr u8)) (rel (ptr ImageRelocation))]
+  (-> i64)
+  (let [bytes (.bytes obj)
+        kind (.kind rel)
+        target (.target rel)
+        fail (image-reader-block! r IMAGE-BLOCK-BAD-RELOCATION (.runtime-id obj)
+               (.offset rel) target "")]
+    (cond
+      (= kind IMAGE-REF-HANDLE)
+        (let [address (image-reader-handle-address r target)]
+          (if (or (= (primitive/cast i64 address) 0)
+                  (not (image-store-word! staged bytes (.offset rel)
+                         (primitive/cast i64 address))))
+              fail
+              (do (set! (.kind (field r blocker)) IMAGE-BLOCK-NONE) 0)))
+      (or (= kind IMAGE-REF-OBJECT) (or (= kind IMAGE-REF-INTERIOR) (= kind IMAGE-REF-SLICE)))
+        (let [base (image-reader-object-address r target)]
+          (if (= (primitive/cast i64 base) 0)
+              fail
+              (let [target-obj (al-elem (field (.image r) objects) (- target 1))
+                    native-size (al-get (.native-sizes r) (- target 1))
+                    native-bytes (* native-size (.count target-obj))
+                    interior (if (= kind IMAGE-REF-OBJECT)
+                                 (* (.interior rel) native-size)
+                                 (.interior rel))]
+                (cond
+                  (or (< interior 0) (> interior native-bytes)) fail
+                  (and (= kind IMAGE-REF-OBJECT) (>= interior native-bytes)) fail
+                  (= kind IMAGE-REF-SLICE)
+                    (if (and (image-store-word! staged bytes (.offset rel)
+                               (+ (primitive/cast i64 base) interior))
+                             (image-store-word! staged bytes (+ (.offset rel) 8)
+                               (.length rel)))
+                        (do (set! (.kind (field r blocker)) IMAGE-BLOCK-NONE) 0)
+                        fail)
+                  :else
+                    (if (image-store-word! staged bytes (.offset rel)
+                          (+ (primitive/cast i64 base) interior))
+                        (do (set! (.kind (field r blocker)) IMAGE-BLOCK-NONE) 0)
+                        fail)))))
+      :else fail)))
+
+(defn image-reader-materialize-object! [(r (ptr ImageReader)) (index i64)] (-> i64)
+  (let [obj (al-elem (field (.image r) objects) index)
+        storage (image-reader-object-address r (.id obj))
+        native-size (al-get (.native-sizes r) index)
+        adapter (image-find-adapter (.runtime-id obj) (.fingerprint obj))]
+    (match (alloc/alloc-bytes (.a r) (.bytes obj) 8)
+      (None []
+        (image-reader-block! r IMAGE-BLOCK-ALLOCATION-FAILED (.runtime-id obj) 0
+          (.bytes obj) ""))
+      (Some [staged-slice]
+        (let [staged (slice-data staged-slice)
+              (mut status) 0]
+          (memcpy (primitive/cast (ptr i8) staged)
+                  (primitive/cast (ptr i8) (slice-data (.data (field obj payload))))
+                  (primitive/cast isize (.bytes obj)))
+          (for [k 0 (al-len (.relocations obj))]
+            (if (= (load status) 0)
+                (set! status (image-reader-apply-relocation! r obj staged
+                               (al-elem (field obj relocations) k)))
+                0))
+          (for [k 0 (al-len (.functions obj))]
+            (if (= (load status) 0)
+                (let [fv (al-elem (field obj functions) k)
+                      address (primitive/call-ptr (.function-address r) (.ctx r) fv)]
+                  (if (or (= (primitive/cast i64 address) 0)
+                          (not (image-store-word! staged (.bytes obj) (.offset fv)
+                                 (primitive/cast i64 address))))
+                      (set! status (image-reader-block! r IMAGE-BLOCK-UNKNOWN-FUNCTION
+                                     (.runtime-id obj) (.offset fv) 0 (.stable-id fv)))
+                      0))
+                0))
+          (for [e 0 (.count obj)]
+            (if (= (load status) 0)
+                (let [read-status
+                        (primitive/call-ptr (.read adapter) r
+                          (primitive/cast (ptr i8)
+                            (+ (primitive/cast i64 storage) (* e native-size)))
+                          (primitive/cast (ptr i8) (primitive/index staged (* e (.stride obj)))))]
+                  (if (!= read-status 0)
+                      (set! status (image-reader-block! r IMAGE-BLOCK-BAD-TAG
+                                     (.runtime-id obj) e read-status ""))
+                      0))
+                0))
+          (alloc/free-bytes (.a r) staged-slice 8)
+          (load status))))))
+
+;;; Allocate every object, create every handle, then rebuild each object from
+;;; its payload with all references resolved. Returns 0, or -1 with the
+;;; blocker set; on failure nothing is guaranteed about partially written
+;;; storage, and the caller releases what `allocate` produced.
+(defn image-reader-materialize! [(r (ptr ImageReader))] (-> i64)
+  (if (!= (image-reader-allocate-objects! r) 0)
+      -1
+      (if (!= (image-reader-create-handles! r) 0)
+          -1
+          (let [(mut status) 0]
+            (for [i 0 (al-len (.objects (.image r)))]
+              (if (= (load status) 0)
+                  (set! status (image-reader-materialize-object! r i))
+                  0))
+            (load status)))))
+
+; ---- small helpers used by generated layout expressions ---------------------
+
+(defn image-align8 [(n i64)] (-> i64)
+  (primitive/iand (+ n 7) -8))
+
+(defn image-max [(a i64) (b i64)] (-> i64)
+  (if (> a b) a b))

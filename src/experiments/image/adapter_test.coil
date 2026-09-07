@@ -1,0 +1,484 @@
+(module experiments.image.adapter-test)
+
+; Phase A gate: a handwritten object graph with sharing, a cycle, a slice, a
+; sum carrying a pointer, a stored function value, a stable handle, a fixed
+; array, and a transient field round-trips through a file to identical bytes
+; and relocations, materializes with every reference restored, and every
+; blocker kind is produced with its field site.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.assert" :use *)
+(import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
+(import "experiments.image.format" :use *)
+(import "experiments.image.runtime" :use *)
+(import "experiments.image.adapters" :use *)
+(import "experiments.heap-inspector.live" :as live)
+
+; The live handle owner as generated candidates see it. `live-types` itself
+; declares the `coil_live_handle_*` externs that `live` exports, and Coil
+; rejects an extern and an export-c of one symbol in one program, so this test
+; carries the same one-field shape under the name the adapters recognize.
+(defstruct LiveHandleOwner [(raw (ptr i8))])
+
+(image-sum Shape
+  (Dot)
+  (Line [(len i64)])
+  (Link [(w i64) (to (ptr Node))]))
+
+(image-struct Wrapper [(live-handle LiveHandleOwner)])
+
+(image-struct Letter [(c u8)])
+
+(image-struct Node
+  [(value i64)
+   (next (ptr Node))
+   (shape Shape)
+   (name (slice u8))
+   (cb (fnptr c [i64] i64))
+   (layer (ptr i8) :transient)
+   (child Wrapper)
+   (tags (array i64 3))])
+
+(image-struct Foreign [(fd i64 :foreign)])
+
+(defn restore-window [(raw (ptr i8))] (-> i64) (primitive/cast i64 raw) 0)
+(image-struct Window [(fd i64 :foreign)] :restore restore-window)
+
+(defn cb-one [(x i64)] (-> i64) (+ x 1))
+(defn cb-two [(x i64)] (-> i64) (+ x 2))
+
+(defn fn-address [(f (fnptr c [i64] i64))] (-> (ptr i8))
+  (primitive/cast (ptr i8) f))
+
+; Only `cb-one` has a stable identity in this test program.
+(defn identify [(ctx (ptr i8)) (address (ptr i8)) (out (ptr ImageFunctionValue))] (-> i64)
+  (primitive/cast i64 ctx)
+  (if (= address (fn-address (primitive/fnptr-of cb-one)))
+      (do (set! (.stable-id out) "adapter-test/cb-one")
+          (set! (.lineage out) 1)
+          0)
+      -1))
+
+(defn resolve [(ctx (ptr i8)) (fv (ptr ImageFunctionValue))] (-> (ptr i8))
+  (primitive/cast i64 ctx)
+  (if (and (= (.lineage fv) 1) (image-bytes=? (.stable-id fv) "adapter-test/cb-one"))
+      (fn-address (primitive/fnptr-of cb-one))
+      (primitive/cast (ptr i8) 0)))
+
+(defn allocate [(ctx (ptr i8)) (bytes i64) (align i64)] (-> (ptr i8))
+  (primitive/cast i64 ctx)
+  (match (alloc/alloc-bytes (alloc/malloc-allocator) bytes align)
+    (None [] (primitive/cast (ptr i8) 0))
+    (Some [s] (primitive/cast (ptr i8) (slice-data s)))))
+
+; Handle records are real live runtime handles whose payload is the
+; materialized object.
+(defn handle-for [(ctx (ptr i8)) (index i64) (object (ptr i8))] (-> (ptr i8))
+  (primitive/cast i64 ctx)
+  (primitive/cast i64 index)
+  (primitive/cast (ptr i8) (live/live-handle-new! (image-name-hash "Node") 0 object)))
+
+(defn bytes-alloc [(bytes i64)] (-> (ptr i8))
+  (allocate (primitive/cast (ptr i8) 0) bytes 8))
+
+(defn register-all! [] (-> i64)
+  (Shape--image-register!)
+  (Wrapper--image-register!)
+  (Letter--image-register!)
+  (Node--image-register!)
+  (Foreign--image-register!)
+  (Window--image-register!)
+  0)
+
+(defn node-alloc [] (-> (ptr Node))
+  (let [p (primitive/cast (ptr Node) (bytes-alloc (primitive/sizeof Node)))]
+    (store! p (primitive/zeroed Node))
+    p))
+
+; The graph: two nodes in a cycle, both sharing one handle; node 1's sum
+; points at node 2 (sharing through a sum payload); names are slices into one
+; five-letter array object; node 1 stores a function value.
+; Hand-written structs cannot name macro-generated types (the checker
+; resolves struct field types before expansion output is visible), so the
+; graph record carries untyped pointers.
+(defstruct Graph
+  [(n1 (ptr i8))
+   (n2 (ptr i8))
+   (letters (ptr i8))
+   (handle (ptr i8))])
+
+(defn build-graph [] (-> Graph)
+  (let [n1 (node-alloc)
+        n2 (node-alloc)
+        letters (bytes-alloc 5)
+        handle (primitive/cast (ptr i8)
+                 (live/live-handle-new! (image-name-hash "Node") 0 (primitive/cast (ptr i8) n2)))]
+    (store! (primitive/index letters 0) (primitive/cast i8 \h))
+    (store! (primitive/index letters 1) (primitive/cast i8 \e))
+    (store! (primitive/index letters 2) (primitive/cast i8 \l))
+    (store! (primitive/index letters 3) (primitive/cast i8 \l))
+    (store! (primitive/index letters 4) (primitive/cast i8 \o))
+    (set! (.value n1) 1)
+    (set! (.next n1) n2)
+    (set! (.shape n1) (Link 7 n2))
+    (set! (.name n1) (slice-new [u8] (primitive/cast (ptr u8) letters) 5))
+    (set! (.cb n1) (primitive/fnptr-of cb-one))
+    (set! (.layer n1) (primitive/cast (ptr i8) 57005))
+    (set! (.raw (.live-handle (.child n1))) handle)
+    (set! (primitive/index (field n1 tags) 0) 10)
+    (set! (primitive/index (field n1 tags) 1) 20)
+    (set! (primitive/index (field n1 tags) 2) 30)
+    (set! (.value n2) 2)
+    (set! (.next n2) n1)
+    (set! (.shape n2) (Line 3))
+    (set! (.name n2) (slice-new [u8] (primitive/cast (ptr u8) (primitive/index letters 1)) 3))
+    (set! (.cb n2) (primitive/cast (fnptr c [i64] i64) (primitive/cast (ptr i8) 0)))
+    (set! (.layer n2) (primitive/cast (ptr i8) 0))
+    (set! (.raw (.live-handle (.child n2))) handle)
+    (Graph :n1 (primitive/cast (ptr i8) n1) :n2 (primitive/cast (ptr i8) n2)
+           :letters letters :handle handle)))
+
+(defn write-graph! [(w (ptr ImageWriter)) (g (ptr Graph))] (-> i64)
+  (let [o1 (image-writer-add-object! w (.n1 g) (image-name-hash "Node") 1)
+        o2 (image-writer-add-object! w (.n2 g) (image-name-hash "Node") 1)
+        o3 (image-writer-add-object! w (.letters g) (image-name-hash "Letter") 5)
+        h (image-writer-add-handle! w (.handle g) o2 2 0)]
+    (assert-eq 1 o1)
+    (assert-eq 2 o2)
+    (assert-eq 3 o3)
+    (assert-eq 1 h)
+    (image-writer-add-root! w "first" (image-name-hash "Node") 0 o1)
+    (image-writer-write-objects! w)))
+
+(defn relocation-at [(obj (ptr ImageObject)) (i i64)] (-> (ptr ImageRelocation))
+  (al-elem (field obj relocations) i))
+
+(defn find-relocation [(obj (ptr ImageObject)) (kind i64) (offset i64)] (-> (ptr ImageRelocation))
+  (let [(mut found) (primitive/cast (ptr ImageRelocation) 0)]
+    (for [i 0 (al-len (.relocations obj))]
+      (let [r (relocation-at obj i)]
+        (if (and (= (.kind r) kind) (= (.offset r) offset)) (set! found r) 0)))
+    (load found)))
+
+(defn assert-same-object [(x (ptr ImageObject)) (y (ptr ImageObject))] (-> i64)
+  (assert-eq (.id x) (.id y))
+  (assert-eq (.runtime-id x) (.runtime-id y))
+  (assert-eq (.fingerprint x) (.fingerprint y))
+  (assert-eq (.count x) (.count y))
+  (assert-eq (.stride x) (.stride y))
+  (assert-eq (.bytes x) (.bytes y))
+  (assert (image-bytes=? (.data (field x payload)) (.data (field y payload))))
+  (assert-eq (al-len (.relocations x)) (al-len (.relocations y)))
+  (for [i 0 (al-len (.relocations x))]
+    (let [a (relocation-at x i) b (relocation-at y i)]
+      (assert-eq (.offset a) (.offset b))
+      (assert-eq (.kind a) (.kind b))
+      (assert-eq (.target a) (.target b))
+      (assert-eq (.interior a) (.interior b))
+      (assert-eq (.length a) (.length b))))
+  (assert-eq (al-len (.functions x)) (al-len (.functions y)))
+  (for [i 0 (al-len (.functions x))]
+    (let [a (al-elem (field x functions) i) b (al-elem (field y functions) i)]
+      (assert-eq (.offset a) (.offset b))
+      (assert-eq (.lineage a) (.lineage b))
+      (assert (image-bytes=? (.stable-id a) (.stable-id b)))))
+  (assert-eq (al-len (.transient x)) (al-len (.transient y)))
+  (for [i 0 (al-len (.transient x))]
+    (assert-eq (al-get (.transient x) i) (al-get (.transient y) i)))
+  0)
+
+; Image slot offsets of Node: value 0, next 8, shape 16 (tag + widest variant
+; = 8 + 16 = 24), name 40, cb 56, layer 64, child 72, tags 80..104.
+(const NODE-NEXT 8)
+(const NODE-SHAPE 16)
+(const NODE-NAME 40)
+(const NODE-CB 56)
+(const NODE-LAYER 64)
+(const NODE-CHILD 72)
+(const NODE-TAGS 80)
+
+(deftest generated-layout-is-slot-based
+  (assert-eq 24 (Shape--image-stride))
+  (assert-eq 8 (Wrapper--image-stride))
+  (assert-eq 8 (Letter--image-stride))
+  (assert-eq 104 (Node--image-stride))
+  (assert-eq 8 (Foreign--image-stride)))
+
+(deftest graph-round-trips-through-a-file
+  (register-all!)
+  (let [a (alloc/malloc-allocator)
+        g (primitive/alloc-stack Graph)
+        img (primitive/alloc-stack Image)
+        w (primitive/alloc-stack ImageWriter)]
+    (store! g (build-graph))
+    (store! img (image-new a))
+    (image-writer-init! w a img (primitive/cast (ptr i8) 0) (primitive/fnptr-of identify))
+    (assert-eq 0 (write-graph! w g))
+    (assert-eq IMAGE-BLOCK-NONE (.kind (field w blocker)))
+    (assert-eq 3 (al-len (.objects img)))
+    (assert-eq 1 (al-len (.handles img)))
+    (assert-eq 1 (al-len (.roots img)))
+    ; Shape, Wrapper, Node, Letter schemas were described (Shape and Wrapper
+    ; are nested by value, so only the object types appear).
+    (assert-eq 2 (al-len (.schemas img)))
+    (let [o1 (al-elem (field img objects) 0)
+          o2 (al-elem (field img objects) 1)
+          o3 (al-elem (field img objects) 2)]
+      (assert-eq 104 (.bytes o1))
+      (assert-eq 40 (.bytes o3))
+      ; node 1: next -> 2, shape.to -> 2, name -> letters, child -> handle 1
+      (assert-eq 4 (al-len (.relocations o1)))
+      (let [next (find-relocation o1 IMAGE-REF-OBJECT NODE-NEXT)
+            to (find-relocation o1 IMAGE-REF-OBJECT (+ NODE-SHAPE 16))
+            name (find-relocation o1 IMAGE-REF-SLICE NODE-NAME)
+            child (find-relocation o1 IMAGE-REF-HANDLE NODE-CHILD)]
+        (assert (!= (primitive/cast i64 next) 0))
+        (assert-eq 2 (.target next))
+        (assert (!= (primitive/cast i64 to) 0))
+        (assert-eq 2 (.target to))
+        (assert (!= (primitive/cast i64 name) 0))
+        (assert-eq 3 (.target name))
+        (assert-eq 0 (.interior name))
+        (assert-eq 5 (.length name))
+        (assert (!= (primitive/cast i64 child) 0))
+        (assert-eq 1 (.target child)))
+      (assert-eq 1 (al-len (.functions o1)))
+      (assert-eq NODE-CB (.offset (al-elem (field o1 functions) 0)))
+      (assert-eq 1 (al-len (.transient o1)))
+      (assert-eq NODE-LAYER (al-get (.transient o1) 0))
+      ; the transient pointer and every reference word are zero in the payload
+      (assert-eq 0 (load (primitive/cast (ptr i64)
+                           (image-payload-ptr o1 NODE-LAYER 8))))
+      (assert-eq 0 (load (primitive/cast (ptr i64)
+                           (image-payload-ptr o1 NODE-NEXT 8))))
+      (assert-eq 1 (load (primitive/cast (ptr i64) (image-payload-ptr o1 0 8))))
+      (assert-eq 2 (load (primitive/cast (ptr i64) (image-payload-ptr o1 NODE-SHAPE 8))))
+      (assert-eq 7 (load (primitive/cast (ptr i64) (image-payload-ptr o1 (+ NODE-SHAPE 8) 8))))
+      (assert-eq 30 (load (primitive/cast (ptr i64) (image-payload-ptr o1 (+ NODE-TAGS 16) 8))))
+      ; node 2: next -> 1, name -> letters+1 (3 long), child -> handle 1; no function
+      (assert-eq 3 (al-len (.relocations o2)))
+      (let [name (find-relocation o2 IMAGE-REF-SLICE NODE-NAME)]
+        (assert (!= (primitive/cast i64 name) 0))
+        (assert-eq 1 (.interior name))
+        (assert-eq 3 (.length name)))
+      (assert-eq 0 (al-len (.functions o2)))
+      (assert-eq 1 (load (primitive/cast (ptr i64) (image-payload-ptr o2 NODE-SHAPE 8))))
+      (assert-eq 3 (load (primitive/cast (ptr i64) (image-payload-ptr o2 (+ NODE-SHAPE 8) 8))))
+      ; letters: five one-byte elements in 8-byte slots
+      (assert-eq \h (primitive/cast i64 (load (image-payload-ptr o3 0 1))))
+      (assert-eq \o (primitive/cast i64 (load (image-payload-ptr o3 32 1)))))
+    ; encode, write, read, decode: identical sections
+    (let [path "build/image-adapter-test.coilimage"]
+      (match (image-write-file a path img)
+        (Err [e] (do (println "write failed: {s}" (image-format-error-name e)) (assert false)))
+        (Ok [_] 0))
+      (match (image-read-file a path)
+        (Err [e] (do (println "read failed: {s}" (image-format-error-name e)) (assert false)))
+        (Ok [back]
+          (let [bp (primitive/alloc-stack Image)]
+            (store! bp back)
+            (assert-eq IMAGE-FORMAT-VERSION (.format-version (field bp header)))
+            (assert (image-bytes=? (.target (field img header)) (.target (field bp header))))
+            (assert-eq 3 (al-len (.objects bp)))
+            (for [i 0 3]
+              (assert-same-object (al-elem (field img objects) i)
+                                  (al-elem (field bp objects) i)))
+            (assert-eq 1 (al-len (.handles bp)))
+            (assert-eq 2 (.object (al-elem (field bp handles) 0)))
+            (assert-eq 1 (al-len (.roots bp)))
+            (assert (image-bytes=? "first" (.name (al-elem (field bp roots) 0))))
+            (assert-eq 2 (al-len (.schemas bp)))
+            (let [s (al-elem (field bp schemas) 0)]
+              (assert (image-bytes=? "Node" (.name s)))
+              (assert-eq 8 (al-len (.fields s)))
+              ; next, name, cb: nested Shape and Wrapper describe their own references
+              (assert-eq 3 (al-len (.references s)))
+              (assert-eq 1 (.version s)))
+            ; materialize the decoded image into fresh memory
+            (let [r (primitive/alloc-stack ImageReader)]
+              (image-reader-init! r a bp (primitive/cast (ptr i8) 0)
+                (primitive/fnptr-of allocate) (primitive/fnptr-of handle-for)
+                (primitive/fnptr-of resolve))
+              (assert-eq 0 (image-reader-materialize! r))
+              (assert-eq IMAGE-BLOCK-NONE (.kind (field r blocker)))
+              (let [m1 (primitive/cast (ptr Node) (image-reader-object-address r 1))
+                    m2 (primitive/cast (ptr Node) (image-reader-object-address r 2))
+                    letters (image-reader-object-address r 3)
+                    handle (image-reader-handle-address r 1)]
+                ; fresh storage, not the original objects
+                (assert (!= (primitive/cast i64 m1) (primitive/cast i64 (.n1 g))))
+                (assert-eq 1 (.value m1))
+                (assert-eq 2 (.value m2))
+                ; the cycle and the shared target
+                (assert-eq (primitive/cast i64 m2) (primitive/cast i64 (.next m1)))
+                (assert-eq (primitive/cast i64 m1) (primitive/cast i64 (.next m2)))
+                (match (.shape m1)
+                  (Dot [] (assert false))
+                  (Line [_] (assert false))
+                  (Link [width to]
+                    (do (assert-eq 7 width)
+                        (assert-eq (primitive/cast i64 m2) (primitive/cast i64 to)))))
+                (match (.shape m2)
+                  (Dot [] (assert false))
+                  (Line [len] (assert-eq 3 len))
+                  (Link [_ _] (assert false)))
+                ; slices point into the materialized letters with the same bytes
+                (assert-eq (primitive/cast i64 letters) (primitive/cast i64 (slice-data (.name m1))))
+                (assert-eq 5 (slice-len (.name m1)))
+                (assert (image-bytes=? "hello" (.name m1)))
+                (assert-eq (+ (primitive/cast i64 letters) 1) (primitive/cast i64 (slice-data (.name m2))))
+                (assert (image-bytes=? "ell" (.name m2)))
+                ; the function value resolved through its stable identity
+                (assert-eq 42 (primitive/call-ptr (.cb m1) 41))
+                (assert-eq 0 (primitive/cast i64 (primitive/cast (ptr i8) (.cb m2))))
+                ; the transient pointer is zero
+                (assert-eq 0 (primitive/cast i64 (.layer m1)))
+                ; both nodes share the one recreated handle, whose payload is node 2
+                (assert (!= (primitive/cast i64 handle) 0))
+                (assert-eq (primitive/cast i64 handle) (primitive/cast i64 (.raw (.live-handle (.child m1)))))
+                (assert-eq (primitive/cast i64 handle) (primitive/cast i64 (.raw (.live-handle (.child m2)))))
+                (assert-eq (primitive/cast i64 m2)
+                  (primitive/cast i64
+                    (.payload (primitive/cast (ptr live/LiveHandle) handle))))
+                ; fixed array
+                (assert-eq 10 (load (primitive/index (field m1 tags) 0)))
+                (assert-eq 20 (load (primitive/index (field m1 tags) 1)))
+                (assert-eq 30 (load (primitive/index (field m1 tags) 2)))))))))))
+
+(defn fresh-writer [(w (ptr ImageWriter)) (img (ptr Image))] (-> i64)
+  (let [a (alloc/malloc-allocator)]
+    (store! img (image-new a))
+    (image-writer-init! w a img (primitive/cast (ptr i8) 0) (primitive/fnptr-of identify))))
+
+(defn assert-blocked [(w (ptr ImageWriter)) (kind i64) (site (slice u8)) (offset i64)] (-> void)
+  (assert-eq -1 (image-writer-write-objects! w))
+  (assert-eq kind (.kind (field w blocker)))
+  (assert (image-bytes=? site (.site (field w blocker))))
+  (assert-eq offset (.offset (field w blocker))))
+
+(deftest untracked-pointer-blocks-the-save
+  (register-all!)
+  (let [img (primitive/alloc-stack Image) w (primitive/alloc-stack ImageWriter)
+        n (node-alloc) stray (node-alloc)]
+    (fresh-writer w img)
+    (set! (.next n) stray)
+    (assert-eq 1 (image-writer-add-object! w (primitive/cast (ptr i8) n) (image-name-hash "Node") 1))
+    (assert-blocked w IMAGE-BLOCK-UNTRACKED-POINTER "Node.next" NODE-NEXT)
+    (assert-eq (primitive/cast i64 stray) (.address (field w blocker)))))
+
+(deftest untracked-pointer-inside-a-sum-blocks-the-save
+  (register-all!)
+  (let [img (primitive/alloc-stack Image) w (primitive/alloc-stack ImageWriter)
+        n (node-alloc) stray (node-alloc)]
+    (fresh-writer w img)
+    (set! (.shape n) (Link 1 stray))
+    (assert-eq 1 (image-writer-add-object! w (primitive/cast (ptr i8) n) (image-name-hash "Node") 1))
+    (assert-blocked w IMAGE-BLOCK-UNTRACKED-POINTER "Shape.to" (+ NODE-SHAPE 16))))
+
+(deftest type-mismatch-blocks-the-save
+  (register-all!)
+  (let [img (primitive/alloc-stack Image) w (primitive/alloc-stack ImageWriter)
+        n (node-alloc) letters (bytes-alloc 5)]
+    (fresh-writer w img)
+    (set! (.next n) (primitive/cast (ptr Node) letters))
+    (assert-eq 1 (image-writer-add-object! w (primitive/cast (ptr i8) n) (image-name-hash "Node") 1))
+    (assert-eq 2 (image-writer-add-object! w letters (image-name-hash "Letter") 5))
+    (assert-blocked w IMAGE-BLOCK-TYPE-MISMATCH "Node.next" NODE-NEXT)))
+
+(deftest slice-past-its-object-blocks-the-save
+  (register-all!)
+  (let [img (primitive/alloc-stack Image) w (primitive/alloc-stack ImageWriter)
+        n (node-alloc) letters (bytes-alloc 5)]
+    (fresh-writer w img)
+    (set! (.name n) (slice-new [u8] (primitive/cast (ptr u8) letters) 9))
+    (assert-eq 1 (image-writer-add-object! w (primitive/cast (ptr i8) n) (image-name-hash "Node") 1))
+    (assert-eq 2 (image-writer-add-object! w letters (image-name-hash "Letter") 5))
+    (assert-blocked w IMAGE-BLOCK-UNTRACKED-SLICE "Node.name" NODE-NAME)))
+
+(deftest unknown-function-blocks-the-save
+  (register-all!)
+  (let [img (primitive/alloc-stack Image) w (primitive/alloc-stack ImageWriter)
+        n (node-alloc)]
+    (fresh-writer w img)
+    (set! (.cb n) (primitive/fnptr-of cb-two))
+    (assert-eq 1 (image-writer-add-object! w (primitive/cast (ptr i8) n) (image-name-hash "Node") 1))
+    (assert-blocked w IMAGE-BLOCK-UNKNOWN-FUNCTION "Node.cb" NODE-CB)))
+
+(deftest unknown-handle-blocks-the-save
+  (register-all!)
+  (let [img (primitive/alloc-stack Image) w (primitive/alloc-stack ImageWriter)
+        n (node-alloc)]
+    (fresh-writer w img)
+    (set! (.raw (.live-handle (.child n))) (primitive/cast (ptr i8) 4096))
+    (assert-eq 1 (image-writer-add-object! w (primitive/cast (ptr i8) n) (image-name-hash "Node") 1))
+    (assert-blocked w IMAGE-BLOCK-UNKNOWN-HANDLE "Wrapper.live-handle" NODE-CHILD)))
+
+(deftest foreign-without-restore-blocks-and-with-restore-is-transient
+  (register-all!)
+  (let [img (primitive/alloc-stack Image) w (primitive/alloc-stack ImageWriter)
+        f (primitive/cast (ptr Foreign) (bytes-alloc 8))
+        win (primitive/cast (ptr Window) (bytes-alloc 8))]
+    (set! (.fd f) 3)
+    (set! (.fd win) 4)
+    (fresh-writer w img)
+    (assert-eq 1 (image-writer-add-object! w (primitive/cast (ptr i8) f) (image-name-hash "Foreign") 1))
+    (assert-blocked w IMAGE-BLOCK-FOREIGN-WITHOUT-RESTORE "Foreign.fd" 0)
+    (fresh-writer w img)
+    (assert-eq 1 (image-writer-add-object! w (primitive/cast (ptr i8) win) (image-name-hash "Window") 1))
+    (assert-eq 0 (image-writer-write-objects! w))
+    (let [o (al-elem (field img objects) 0)]
+      (assert-eq 1 (al-len (.transient o)))
+      (assert-eq 0 (al-get (.transient o) 0))
+      (assert-eq 0 (load (primitive/cast (ptr i64) (image-payload-ptr o 0 8)))))))
+
+(deftest unregistered-and-duplicate-objects-are-rejected
+  (register-all!)
+  (let [img (primitive/alloc-stack Image) w (primitive/alloc-stack ImageWriter)
+        n (node-alloc)]
+    (fresh-writer w img)
+    (assert-eq 0 (image-writer-add-object! w (primitive/cast (ptr i8) n) (image-name-hash "Nobody") 1))
+    (assert-eq IMAGE-BLOCK-UNREGISTERED-SCHEMA (.kind (field w blocker)))
+    (fresh-writer w img)
+    (assert-eq 1 (image-writer-add-object! w (primitive/cast (ptr i8) n) (image-name-hash "Node") 1))
+    (assert-eq 0 (image-writer-add-object! w (primitive/cast (ptr i8) n) (image-name-hash "Node") 1))
+    (assert-eq IMAGE-BLOCK-DUPLICATE-OBJECT (.kind (field w blocker)))))
+
+(deftest a-load-with-a-schema-the-program-lacks-is-refused
+  (register-all!)
+  (let [a (alloc/malloc-allocator)
+        img (primitive/alloc-stack Image) w (primitive/alloc-stack ImageWriter)
+        n (node-alloc)]
+    (fresh-writer w img)
+    (assert-eq 1 (image-writer-add-object! w (primitive/cast (ptr i8) n) (image-name-hash "Node") 1))
+    (assert-eq 0 (image-writer-write-objects! w))
+    (let [o (al-elem (field img objects) 0)]
+      (set! (.fingerprint o) (+ (.fingerprint o) 1)))
+    (let [r (primitive/alloc-stack ImageReader)]
+      (image-reader-init! r a img (primitive/cast (ptr i8) 0)
+        (primitive/fnptr-of allocate) (primitive/fnptr-of handle-for)
+        (primitive/fnptr-of resolve))
+      (assert-eq -1 (image-reader-materialize! r))
+      (assert-eq IMAGE-BLOCK-SCHEMA-MISMATCH (.kind (field r blocker)))
+      (assert-eq (image-name-hash "Node") (.runtime-id (field r blocker))))))
+
+(deftest a-relocation-outside-its-target-is-refused
+  (register-all!)
+  (let [a (alloc/malloc-allocator)
+        img (primitive/alloc-stack Image) w (primitive/alloc-stack ImageWriter)
+        n1 (node-alloc) n2 (node-alloc)]
+    (fresh-writer w img)
+    (set! (.next n1) n2)
+    (assert-eq 1 (image-writer-add-object! w (primitive/cast (ptr i8) n1) (image-name-hash "Node") 1))
+    (assert-eq 2 (image-writer-add-object! w (primitive/cast (ptr i8) n2) (image-name-hash "Node") 1))
+    (assert-eq 0 (image-writer-write-objects! w))
+    (let [rel (find-relocation (al-elem (field img objects) 0) IMAGE-REF-OBJECT NODE-NEXT)]
+      (set! (.interior rel) 5))
+    (let [r (primitive/alloc-stack ImageReader)]
+      (image-reader-init! r a img (primitive/cast (ptr i8) 0)
+        (primitive/fnptr-of allocate) (primitive/fnptr-of handle-for)
+        (primitive/fnptr-of resolve))
+      (assert-eq -1 (image-reader-materialize! r))
+      (assert-eq IMAGE-BLOCK-BAD-RELOCATION (.kind (field r blocker)))
+      (assert-eq NODE-NEXT (.offset (field r blocker))))))

@@ -1,0 +1,576 @@
+(module experiments.image.adapters)
+
+; Generated per-schema image adapters. `image-struct` and `image-sum` emit the
+; ordinary declaration plus typed native functions that copy a value into an
+; image payload (resolving every reference through the runtime's tables) and
+; rebuild it from a staged payload. Everything is decided from the declaration
+; `Code`; nothing is recovered from runtime type names or generated symbols.
+;
+;   (image-struct Node [(value i64) (next (ptr Node)) (layer (ptr i8) :transient)])
+;   (image-sum Shape (Dot) (Line [(len i64)]))
+;   (image-struct Window [(fd i64 :foreign)] :restore reopen-window!)
+;
+; Field policies: `:transient` (zeroed in the image, rebuilt by the restore
+; adapter) and `:foreign` (transient, but only legal when a restore adapter is
+; registered). Every other field is either a scalar, a pointer to a registered
+; object, a slice into one, a stable live handle, a function value, a fixed
+; array, or a nested by-value image struct/sum.
+;
+; Image layout is generated, not native: each field gets an 8-byte-aligned
+; slot; a sum is a tag word followed by the slots of its widest variant. The
+; native layout is only ever touched through typed `field` places.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.mem" :use *)
+(import "coil.str" :as str)
+(import "coil.meta" :as cm)
+(import "experiments.image.format" :use *)
+(import "experiments.image.runtime" :use *)
+
+; The identity formulas below mirror `live-name-hash` and
+; `live-declaration-hash` in experiments.heap-inspector.live-meta exactly, so
+; image runtime IDs and fingerprints agree with the live metaprogram's. They
+; are duplicated rather than imported because importing live-meta into an
+; ordinary program makes the compiler expand its `[Code] -> Code` helpers as
+; macros at their internal call sites (recorded in the coil-bugs pad).
+
+(defn ia-text=? [(a (slice u8)) (b (slice u8))] (-> bool)
+  (if (!= (slice-len a) (slice-len b))
+      false
+      (let [(mut i) 0 (mut same) true]
+        (loop (if (or (not (load same)) (>= (load i) (slice-len a)))
+                  (break)
+                  (if (= (slice-get a (load i)) (slice-get b (load i)))
+                      (set! i (+ (load i) 1))
+                      (set! same false))))
+        (load same))))
+
+;;; Nominal runtime identity of a type symbol: FNV-1a over its text, masked
+;;; positive. Identical to `image-name-hash` over the same bytes.
+(defn ia-name-hash [(name Code)] (-> i64)
+  (image-name-hash (primitive/code-str name)))
+
+(defn ia-code-hash [(node Code) (seed i64)] (-> i64)
+  (if (primitive/code-list? node)
+      (let [(mut h) (primitive/imul (primitive/ixor seed 40) 16777619)]
+        (for [i 0 (primitive/code-count node)]
+          (set! h (ia-code-hash (primitive/code-nth node i) (load h))))
+        (primitive/imul (primitive/ixor (load h) 41) 16777619))
+      (let [s (primitive/code-str node) (mut h) seed]
+        (for [i 0 (slice-len s)]
+          (set! h (primitive/imul
+                    (primitive/ixor (load h) (primitive/cast i64 (slice-get s i)))
+                    16777619)))
+        (load h))))
+
+;;; Structural fingerprint of a declaration form.
+(defn ia-declaration-hash [(decl Code)] (-> i64)
+  (ia-code-hash decl 2166136261))
+
+; ---- classification ---------------------------------------------------------
+
+(const IA-SCALAR 1)
+(const IA-POINTER 2)
+(const IA-SLICE 3)
+(const IA-FUNCTION 4)
+(const IA-ARRAY 5)
+(const IA-HANDLE 6)
+(const IA-NESTED 7)
+
+(defn ia-scalar-size [(T Code)] (-> i64)
+  (if (not (primitive/code-sym? T))
+      -1
+      (let [s (primitive/code-str T)]
+        (cond
+          (ia-text=? s "i64") 8
+          (ia-text=? s "u64") 8
+          (ia-text=? s "f64") 8
+          (ia-text=? s "isize") 8
+          (ia-text=? s "usize") 8
+          (ia-text=? s "i32") 4
+          (ia-text=? s "u32") 4
+          (ia-text=? s "f32") 4
+          (ia-text=? s "i16") 2
+          (ia-text=? s "u16") 2
+          (ia-text=? s "i8") 1
+          (ia-text=? s "u8") 1
+          (ia-text=? s "bool") 1
+          :else -1))))
+
+(defn ia-kind [(T Code)] (-> i64)
+  (cond
+    (>= (ia-scalar-size T) 0) IA-SCALAR
+    (and (primitive/code-sym? T)
+         (ia-text=? (primitive/code-str T) "LiveHandleOwner")) IA-HANDLE
+    (primitive/code-sym? T) IA-NESTED
+    (and (primitive/code-list? T) (> (primitive/code-count T) 0))
+      (let [h (primitive/code-nth T 0)]
+        (cond
+          (and (primitive/code-eq h `ptr) (= (primitive/code-count T) 2)) IA-POINTER
+          (and (primitive/code-eq h `slice) (= (primitive/code-count T) 2)) IA-SLICE
+          (primitive/code-eq h `fnptr) IA-FUNCTION
+          (and (primitive/code-eq h `array) (= (primitive/code-count T) 3)) IA-ARRAY
+          :else (primitive/error
+                  (primitive/code-str "image adapters: unsupported field type "
+                                      (primitive/code-str T)))))
+    :else (primitive/error
+            (primitive/code-str "image adapters: unsupported field type "
+                                (primitive/code-str T)))))
+
+(defn ia-symbol [(T Code) (suffix (slice u8))] (-> Code)
+  (primitive/datum->syntax T
+    (primitive/syntax->datum (primitive/code-symbol T suffix))))
+
+(defn ia-stride-name [(T Code)] (-> Code) (ia-symbol T "--image-stride"))
+(defn ia-write-name [(T Code)] (-> Code) (ia-symbol T "--image-write-fields"))
+(defn ia-read-name [(T Code)] (-> Code) (ia-symbol T "--image-read-fields"))
+(defn ia-describe-name [(T Code)] (-> Code) (ia-symbol T "--image-describe"))
+(defn ia-register-name [(T Code)] (-> Code) (ia-symbol T "--image-register!"))
+
+;;; The image slot size of a field type, as a constant-foldable expression.
+(defn ia-size-expr [(T Code)] (-> Code)
+  (let [k (ia-kind T)]
+    (cond
+      (= k IA-SCALAR) (let [n (ia-scalar-size T)] `~n)
+      (or (= k IA-POINTER) (or (= k IA-FUNCTION) (= k IA-HANDLE))) `8
+      (= k IA-SLICE) `16
+      (= k IA-ARRAY) `(* ~(primitive/code-nth T 2) ~(ia-size-expr (primitive/code-nth T 1)))
+      :else `(~(ia-stride-name T)))))
+
+(defn ia-policy [(field Code)] (-> i64)
+  (if (<= (primitive/code-count field) 2)
+      IMAGE-POLICY-DEFAULT
+      (let [p (primitive/code-nth field 2)]
+        (cond
+          (primitive/code-eq p `:transient) IMAGE-POLICY-TRANSIENT
+          (primitive/code-eq p `:foreign) IMAGE-POLICY-FOREIGN
+          :else (primitive/error
+                  (primitive/code-str "image adapters: unknown field policy "
+                                      (primitive/code-str p)))))))
+
+(defn ia-field-name [(field Code)] (-> Code) (primitive/code-nth field 0))
+(defn ia-field-type [(field Code)] (-> Code) (primitive/code-nth field 1))
+
+(defn ia-site [(T Code) (name Code)] (-> (slice u8))
+  (primitive/code-str (primitive/code-symbol T "." name)))
+
+;;; Source text of a type node. Field types come from the author's
+;;; declaration, so their original spelling is available.
+(defn ia-type-text [(T Code)] (-> (slice u8))
+  (if (primitive/code-sym? T) (primitive/code-str T) (primitive/code-src T)))
+
+;;; `(defstruct T FIELDS)` / `(defsum T VARIANTS...)` as text, built from the
+;;; author's own spelling of the field and variant forms.
+(defn ia-declaration-text [(head (slice u8)) (T Code) (parts Code)] (-> (slice u8))
+  (let [(mut sb) (str/sb-new (cm/expansion-allocator))]
+    (str/sb-push-str! (mut sb) "(")
+    (str/sb-push-str! (mut sb) head)
+    (str/sb-push-str! (mut sb) " ")
+    (str/sb-push-str! (mut sb) (primitive/code-str T))
+    (for [i 0 (primitive/code-count parts)]
+      (str/sb-push-str! (mut sb) " ")
+      (str/sb-push-str! (mut sb) (primitive/code-src (primitive/code-nth parts i))))
+    (str/sb-push-str! (mut sb) ")")
+    (str/sb-finish! (mut sb))))
+
+;;; Slot offsets for a field list: element i is the expression for field i's
+;;; offset from `start`; the final element is the total aligned size.
+(defn ia-offsets [(fields Code) (start Code)] (-> Code)
+  (let [out (primitive/code-list-new) (mut at) start]
+    (for [i 0 (primitive/code-count fields)]
+      (primitive/code-list-push! out (load at))
+      (set! at `(image-align8 (+ ~(load at) ~(ia-size-expr (ia-field-type (primitive/code-nth fields i)))))))
+    (primitive/code-list-push! out (load at))
+    (primitive/code-list-done out)))
+
+; ---- per-field write and read -----------------------------------------------
+
+;;; Code that writes one field at `place` (a typed pointer to the native
+;;; field) into the payload at absolute offset `off`. Yields an i64 status.
+(defn ia-write-field [(T Code) (policy i64) (place Code) (off Code)
+                      (site (slice u8)) (wv Code) (ov Code)] (-> Code)
+  (cond
+    (= policy IMAGE-POLICY-TRANSIENT)
+      `(image-write-transient! ~wv ~ov ~off ~(ia-size-expr T))
+    (= policy IMAGE-POLICY-FOREIGN)
+      `(image-write-foreign! ~wv ~ov ~off ~(ia-size-expr T) ~site)
+    :else
+      (let [k (ia-kind T)]
+        (cond
+          (= k IA-SCALAR)
+            `(image-write-bytes! ~wv ~ov ~off (primitive/cast (ptr i8) ~place)
+                                 ~(ia-scalar-size T))
+          (= k IA-POINTER)
+            (let [X (primitive/code-nth T 1)]
+              (if (>= (ia-scalar-size X) 0)
+                  `(image-write-interior-ref! ~wv ~ov ~off
+                     (primitive/cast i64 (load ~place)) ~site)
+                  `(image-write-object-ref! ~wv ~ov ~off
+                     (primitive/cast i64 (load ~place)) ~(ia-name-hash X) ~site)))
+          (= k IA-SLICE)
+            (let [X (primitive/code-nth T 1) s (primitive/fresh-identifier "image_slice")]
+              `(let [~s (load ~place)]
+                 (image-write-slice! ~wv ~ov ~off
+                   (primitive/cast i64 (slice-data ~s)) (slice-len ~s)
+                   (primitive/sizeof ~X) ~site)))
+          (= k IA-FUNCTION)
+            `(image-write-function! ~wv ~ov ~off
+               (primitive/cast i64 (primitive/cast (ptr i8) (load ~place))) ~site)
+          (= k IA-HANDLE)
+            `(image-write-handle! ~wv ~ov ~off
+               (primitive/cast i64 (load (field ~place raw))) ~site)
+          (= k IA-ARRAY)
+            (let [X (primitive/code-nth T 1)
+                  N (primitive/code-nth T 2)
+                  i (primitive/fresh-identifier "image_i")
+                  status (primitive/fresh-identifier "image_status")]
+              (if (>= (ia-scalar-size X) 0)
+                  `(image-write-bytes! ~wv ~ov ~off (primitive/cast (ptr i8) ~place)
+                                       (* ~N ~(ia-scalar-size X)))
+                  `(let [(mut ~status) 0]
+                     (for [~i 0 ~N]
+                       (if (= (load ~status) 0)
+                           (set! ~status
+                             ~(ia-write-field X IMAGE-POLICY-DEFAULT
+                                `(primitive/index ~place ~i)
+                                `(+ ~off (* ~i ~(ia-size-expr X)))
+                                site wv ov))
+                           0))
+                     (load ~status))))
+          :else
+            `(~(ia-write-name T) ~wv ~ov (primitive/cast (ptr i8) ~place) ~off)))))
+
+;;; Code that rebuilds one field at `place` from the staged payload `sv` at
+;;; absolute offset `off`. Yields an i64 status.
+(defn ia-read-field [(T Code) (policy i64) (place Code) (off Code)
+                     (rv Code) (sv Code)] (-> Code)
+  (if (!= policy IMAGE-POLICY-DEFAULT)
+      `(do (store! ~place (primitive/zeroed ~T)) 0)
+      (let [k (ia-kind T)]
+        (cond
+          (= k IA-SCALAR)
+            `(do (store! ~place (load (primitive/cast (ptr ~T) (primitive/index ~sv ~off)))) 0)
+          (or (= k IA-POINTER) (= k IA-FUNCTION))
+            `(do (store! ~place
+                   (primitive/cast ~T
+                     (load (primitive/cast (ptr (ptr i8)) (primitive/index ~sv ~off)))))
+                 0)
+          (= k IA-SLICE)
+            (let [X (primitive/code-nth T 1)]
+              `(do (store! ~place
+                     (slice-new [~X]
+                       (primitive/cast (ptr ~X)
+                         (load (primitive/cast (ptr (ptr i8)) (primitive/index ~sv ~off))))
+                       (load (primitive/cast (ptr i64) (primitive/index ~sv (+ ~off 8))))))
+                   0))
+          (= k IA-HANDLE)
+            `(do (store! (field ~place raw)
+                   (load (primitive/cast (ptr (ptr i8)) (primitive/index ~sv ~off))))
+                 0)
+          (= k IA-ARRAY)
+            (let [X (primitive/code-nth T 1)
+                  N (primitive/code-nth T 2)
+                  i (primitive/fresh-identifier "image_i")
+                  status (primitive/fresh-identifier "image_status")]
+              (if (>= (ia-scalar-size X) 0)
+                  `(do (memcpy (primitive/cast (ptr i8) ~place)
+                               (primitive/index ~sv ~off)
+                               (primitive/cast isize (* ~N ~(ia-scalar-size X))))
+                       0)
+                  `(let [(mut ~status) 0]
+                     (for [~i 0 ~N]
+                       (if (= (load ~status) 0)
+                           (set! ~status
+                             ~(ia-read-field X IMAGE-POLICY-DEFAULT
+                                `(primitive/index ~place ~i)
+                                `(+ ~off (* ~i ~(ia-size-expr X)))
+                                rv sv))
+                           0))
+                     (load ~status))))
+          :else
+            `(~(ia-read-name T) ~rv (primitive/cast (ptr i8) ~place)
+               (primitive/index ~sv ~off))))))
+
+; ---- schema description -----------------------------------------------------
+
+;;; Code pushing an ImageField onto the list at `fields-place` and, for a
+;;; reference field, an ImageReference onto the list at `refs-place`, for field
+;;; `field` at absolute image offset `off`. Nested by-value types describe
+;;; their own references in their own schema.
+(defn ia-describe-field [(field Code) (off Code) (fields-place Code)
+                         (refs-place Code)] (-> Code)
+  (let [T (ia-field-type field)
+        name (ia-field-name field)
+        policy (ia-policy field)
+        k (ia-kind T)
+        name-text (primitive/code-str name)
+        type-text (ia-type-text T)
+        refs (if (!= policy IMAGE-POLICY-DEFAULT)
+                 `()
+                 (cond
+                   (= k IA-POINTER)
+                     (let [X (primitive/code-nth T 1)]
+                       (if (>= (ia-scalar-size X) 0)
+                           `((al-push! (mut ~refs-place)
+                               (ImageReference :offset ~off :kind IMAGE-REF-INTERIOR :target 0)))
+                           `((al-push! (mut ~refs-place)
+                               (ImageReference :offset ~off :kind IMAGE-REF-OBJECT
+                                               :target ~(ia-name-hash X))))))
+                   (= k IA-SLICE)
+                     `((al-push! (mut ~refs-place)
+                         (ImageReference :offset ~off :kind IMAGE-REF-SLICE :target 0)))
+                   (= k IA-HANDLE)
+                     `((al-push! (mut ~refs-place)
+                         (ImageReference :offset ~off :kind IMAGE-REF-HANDLE :target 0)))
+                   (= k IA-FUNCTION)
+                     `((al-push! (mut ~refs-place)
+                         (ImageReference :offset ~off :kind IMAGE-REF-FUNCTION :target 0)))
+                   :else `()))]
+    `(do
+       (al-push! (mut ~fields-place)
+         (ImageField :name ~name-text :type-text ~type-text :offset ~off
+                     :size ~(ia-size-expr T) :policy ~policy))
+       ~@refs
+       0)))
+
+(defn ia-restore-option [(options Code)] (-> Code)
+  (let [(mut restore) `:none]
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (primitive/code-count options))
+                (break)
+                (let [key (primitive/code-nth options (load i))]
+                  (if (primitive/code-eq key `:restore)
+                      (if (>= (+ (load i) 1) (primitive/code-count options))
+                          (primitive/error "image adapters: :restore needs a function name")
+                          (do (set! restore (primitive/code-nth options (+ (load i) 1)))
+                              (set! i (+ (load i) 2))))
+                      (primitive/error
+                        (primitive/code-str "image adapters: unknown option "
+                                            (primitive/code-str key))))))))
+    (load restore)))
+
+(defn ia-register-form [(T Code) (kind Code) (fingerprint i64) (restore Code)] (-> Code)
+  `(defn ~(ia-register-name T) [] (-> i64)
+     (image-register-adapter!
+       (ImageSchemaAdapter
+         :runtime-id ~(ia-name-hash T)
+         :fingerprint ~fingerprint
+         :name ~(primitive/code-str T)
+         :kind ~kind
+         :native-size (primitive/sizeof ~T)
+         :native-align (primitive/alignof ~T)
+         :stride (~(ia-stride-name T))
+         :write (primitive/fnptr-of ~(ia-write-name T))
+         :read (primitive/fnptr-of ~(ia-read-name T))
+         :describe (primitive/fnptr-of ~(ia-describe-name T))
+         :restore ~(if (primitive/code-eq restore `:none)
+                       `(primitive/cast (fnptr c [(ptr i8)] i64) (primitive/cast (ptr i8) 0))
+                       `(primitive/fnptr-of ~restore))
+         :has-restore ~(if (primitive/code-eq restore `:none) `false `true)))))
+
+; ---- image-struct -----------------------------------------------------------
+
+(defn image-struct [(T Code) (fields Code) & (options Code)] (-> Code)
+  (let [n (primitive/code-count fields)
+        clean (primitive/code-list-new)
+        wv (primitive/fresh-identifier "image_w")
+        ov (primitive/fresh-identifier "image_obj")
+        rawv (primitive/fresh-identifier "image_raw")
+        basev (primitive/fresh-identifier "image_base")
+        pv (primitive/fresh-identifier "image_p")
+        rv (primitive/fresh-identifier "image_r")
+        sv (primitive/fresh-identifier "image_staged")
+        outv (primitive/fresh-identifier "image_out")
+        restore (ia-restore-option options)
+        offsets (ia-offsets fields `0)
+        writes (primitive/code-list-new)
+        reads (primitive/code-list-new)
+        describes (primitive/code-list-new)]
+    (for [i 0 n]
+      (let [field (primitive/code-nth fields i)
+            name (ia-field-name field)
+            FT (ia-field-type field)
+            policy (ia-policy field)
+            off (primitive/code-nth offsets i)
+            site (ia-site T name)]
+        (ia-kind FT)
+        (primitive/code-list-push! clean `(~name ~FT))
+        (primitive/code-list-push! writes
+          `(if (!= ~(ia-write-field FT policy `(field ~pv ~name) `(+ ~basev ~off) site wv ov) 0)
+               (return-from :image-write -1)
+               0))
+        (primitive/code-list-push! reads
+          `(if (!= ~(ia-read-field FT policy `(field ~pv ~name) off rv sv) 0)
+               (return-from :image-read -1)
+               0))
+        (primitive/code-list-push! describes
+          (ia-describe-field field off `(.fields ~outv) `(.references ~outv)))))
+    (let [decl `(defstruct ~T [~@(primitive/code-list-done clean)])
+          fingerprint (ia-declaration-hash decl)
+          decl-text (ia-declaration-text "defstruct" T `(~fields))]
+      `(do
+         ~decl
+         (defn ~(ia-stride-name T) [] (-> i64) ~(primitive/code-nth offsets n))
+         (defn ~(ia-write-name T) [(~wv (ptr ImageWriter)) (~ov (ptr ImageObject))
+                                   (~rawv (ptr i8)) (~basev i64)] (-> i64)
+           (let [~pv (primitive/cast (ptr ~T) ~rawv)]
+             (block :image-write
+               ~@(primitive/code-list-done writes)
+               0)))
+         (defn ~(ia-read-name T) [(~rv (ptr ImageReader)) (~rawv (ptr i8))
+                                  (~sv (ptr i8))] (-> i64)
+           (let [~pv (primitive/cast (ptr ~T) ~rawv)]
+             (block :image-read
+               ~@(primitive/code-list-done reads)
+               0)))
+         (defn ~(ia-describe-name T) [(~wv (ptr ImageWriter)) (~outv (ptr ImageSchema))] (-> i64)
+           (set! (.declaration ~outv) ~decl-text)
+           ~@(primitive/code-list-done describes)
+           0)
+         ~(ia-register-form T `IMAGE-KIND-STRUCT fingerprint restore)))))
+
+; ---- image-sum --------------------------------------------------------------
+
+(defn ia-variant-name [(variant Code)] (-> Code) (primitive/code-nth variant 0))
+
+(defn ia-variant-fields [(variant Code)] (-> Code)
+  (if (>= (primitive/code-count variant) 2)
+      (primitive/code-nth variant 1)
+      `[]))
+
+(defn image-sum [(T Code) & (rest Code)] (-> Code)
+  (let [variants (primitive/code-list-new)
+        options (primitive/code-list-new)]
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (primitive/code-count rest))
+                (break)
+                (let [item (primitive/code-nth rest (load i))]
+                  (if (primitive/code-list? item)
+                      (do (primitive/code-list-push! variants item)
+                          (set! i (+ (load i) 1)))
+                      (do (primitive/code-list-push! options item)
+                          (if (< (+ (load i) 1) (primitive/code-count rest))
+                              (do (primitive/code-list-push! options
+                                    (primitive/code-nth rest (+ (load i) 1)))
+                                  0)
+                              0)
+                          (set! i (+ (load i) 2))))))))
+    (let [variants (primitive/code-list-done variants)
+          restore (ia-restore-option (primitive/code-list-done options))
+          nv (primitive/code-count variants)
+          wv (primitive/fresh-identifier "image_w")
+          ov (primitive/fresh-identifier "image_obj")
+          rawv (primitive/fresh-identifier "image_raw")
+          basev (primitive/fresh-identifier "image_base")
+          rv (primitive/fresh-identifier "image_r")
+          sv (primitive/fresh-identifier "image_staged")
+          tagv (primitive/fresh-identifier "image_tag")
+          outv (primitive/fresh-identifier "image_out")
+          vlist (primitive/fresh-identifier "image_variant_fields")
+          clean (primitive/code-list-new)
+          arms (primitive/code-list-new)
+          reads (primitive/code-list-new)
+          describes (primitive/code-list-new)
+          (mut widest) `0]
+      (for [vi 0 nv]
+        (let [variant (primitive/code-nth variants vi)
+              vname (ia-variant-name variant)
+              vfields (ia-variant-fields variant)
+              nf (primitive/code-count vfields)
+              offsets (ia-offsets vfields `8)
+              binders (primitive/code-list-new)
+              slots (primitive/code-list-new)
+              cleanf (primitive/code-list-new)
+              stores (primitive/code-list-new)
+              writes (primitive/code-list-new)
+              readsf (primitive/code-list-new)
+              loads (primitive/code-list-new)
+              vdescribes (primitive/code-list-new)]
+          (set! widest `(image-max ~(load widest) ~(primitive/code-nth offsets nf)))
+          (for [fi 0 nf]
+            (let [field (primitive/code-nth vfields fi)
+                  name (ia-field-name field)
+                  FT (ia-field-type field)
+                  policy (ia-policy field)
+                  off (primitive/code-nth offsets fi)
+                  b (primitive/fresh-identifier "image_bind")
+                  s (primitive/fresh-identifier "image_slot")
+                  site (ia-site T name)]
+              (ia-kind FT)
+              (primitive/code-list-push! cleanf `(~name ~FT))
+              (primitive/code-list-push! binders b)
+              (primitive/code-list-push! slots `(~s (primitive/alloc-stack ~FT)))
+              (primitive/code-list-push! stores `(store! ~s ~b))
+              (primitive/code-list-push! writes
+                `(if (!= ~(ia-write-field FT policy s `(+ ~basev ~off) site wv ov) 0)
+                     (return-from :image-write -1)
+                     0))
+              (primitive/code-list-push! readsf
+                `(if (!= ~(ia-read-field FT policy s off rv sv) 0)
+                     (return-from :image-read -1)
+                     0))
+              (primitive/code-list-push! loads `(load ~s))
+              (primitive/code-list-push! vdescribes
+                (ia-describe-field field off vlist `(.references ~outv)))))
+          (let [cleanf (primitive/code-list-done cleanf)
+                binders (primitive/code-list-done binders)
+                slots (primitive/code-list-done slots)
+                loads (primitive/code-list-done loads)]
+            (primitive/code-list-push! clean
+              (if (= nf 0) `(~vname) `(~vname [~@cleanf])))
+            (primitive/code-list-push! arms
+              `(~vname [~@binders]
+                 (let [~@(ia-splice-pairs slots)]
+                   ~@(primitive/code-list-done stores)
+                   (block :image-write
+                     (if (!= (image-write-tag! ~wv ~ov ~basev ~vi) 0)
+                         (return-from :image-write -1)
+                         0)
+                     ~@(primitive/code-list-done writes)
+                     0))))
+            (primitive/code-list-push! reads `(= ~tagv ~vi))
+            (primitive/code-list-push! reads
+              `(let [~@(ia-splice-pairs slots)]
+                 (block :image-read
+                   ~@(primitive/code-list-done readsf)
+                   (store! (primitive/cast (ptr ~T) ~rawv) (~vname ~@loads))
+                   0)))
+            (primitive/code-list-push! describes
+              `(let [(mut ~vlist) (al-new [ImageField] (.a ~wv))]
+                 ~@(primitive/code-list-done vdescribes)
+                 (al-push! (mut (.variants ~outv))
+                   (ImageVariant :name ~(primitive/code-str vname) :fields (load ~vlist)))
+                 0)))))
+      (let [decl `(defsum ~T ~@(primitive/code-list-done clean))
+            fingerprint (ia-declaration-hash decl)
+            decl-text (ia-declaration-text "defsum" T variants)]
+        `(do
+           ~decl
+           (defn ~(ia-stride-name T) [] (-> i64) (image-align8 ~(load widest)))
+           (defn ~(ia-write-name T) [(~wv (ptr ImageWriter)) (~ov (ptr ImageObject))
+                                     (~rawv (ptr i8)) (~basev i64)] (-> i64)
+             (match (load (primitive/cast (ptr ~T) ~rawv))
+               ~@(primitive/code-list-done arms)))
+           (defn ~(ia-read-name T) [(~rv (ptr ImageReader)) (~rawv (ptr i8))
+                                    (~sv (ptr i8))] (-> i64)
+             (let [~tagv (load (primitive/cast (ptr i64) ~sv))]
+               (cond
+                 ~@(primitive/code-list-done reads)
+                 :else (image-reader-bad-tag! ~rv ~(ia-name-hash T) ~tagv))))
+           (defn ~(ia-describe-name T) [(~wv (ptr ImageWriter)) (~outv (ptr ImageSchema))] (-> i64)
+             (set! (.declaration ~outv) ~decl-text)
+             ~@(primitive/code-list-done describes)
+             0)
+           ~(ia-register-form T `IMAGE-KIND-SUM fingerprint restore))))))
+
+;;; Flatten a list of `(name init)` pairs into let-binding order.
+(defn ia-splice-pairs [(pairs Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count pairs)]
+      (let [pair (primitive/code-nth pairs i)]
+        (primitive/code-list-push! out (primitive/code-nth pair 0))
+        (primitive/code-list-push! out (primitive/code-nth pair 1))))
+    (primitive/code-list-done out)))

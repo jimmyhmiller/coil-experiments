@@ -1,0 +1,172 @@
+(module experiments.image.live-bridge-test)
+
+; The live bridge over the real heap-inspector runtime: save captures the
+; registered graph, blockers name the offending field, and a captured image
+; materializes back into a fresh world after the originals are torn down. Each
+; deftest runs in its own forked process, so the process-global live registries
+; start empty per test.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.assert" :use *)
+(import "coil.atomic" :as atomic)
+(import "coil.thread" :as thread)
+(import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
+(import "experiments.image.format" :use *)
+(import "experiments.image.runtime" :use [ImageBlocker image-blocker-name
+        IMAGE-BLOCK-NONE IMAGE-BLOCK-UNTRACKED-POINTER IMAGE-BLOCK-UNKNOWN-HANDLE])
+(import "experiments.image.live-bridge" :as bridge)
+(import "experiments.image.image" :as image)
+(import "experiments.image.ledger" :as ledger)
+(import "experiments.heap-inspector.runtime" :as inspector)
+(import "experiments.heap-inspector.live" :as live)
+
+(extern calloc :cc c [u64 u64] (-> (ptr i8)))
+
+(defstruct NodePayload [(value i64) (next (ptr i8))])
+(const RN 990001)
+(const FP 555001)
+
+(defn node-show [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0)
+
+(defn register-node! [] (-> i64)
+  (let [schema (inspector/register-type "Node" RN FP
+                 (primitive/sizeof NodePayload) (primitive/alignof NodePayload) 2
+                 (primitive/fnptr-of node-show) (primitive/fnptr-of node-show))]
+    (inspector/register-type-kind schema 1)
+    (live/live-register-reference-field schema (primitive/offsetof NodePayload next) RN 4)
+    schema))
+
+(defn mk-node [(schema i64) (value i64)] (-> (ptr live/LiveHandle))
+  (let [p (primitive/cast (ptr NodePayload) (calloc 1 (primitive/cast u64 (primitive/sizeof NodePayload))))]
+    (set! (.value p) value)
+    (live/live-handle-new! RN schema (primitive/cast (ptr i8) p))))
+
+(defn payload-of [(h (ptr live/LiveHandle))] (-> (ptr NodePayload))
+  (primitive/cast (ptr NodePayload) (live/live-handle-payload h (.runtime-id h) (.schema-id h))))
+
+(defn build-cycle! [] (-> (ptr live/LiveHandle))
+  (let [schema (register-node!)
+        h1 (mk-node schema 10)
+        h2 (mk-node schema 20)]
+    (set! (.next (payload-of h1)) (primitive/cast (ptr i8) h2))
+    (set! (.next (payload-of h2)) (primitive/cast (ptr i8) h1))
+    (live/live-register-handle-root "first" h1)
+    h1))
+
+(deftest save-captures-the-live-graph
+  (build-cycle!)
+  (let [a (alloc/malloc-allocator)
+        img (primitive/alloc-stack Image)]
+    (store! img (image-new a))
+    (assert-eq 0 (bridge/bridge-save! a img))
+    (assert-eq IMAGE-BLOCK-NONE (.kind (bridge/bridge-blocker)))
+    (assert-eq 2 (al-len (.objects img)))
+    (assert-eq 2 (al-len (.handles img)))
+    (assert-eq 1 (al-len (.roots img)))
+    (assert-eq 1 (al-len (.schemas img)))
+    ; Object order follows the handle list (LIFO), so check both by value.
+    (let [(mut saw10) false (mut saw20) false]
+      (for [i 0 (al-len (.objects img))]
+        (let [o (al-elem (field img objects) i)
+              value (load (primitive/cast (ptr i64) (slice-data (.data (field o payload)))))]
+          (assert-eq RN (.runtime-id o))
+          (assert-eq (primitive/sizeof NodePayload) (.bytes o))
+          ; the next word is a relocation, zeroed in the stored payload
+          (assert-eq 0 (load (primitive/cast (ptr i64)
+                         (primitive/index (slice-data (.data (field o payload))) 8))))
+          (assert-eq 1 (al-len (.relocations o)))
+          (let [rel (al-elem (field o relocations) 0)]
+            (assert-eq IMAGE-REF-HANDLE (.kind rel))
+            (assert-eq 8 (.offset rel)))
+          (if (= value 10) (set! saw10 true) 0)
+          (if (= value 20) (set! saw20 true) 0)))
+      (assert (load saw10))
+      (assert (load saw20)))
+    (let [root (al-elem (field img roots) 0)]
+      (assert (image-bytes=? "first" (.name root)))
+      ; the root names the handle whose payload holds value 10
+      (let [h (al-elem (field img handles) (- (.handle root) 1))
+            o (al-elem (field img objects) (- (.object h) 1))]
+        (assert-eq 10 (load (primitive/cast (ptr i64) (slice-data (.data (field o payload))))))))))
+
+(deftest untracked-pointer-blocks-the-live-save
+  (let [schema (register-node!)
+        h (mk-node schema 7)]
+    ; point next at a raw address that is no tracked handle
+    (set! (.next (payload-of h)) (primitive/cast (ptr i8) 4096))
+    (live/live-register-handle-root "first" h)
+    (let [a (alloc/malloc-allocator)
+          img (primitive/alloc-stack Image)]
+      (store! img (image-new a))
+      ; a handle field pointing at an unregistered address is UNKNOWN-HANDLE
+      (assert-eq -1 (bridge/bridge-save! a img))
+      (assert-eq IMAGE-BLOCK-UNKNOWN-HANDLE (.kind (bridge/bridge-blocker)))
+      (assert-eq 4096 (.address (bridge/bridge-blocker))))))
+
+(deftest captured-image-materializes-into-a-fresh-world
+  (build-cycle!)
+  (let [a (alloc/malloc-allocator)
+        img (primitive/alloc-stack Image)]
+    (store! img (image-new a))
+    (assert-eq 0 (bridge/bridge-save! a img))
+    ; Tear the original world down completely: unregister the root and release
+    ; both handles. The captured image must be able to rebuild from nothing.
+    (let [roots (live/live-roots)]
+      (for [i 0 (load (live/live-root-count))]
+        (let [r (primitive/index roots i)]
+          (if (.live r) (live/live-unregister-root! (.id r)) 0))))
+    (let [(mut h) (load (live/live-handle-head))]
+      (loop (if (= (primitive/cast i64 (load h)) 0) (break)
+                (let [next (.next (load h))]
+                  (live/live-handle-release! (load h))
+                  (set! h next)))))
+    (assert-eq 0 (load (live/live-handle-count)))
+    ; Rebuild from the image.
+    (assert-eq 0 (bridge/bridge-reconstruct-schemas! img))
+    (assert-eq 0 (bridge/bridge-materialize! a img))
+    (assert-eq IMAGE-BLOCK-NONE (.kind (bridge/bridge-blocker)))
+    (assert-eq 2 (load (live/live-handle-count)))
+    (assert-eq 1 (load (live/live-root-count)))
+    ; Verify the reconstructed graph: values, the cycle, fresh addresses.
+    (let [roots (live/live-roots)
+          root (primitive/index roots 0)
+          h1 (.handle root)
+          n1 (payload-of h1)
+          h2 (primitive/cast (ptr live/LiveHandle) (.next n1))
+          n2 (payload-of h2)]
+      (assert-eq 10 (.value n1))
+      (assert-eq 20 (.value n2))
+      (assert-eq (primitive/cast i64 h1)
+                 (primitive/cast i64 (primitive/cast (ptr live/LiveHandle) (.next n2)))))))
+
+; ---- quiescence -------------------------------------------------------------
+
+(defn reader-gate [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn reader-in [] (-> (ptr i64)) (primitive/alloc-static i64))
+
+(defn reader-worker [(ctx (ptr i8))] (-> (ptr i8))
+  (primitive/cast i64 ctx)
+  (live/live-enter!)
+  (atomic/atomic-store (reader-in) 1)
+  ; Hold the reader lease until released.
+  (loop (if (!= (atomic/atomic-load (reader-gate)) 0) (break) 0))
+  (live/live-exit!)
+  (primitive/cast (ptr i8) 0))
+
+(deftest save-waits-for-a-reader-lease-then-proceeds
+  (atomic/atomic-store (reader-gate) 0)
+  (atomic/atomic-store (reader-in) 0)
+  (let [worker (primitive/alloc-stack thread/Thread)]
+    (assert-eq 0 (primitive/cast i64
+                   (thread/thread-spawn worker (primitive/fnptr-of reader-worker)
+                     (primitive/cast (ptr i8) 0))))
+    (loop (if (!= (atomic/atomic-load (reader-in)) 0) (break) 0))
+    ; A reader lease is held: a non-blocking save reports WaitingForQuiescence.
+    (assert-eq image/IMAGE-E-WAITING (image/image-try-save! "build/image-quiesce.coilimage" IMAGE-MODE-CONTINUE))
+    ; Release the reader; the save then proceeds.
+    (atomic/atomic-store (reader-gate) 1)
+    (thread/thread-join worker)
+    (assert-eq 0 (atomic/atomic-load (live/live-reader-count)))
+    (assert-eq 0 (image/image-try-save! "build/image-quiesce.coilimage" IMAGE-MODE-CONTINUE))))

@@ -1,0 +1,372 @@
+(module experiments.image.format)
+
+; The image container: the in-memory model of everything an image holds and
+; its msgpack encoding with a validated envelope. This module knows nothing
+; about live objects or adapters; it only describes and (de)serializes the
+; sections listed in docs/IMAGE_METAPROGRAM.md.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.mem" :use *)
+(import "coil.result" :use *)
+(import "coil.serde" :use *)
+(import "coil.serde.derive" :use *)
+(import "coil.serde.msgpack" :use *)
+(import "coil.fs" :as fs)
+(import "coil.io" :use [IoError])
+(import "coil.str" :as str)
+(import "coil.meta" :as cm)
+
+; ---- constants shared by the runtime and the generated adapters -----------
+
+(const IMAGE-FORMAT-VERSION 1)
+(const IMAGE-POINTER-WIDTH 8)
+; Eight ASCII bytes open the file; sixteen trailer bytes close it.
+(const IMAGE-MAGIC "COILIMG1")
+(const IMAGE-ENVELOPE-BYTES 24)
+
+; Relocation and schema-reference kinds.
+(const IMAGE-REF-OBJECT 1)     ; typed pointer to an object (interior = element)
+(const IMAGE-REF-SLICE 2)      ; slice into an object: data word + length word
+(const IMAGE-REF-HANDLE 3)     ; pointer to a stable live handle record
+(const IMAGE-REF-INTERIOR 4)   ; untyped pointer somewhere inside an object
+(const IMAGE-REF-FUNCTION 5)   ; function value (schema-level only)
+
+; Object and schema kinds.
+(const IMAGE-KIND-STRUCT 1)
+(const IMAGE-KIND-SUM 2)
+
+; Field policies.
+(const IMAGE-POLICY-DEFAULT 0)
+(const IMAGE-POLICY-TRANSIENT 1)
+(const IMAGE-POLICY-FOREIGN 2)
+
+; Ledger entry kinds and statuses.
+(const IMAGE-LEDGER-BASE 1)
+(const IMAGE-LEDGER-EDIT 2)
+(const IMAGE-LEDGER-RECOVERY 3)
+(const IMAGE-LEDGER-ACCEPTED 1)
+(const IMAGE-LEDGER-OVERRIDDEN 2)
+
+; Save modes.
+(const IMAGE-MODE-CONTINUE 1)
+(const IMAGE-MODE-QUIT 2)
+
+; ---- the model --------------------------------------------------------------
+
+(defstruct ImageHeader
+  [(format-version i64)
+   (pointer-width i64)
+   (target (slice u8))
+   (live-fingerprint i64)
+   (image-fingerprint i64)
+   (base-fingerprint i64)
+   (epoch i64)
+   (serial i64)
+   (mode i64)])
+(derive Serialize Deserialize ImageHeader)
+
+(defstruct ImageLedgerEntry
+  [(serial i64)
+   (source (slice u8))
+   (fingerprint i64)
+   (kind i64)
+   (status i64)
+   (affected (ArrayList (slice u8)))
+   (schemas (ArrayList i64))])
+(derive Serialize Deserialize ImageLedgerEntry)
+
+(defstruct ImagePending
+  [(present bool)
+   (source (slice u8))
+   (diagnostic (slice u8))
+   (condition i64)])
+(derive Serialize Deserialize ImagePending)
+
+(defstruct ImageField
+  [(name (slice u8))
+   (type-text (slice u8))
+   (offset i64)
+   (size i64)
+   (policy i64)])
+(derive Serialize Deserialize ImageField)
+
+(defstruct ImageReference
+  [(offset i64)
+   (kind i64)
+   (target i64)])
+(derive Serialize Deserialize ImageReference)
+
+(defstruct ImageVariant
+  [(name (slice u8))
+   (fields (ArrayList ImageField))])
+(derive Serialize Deserialize ImageVariant)
+
+(defstruct ImageSchema
+  [(runtime-id i64)
+   (name (slice u8))
+   (version i64)
+   (fingerprint i64)
+   (kind i64)
+   (size i64)
+   (align i64)
+   (stride i64)
+   (declaration (slice u8))
+   (fields (ArrayList ImageField))
+   (variants (ArrayList ImageVariant))
+   (references (ArrayList ImageReference))
+   (edges (ArrayList i64))])
+(derive Serialize Deserialize ImageSchema)
+
+(defstruct ImageRelocation
+  [(offset i64)
+   (kind i64)
+   (target i64)
+   (interior i64)
+   (length i64)])
+(derive Serialize Deserialize ImageRelocation)
+
+(defstruct ImageFunctionValue
+  [(offset i64)
+   (stable-id (slice u8))
+   (lineage i64)])
+(derive Serialize Deserialize ImageFunctionValue)
+
+; Payload bytes travel as msgpack `bin`, never as a string: reference words are
+; zeroed and the remaining bytes are arbitrary.
+(defstruct ImageBytes [(data (slice u8))])
+(impl Serialize ImageBytes
+  (ser [(x ImageBytes) (s (dyn Serializer))] (-> (Result i64 SerError))
+    (ser-bytes s (.data x))))
+(impl Deserialize ImageBytes
+  (de [(out (ptr ImageBytes)) (d (dyn Deserializer))] (-> (Result i64 DeError))
+    (match (de-bytes d)
+      (Err [e] (Err e))
+      (Ok [b] (do (store! (field out data) b) (Ok 0))))))
+
+(defstruct ImageObject
+  [(id i64)
+   (runtime-id i64)
+   (fingerprint i64)
+   (kind i64)
+   (count i64)
+   (stride i64)
+   (bytes i64)
+   (align i64)
+   (payload ImageBytes)
+   (relocations (ArrayList ImageRelocation))
+   (functions (ArrayList ImageFunctionValue))
+   (transient (ArrayList i64))])
+(derive Serialize Deserialize ImageObject)
+
+(defstruct ImageHandle
+  [(id i64)
+   (object i64)
+   (refs i64)
+   (root i64)])
+(derive Serialize Deserialize ImageHandle)
+
+(defstruct ImageRoot
+  [(name (slice u8))
+   (runtime-id i64)
+   (fingerprint i64)
+   (handle i64)
+   (object i64)])
+(derive Serialize Deserialize ImageRoot)
+
+(defstruct ImageCensus
+  [(unreachable i64)
+   (untracked i64)])
+(derive Serialize Deserialize ImageCensus)
+
+(defstruct Image
+  [(header ImageHeader)
+   (ledger (ArrayList ImageLedgerEntry))
+   (pending ImagePending)
+   (schemas (ArrayList ImageSchema))
+   (objects (ArrayList ImageObject))
+   (handles (ArrayList ImageHandle))
+   (roots (ArrayList ImageRoot))
+   (hooks (ArrayList (slice u8)))
+   (census ImageCensus)])
+(derive Serialize Deserialize Image)
+
+;;; A zeroed image whose lists are owned by `a`, with the format header filled.
+(defn image-new [(a (dyn alloc/Allocator))] (-> Image)
+  (let [(mut img) (primitive/zeroed Image)]
+    (set! (.format-version (.header img)) IMAGE-FORMAT-VERSION)
+    (set! (.pointer-width (.header img)) IMAGE-POINTER-WIDTH)
+    (set! (.target (.header img)) (image-target-name))
+    (set! (.ledger img) (al-new [ImageLedgerEntry] a))
+    (set! (.schemas img) (al-new [ImageSchema] a))
+    (set! (.objects img) (al-new [ImageObject] a))
+    (set! (.handles img) (al-new [ImageHandle] a))
+    (set! (.roots img) (al-new [ImageRoot] a))
+    (set! (.hooks img) (al-new [(slice u8)] a))
+    (load img)))
+
+; `target-arch`/`target-os`/`code-str` are metaprogram-only primitives; calling
+; them in a runtime function silently makes it (and every caller) metaprogram-
+; only. The macro runs them at expansion time and splices a string literal.
+(defn image-target-literal [(site Code)] (-> Code)
+  (let [(mut sb) (str/sb-new (cm/expansion-allocator))]
+    (str/sb-push-str! (mut sb) (primitive/code-str (primitive/target-arch)))
+    (str/sb-push-str! (mut sb) "-")
+    (str/sb-push-str! (mut sb) (primitive/code-str (primitive/target-os)))
+    (let [text (str/sb-finish! (mut sb))]
+      `~text)))
+
+(defn image-target-name [] (-> (slice u8))
+  (image-target-literal here))
+
+; ---- hashing ----------------------------------------------------------------
+
+;;; FNV-1a 64 over bytes, unmasked. Used for the envelope hash and content
+;;; fingerprints.
+(defn image-content-hash [(bytes (slice u8))] (-> i64)
+  (let [(mut h) -3750763034362895579]
+    (for [i 0 (slice-len bytes)]
+      (set! h (primitive/imul
+                (primitive/ixor (load h) (primitive/cast i64 (slice-get bytes i)))
+                1099511628211)))
+    (load h)))
+
+;;; The nominal runtime identity of a type name. This is exactly the formula
+;;; the live metaprogram uses (`live-name-hash` / `live-type-id`), so image
+;;; runtime IDs and live runtime IDs agree.
+(defn image-name-hash [(name (slice u8))] (-> i64)
+  (let [(mut h) 2166136261]
+    (for [i 0 (slice-len name)]
+      (set! h (primitive/imul
+                (primitive/ixor (load h) (primitive/cast i64 (slice-get name i)))
+                16777619)))
+    (primitive/iand (load h) 9223372036854775807)))
+
+; ---- envelope ---------------------------------------------------------------
+
+(defsum ImageFormatError
+  (BadMagic)
+  (Truncated [(bytes i64)])
+  (BadLength [(expected i64) (actual i64)])
+  (BadHash [(expected i64) (actual i64)])
+  (BadVersion [(version i64)])
+  (BadPointerWidth [(width i64)])
+  (Encode [(error SerError)])
+  (Decode [(error DeError)])
+  (Io [(error IoError)])
+  (OutOfMemory))
+
+(defn image-store-le64! [(p (ptr u8)) (v i64)] (-> i64)
+  (for [i 0 8]
+    (store! (primitive/index p i)
+            (primitive/cast u8 (primitive/iand (primitive/ishr v (* i 8)) 255))))
+  0)
+
+(defn image-load-le64 [(p (ptr u8))] (-> i64)
+  (let [(mut v) 0]
+    (for [i 0 8]
+      (set! v (primitive/ior (load v)
+                (primitive/ishl (primitive/cast i64 (load (primitive/index p i)))
+                                (* i 8)))))
+    (load v)))
+
+;;; Encode an image as `magic ++ msgpack ++ length ++ hash`. The result is
+;;; owned by `a`.
+(defn image-encode [(a (dyn alloc/Allocator)) (img (ptr Image))]
+  (-> (Result (slice u8) ImageFormatError))
+  (match (to-msgpack-bytes [Image] a (load img))
+    (Err [e] (Err (Encode e)))
+    (Ok [body]
+      (let [total (+ (slice-len body) IMAGE-ENVELOPE-BYTES)]
+        (match (alloc/alloc-bytes a total 8)
+          (None [] (Err (OutOfMemory)))
+          (Some [out]
+            (let [data (slice-data out)]
+              (memcpy (primitive/cast (ptr i8) data)
+                      (primitive/cast (ptr i8) (slice-data IMAGE-MAGIC))
+                      (primitive/cast isize 8))
+              (memcpy (primitive/cast (ptr i8) (primitive/index data 8))
+                      (primitive/cast (ptr i8) (slice-data body))
+                      (primitive/cast isize (slice-len body)))
+              (image-store-le64! (primitive/index data (+ 8 (slice-len body)))
+                                 (slice-len body))
+              (image-store-le64! (primitive/index data (+ 16 (slice-len body)))
+                                 (image-content-hash body))
+              (alloc/free-bytes a body 8)
+              (Ok out))))))))
+
+;;; Validate the envelope and decode the image. Decoded strings and payloads
+;;; borrow `bytes`; keep the buffer alive while the image is used.
+(defn image-decode [(a (dyn alloc/Allocator)) (bytes (slice u8))]
+  (-> (Result Image ImageFormatError))
+  (if (< (slice-len bytes) IMAGE-ENVELOPE-BYTES)
+      (Err (Truncated (slice-len bytes)))
+      (if (not (image-bytes=? (subslice bytes 0 8) IMAGE-MAGIC))
+          (Err (BadMagic))
+          (let [body-len (- (slice-len bytes) IMAGE-ENVELOPE-BYTES)
+                recorded-len (image-load-le64
+                               (primitive/index (slice-data bytes) (+ 8 body-len)))
+                recorded-hash (image-load-le64
+                                (primitive/index (slice-data bytes) (+ 16 body-len)))
+                body (subslice bytes 8 (+ 8 body-len))
+                actual-hash (image-content-hash body)]
+            (cond
+              (!= recorded-len body-len) (Err (BadLength recorded-len body-len))
+              (!= recorded-hash actual-hash) (Err (BadHash recorded-hash actual-hash))
+              :else
+                (match (from-msgpack [Image] a body)
+                  (Err [e] (Err (Decode e)))
+                  (Ok [img]
+                    (let [p (primitive/alloc-stack Image)]
+                      (store! p img)
+                      (cond
+                        (!= (.format-version (.header p)) IMAGE-FORMAT-VERSION)
+                          (Err (BadVersion (.format-version (.header p))))
+                        (!= (.pointer-width (.header p)) IMAGE-POINTER-WIDTH)
+                          (Err (BadPointerWidth (.pointer-width (.header p))))
+                        :else (Ok img))))))))))
+
+(defn image-bytes=? [(x (slice u8)) (y (slice u8))] (-> bool)
+  (if (!= (slice-len x) (slice-len y))
+      false
+      (let [(mut same) true]
+        (for [i 0 (slice-len x)]
+          (if (!= (slice-get x i) (slice-get y i)) (set! same false) 0))
+        (load same))))
+
+;;; Encode and write to `path`. Atomic replacement belongs to the save
+;;; transaction (phase B); this writes the container as one file.
+(defn image-write-file [(a (dyn alloc/Allocator)) (path (slice u8)) (img (ptr Image))]
+  (-> (Result i64 ImageFormatError))
+  (match (image-encode a img)
+    (Err [e] (Err e))
+    (Ok [bytes]
+      (let [written (fs/write-file a path bytes)]
+        (alloc/free-bytes a bytes 8)
+        (match written
+          (Err [e] (Err (Io e)))
+          (Ok [n] (Ok n)))))))
+
+;;; Read and decode `path`. The file buffer is owned by `a` and must outlive the
+;;; returned image.
+(defn image-read-file [(a (dyn alloc/Allocator)) (path (slice u8))]
+  (-> (Result Image ImageFormatError))
+  (match (fs/read-file a path)
+    (Err [e] (Err (Io e)))
+    (Ok [bytes] (image-decode a bytes))))
+
+;;; Stable text for a format error, for diagnostics and tests.
+(defn image-format-error-name [(e ImageFormatError)] (-> (slice u8))
+  (match e
+    (BadMagic [] "bad-magic")
+    (Truncated [_] "truncated")
+    (BadLength [_ _] "bad-length")
+    (BadHash [_ _] "bad-hash")
+    (BadVersion [_] "bad-version")
+    (BadPointerWidth [_] "bad-pointer-width")
+    (Encode [_] "encode")
+    (Decode [_] "decode")
+    (Io [_] "io")
+    (OutOfMemory [] "out-of-memory")))

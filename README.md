@@ -74,6 +74,9 @@ of the Coil compiler through one `--use experiments.rust-like.lang`. See
 - `async/` — generated activation records; `await` parks the current computation
 - `csp/` — Go-style processes with parking, bounded channels, and backpressure
 - `dataflow/` — Oz-style logic variables that suspend and wake dataflow threads
+- `image/` — Smalltalk/Lisp-style images as a metaprogram over the live runtime;
+  design in [`docs/IMAGE_METAPROGRAM.md`](docs/IMAGE_METAPROGRAM.md), phase A
+  (container format and generated adapters) implemented
 
 The three concurrency dialects include runnable business-shaped examples and a
 design/tradeoff discussion in

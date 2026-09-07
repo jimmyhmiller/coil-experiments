@@ -1,0 +1,216 @@
+(module experiments.image.ledger)
+
+; The accepted-submission ledger: the code half of an image. Every source
+; submission accepted by the live controller is appended here in order. On load
+; the ledger is replayed to reconstruct the program (see image-boot!). This is
+; the Smalltalk changes file, kept inside the image.
+;
+; The ledger is ordinary runtime state (one process-global table of owned source
+; strings). The image controller wrapper records into it on each successful
+; edit; the format module carries it in and out of the container.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
+(import "experiments.image.format" :use *)
+
+(extern malloc :cc c [u64] (-> (ptr i8)))
+(extern free :cc c [(ptr i8)] (-> i64))
+
+; A fixed fingerprint of this binary's live metaprogram + image format. Two
+; processes of the same executable share it, so a load rejects only a genuinely
+; different binary. It is a compile-time constant, not a runtime hash.
+(const LEDGER-LIVE-FINGERPRINT 8241730016901123)
+(const LEDGER-IMAGE-FINGERPRINT 5566778899001122)
+
+(defstruct LedgerEntry
+  [(serial i64)
+   (source (slice u8))     ; owned copy
+   (fingerprint i64)
+   (kind i64)
+   (status i64)])
+
+(defstruct LedgerState
+  [(ready bool)
+   (entries (ArrayList LedgerEntry))
+   (pending-present bool)
+   (pending-source (slice u8))
+   (pending-diagnostic (slice u8))
+   (pending-condition i64)])
+
+(defn ledger-state [] (-> (ptr LedgerState))
+  (let [s (primitive/alloc-static LedgerState)]
+    (if (not (.ready s))
+        (do (set! (.entries s) (al-new [LedgerEntry] (alloc/malloc-allocator)))
+            (set! (.pending-source s) "")
+            (set! (.pending-diagnostic s) "")
+            (set! (.ready s) true) 0)
+        0)
+    s))
+
+(defn ledger-own [(source (slice u8))] (-> (slice u8))
+  (let [n (slice-len source)
+        p (primitive/cast (ptr u8) (malloc (primitive/cast u64 (if (= n 0) 1 n))))]
+    (if (= (primitive/cast i64 p) 0) ""
+        (do (for [i 0 n] (store! (primitive/index p i) (slice-get source i)))
+            (slice-new p n)))))
+
+;;; FNV-1a over the source, for the entry fingerprint.
+(defn ledger-fingerprint [(source (slice u8))] (-> i64)
+  (let [(mut h) 2166136261]
+    (for [i 0 (slice-len source)]
+      (set! h (primitive/imul (primitive/ixor (load h) (primitive/cast i64 (slice-get source i)))
+                              16777619)))
+    (primitive/iand (load h) 9223372036854775807)))
+
+;;; Append one accepted submission. `kind` is IMAGE-LEDGER-BASE/EDIT/RECOVERY.
+;;; Returns the new serial (1-based).
+(defn ledger-record! [(source (slice u8)) (kind i64)] (-> i64)
+  (let [s (ledger-state)
+        serial (+ (al-len (.entries s)) 1)]
+    (al-push! (mut (.entries s))
+      (LedgerEntry :serial serial :source (ledger-own source)
+                   :fingerprint (ledger-fingerprint source) :kind kind
+                   :status IMAGE-LEDGER-ACCEPTED))
+    serial))
+
+(defn ledger-set-pending! [(source (slice u8)) (diagnostic (slice u8)) (condition i64)] (-> i64)
+  (let [s (ledger-state)]
+    (set! (.pending-present s) true)
+    (set! (.pending-source s) (ledger-own source))
+    (set! (.pending-diagnostic s) (ledger-own diagnostic))
+    (set! (.pending-condition s) condition)
+    0))
+
+(defn ledger-clear-pending! [] (-> i64)
+  (let [s (ledger-state)] (set! (.pending-present s) false) 0))
+
+(defn ledger-count [] (-> i64) (al-len (.entries (ledger-state))))
+
+(defn ledger-entry [(i i64)] (-> (ptr LedgerEntry))
+  (al-elem (field (ledger-state) entries) i))
+
+;;; Mark entry `i` overridden by the base program (conflict resolution).
+(defn ledger-mark-overridden! [(i i64)] (-> i64)
+  (if (or (< i 0) (>= i (ledger-count))) -1
+      (do (set! (.status (ledger-entry i)) IMAGE-LEDGER-OVERRIDDEN) 0)))
+
+; ---- container in/out -------------------------------------------------------
+
+;;; Copy the runtime ledger into the image container.
+(defn ledger-into-image! [(img (ptr Image))] (-> i64)
+  (let [s (ledger-state) a (alloc/malloc-allocator)]
+    (set! (.live-fingerprint (field img header)) LEDGER-LIVE-FINGERPRINT)
+    (set! (.image-fingerprint (field img header)) LEDGER-IMAGE-FINGERPRINT)
+    (if (> (al-len (.entries s)) 0)
+        (set! (.base-fingerprint (field img header)) (.fingerprint (ledger-entry 0))) 0)
+    (for [i 0 (al-len (.entries s))]
+      (let [e (ledger-entry i)]
+        (al-push! (mut (.ledger img))
+          (ImageLedgerEntry :serial (.serial e) :source (.source e)
+                            :fingerprint (.fingerprint e) :kind (.kind e) :status (.status e)
+                            :affected (al-new [(slice u8)] a) :schemas (al-new [i64] a)))))
+    (set! (.present (.pending img)) (.pending-present s))
+    (set! (.source (.pending img)) (.pending-source s))
+    (set! (.diagnostic (.pending img)) (.pending-diagnostic s))
+    (set! (.condition (.pending img)) (.pending-condition s))
+    0))
+
+;;; Load the ledger from an image container into the runtime table (owning
+;;; copies), so a freshly booted process continues appending after replay.
+(defn ledger-from-image! [(img (ptr Image))] (-> i64)
+  (let [s (ledger-state)]
+    (set! (.entries s) (al-new [LedgerEntry] (alloc/malloc-allocator)))
+    (for [i 0 (al-len (.ledger img))]
+      (let [e (al-elem (field img ledger) i)]
+        (al-push! (mut (.entries s))
+          (LedgerEntry :serial (.serial e) :source (ledger-own (.source e))
+                       :fingerprint (.fingerprint e) :kind (.kind e) :status (.status e)))))
+    (set! (.pending-present s) (.present (.pending img)))
+    (set! (.pending-source s) (ledger-own (.source (.pending img))))
+    (set! (.pending-diagnostic s) (ledger-own (.diagnostic (.pending img))))
+    (set! (.pending-condition s) (.condition (.pending img)))
+    0))
+
+;;; Validate the header of a candidate image against this binary. Returns 0 or
+;;; a negative mismatch code.
+(defn ledger-validate-header [(img (ptr Image))] (-> i64)
+  (cond
+    (!= (.live-fingerprint (field img header)) LEDGER-LIVE-FINGERPRINT) -1
+    (!= (.image-fingerprint (field img header)) LEDGER-IMAGE-FINGERPRINT) -2
+    :else 0))
+
+; ---- conflict marking (upgrade mode) ----------------------------------------
+;
+; When a booting binary submits a base program that changed a definition a
+; prior live edit also changed, the on-disk program wins: the overridden edit
+; stays in the ledger marked, and replay skips it. Matching is by the top-level
+; definition name, extracted from the submission source.
+
+(defn ledger-is-space? [(c i64)] (-> bool)
+  (or (= c 32) (or (= c 9) (or (= c 10) (= c 13)))))
+
+(defn ledger-char [(source (slice u8)) (i i64)] (-> i64)
+  (primitive/cast i64 (slice-get source i)))
+
+;;; Advance `from` past a head symbol at an open paren; return the index after
+;;; the head. `out-start`/`out-end` receive the head symbol span.
+(defn ledger-token-end [(source (slice u8)) (from i64)] (-> i64)
+  (let [n (slice-len source) (mut j) from]
+    (loop (if (or (>= (load j) n)
+                  (let [c (ledger-char source (load j))]
+                    (or (ledger-is-space? c) (or (= c 40) (= c 41))))) (break)
+              (set! j (+ (load j) 1))))
+    (load j)))
+
+(defn ledger-skip-space [(source (slice u8)) (from i64)] (-> i64)
+  (let [n (slice-len source) (mut j) from]
+    (loop (if (or (>= (load j) n) (not (ledger-is-space? (ledger-char source (load j))))) (break)
+              (set! j (+ (load j) 1))))
+    (load j)))
+
+(defn ledger-def-head? [(head (slice u8))] (-> bool)
+  (or (ledger-text=? head "defn") (or (ledger-text=? head "defstruct")
+      (or (ledger-text=? head "defsum") (or (ledger-text=? head "deftrait")
+          (ledger-text=? head "letonce"))))) )
+
+;;; The first top-level defined name in a submission, or "" when none is found.
+(defn ledger-defined-name [(source (slice u8))] (-> (slice u8))
+  (let [n (slice-len source) (mut i) 0 (mut result) ""]
+    (loop
+      (if (or (> (slice-len (load result)) 0) (>= (load i) n)) (break)
+          (do
+            (if (= (ledger-char source (load i)) 40)
+                (let [head-start (+ (load i) 1)
+                      head-end (ledger-token-end source head-start)
+                      head (subslice source head-start head-end)]
+                  (if (ledger-def-head? head)
+                      (let [name-start (ledger-skip-space source head-end)
+                            name-end (ledger-token-end source name-start)]
+                        (set! result (subslice source name-start name-end)))
+                      0))
+                0)
+            (set! i (+ (load i) 1)))))
+    (load result)))
+
+(defn ledger-text=? [(a (slice u8)) (b (slice u8))] (-> bool)
+  (if (!= (slice-len a) (slice-len b)) false
+      (let [(mut i) 0 (mut same) true]
+        (loop (if (or (not (load same)) (>= (load i) (slice-len a))) (break)
+                  (if (= (slice-get a (load i)) (slice-get b (load i)))
+                      (set! i (+ (load i) 1)) (set! same false))))
+        (load same))))
+
+;;; Mark every accepted EDIT entry whose defined name matches one defined in
+;;; `base-source` as overridden by the base program. Returns the count marked.
+(defn ledger-mark-conflicts! [(base-source (slice u8))] (-> i64)
+  (let [base-name (ledger-defined-name base-source) (mut marked) 0]
+    (if (= (slice-len base-name) 0) 0
+        (for [i 0 (ledger-count)]
+          (let [e (ledger-entry i)]
+            (if (and (= (.kind e) IMAGE-LEDGER-EDIT) (= (.status e) IMAGE-LEDGER-ACCEPTED)
+                     (ledger-text=? (ledger-defined-name (.source e)) base-name))
+                (do (set! (.status e) IMAGE-LEDGER-OVERRIDDEN) (set! marked (+ (load marked) 1)))
+                0))))
+    (load marked)))

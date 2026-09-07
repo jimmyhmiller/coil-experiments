@@ -1,0 +1,88 @@
+(module experiments.image.image-boot)
+
+; The controller-backed half of the image front door: recording edits into the
+; ledger, and full boot (replay the accepted-program ledger through the live
+; JIT controller, then overlay the saved heap state). Kept in its own module so
+; that apps which only save and data-reload never import the controller — and so
+; never compile the in-process compiler (coil.jit) into their binary.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.fs" :as fs)
+(import "coil.mem" :use *)
+(import "experiments.image.format" :use *)
+(import "experiments.image.live-bridge" :as bridge)
+(import "experiments.image.ledger" :as ledger)
+(import "experiments.image.image" :as image)
+(import "experiments.image.bake" :as bake)
+(import "experiments.heap-inspector.controller" :as controller)
+
+; ---- ledger recording -------------------------------------------------------
+
+;;; Submit one source edit through the live controller and, on success, append
+;;; it to the ledger. This is the recording wrapper an image-enabled program
+;;; uses in place of a bare controller edit.
+(defn image-controller-edit! [(source (slice u8)) (kind i64)] (-> i64)
+  (let [status (controller/live-controller-edit-source! source)]
+    (if (= status 0) (do (ledger/ledger-record! source kind) 0) 0)
+    status))
+
+; ---- full boot (replay code, then overlay heap state) -----------------------
+
+;;; Boot a fresh process from `path`: validate the header, load the ledger,
+;;; replay every accepted submission through the controller to rebuild the
+;;; schemas/functions/roots, then overlay the saved heap state onto the
+;;; reconstructed graph in place. Returns 0 or a negative error.
+(defn image-boot! [(path (slice u8))] (-> i64)
+  (let [a (alloc/malloc-allocator)]
+    (match (image-read-file a path)
+      (Err [_] image/IMAGE-E-IO)
+      (Ok [decoded]
+        (let [img (primitive/alloc-stack Image)]
+          (store! img decoded)
+          (image-boot-decoded! a img))))))
+
+;;; Boot from an in-memory container (used by the baked-executable path).
+(defn image-boot-bytes! [(a (dyn alloc/Allocator)) (bytes (slice u8))] (-> i64)
+  (match (image-decode a bytes)
+    (Err [_] image/IMAGE-E-IO)
+    (Ok [decoded]
+      (let [img (primitive/alloc-stack Image)]
+        (store! img decoded)
+        (image-boot-decoded! a img)))))
+
+;;; Validate, replay the ledger through the controller, then overlay the saved
+;;; heap state onto the reconstructed graph.
+(defn image-boot-decoded! [(a (dyn alloc/Allocator)) (img (ptr Image))] (-> i64)
+  (if (!= (ledger/ledger-validate-header img) 0) image/IMAGE-E-SCHEMA
+      (do
+        (ledger/ledger-from-image! img)
+        (let [(mut status) 0]
+          (for [i 0 (al-len (.ledger img))]
+            (if (= (load status) 0)
+                (let [e (al-elem (field img ledger) i)]
+                  (if (= (.status e) IMAGE-LEDGER-OVERRIDDEN) 0
+                      (if (!= (controller/live-controller-edit-source! (.source e)) 0)
+                          (set! status image/IMAGE-E-SCHEMA) 0)))
+                0))
+          (if (!= (load status) 0) status
+              (bridge/bridge-restore-in-place! a img))))))
+
+; ---- full baked boot (replay code) ------------------------------------------
+;;; Boot from a baked executable at `self-path`: locate the trailer, extract the
+;;; embedded image bytes, and boot from them. Returns image-boot!'s code, or a
+;;; negative value when no trailer is present.
+(defn image-boot-baked! [(self-path (slice u8))] (-> i64)
+  (let [a (alloc/malloc-allocator)]
+    (match (fs/read-file a self-path)
+      (Err [_] -1)
+      (Ok [file]
+        (if (< (slice-len file) bake/BAKE-TRAILER-BYTES) -2
+            (let [trailer-at (- (slice-len file) bake/BAKE-TRAILER-BYTES)]
+              (if (not (bake/bake-bytes=? (subslice file trailer-at (+ trailer-at 8)) bake/BAKE-MAGIC)) -2
+                  (let [img-len (bake/bake-load-le64 (primitive/index (slice-data file) (+ trailer-at 8)))
+                        img-start (- trailer-at img-len)]
+                    (if (or (< img-start 0) (> img-len (slice-len file))) -3
+                        (image-boot-bytes! a (subslice file img-start trailer-at)))))))))))

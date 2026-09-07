@@ -1,0 +1,104 @@
+(module experiments.image.image)
+
+; The image feature's front door: gated save and load of the live world, the
+; ledger, and the boot sequence. `save`/`load` here operate on the real
+; heap-inspector live runtime through the bridge.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
+(import "experiments.image.format" :use *)
+(import "experiments.image.runtime" :use [ImageBlocker image-blocker-name])
+(import "experiments.image.live-bridge" :as bridge)
+(import "experiments.image.ledger" :as ledger)
+(import "coil.atomic" :as atomic)
+(import "experiments.heap-inspector.live" :as live)
+
+(const IMAGE-OK 0)
+(const IMAGE-E-BLOCKED -1)
+(const IMAGE-E-IO -100)
+(const IMAGE-E-SCHEMA -101)
+(const IMAGE-E-WAITING -102)
+
+; ---- save -------------------------------------------------------------------
+
+;;; Build the image for the current live world into `img` (ledger + graph),
+;;; under the world publication gate. Returns 0 or a negative error.
+(defn image-capture! [(a (dyn alloc/Allocator)) (img (ptr Image)) (mode i64)] (-> i64)
+  (set! (.mode (field img header)) mode)
+  (set! (.epoch (field img header)) (live/live-epoch))
+  (set! (.serial (field img header)) (+ (.serial (field img header)) 1))
+  (ledger/ledger-into-image! img)
+  (live/live-begin-publication!)
+  (let [status (bridge/bridge-save! a img)]
+    (live/live-end-publication!)
+    status))
+
+;;; Save the current live world to `path`. Blocks at the publication gate until
+;;; readers drain (a thread that never reaches a live poll would block it).
+(defn image-save! [(path (slice u8)) (mode i64)] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        img (primitive/alloc-stack Image)]
+    (store! img (image-new a))
+    (let [status (image-capture! a img mode)]
+      (if (!= status 0) status
+          (match (image-write-file a path img)
+            (Err [_] IMAGE-E-IO)
+            (Ok [_] IMAGE-OK))))))
+
+;;; Non-blocking save probe: if any reader lease is held (a thread inside a live
+;;; entry that has not reached a boundary) return IMAGE-E-WAITING without
+;;; touching the world; otherwise perform the save.
+(defn image-try-save! [(path (slice u8)) (mode i64)] (-> i64)
+  (if (> (atomic/atomic-load (live/live-reader-count)) 0)
+      IMAGE-E-WAITING
+      (image-save! path mode)))
+
+; ---- load: data reload (schemas + graph, no code) ---------------------------
+
+;;; Reconstruct the schema registry from `path` and materialize its graph into
+;;; the live runtime, installing every root. Does NOT restore code; use
+;;; `image-boot!` for a full boot that also replays the ledger.
+(defn image-load-data! [(path (slice u8))] (-> i64)
+  (let [a (alloc/malloc-allocator)]
+    (match (image-read-file a path)
+      (Err [_] IMAGE-E-IO)
+      (Ok [decoded]
+        (let [img (primitive/alloc-stack Image)]
+          (store! img decoded)
+          (image-load-data-decoded! a img))))))
+
+;;; Data reload from an in-memory container (used by baked self-boot).
+(defn image-load-data-bytes! [(a (dyn alloc/Allocator)) (bytes (slice u8))] (-> i64)
+  (match (image-decode a bytes)
+    (Err [_] IMAGE-E-IO)
+    (Ok [decoded]
+      (let [img (primitive/alloc-stack Image)]
+        (store! img decoded)
+        (image-load-data-decoded! a img)))))
+
+(defn image-load-data-decoded! [(a (dyn alloc/Allocator)) (img (ptr Image))] (-> i64)
+  (do
+    (ledger/ledger-from-image! img)
+    (if (!= (bridge/bridge-reconstruct-schemas! img) 0) IMAGE-E-SCHEMA
+        (bridge/bridge-materialize! a img))))
+
+;;; Read an image's header/ledger without materializing anything.
+(defn image-inspect! [(a (dyn alloc/Allocator)) (path (slice u8)) (out (ptr Image))] (-> i64)
+  (match (image-read-file a path)
+    (Err [_] IMAGE-E-IO)
+    (Ok [decoded] (do (store! out decoded) IMAGE-OK))))
+
+; ---- diagnostics ------------------------------------------------------------
+
+(defn image-blocker [] (-> (ptr ImageBlocker)) (bridge/bridge-blocker))
+
+(defn image-error-name [(code i64)] (-> (slice u8))
+  (cond
+    (= code IMAGE-OK) "ok"
+    (= code IMAGE-E-BLOCKED) (image-blocker-name (.kind (bridge/bridge-blocker)))
+    (= code IMAGE-E-IO) "io"
+    (= code IMAGE-E-SCHEMA) "schema-reconstruction"
+    (= code IMAGE-E-WAITING) "waiting-for-quiescence"
+    :else "unknown"))
