@@ -2946,7 +2946,35 @@
         forms (if (lr-head? parsed `do) (primitive/code-rest parsed) parsed)
         out (primitive/code-list-new)]
     (for [i 0 (primitive/code-count forms)]
-      (primitive/code-list-push! out (lr-normal-form (primitive/code-nth forms i))))
+      (let [form (primitive/code-nth forms i)]
+        ; A live buffer belongs to the retained session module. Its file module
+        ; declaration is editor/project metadata; emitting it would move the
+        ; generated slot wrappers away from the controller ABI preamble.
+        (when (not (lr-head? form `module))
+          (primitive/code-list-push! out (lr-normal-form form))
+          0)))
+    (primitive/code-list-done out)))
+
+(defn lr-reanchor [(form Code) (site Code)] (-> Code)
+  (if (primitive/code-sym? form)
+      (primitive/datum->syntax site (primitive/syntax->datum form))
+      (if (primitive/code-list? form)
+          (let [out (primitive/code-list-new)]
+            (for [i 0 (primitive/code-count form)]
+              (primitive/code-list-push! out
+                (lr-reanchor (primitive/code-nth form i) site)))
+            (let [done (primitive/code-list-done out)]
+              (if (primitive/code-vector? form) `[~@done] done)))
+          form)))
+
+(defn lr-normal-forms-at [(source Code) (site Code)] (-> Code)
+  (let [forms (lr-normal-forms source) out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count forms)]
+      ; Text submitted to the live session must receive the session request's
+      ; lexical context. A discarded file `(module ...)` form may otherwise
+      ; leave its module scope on every following identifier.
+      (primitive/code-list-push! out
+        (lr-reanchor (primitive/code-nth forms i) site)))
     (primitive/code-list-done out)))
 
 (defn lr-same-definition? [(a Code) (b Code)] (-> bool)
@@ -3557,6 +3585,10 @@
                             (accepted-registry Code)
                             (candidate-registry Code)] (-> Code)
   (let [out (primitive/code-list-new)]
+    ; Multi-form edits need the same accepted aliases as the one-definition
+    ; path. They are source context, not live definitions, and are safe to emit
+    ; again in the candidate generation.
+    (lr-push-list! out (lr-import-forms new-forms))
     (lr-emit-required-trait-closure! out incoming candidate-registry)
     (for [i 0 (primitive/code-count incoming)]
       (let [form (primitive/code-nth incoming i)
@@ -3739,7 +3771,7 @@
 ; candidate overlay construction, and registry publication all happen over
 ; original Coil syntax here. A one-defn edit emits only that private function and
 ; its typed binder; every other accepted form remains native and untouched.
-(defn live-submit-coil [(snippet Code)] (-> Code)
+(defn live-submit-coil-at [(snippet Code) (site Code)] (-> Code)
   (if (not (primitive/code-string? snippet))
       (primitive/error "live-submit-coil: expected one candidate source string")
       (let [accepted-state (primitive/code-session-state `:empty)
@@ -3751,7 +3783,17 @@
                     (lr-program-state-registry accepted-state)
                     (primitive/code-session-monomorphs) 1)
                   `:empty)
-            submitted-forms (lr-normal-forms snippet)
+            submission-site
+              (if (and initialized (> (primitive/code-count old-forms) 0))
+                  ; Reuse the accepted program's lexical identity. Provider
+                  ; request syntax is freshly read for every edit, so using it
+                  ; again would make an unchanged function name look new.
+                  (primitive/code-nth (primitive/code-nth old-forms 0) 0)
+                  site)
+            submitted-forms
+              (if (primitive/code-eq site `:keep-source-context)
+                  (lr-normal-forms snippet)
+                  (lr-normal-forms-at snippet submission-site))
             _validated-migrations (lr-validate-duplicate-migrations! submitted-forms)
             incoming (lr-merge-forms `[] submitted-forms)
             new-forms (lr-merge-forms old-forms incoming)
@@ -3789,6 +3831,7 @@
                                   new-forms candidate-registry)
                       defs (lr-dynamic-function-update-defs
                              (lr-record-with-form record rewritten))
+                      imports (lr-import-forms new-forms)
                       binder (lr-artifact-symbol record `:slot-binder)
                       gated
                         (lr-begin-affected-publication
@@ -3803,6 +3846,7 @@
                         (lr-stage-changed-source-ids accepted-registry
                           candidate-registry 0 repaired-staging)]
                   `(do
+                     ~@imports
                      ~@defs
                      (defn ~(primitive/syntax->datum `__live_candidate_commit)
                        [] (-> i64)
@@ -3811,6 +3855,12 @@
                          ~commit))))
               (lr-incremental-lower old-forms new-forms incoming
                   accepted-registry candidate-registry))))))
+
+; Keep the public helper source-compatible with direct metaprogram users. The
+; submitted string is also the best available lexical anchor outside the
+; provider protocol, where no enclosing request syntax exists.
+(defn live-submit-coil [(snippet Code)] (-> Code)
+  (live-submit-coil-at snippet `:keep-source-context))
 
 ; Recovery compilation invoked only after ordinary checking rejected a staged
 ; source candidate. It reads compiler-retained original Code, never controller
@@ -3858,9 +3908,19 @@
                 0))))
     (primitive/code-list-done out)))
 
-(defn lr-source-provider-program [(prefix Code) (generated Code) (mode Code)] (-> Code)
+(defn lr-import-forms [(forms Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count forms)]
+      (let [form (primitive/code-nth forms i)]
+        (when (lr-head? form `import)
+          (primitive/code-list-push! out form)
+          0)))
+    (primitive/code-list-done out)))
+
+(defn lr-source-provider-program [(prefix Code) (generated Code) (mode Code)
+                                  (app-start Code)] (-> Code)
   (let [body (if (lr-head? generated `do) (primitive/code-rest generated) generated)]
-    (if (primitive/code-eq mode `:native)
+    (cond (primitive/code-eq mode `:native)
         `(do
            ~@prefix
            (import "experiments.heap-inspector.live-types" :use *)
@@ -3877,7 +3937,24 @@
            (defn ~(primitive/syntax->datum `main) [] (-> i64)
              (~(primitive/syntax->datum `__native_demo_candidate_commit)))
            (export-c [~(primitive/syntax->datum `main) :as "coil_repl_entry"]))
+        (primitive/code-eq mode `:app)
         `(do
+           ~@prefix
+           (import "experiments.heap-inspector.live-types" :use *)
+           ~@body
+           (extern ~(primitive/syntax->datum `coil_live_app_stage_callbacks) :cc c
+             [(fnptr c [] i64) (fnptr c [] i64)] (-> i64))
+           (defn ~(primitive/syntax->datum `__live_app_candidate_commit) [] (-> i64)
+             (let [status (~(primitive/syntax->datum `__live_candidate_commit))]
+               (if (= status 0)
+                   (~(primitive/syntax->datum `coil_live_app_stage_callbacks)
+                     (primitive/fnptr-of ~app-start)
+                     (primitive/fnptr-of ~(primitive/syntax->datum `redraw)))
+                   status)))
+           (defn ~(primitive/syntax->datum `__live_app_entry) [] (-> i64)
+             (~(primitive/syntax->datum `__live_app_candidate_commit)))
+           (export-c [~(primitive/syntax->datum `__live_app_entry) :as "coil_repl_entry"]))
+        :else `(do
            ~@prefix
            (import "experiments.heap-inspector.live-types" :use *)
            ~@body
@@ -3901,11 +3978,19 @@
           form)))
 
 (defn lr-source-provider-program-at [(prefix Code) (generated Code) (mode Code)
-                                     (site Code)] (-> Code)
+                                     (app-start Code) (site Code)] (-> Code)
   ; Reader output has no target macro-call scope. Re-anchor the complete emitted
   ; program at the request syntax so target imports, local artifact names, and
   ; fnptr-of references resolve exactly as they do for an ordinary macro call.
-  (lr-recontext (lr-source-provider-program prefix generated mode) site))
+  (lr-recontext (lr-source-provider-program prefix generated mode app-start) site))
+
+(defn lr-initial-app-start [(snippet Code) (site Code)] (-> Code)
+  (let [forms (lr-normal-forms-at snippet site)
+        registry (lr-program-state-registry (lr-make-program-state forms))
+        record (registry/registry-find registry `:function `main)]
+    (if (not (lr-head? record `live-definition))
+        (primitive/error "live app source must define main")
+        (lr-artifact-symbol record `:private-implementation))))
 
 (defn live-source-provider [(context Code)] (-> Code)
   (let [source (primitive/code-nth context 2)
@@ -3917,8 +4002,17 @@
     (if (not (lr-head? request `live-source-request))
         (primitive/error "live source provider: missing live-source-request")
         (let [mode (primitive/code-nth request 2)
+              request-site (primitive/code-nth request 0)
+              app-start
+                (if (primitive/code-eq mode `:app)
+                    (lr-initial-app-start
+                      (primitive/code-nth request 1) request-site)
+                    `main)
               generated
                 (if (primitive/code-eq mode `:recovery)
                     (live-submit-rejected-condition)
-                    (live-submit-coil (primitive/code-nth request 1)))]
-          (lr-source-provider-program-at prefix generated mode request)))))
+                    (live-submit-coil-at
+                      (primitive/code-nth request 1)
+                      request-site)) ]
+          (lr-source-provider-program-at
+            prefix generated mode app-start request)))))

@@ -10,7 +10,10 @@
 (import "experiments.heap-inspector.live" :as live)
 (import "experiments.heap-inspector.live-api" :as api)
 (import "experiments.heap-inspector.native-demo-api" :as demo)
+(import "experiments.heap-inspector.live-app-api" :as app)
 (import "experiments.heap-inspector.runtime" :as inspector)
+
+(extern getenv :cc c [(ptr i8)] (-> (ptr i8)))
 
 (defstruct LiveRepair
   [(function (slice u8)) (diagnostic (slice u8))])
@@ -33,7 +36,8 @@
    ; source/metaprogram state. It is published once with the first native demo
    ; candidate and never used to classify source.
    (native-callbacks-published bool)
-   (native-demo bool)])
+   (native-demo bool)
+   (live-app bool)])
 
 (defn live-controller [] (-> (ptr LiveController))
   (primitive/alloc-static LiveController))
@@ -65,6 +69,11 @@
 (defn live-controller-enable-native-coil-demo! [] (-> i64)
   (live-controller-enable-native-demo!))
 
+(defn live-controller-enable-app! [] (-> i64)
+  (let [status (live-controller-init!)]
+    (when (= status 0) (set! (.live-app (live-controller)) true))
+    status))
+
 (defn live-controller-init! [] (-> i64)
   ; Keep every C ABI entry used by candidate-generated code reachable in the
   ; host image, including the cooperative loop poll which may not appear in the
@@ -74,7 +83,13 @@
     (if (.initialized controller)
         0
         (do
-          (set! (.session controller) (jit/jit-session-new (alloc/malloc-allocator)))
+          (let [configured-toolchain (getenv c"COIL_LIVE_TOOLCHAIN")]
+            (set! (.session controller)
+              (if (= (primitive/cast i64 configured-toolchain) 0)
+                  (jit/jit-session-new (alloc/malloc-allocator))
+                  (jit/jit-session-new-with-toolchain
+                    (alloc/malloc-allocator)
+                    (str/cstr->str configured-toolchain)))))
           ; The live metaprogram emits and owns typed slots, binders, ABI
           ; lineages, and publication. Running the generic REPL reload transform
           ; as well would create a second incompatible indirection system.
@@ -299,11 +314,12 @@
                         (live/live-condition-raise! 3 owner-status))
                       (do
                   (if (.native-demo controller) (demo/native-demo-publish-staged!) 0)
-                  ; The native host receives permanent trampolines only on the
-                  ; first successful native-demo publication. Retain their exact
-                  ; owning image, not whichever generation happens to be current
-                  ; during a later edit.
-                  (if (and (.native-demo controller)
+                  (if (.live-app controller) (app/live-app-publish-staged!) 0)
+                  (if (.live-app controller) (app/live-app-request-redraw!) 0)
+                  ; Native callbacks and the app's one-shot main-loop entry
+                  ; remain reachable after publication. Retain the exact image
+                  ; that owns them, not a later current generation.
+                  (if (and (or (.native-demo controller) (.live-app controller))
                            (= (.native-callback-generation controller) 0))
                       (set! (.native-callback-generation controller)
                             (jit/jit-generation-retain-current!
@@ -317,6 +333,7 @@
                 (do
                   (live/live-clear-staged-code-owners!)
                   (if (.native-demo controller) (demo/native-demo-abort-staged!) 0)
+                  (if (.live-app controller) (app/live-app-abort-staged!) 0)
                   (live/live-condition-raise! 3 (load status))))
             (live/live-end-affected-publication!)
             (set! (.last-result controller) (load status))
@@ -346,6 +363,9 @@
         ; replaces the private definitions reached through their typed cells.
         stage-native-callbacks
           (and (.native-demo controller)
+               (not (.native-callbacks-published controller)))
+        stage-app-callbacks
+          (and (.live-app controller)
                (not (.native-callbacks-published controller)))]
     ; Rejected source is an editable candidate branch. A following snippet
     ; repairs that branch while migration still compares it with committed code.
@@ -362,12 +382,14 @@
       "(live-source-request \"")
     (live-controller-append-string! (mut wrapper) candidate-source)
     (str/sb-push-str! (mut wrapper)
-      (if stage-native-callbacks "\" :native)" "\" :normal)"))
+      (cond stage-native-callbacks "\" :native)"
+            stage-app-callbacks "\" :app)"
+            :else "\" :normal)"))
       (let [status (live-controller-edit! (str/sb-finish! (mut wrapper))
                                         "0")]
       (if (= status 0)
           (do
-            (if stage-native-callbacks
+            (if (or stage-native-callbacks stage-app-callbacks)
                 (set! (.native-callbacks-published controller) true) 0)
             (alloc/free [u8] a (.pending-live controller))
             (set! (.pending-live controller) "")
