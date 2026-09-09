@@ -1,0 +1,101 @@
+(module experiments.react-hir-frontend.dsl)
+
+(import "coil.primitive" :as p)
+(import "coil.simd" :as v)
+
+;; Byte-class expressions are deliberately target-neutral. The metaprogram lowers
+;; them to coil.simd today; another backend can consume the same syntax later.
+;;
+;;   (byte 47)
+;;   (range 48 57)
+;;   (one-of 34 39 96)
+;;   (or EXPR ...)
+;;   (and EXPR ...)
+;;   (not EXPR)
+;;   ascii-digit | ascii-alpha | ascii-hex-digit | ascii-whitespace
+;;   utf8-continuation
+
+(defn symbol-is? [(value Code) (name (slice u8))] (-> bool)
+  (and (p/code-sym? value) (= (p/code-sym value) name)))
+
+(defn form-is? [(value Code) (name (slice u8))] (-> bool)
+  (and (p/code-list? value)
+       (> (p/code-count value) 0)
+       (symbol-is? (p/code-nth value 0) name)))
+
+(defn fail [(at Code) (message (slice u8))] (-> Code)
+  (do (p/report at message) at))
+
+(defn byte-literal [(at Code)] (-> Code)
+  (if (p/code-int? at)
+      (let [value (p/code-int at)]
+        (if (and (>= value 0) (<= value 255))
+            `(cast u8 ~value)
+            (fail at "byte-class literal must be in [0, 255]")))
+      (fail at "byte-class literal must be an integer")))
+
+(defn compile-fold [(form Code) (width Code) (bytes Code) (op Code) (index i64)] (-> Code)
+  (let [count (p/code-count form)]
+    (if (>= index count)
+        (fail form "byte-class boolean form requires at least one operand")
+        (let [(mut result) (compile-byte-class (p/code-nth form index) width bytes)
+              (mut i) (+ index 1)]
+          (loop
+            (if (>= (load i) count) (break)
+              (do
+                (store! result `(~op ~(load result)
+                                      ~(compile-byte-class (p/code-nth form (load i)) width bytes)))
+                (set! i (+ (load i) 1)))))
+          (load result)))))
+
+(defn compile-one-of [(form Code) (width Code) (bytes Code)] (-> Code)
+  (let [count (p/code-count form)]
+    (if (< count 2) (fail form "one-of requires at least one byte")
+      (let [(mut result) `(v/v= ~bytes (v/vsplat [u8 ~width] ~(byte-literal (p/code-nth form 1))))
+            (mut i) 2]
+        (loop
+          (if (>= (load i) count) (break)
+            (do
+              (store! result `(v/vor ~(load result)
+                                     (v/v= ~bytes (v/vsplat [u8 ~width]
+                                               ~(byte-literal (p/code-nth form (load i)))))))
+              (set! i (+ (load i) 1)))))
+        (load result)))))
+
+(defn compile-byte-class [(expr Code) (width Code) (bytes Code)] (-> Code)
+  (cond
+    (symbol-is? expr "ascii-digit") `(v/ascii-digit? ~bytes)
+    (symbol-is? expr "ascii-alpha") `(v/ascii-alpha? ~bytes)
+    (symbol-is? expr "ascii-hex-digit") `(v/ascii-hex-digit? ~bytes)
+    (symbol-is? expr "ascii-whitespace") `(v/ascii-whitespace? ~bytes)
+    (symbol-is? expr "utf8-continuation") `(v/utf8-continuation? ~bytes)
+    (form-is? expr "byte")
+      (if (= (p/code-count expr) 2)
+          `(v/v= ~bytes (v/vsplat [u8 ~width] ~(byte-literal (p/code-nth expr 1))))
+          (fail expr "byte expects exactly one literal"))
+    (form-is? expr "range")
+      (if (= (p/code-count expr) 3)
+          `(v/byte-in-range? ~bytes
+              ~(byte-literal (p/code-nth expr 1))
+              ~(byte-literal (p/code-nth expr 2)))
+          (fail expr "range expects exactly two literals"))
+    (form-is? expr "one-of") (compile-one-of expr width bytes)
+    (form-is? expr "or") (compile-fold expr width bytes `v/vor 1)
+    (form-is? expr "and") (compile-fold expr width bytes `v/vand 1)
+    (form-is? expr "not")
+      (if (= (p/code-count expr) 2)
+          `(v/vnot ~(compile-byte-class (p/code-nth expr 1) width bytes))
+          (fail expr "not expects exactly one operand"))
+    :else (fail expr "unknown byte-class expression")))
+
+;; Defines a generic SIMD classifier. N remains a compile-time vector width.
+(defn def-byte-class [(name Code) (params Code) (expr Code)] (-> Code)
+  (if (and (p/code-vector? params)
+           (= (p/code-count params) 2)
+           (p/code-sym? (p/code-nth params 0))
+           (p/code-sym? (p/code-nth params 1)))
+      (let [width (p/code-nth params 0)
+            bytes (p/code-nth params 1)]
+        `(defn ~name [~width] [(~bytes (vec u8 ~width))] (-> (mask ~width))
+           ~(compile-byte-class expr width bytes)))
+      (fail params "def-byte-class expects [WIDTH BYTES]")))
