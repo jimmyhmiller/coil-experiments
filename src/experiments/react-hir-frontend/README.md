@@ -29,11 +29,17 @@ The implemented pipeline is:
    layout whose low three bits hold the kind and whose upper 29 bits hold the
    file-relative position. Inputs at or above 512 MiB report overflow before
    writing and can use the unrestricted split layout.
-8. `grammar.coil` begins the target-neutral grammar metaprogram layer. Its
-   S-expression operator declarations are validated and compiled at Coil
-   compile time into an inlined byte dispatch, with no runtime grammar table.
-9. `parser.coil` consumes packed events while lazily reading spellings and
-   operator bytes from the immutable source. It writes source-backed HIR nodes
+8. `frontend_spec.coil` is the single readable language definition for the
+   implemented parser slice. It declares named terminals, precedence groups,
+   primary/postfix dispatch, and complete production shapes.
+9. `grammar.coil` implements `def-frontend-grammar`. The compile-time
+   metaprogram validates references and shapes, assigns stable symbolic ids,
+   and emits specialized terminal, keyword, form, precedence, and production
+   queries. There is no runtime grammar table or initialization.
+10. `parser.coil` consumes those generated queries and packed events while
+   lazily reading spellings and operator bytes from the immutable source. It
+   contains cursor, arena, Pratt-loop, list, and semantic-construction
+   machinery rather than duplicated language spellings. It writes source-backed HIR nodes
    directly into caller-owned structure-of-arrays storage, with linked edge
    records for variable-length child lists. No token array, CST, or JavaScript
    AST is constructed.

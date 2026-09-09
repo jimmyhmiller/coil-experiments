@@ -2,12 +2,8 @@
 
 (import "coil.primitive" :as p)
 
-;; Grammar data stays declarative. This compile-time metaprogram validates an
-;; S-expression operator table and lowers it to a straight-line byte dispatch.
-;; The parser therefore pays neither table initialization nor an indirect call.
-;;
-;;   (def-infix-precedence infix-precedence
-;;     [(operator 42 60) (operator 43 50)])
+;; Grammar data stays declarative. The metaprogram below validates one unified
+;; S-expression frontend description and lowers it to straight-line queries.
 
 (defn grammar-symbol? [(value Code) (name (slice u8))] (-> bool)
   (and (p/code-sym? value) (= (p/code-sym value) name)))
@@ -15,47 +11,408 @@
 (defn grammar-fail [(at Code) (message (slice u8))] (-> Code)
   (do (p/report at message) at))
 
-(defn operator-byte [(entry Code)] (-> i64)
-  (if (and (p/code-list? entry) (= (p/code-count entry) 3)
-           (grammar-symbol? (p/code-nth entry 0) "operator")
+;; Unified frontend grammar compiler. The surface declaration contains all
+;; terminal bytes, operator precedence, parser-form dispatch, and production
+;; shapes. It lowers those symbolic names into constants and straight-line
+;; query functions consumed by the reusable parser backend.
+
+(defn named-section? [(form Code) (name (slice u8))] (-> bool)
+  (and (p/code-list? form) (> (p/code-count form) 0)
+       (grammar-symbol? (p/code-nth form 0) name)))
+
+(defn frontend-section [(sections Code) (name (slice u8)) (occurrence i64)] (-> Code)
+  (let [(mut i) 0 (mut seen) 0 (mut found) `()]
+    (loop
+      (if (>= (load i) (p/code-count sections)) (break)
+        (let [section (p/code-nth sections (load i))]
+          (if (named-section? section name)
+              (if (= (load seen) occurrence)
+                  (do (store! found section) (break))
+                  (set! seen (+ (load seen) 1))) 0)
+          (set! i (+ (load i) 1)))))
+    (if (p/code-list? (load found)) (load found)
+      (grammar-fail sections (p/code-str "missing frontend section: " name)))))
+
+(defn terminal-entry-name [(entry Code)] (-> Code)
+  (if (and (p/code-list? entry) (= (p/code-count entry) 2)
+           (p/code-sym? (p/code-nth entry 0)))
+      (p/code-nth entry 0)
+      (grammar-fail entry "terminal entry expects (NAME BYTE)")))
+
+(defn terminal-entry-byte [(entry Code)] (-> i64)
+  (if (and (p/code-list? entry) (= (p/code-count entry) 2)
            (p/code-int? (p/code-nth entry 1)))
       (let [byte (p/code-int (p/code-nth entry 1))]
-        (if (and (>= byte 0) (<= byte 255)) byte
-          (do (p/report entry "operator byte must be in [0, 255]") 0)))
-      (do (p/report entry "operator entry expects (operator BYTE PRECEDENCE)") 0)))
+        (if (and (> byte 0) (<= byte 255)) byte
+          (do (p/report entry "terminal byte must be in [1, 255]") 0)))
+      (do (p/report entry "terminal entry expects an integer byte") 0)))
 
-(defn operator-precedence [(entry Code)] (-> i64)
-  (if (and (p/code-list? entry) (= (p/code-count entry) 3)
-           (p/code-int? (p/code-nth entry 2)))
-      (let [precedence (p/code-int (p/code-nth entry 2))]
-        (if (> precedence 0) precedence
-          (do (p/report entry "operator precedence must be positive") 0)))
-      (do (p/report entry "operator precedence must be an integer") 0)))
-
-(defn operator-seen-before? [(entries Code) (end i64) (byte i64)] (-> bool)
-  (let [(mut i) 0 (mut found) false]
+(defn named-entry-index [(entries Code) (name Code)] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
     (loop
-      (if (or (>= (load i) end) (load found)) (break)
+      (if (or (>= (load i) (p/code-count entries)) (>= (load found) 0)) (break)
         (do
-          (if (= (operator-byte (p/code-nth entries (load i))) byte)
-              (store! found true) 0)
+          (if (p/free-identifier=? (terminal-entry-name (p/code-nth entries (load i))) name)
+              (store! found (load i)) 0)
           (set! i (+ (load i) 1)))))
     (load found)))
 
-(defn compile-operator-dispatch [(entries Code) (index i64) (byte Code)] (-> Code)
+(defn terminal-byte-by-name [(entries Code) (name Code)] (-> i64)
+  (let [index (named-entry-index entries name)]
+    (if (< index 0)
+        (do (p/report name "unknown terminal name") 0)
+        (terminal-entry-byte (p/code-nth entries index)))))
+
+(defn validate-terminals [(entries Code)] (-> i64)
+  (if (not (p/code-vector? entries))
+      (do (p/report entries "terminals must be a vector") 0)
+      (let [(mut i) 0]
+        (loop
+          (if (>= (load i) (p/code-count entries)) (break)
+            (let [entry (p/code-nth entries (load i))
+                  name (terminal-entry-name entry)
+                  byte (terminal-entry-byte entry)
+                  (mut prior) 0]
+              (loop
+                (if (>= (load prior) (load i)) (break)
+                  (let [prior-entry (p/code-nth entries (load prior))]
+                    (if (p/free-identifier=? (terminal-entry-name prior-entry) name)
+                        (do (p/report entry "duplicate terminal name") 0) 0)
+                    (if (= (terminal-entry-byte prior-entry) byte)
+                        (do (p/report entry "duplicate terminal byte") 0) 0)
+                    (set! prior (+ (load prior) 1)))))
+              (set! i (+ (load i) 1)))))
+        0)))
+
+(defn validate-operator-groups [(groups Code) (terminals Code)] (-> i64)
+  (if (not (p/code-vector? groups))
+      (do (p/report groups "operators must be a vector") 0)
+      (let [(mut i) 0]
+        (loop
+          (if (>= (load i) (p/code-count groups)) (break)
+            (let [group (p/code-nth groups (load i))]
+              (if (not (and (p/code-list? group) (>= (p/code-count group) 4)
+                            (grammar-symbol? (p/code-nth group 0) "left")
+                            (p/code-int? (p/code-nth group 1))
+                            (> (p/code-int (p/code-nth group 1)) 0)))
+                  (do (p/report group "operator group expects (left POSITIVE-PRECEDENCE TERMINAL ...)") 0)
+                  (let [(mut terminal-index) 2]
+                    (loop
+                      (if (>= (load terminal-index) (p/code-count group)) (break)
+                        (do (terminal-byte-by-name terminals
+                              (p/code-nth group (load terminal-index)))
+                            (set! terminal-index (+ (load terminal-index) 1)))))))
+              (set! i (+ (load i) 1)))))
+        0)))
+
+(defn validate-form-entries [(entries Code) (terminals Code) (events Code)] (-> i64)
+  (if (not (p/code-vector? entries))
+      (do (p/report entries "forms must be a vector") 0)
+      (let [(mut i) 0]
+        (loop
+          (if (>= (load i) (p/code-count entries)) (break)
+            (let [entry (p/code-nth entries (load i))]
+              (form-result-symbol entry)
+              (if (and (p/code-list? entry) (= (p/code-count entry) 3)
+                       (grammar-symbol? (p/code-nth entry 0) "terminal"))
+                  (terminal-byte-by-name terminals (p/code-nth entry 1)) 0)
+              (if (and (p/code-list? entry) (= (p/code-count entry) 3)
+                       (grammar-symbol? (p/code-nth entry 0) "event"))
+                  (terminal-byte-by-name events (p/code-nth entry 1)) 0)
+              (set! i (+ (load i) 1)))))
+        0)))
+
+(defn validate-productions [(productions Code) (terminals Code)] (-> i64)
+  (if (not (p/code-vector? productions))
+      (do (p/report productions "productions must be a vector") 0)
+      (let [(mut i) 0]
+        (loop
+          (if (>= (load i) (p/code-count productions)) (break)
+            (let [entry (p/code-nth productions (load i))
+                  atoms (production-atoms entry) (mut atom-index) 0]
+              (production-name entry)
+              (loop
+                (if (>= (load atom-index) (p/code-count atoms)) (break)
+                  (let [atom (p/code-nth atoms (load atom-index))]
+                    (cond
+                      (and (p/code-list? atom) (= (p/code-count atom) 2)
+                           (grammar-symbol? (p/code-nth atom 0) "terminal"))
+                        (terminal-byte-by-name terminals (p/code-nth atom 1))
+                      (and (p/code-list? atom) (= (p/code-count atom) 2)
+                           (or (grammar-symbol? (p/code-nth atom 0) "rule")
+                               (grammar-symbol? (p/code-nth atom 0) "repeat"))
+                           (p/code-sym? (p/code-nth atom 1))) 0
+                      (and (p/code-list? atom) (= (p/code-count atom) 2)
+                           (grammar-symbol? (p/code-nth atom 0) "keyword")
+                           (p/code-string? (p/code-nth atom 1))) 0
+                      (and (p/code-list? atom) (= (p/code-count atom) 3)
+                           (grammar-symbol? (p/code-nth atom 0) "separated")
+                           (p/code-sym? (p/code-nth atom 1)))
+                        (terminal-byte-by-name terminals (p/code-nth atom 2))
+                      :else (do (p/report atom "invalid production atom") 0))
+                    (set! atom-index (+ (load atom-index) 1)))))
+              (set! i (+ (load i) 1)))))
+        0)))
+
+(defn compile-index-dispatch
+  [(entries Code) (index i64) (value Code) (result-byte? bool)] (-> Code)
+  (if (>= index (p/code-count entries))
+      (if result-byte? `(cast u8 0) `0)
+      (let [entry (p/code-nth entries index)
+            result (if result-byte?
+                     `(cast u8 ~(terminal-entry-byte entry))
+                     `~(+ index 1))]
+        `(if (= ~value ~(+ index 1)) ~result
+           ~(compile-index-dispatch entries (+ index 1) value result-byte?)))))
+
+(defn compile-symbol-constants! [(definitions CodeBuilder) (entries Code)] (-> i64)
+  (let [(mut i) 0]
+    (loop
+      (if (>= (load i) (p/code-count entries)) (break)
+        (do
+          (p/code-list-push! definitions
+            `(const ~(terminal-entry-name (p/code-nth entries (load i))) i64 ~(+ (load i) 1)))
+          (set! i (+ (load i) 1)))))
+    0))
+
+(defn operator-terminal-precedence
+  [(groups Code) (terminal Code) (group-index i64)] (-> i64)
+  (if (>= group-index (p/code-count groups)) 0
+    (let [group (p/code-nth groups group-index)]
+      (if (not (and (p/code-list? group) (>= (p/code-count group) 4)
+                    (grammar-symbol? (p/code-nth group 0) "left")
+                    (p/code-int? (p/code-nth group 1))))
+          (do (p/report group "operator group expects (left PRECEDENCE TERMINAL ...)") 0)
+          (let [(mut i) 2 (mut found) false]
+            (loop
+              (if (or (>= (load i) (p/code-count group)) (load found)) (break)
+                (do
+                  (if (p/free-identifier=? (p/code-nth group (load i)) terminal)
+                      (store! found true) 0)
+                  (set! i (+ (load i) 1)))))
+            (if (load found) (p/code-int (p/code-nth group 1))
+              (operator-terminal-precedence groups terminal (+ group-index 1))))))))
+
+(defn compile-precedence-dispatch
+  [(terminals Code) (groups Code) (index i64) (byte Code)] (-> Code)
+  (if (>= index (p/code-count terminals)) `0
+    (let [terminal (terminal-entry-name (p/code-nth terminals index))
+          precedence (operator-terminal-precedence groups terminal 0)]
+      (if (= precedence 0)
+          (compile-precedence-dispatch terminals groups (+ index 1) byte)
+          `(if (= ~byte (cast u8 ~(terminal-entry-byte (p/code-nth terminals index))))
+               ~precedence
+               ~(compile-precedence-dispatch terminals groups (+ index 1) byte))))))
+
+(defn form-result-symbol [(entry Code)] (-> Code)
+  (if (and (p/code-list? entry) (= (p/code-count entry) 3)
+           (p/code-sym? (p/code-nth entry 2)))
+      (p/code-nth entry 2)
+      (grammar-fail entry "form entry expects (event KIND RESULT) or (terminal NAME RESULT)")))
+
+(defn compile-form-dispatch
+  [(entries Code) (terminals Code) (events Code)
+   (index i64) (kind Code) (byte Code)] (-> Code)
   (if (>= index (p/code-count entries)) `0
     (let [entry (p/code-nth entries index)
-          op (operator-byte entry)
-          precedence (operator-precedence entry)]
-      (if (operator-seen-before? entries index op)
-          (do (p/report entry "duplicate operator byte")
-              (compile-operator-dispatch entries (+ index 1) byte))
-          `(if (= ~byte (cast u8 ~op)) ~precedence
-             ~(compile-operator-dispatch entries (+ index 1) byte))))))
+          result (+ index 1)
+          condition
+            (cond
+              (and (p/code-list? entry) (= (p/code-count entry) 3)
+                   (grammar-symbol? (p/code-nth entry 0) "event")
+                   (p/code-sym? (p/code-nth entry 1)))
+                `(= ~kind (cast u8 ~(terminal-byte-by-name events (p/code-nth entry 1))))
+              (and (p/code-list? entry) (= (p/code-count entry) 3)
+                   (grammar-symbol? (p/code-nth entry 0) "terminal")
+                   (p/code-sym? (p/code-nth entry 1)))
+                `(= ~byte (cast u8 ~(terminal-byte-by-name terminals (p/code-nth entry 1))))
+              :else (do (p/report entry "invalid parser form dispatch entry") `false))]
+      `(if ~condition ~result
+         ~(compile-form-dispatch entries terminals events (+ index 1) kind byte)))))
 
-(defn def-infix-precedence [(name Code) (entries Code)] (-> Code)
-  (if (not (p/code-vector? entries))
-      (grammar-fail entries "def-infix-precedence expects an entry vector")
-      (let [byte (p/fresh-identifier "operator-byte")]
-        `(defn ~name :inline (Always) [(~byte u8)] (-> i64)
-           ~(compile-operator-dispatch entries 0 byte)))))
+(defn production-name [(entry Code)] (-> Code)
+  (if (and (p/code-list? entry) (= (p/code-count entry) 2)
+           (p/code-sym? (p/code-nth entry 0)) (p/code-vector? (p/code-nth entry 1)))
+      (p/code-nth entry 0)
+      (grammar-fail entry "production expects (NAME [ATOM ...])")))
+
+(defn production-atoms [(entry Code)] (-> Code)
+  (if (and (p/code-list? entry) (= (p/code-count entry) 2)) (p/code-nth entry 1)
+    (grammar-fail entry "production expects a vector of atoms")))
+
+(defn production-accessor-name [(entry Code) (suffix (slice u8))] (-> Code)
+  (p/datum->syntax (production-name entry)
+    (p/code-str (production-name entry) suffix)))
+
+(defn compile-atom-terminal
+  [(atoms Code) (terminals Code) (atom-index i64) (step Code)] (-> Code)
+  (if (>= atom-index (p/code-count atoms)) `(cast u8 0)
+    (let [atom (p/code-nth atoms atom-index)
+          rest (compile-atom-terminal atoms terminals (+ atom-index 1) step)]
+      (cond
+        (and (p/code-list? atom) (= (p/code-count atom) 2)
+             (grammar-symbol? (p/code-nth atom 0) "terminal"))
+          `(if (= ~step ~atom-index)
+               (cast u8 ~(terminal-byte-by-name terminals (p/code-nth atom 1))) ~rest)
+        (and (p/code-list? atom) (= (p/code-count atom) 3)
+             (grammar-symbol? (p/code-nth atom 0) "separated"))
+          `(if (= ~step ~atom-index)
+               (cast u8 ~(terminal-byte-by-name terminals (p/code-nth atom 2))) ~rest)
+        :else rest))))
+
+(defn compile-atom-keyword [(atoms Code) (atom-index i64) (step Code)] (-> Code)
+  (if (>= atom-index (p/code-count atoms)) `""
+    (let [atom (p/code-nth atoms atom-index)
+          rest (compile-atom-keyword atoms (+ atom-index 1) step)]
+      (if (and (p/code-list? atom) (= (p/code-count atom) 2)
+               (grammar-symbol? (p/code-nth atom 0) "keyword")
+               (p/code-string? (p/code-nth atom 1)))
+          `(if (= ~step ~atom-index) ~(p/code-nth atom 1) ~rest)
+          rest))))
+
+(defn compile-production-terminal
+  [(productions Code) (terminals Code) (production-index i64)
+   (production Code) (step Code)] (-> Code)
+  (if (>= production-index (p/code-count productions)) `(cast u8 0)
+    (let [atoms (production-atoms (p/code-nth productions production-index))
+          (mut atom-index) 0 (mut result) `(cast u8 0)]
+      (loop
+        (if (>= (load atom-index) (p/code-count atoms)) (break)
+          (let [atom (p/code-nth atoms (load atom-index))]
+            (if (and (p/code-list? atom) (= (p/code-count atom) 2)
+                     (grammar-symbol? (p/code-nth atom 0) "terminal"))
+                (store! result
+                  `(if (= ~step ~(load atom-index))
+                       (cast u8 ~(terminal-byte-by-name terminals (p/code-nth atom 1)))
+                       ~(load result)))
+                (if (and (p/code-list? atom) (= (p/code-count atom) 3)
+                         (grammar-symbol? (p/code-nth atom 0) "separated"))
+                    (store! result
+                      `(if (= ~step ~(load atom-index))
+                           (cast u8 ~(terminal-byte-by-name terminals (p/code-nth atom 2)))
+                           ~(load result))) 0))
+            (set! atom-index (+ (load atom-index) 1)))))
+      `(if (= ~production ~(+ production-index 1)) ~(load result)
+         ~(compile-production-terminal productions terminals (+ production-index 1)
+                                           production step)))))
+
+(defn compile-production-keyword
+  [(productions Code) (production-index i64) (production Code) (step Code)] (-> Code)
+  (if (>= production-index (p/code-count productions)) `""
+    (let [atoms (production-atoms (p/code-nth productions production-index))
+          (mut atom-index) 0 (mut result) `""]
+      (loop
+        (if (>= (load atom-index) (p/code-count atoms)) (break)
+          (let [atom (p/code-nth atoms (load atom-index))]
+            (if (and (p/code-list? atom) (= (p/code-count atom) 2)
+                     (grammar-symbol? (p/code-nth atom 0) "keyword")
+                     (p/code-string? (p/code-nth atom 1)))
+                (store! result `(if (= ~step ~(load atom-index))
+                                  ~(p/code-nth atom 1) ~(load result))) 0)
+            (set! atom-index (+ (load atom-index) 1)))))
+      `(if (= ~production ~(+ production-index 1)) ~(load result)
+         ~(compile-production-keyword productions (+ production-index 1)
+                                      production step)))))
+
+(defn def-frontend-grammar [(name Code) & (sections Code)] (-> Code)
+  (let [terminal-section (frontend-section sections "terminals" 0)
+        event-section (frontend-section sections "events" 0)
+        operator-section (frontend-section sections "operators" 0)
+        primary-section (frontend-section sections "forms" 0)
+        postfix-section (frontend-section sections "forms" 1)
+        production-section (frontend-section sections "productions" 0)]
+    (if (not (and (p/code-sym? name) (= (p/code-count sections) 6)
+                  (= (p/code-count terminal-section) 3)
+                  (= (p/code-count event-section) 2)
+                  (= (p/code-count operator-section) 3)
+                  (= (p/code-count primary-section) 3)
+                  (= (p/code-count postfix-section) 3)
+                  (= (p/code-count production-section) 4)))
+        (grammar-fail name
+          "def-frontend-grammar expects terminals, events, operators, two forms, and productions sections")
+        (let [terminal-function (p/code-nth terminal-section 1)
+              terminals (p/code-nth terminal-section 2)
+              events (p/code-nth event-section 1)
+              precedence-function (p/code-nth operator-section 1)
+              operator-groups (p/code-nth operator-section 2)
+              primary-function (p/code-nth primary-section 1)
+              primary-entries (p/code-nth primary-section 2)
+              postfix-function (p/code-nth postfix-section 1)
+              postfix-entries (p/code-nth postfix-section 2)
+              production-terminal-function (p/code-nth production-section 1)
+              production-keyword-function (p/code-nth production-section 2)
+              productions (p/code-nth production-section 3)
+              definitions (p/code-list-new)
+              terminal-id (p/fresh-identifier "terminal-id")
+              operator-byte-code (p/fresh-identifier "operator-byte")
+              event-kind-code (p/fresh-identifier "event-kind")
+              form-byte-code (p/fresh-identifier "form-byte")
+              production-id (p/fresh-identifier "production-id")
+              production-step (p/fresh-identifier "production-step")]
+          (validate-terminals terminals)
+          (validate-terminals events)
+          (validate-operator-groups operator-groups terminals)
+          (validate-form-entries primary-entries terminals events)
+          (validate-form-entries postfix-entries terminals events)
+          (validate-productions productions terminals)
+          (compile-symbol-constants! definitions terminals)
+          (let [(mut i) 0]
+            (loop
+              (if (>= (load i) (p/code-count primary-entries)) (break)
+                (do (p/code-list-push! definitions
+                      `(const ~(form-result-symbol (p/code-nth primary-entries (load i)))
+                              i64 ~(+ (load i) 1)))
+                    (set! i (+ (load i) 1)))))
+            (store! i 0)
+            (loop
+              (if (>= (load i) (p/code-count postfix-entries)) (break)
+                (do (p/code-list-push! definitions
+                      `(const ~(form-result-symbol (p/code-nth postfix-entries (load i)))
+                              i64 ~(+ (load i) 1)))
+                    (set! i (+ (load i) 1)))))
+            (store! i 0)
+            (loop
+              (if (>= (load i) (p/code-count productions)) (break)
+                (let [production (p/code-nth productions (load i))
+                      atoms (production-atoms production)
+                      terminal-accessor (production-accessor-name production "-terminal")
+                      keyword-accessor (production-accessor-name production "-keyword")
+                      accessor-step (p/fresh-identifier "production-step")]
+                  (p/code-list-push! definitions
+                    `(const ~(production-name production) i64 ~(+ (load i) 1)))
+                  (p/code-list-push! definitions
+                    `(defn ~terminal-accessor :inline (Always)
+                       [(~accessor-step i64)] (-> u8)
+                       ~(compile-atom-terminal atoms terminals 0 accessor-step)))
+                  (p/code-list-push! definitions
+                    `(defn ~keyword-accessor :inline (Always)
+                       [(~accessor-step i64)] (-> (slice u8))
+                       ~(compile-atom-keyword atoms 0 accessor-step)))
+                    (set! i (+ (load i) 1))))))
+          (p/code-list-push! definitions
+            `(defn ~terminal-function :inline (Always) [(~terminal-id i64)] (-> u8)
+               ~(compile-index-dispatch terminals 0 terminal-id true)))
+          (p/code-list-push! definitions
+            `(defn ~precedence-function :inline (Always) [(~operator-byte-code u8)] (-> i64)
+               ~(compile-precedence-dispatch terminals operator-groups 0 operator-byte-code)))
+          (p/code-list-push! definitions
+            `(defn ~primary-function :inline (Always)
+               [(~event-kind-code u8) (~form-byte-code u8)] (-> i64)
+               ~(compile-form-dispatch primary-entries terminals events
+                                       0 event-kind-code form-byte-code)))
+          (p/code-list-push! definitions
+            `(defn ~postfix-function :inline (Always)
+               [(~event-kind-code u8) (~form-byte-code u8)] (-> i64)
+               ~(compile-form-dispatch postfix-entries terminals events
+                                       0 event-kind-code form-byte-code)))
+          (p/code-list-push! definitions
+            `(defn ~production-terminal-function :inline (Always)
+               [(~production-id i64) (~production-step i64)] (-> u8)
+               ~(compile-production-terminal productions terminals 0
+                                             production-id production-step)))
+          (p/code-list-push! definitions
+            `(defn ~production-keyword-function :inline (Always)
+               [(~production-id i64) (~production-step i64)] (-> (slice u8))
+               ~(compile-production-keyword productions 0 production-id production-step)))
+          (let [all-definitions (p/code-list-done definitions)]
+            `(do ~@all-definitions))))))
