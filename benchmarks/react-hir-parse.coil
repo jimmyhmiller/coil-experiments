@@ -1,0 +1,132 @@
+(module react-hir-parse-benchmark)
+
+(import "coil.primitive" :as p)
+(import "coil.slice" :use [slice-get])
+(import "experiments.react-hir-frontend.frontend" :as frontend)
+(import "experiments.react-hir-frontend.pipeline" :as pipeline)
+(import "experiments.react-hir-frontend.parser" :as parser)
+
+(extern malloc :cc c [i64] (-> (ptr u8)))
+(extern free :cc c [(ptr u8)] (-> i64))
+(extern clock_gettime :cc c [i32 (ptr Timespec)] (-> i32))
+(extern printf :cc c [(ptr i8) ...] (-> i32))
+(extern coil_benchmark_consume :cc c [(ptr i8) i64] (-> void))
+
+(defstruct Timespec [(seconds i64) (nanos i64)])
+
+(defn monotonic-nanos [] (-> i64)
+  (let [time (p/alloc-stack Timespec)]
+    (clock_gettime 6 time)
+    (+ (* (.seconds time) 1000000000) (.nanos time))))
+
+(defn fill-program! [(buffer (ptr u8)) (size i64)] (-> i64)
+  (let [pattern "const result = condition ? foo(a + b) : <Component value={x} />;\n"
+        (mut i) 0]
+    (loop
+      (if (>= (load i) size) (break)
+        (do (store! (p/index buffer (load i))
+                    (slice-get pattern (% (load i) (len pattern))))
+            (set! i (+ (load i) 1)))))
+    size))
+
+(defn run-benchmark [(size i64) (rounds i64)] (-> i64)
+  (let [source (malloc size)
+        events (p/cast (ptr u32) (malloc (* size 4)))
+        kinds (malloc size)
+        starts (p/cast (ptr u32) (malloc (* size 4)))
+        ends (p/cast (ptr u32) (malloc (* size 4)))
+        aa (p/cast (ptr u32) (malloc (* size 4)))
+        bb (p/cast (ptr u32) (malloc (* size 4)))
+        cc (p/cast (ptr u32) (malloc (* size 4)))
+        edge-nodes (p/cast (ptr u32) (malloc (* size 4)))
+        edge-next (p/cast (ptr u32) (malloc (* size 4)))
+        arena-storage (p/alloc-stack parser/HirArena)]
+    (fill-program! source size)
+    (store! arena-storage (parser/HirArena
+      :kinds kinds :starts starts :ends ends :a aa :b bb :c cc
+      :node-capacity size :node-count 0
+      :edge-nodes edge-nodes :edge-next edge-next
+      :edge-capacity size :edge-count 0))
+    ;; Parse-only measures the grammar/HIR stage over one already materialized
+    ;; tape. The second measurement includes fresh SIMD scanning and tape writes.
+    (let [prepared (pipeline/scan-source-to-packed-tape64
+                     source size (cast u32 0) events
+                     (frontend/frontend-initial-state))
+          parse-start (monotonic-nanos) (mut parse-round) 0
+          (mut parse-checksum) (cast u64 0)]
+      (loop
+        (if (>= (load parse-round) rounds) (break)
+          (do
+            (set! (.node-count arena-storage) 0)
+            (set! (.edge-count arena-storage) 0)
+            (let [result (parser/parse-program!
+                           source size events (.count prepared) arena-storage)]
+              (if (!= (.error result) parser/PARSE-OK)
+                  (set! parse-round rounds)
+                  (do
+                    (coil_benchmark_consume (p/cast (ptr i8) kinds)
+                                            (.node-count result))
+                    (coil_benchmark_consume (p/cast (ptr i8) edge-nodes)
+                                            (* (.edge-count result) 4))
+                    (store! parse-checksum (p/ixor (load parse-checksum)
+                                            (cast u64 (.root result))))
+                    (set! parse-round (+ (load parse-round) 1))))))))
+      (let [elapsed (- (monotonic-nanos) parse-start)
+            bytes (* size rounds)]
+        (printf c"tape-to-hir %8.3f GB/s  %10lld ns  checksum=%llu\n"
+                (/ (cast f64 bytes) (cast f64 elapsed)) elapsed
+                (load parse-checksum))))
+    (let [start-time (monotonic-nanos) (mut round) 0
+          (mut checksum) (cast u64 0)]
+      (loop
+        (if (>= (load round) rounds) (break)
+          (do
+            (set! (.node-count arena-storage) 0)
+            (set! (.edge-count arena-storage) 0)
+            (let [tape-result (pipeline/scan-source-to-packed-tape64
+                                source size (cast u32 0) events
+                                (frontend/frontend-initial-state))
+                  parse-result (parser/parse-program!
+                                 source size events (.count tape-result) arena-storage)]
+              (if (!= (.error parse-result) parser/PARSE-OK)
+                  (do (printf c"parse failed at %u with code %lld\n"
+                              (.error-offset parse-result) (.error parse-result))
+                      (set! round rounds))
+                  (do
+                    (coil_benchmark_consume (p/cast (ptr i8) events)
+                                            (* (.count tape-result) 4))
+                    (coil_benchmark_consume (p/cast (ptr i8) kinds)
+                                            (.node-count parse-result))
+                    (coil_benchmark_consume (p/cast (ptr i8) starts)
+                                            (* (.node-count parse-result) 4))
+                    (coil_benchmark_consume (p/cast (ptr i8) edge-nodes)
+                                            (* (.edge-count parse-result) 4))
+                    (store! checksum (p/ixor (load checksum)
+                                      (cast u64 (.root parse-result))))
+                    (set! round (+ (load round) 1))))))))
+      (let [elapsed (- (monotonic-nanos) start-time)
+            bytes (* size rounds)
+            gbps (/ (cast f64 bytes) (cast f64 elapsed))]
+        (printf c"text-to-hir %8.3f GB/s  %10lld ns  nodes=%lld edges=%lld checksum=%llu\n"
+                gbps elapsed (.node-count arena-storage) (.edge-count arena-storage)
+                (load checksum))))
+    (free source)
+    (free (p/cast (ptr u8) events))
+    (free kinds)
+    (free (p/cast (ptr u8) starts))
+    (free (p/cast (ptr u8) ends))
+    (free (p/cast (ptr u8) aa))
+    (free (p/cast (ptr u8) bb))
+    (free (p/cast (ptr u8) cc))
+    (free (p/cast (ptr u8) edge-nodes))
+    (free (p/cast (ptr u8) edge-next))
+    0))
+
+(defn main [] (-> i64)
+  (let [pattern-size (len "const result = condition ? foo(a + b) : <Component value={x} />;\n")
+        target (* 1024 1024)
+        size (* (/ target pattern-size) pattern-size)
+        rounds 101]
+    (printf c"direct packed-tape parser benchmark: %lld MiB total\n"
+            (/ (* size rounds) (* 1024 1024)))
+    (run-benchmark size rounds)))

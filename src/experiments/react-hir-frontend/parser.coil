@@ -1,0 +1,333 @@
+(module experiments.react-hir-frontend.parser)
+
+(import "coil.primitive" :as p)
+(import "coil.slice" :use [slice-data])
+(import "experiments.react-hir-frontend.tape" :as tape)
+(import "experiments.react-hir-frontend.grammar" :use [def-infix-precedence])
+
+(const INVALID-NODE u32 4294967295)
+(const INVALID-EDGE u32 4294967295)
+
+(const HIR-IDENTIFIER u8 1)
+(const HIR-NUMBER u8 2)
+(const HIR-BINARY u8 3)
+(const HIR-CALL u8 4)
+(const HIR-CONDITIONAL u8 5)
+(const HIR-JSX-ELEMENT u8 6)
+(const HIR-JSX-ATTRIBUTE u8 7)
+(const HIR-VARIABLE u8 8)
+(const HIR-PROGRAM u8 9)
+
+(const PARSE-OK i64 0)
+(const PARSE-UNEXPECTED i64 1)
+(const PARSE-EXPECTED i64 2)
+(const PARSE-NODE-CAPACITY i64 3)
+(const PARSE-EDGE-CAPACITY i64 4)
+(const PARSE-TRAILING-EVENT i64 5)
+
+;; A compact structure-of-arrays HIR. Source-backed names and literals need no
+;; allocation: their byte spans point into the immutable input. a/b/c are
+;; kind-specific payloads. Variable/binary/conditional use direct node ids;
+;; call, JSX, and program nodes use linked ChildEdge lists.
+(defstruct HirArena
+  [(kinds (ptr u8))
+   (starts (ptr u32))
+   (ends (ptr u32))
+   (a (ptr u32))
+   (b (ptr u32))
+   (c (ptr u32))
+   (node-capacity i64)
+   (node-count i64)
+   (edge-nodes (ptr u32))
+   (edge-next (ptr u32))
+   (edge-capacity i64)
+   (edge-count i64)])
+
+(defstruct ParseState
+  [(source (ptr u8))
+   (source-size i64)
+   (events (ptr u32))
+   (event-count i64)
+   (event-index i64)
+   (arena (ptr HirArena))
+   (error i64)
+   (error-offset u32)])
+
+(defstruct ParseResult
+  [(root u32)
+   (error i64)
+   (error-offset u32)
+   (consumed-events i64)
+   (node-count i64)
+   (edge-count i64)])
+
+(defstruct EdgeList [(head u32) (tail u32) (count u32)])
+
+(def-infix-precedence binary-precedence
+  [(operator 42 60)  ; *
+   (operator 47 60)  ; /
+   (operator 37 60)  ; %
+   (operator 43 50)  ; +
+   (operator 45 50)  ; -
+   (operator 60 40)  ; <
+   (operator 62 40)]) ; >
+
+(defn empty-edge-list [] (-> EdgeList)
+  (EdgeList :head (cast u32 INVALID-EDGE) :tail (cast u32 INVALID-EDGE)
+            :count (cast u32 0)))
+
+(defn event-position [(event u32)] (-> u32)
+  (cast u32 (p/ishr (cast u64 event) (cast u64 3))))
+
+(defn event-kind [(event u32)] (-> u8)
+  (cast u8 (p/iand (cast u64 event) (cast u64 7))))
+
+(defn current-event [(state (ptr ParseState))] (-> u32)
+  (if (>= (.event-index state) (.event-count state)) (cast u32 0)
+    (load (p/index (.events state) (.event-index state)))))
+
+(defn current-position [(state (ptr ParseState))] (-> u32)
+  (if (>= (.event-index state) (.event-count state))
+      (cast u32 (.source-size state))
+      (event-position (current-event state))))
+
+(defn source-byte [(state (ptr ParseState)) (position u32)] (-> u8)
+  (if (>= (cast i64 position) (.source-size state)) (cast u8 0)
+    (load (p/index (.source state) (cast i64 position)))))
+
+(defn current-byte [(state (ptr ParseState))] (-> u8)
+  (source-byte state (current-position state)))
+
+(defn advance! [(state (ptr ParseState))] (-> i64)
+  (if (< (.event-index state) (.event-count state))
+      (set! (.event-index state) (+ (.event-index state) 1)) 0)
+  0)
+
+(defn fail! [(state (ptr ParseState)) (code i64)] (-> u32)
+  (if (= (.error state) PARSE-OK)
+      (do (set! (.error state) code)
+          (set! (.error-offset state) (current-position state))) 0)
+  (cast u32 INVALID-NODE))
+
+(defn ascii-word? [(byte u8)] (-> bool)
+  (or (and (>= byte (cast u8 48)) (<= byte (cast u8 57)))
+      (and (>= byte (cast u8 65)) (<= byte (cast u8 90)))
+      (and (>= byte (cast u8 97)) (<= byte (cast u8 122)))
+      (= byte (cast u8 95)) (= byte (cast u8 36))))
+
+(defn word-end [(state (ptr ParseState)) (start u32)] (-> u32)
+  (let [(mut at) (cast i64 start)]
+    (loop
+      (if (or (>= (load at) (.source-size state))
+              (not (ascii-word? (load (p/index (.source state) (load at))))))
+          (break)
+          (set! at (+ (load at) 1))))
+    (cast u32 (load at))))
+
+(defn word-equals? [(state (ptr ParseState)) (start u32) (end u32)
+                    (expected (slice u8))] (-> bool)
+  (if (!= (- (cast i64 end) (cast i64 start)) (len expected)) false
+    (let [(mut i) 0 (mut same) true]
+      (loop
+        (if (or (>= (load i) (len expected)) (not (load same))) (break)
+          (do
+            (if (!= (load (p/index (.source state) (+ (cast i64 start) (load i))))
+                    (load (p/index (slice-data expected) (load i))))
+                (store! same false) 0)
+            (set! i (+ (load i) 1)))))
+      (load same))))
+
+(defn emit-node! [(state (ptr ParseState)) (kind u8) (start u32) (end u32)
+                  (a u32) (b u32) (c u32)] (-> u32)
+  (let [arena (.arena state)]
+    (if (>= (.node-count arena) (.node-capacity arena))
+        (fail! state PARSE-NODE-CAPACITY)
+        (let [index (.node-count arena)]
+          (store! (p/index (.kinds arena) index) kind)
+          (store! (p/index (.starts arena) index) start)
+          (store! (p/index (.ends arena) index) end)
+          (store! (p/index (.a arena) index) a)
+          (store! (p/index (.b arena) index) b)
+          (store! (p/index (.c arena) index) c)
+          (set! (.node-count arena) (+ index 1))
+          (cast u32 index)))))
+
+(defn append-edge! [(state (ptr ParseState)) (list EdgeList) (node u32)] (-> EdgeList)
+  (let [arena (.arena state)]
+    (if (or (= node (cast u32 INVALID-NODE))
+            (>= (.edge-count arena) (.edge-capacity arena)))
+        (do
+          (if (and (!= node (cast u32 INVALID-NODE)) (= (.error state) PARSE-OK))
+              (fail! state PARSE-EDGE-CAPACITY) (cast u32 INVALID-NODE))
+          list)
+        (let [edge (cast u32 (.edge-count arena))]
+          (store! (p/index (.edge-nodes arena) (cast i64 edge)) node)
+          (store! (p/index (.edge-next arena) (cast i64 edge)) (cast u32 INVALID-EDGE))
+          (if (= (.tail list) (cast u32 INVALID-EDGE)) 0
+            (store! (p/index (.edge-next arena) (cast i64 (.tail list))) edge))
+          (set! (.edge-count arena) (+ (.edge-count arena) 1))
+          (EdgeList :head (if (= (.head list) INVALID-EDGE) edge (.head list))
+                    :tail edge :count (+ (.count list) (cast u32 1)))))))
+
+(defn consume-byte! [(state (ptr ParseState)) (expected u8)] (-> bool)
+  (if (and (< (.event-index state) (.event-count state))
+           (= (current-byte state) expected))
+      (do (advance! state) true)
+      (do (fail! state PARSE-EXPECTED) false)))
+
+(defn parse-word-node! [(state (ptr ParseState))] (-> u32)
+  (if (or (>= (.event-index state) (.event-count state))
+          (!= (event-kind (current-event state)) (cast u8 tape/EVENT-WORD)))
+      (fail! state PARSE-UNEXPECTED)
+      (let [start (current-position state) end (word-end state start)
+            first (source-byte state start)]
+        (advance! state)
+        (emit-node! state
+          (if (and (>= first (cast u8 48)) (<= first (cast u8 57)))
+              (cast u8 HIR-NUMBER) (cast u8 HIR-IDENTIFIER))
+          start end (cast u32 0) (cast u32 0) (cast u32 0)))))
+
+(defn parse-primary! [(state (ptr ParseState))] (-> u32)
+  (if (>= (.event-index state) (.event-count state))
+      (fail! state PARSE-UNEXPECTED)
+      (let [byte (current-byte state)]
+        (cond
+          (= (event-kind (current-event state)) (cast u8 tape/EVENT-WORD))
+            (parse-word-node! state)
+          (= byte (cast u8 40))
+            (do (advance! state)
+                (let [value (parse-expression! state 0)]
+                  (if (consume-byte! state (cast u8 41)) value (cast u32 INVALID-NODE))))
+          (= byte (cast u8 60)) (parse-jsx-element! state)
+          :else (fail! state PARSE-UNEXPECTED)))))
+
+(defn parse-call! [(state (ptr ParseState)) (callee u32)] (-> u32)
+  (let [start (load (p/index (.starts (.arena state)) (cast i64 callee)))]
+    (advance! state)
+    (let [(mut args) (empty-edge-list)]
+      (if (= (current-byte state) (cast u8 41)) 0
+        (loop
+          (let [arg (parse-expression! state 0)]
+            (store! args (append-edge! state (load args) arg))
+            (if (= (.error state) PARSE-OK)
+                (if (= (current-byte state) (cast u8 44))
+                    (advance! state)
+                    (break))
+                (break)))))
+      (let [end-position (current-position state)]
+        (if (consume-byte! state (cast u8 41))
+            (let [finished (load args)]
+              (emit-node! state (cast u8 HIR-CALL) start (+ end-position (cast u32 1)) callee
+                          (.head finished) (.count finished)))
+            (cast u32 INVALID-NODE))))))
+
+(defn parse-postfix! [(state (ptr ParseState))] (-> u32)
+  (let [(mut value) (parse-primary! state)]
+    (loop
+      (if (or (!= (.error state) PARSE-OK)
+              (!= (current-byte state) (cast u8 40)))
+          (break)
+          (store! value (parse-call! state (load value)))))
+    (load value)))
+
+(defn parse-expression! [(state (ptr ParseState)) (minimum i64)] (-> u32)
+  (let [(mut left) (parse-postfix! state)]
+    (loop
+      (let [precedence (if (= (.error state) PARSE-OK)
+                         (binary-precedence (current-byte state)) 0)]
+        (if (or (= precedence 0) (< precedence minimum)) (break)
+          (let [operator (current-byte state)]
+            (advance! state)
+            (let [right (parse-expression! state (+ precedence 1))
+                  start (load (p/index (.starts (.arena state)) (cast i64 (load left))))
+                  end (load (p/index (.ends (.arena state)) (cast i64 right)))]
+              (store! left (emit-node! state (cast u8 HIR-BINARY) start end (load left) right
+                            (cast u32 operator))))))))
+    (if (and (<= minimum 10) (= (.error state) PARSE-OK)
+             (= (current-byte state) (cast u8 63)))
+        (let [start (load (p/index (.starts (.arena state)) (cast i64 (load left))))]
+          (advance! state)
+          (let [consequent (parse-expression! state 0)]
+            (if (consume-byte! state (cast u8 58))
+                (let [alternate (parse-expression! state 10)
+                      end (load (p/index (.ends (.arena state)) (cast i64 alternate)))]
+                  (emit-node! state (cast u8 HIR-CONDITIONAL) start end
+                              (load left) consequent alternate))
+                (cast u32 INVALID-NODE))))
+        (load left))))
+
+(defn parse-jsx-attribute! [(state (ptr ParseState))] (-> u32)
+  (let [start (current-position state) name (parse-word-node! state)]
+    (if (consume-byte! state (cast u8 61))
+        (if (consume-byte! state (cast u8 123))
+            (let [value (parse-expression! state 0)
+                  end-position (current-position state)]
+              (if (consume-byte! state (cast u8 125))
+                  (emit-node! state (cast u8 HIR-JSX-ATTRIBUTE)
+                              start (+ end-position (cast u32 1))
+                              name value (cast u32 0))
+                  (cast u32 INVALID-NODE)))
+            (fail! state PARSE-EXPECTED))
+        (cast u32 INVALID-NODE))))
+
+(defn parse-jsx-element! [(state (ptr ParseState))] (-> u32)
+  (let [start (current-position state)]
+    (advance! state)
+    (let [name (parse-word-node! state) (mut attributes) (empty-edge-list)]
+      (loop
+        (if (or (!= (.error state) PARSE-OK)
+                (= (current-byte state) (cast u8 47))
+                (= (current-byte state) (cast u8 62)))
+            (break)
+            (store! attributes
+              (append-edge! state (load attributes) (parse-jsx-attribute! state)))))
+      (if (= (current-byte state) (cast u8 47))
+          (let [_slash (advance! state) end-position (current-position state)]
+            (if (consume-byte! state (cast u8 62))
+                (let [finished (load attributes)]
+                  (emit-node! state (cast u8 HIR-JSX-ELEMENT)
+                              start (+ end-position (cast u32 1))
+                              name (.head finished) (.count finished)))
+                (cast u32 INVALID-NODE)))
+          (fail! state PARSE-EXPECTED)))))
+
+(defn parse-variable! [(state (ptr ParseState))] (-> u32)
+  (let [start (current-position state) keyword-end (word-end state start)]
+    (if (not (word-equals? state start keyword-end "const"))
+        (fail! state PARSE-UNEXPECTED)
+        (do
+          (advance! state)
+          (let [name (parse-word-node! state)]
+            (if (consume-byte! state (cast u8 61))
+                (let [value (parse-expression! state 0)
+                      end-position (current-position state)]
+                  (if (consume-byte! state (cast u8 59))
+                      (emit-node! state (cast u8 HIR-VARIABLE)
+                                  start (+ end-position (cast u32 1))
+                                  name value (cast u32 0))
+                      (cast u32 INVALID-NODE)))
+                (cast u32 INVALID-NODE)))))))
+
+(defn parse-program!
+  [(source (ptr u8)) (source-size i64) (events (ptr u32)) (event-count i64)
+   (arena (ptr HirArena))] (-> ParseResult)
+  (let [state (p/alloc-stack ParseState)]
+    (store! state (ParseState :source source :source-size source-size
+                   :events events :event-count event-count :event-index 0
+                   :arena arena :error PARSE-OK :error-offset (cast u32 0)))
+    (let [(mut statements) (empty-edge-list)]
+      (loop
+        (if (or (>= (.event-index state) (.event-count state))
+                (!= (.error state) PARSE-OK))
+            (break)
+            (store! statements
+              (append-edge! state (load statements) (parse-variable! state)))))
+      (let [finished (load statements)
+            root (if (= (.error state) PARSE-OK)
+                   (emit-node! state (cast u8 HIR-PROGRAM)
+                               (cast u32 0) (cast u32 source-size)
+                               (.head finished) (.tail finished) (.count finished))
+                   (cast u32 INVALID-NODE))]
+        (ParseResult :root root :error (.error state) :error-offset (.error-offset state)
+                     :consumed-events (.event-index state)
+                     :node-count (.node-count arena) :edge-count (.edge-count arena))))))
