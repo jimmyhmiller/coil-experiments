@@ -26,6 +26,56 @@
     (!= (p/iand (p/ishr bits (cast u64 (- count 1))) (cast u64 1))
         (cast u64 0))))
 
+(defn finish-frontend :inline (Always)
+  [(raw structural/StructuralChunk)
+   (lexical lex/LexicalChunk)
+   (count i64)
+   (initial FrontendState)] (-> FrontendChunk)
+  (let [visible (.code-bits lexical)
+        word (p/iand (.word-bits raw) visible)
+        whitespace (p/iand (.whitespace-bits raw) visible)
+        prior (p/ior (p/ishl word (cast u64 1))
+                     (if (.previous-code-word initial) (cast u64 1) (cast u64 0)))
+        starts (p/iand word (p/inot prior))
+        code (structural/StructuralChunk
+               :word-bits word
+               :word-start-bits starts
+               :whitespace-bits whitespace
+               :punctuation-bits (p/iand (.punctuation-bits raw) visible)
+               :operator-bits (p/iand (.operator-bits raw) visible)
+               :operator-adjacent-bits
+                 (p/iand (.operator-adjacent-bits raw) visible)
+               :quote-bits (cast u64 0)
+               :slash-bits (p/iand (.slash-bits raw) visible)
+               :backtick-bits (cast u64 0)
+               :delimiter-bits (p/iand (.delimiter-bits raw) visible)
+               :jsx-marker-bits (p/iand (.jsx-marker-bits raw) visible)
+               :next-word (final-bit? word count (.previous-code-word initial)))
+        state (FrontendState :lexical (.state lexical)
+                             :previous-code-word (.next-word code))]
+    (FrontendChunk :raw raw :lexical lexical :code code :state state)))
+
+(defn join32 [(low u64) (high u64)] (-> u64)
+  (p/ior low (p/ishl high (cast u64 32))))
+
+(defn join-structural32
+  [(low structural/StructuralChunk) (high structural/StructuralChunk)]
+  (-> structural/StructuralChunk)
+  (let [operator (join32 (.operator-bits low) (.operator-bits high))]
+    (structural/StructuralChunk
+      :word-bits (join32 (.word-bits low) (.word-bits high))
+      :word-start-bits (join32 (.word-start-bits low) (.word-start-bits high))
+      :whitespace-bits (join32 (.whitespace-bits low) (.whitespace-bits high))
+      :punctuation-bits (join32 (.punctuation-bits low) (.punctuation-bits high))
+      :operator-bits operator
+      :operator-adjacent-bits (p/iand operator (p/ishr operator (cast u64 1)))
+      :quote-bits (join32 (.quote-bits low) (.quote-bits high))
+      :slash-bits (join32 (.slash-bits low) (.slash-bits high))
+      :backtick-bits (join32 (.backtick-bits low) (.backtick-bits high))
+      :delimiter-bits (join32 (.delimiter-bits low) (.delimiter-bits high))
+      :jsx-marker-bits (join32 (.jsx-marker-bits low) (.jsx-marker-bits high))
+      :next-word (.next-word high))))
+
 ;; One fused public boundary for the byte-class and lexical passes. The
 ;; one-byte overlap is only needed to decide a trailing `/` without backpatching.
 (defn classify-frontend [N]
@@ -49,27 +99,44 @@
                   count (.single-quote classes) (.double-quote classes)
                   (.backtick classes) (.slash classes) star backslash lf cr
                   next-byte has-next (.lexical initial))
-        raw (structural/structural-from-classes classes count false)
-        visible (.code-bits lexical)
-        word (p/iand (.word-bits raw) visible)
-        whitespace (p/iand (.whitespace-bits raw) visible)
-        prior (p/ior (p/ishl word (cast u64 1))
-                     (if (.previous-code-word initial) (cast u64 1) (cast u64 0)))
-        starts (p/iand word (p/inot prior))
-        code (structural/StructuralChunk
-               :word-bits word
-               :word-start-bits starts
-               :whitespace-bits whitespace
-               :punctuation-bits (p/iand (.punctuation-bits raw) visible)
-               :operator-bits (p/iand (.operator-bits raw) visible)
-               :operator-adjacent-bits
-                 (p/iand (.operator-adjacent-bits raw) visible)
-               :quote-bits (cast u64 0)
-               :slash-bits (p/iand (.slash-bits raw) visible)
-               :backtick-bits (cast u64 0)
-               :delimiter-bits (p/iand (.delimiter-bits raw) visible)
-               :jsx-marker-bits (p/iand (.jsx-marker-bits raw) visible)
-               :next-word (final-bit? word count (.previous-code-word initial)))
-        state (FrontendState :lexical (.state lexical)
-                             :previous-code-word (.next-word code))]
-    (FrontendChunk :raw raw :lexical lexical :code code :state state)))
+        raw (structural/structural-from-classes classes count false)]
+    (finish-frontend raw lexical count initial)))
+
+;; A 64-byte logical chunk built from two target-native 32-byte vectors. This
+;; lets the lexical state machine cross the midpoint only once while keeping
+;; table classification on the physical width that benchmarks best on AVX2.
+(defn classify-frontend-pair32
+  [(low (vec u8 32)) (high (vec u8 32))
+   (valid-count i64) (next-byte u8) (has-next bool)
+   (initial FrontendState)] (-> FrontendChunk)
+  (let [count (cond (< valid-count 0) 0 (> valid-count 64) 64 :else valid-count)
+        low-count (if (> count 32) 32 count)
+        high-count (if (> count 32) (- count 32) 0)
+        low-classes (structural/classify-js-classes low low-count)
+        high-classes (structural/classify-js-classes high high-count)
+        low-raw (structural/structural-from-classes low-classes low-count false)
+        high-raw (structural/structural-from-classes
+                   high-classes high-count (.next-word low-raw))
+        raw (join-structural32 low-raw high-raw)
+        low-valid (v/bits-low low-count)
+        high-valid (v/bits-low high-count)
+        star (join32
+               (p/iand low-valid (v/mask->bits (v/v= low (v/vsplat [u8 32] (cast u8 42)))))
+               (p/iand high-valid (v/mask->bits (v/v= high (v/vsplat [u8 32] (cast u8 42))))))
+        backslash (join32
+                    (p/iand low-valid (v/mask->bits (v/v= low (v/vsplat [u8 32] (cast u8 92)))))
+                    (p/iand high-valid (v/mask->bits (v/v= high (v/vsplat [u8 32] (cast u8 92))))))
+        lf (join32
+             (p/iand low-valid (v/mask->bits (v/v= low (v/vsplat [u8 32] (cast u8 10)))))
+             (p/iand high-valid (v/mask->bits (v/v= high (v/vsplat [u8 32] (cast u8 10))))))
+        cr (join32
+             (p/iand low-valid (v/mask->bits (v/v= low (v/vsplat [u8 32] (cast u8 13)))))
+             (p/iand high-valid (v/mask->bits (v/v= high (v/vsplat [u8 32] (cast u8 13))))))
+        lexical (lex/classify-lexical-events
+                  count
+                  (join32 (.single-quote low-classes) (.single-quote high-classes))
+                  (join32 (.double-quote low-classes) (.double-quote high-classes))
+                  (join32 (.backtick low-classes) (.backtick high-classes))
+                  (join32 (.slash low-classes) (.slash high-classes))
+                  star backslash lf cr next-byte has-next (.lexical initial))]
+    (finish-frontend raw lexical count initial)))
