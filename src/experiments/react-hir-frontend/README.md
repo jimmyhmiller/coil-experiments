@@ -25,8 +25,10 @@ The implemented pipeline is:
    sparse bitmap iteration and compile-time tag bitplanes.
 7. `pipeline.coil` is the complete buffer API: it scans bulk 64-byte chunks,
    handles the safe partial tail, carries state, and materializes the tape.
-   It offers split position/kind arrays and a faster packed `u64` event layout
-   whose low three bits hold the kind and whose upper bits hold the position.
+   It offers split position/kind arrays and a faster checked packed `u32` event
+   layout whose low three bits hold the kind and whose upper 29 bits hold the
+   file-relative position. Inputs at or above 512 MiB report overflow before
+   writing and can use the unrestricted split layout.
 
 All bitmap-producing entry points accept an explicit valid byte count. SIMD
 tail fill bytes therefore cannot appear as source events. Tape writes report
