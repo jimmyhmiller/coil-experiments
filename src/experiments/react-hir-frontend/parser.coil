@@ -17,6 +17,21 @@
 (const HIR-JSX-ATTRIBUTE u8 7)
 (const HIR-VARIABLE u8 8)
 (const HIR-PROGRAM u8 9)
+(const HIR-STRING u8 10)
+(const HIR-UNARY u8 11)
+(const HIR-ASSIGNMENT u8 12)
+(const HIR-ARRAY u8 13)
+(const HIR-OBJECT u8 14)
+(const HIR-PROPERTY u8 15)
+(const HIR-MEMBER u8 16)
+(const HIR-EXPRESSION-STATEMENT u8 17)
+(const HIR-RETURN u8 18)
+(const HIR-BLOCK u8 19)
+(const HIR-IF u8 20)
+(const HIR-WHILE u8 21)
+(const HIR-FUNCTION u8 22)
+(const HIR-PARAMETERS u8 23)
+(const HIR-JSX-TEXT u8 24)
 
 (const PARSE-OK i64 0)
 (const PARSE-UNEXPECTED i64 1)
@@ -88,6 +103,20 @@
 
 (defn current-byte [(state (ptr ParseState))] (-> u8)
   (source-byte state (current-position state)))
+
+(defn adjacent-event-byte [(state (ptr ParseState)) (distance i64)] (-> u8)
+  (let [index (+ (.event-index state) distance)]
+    (if (>= index (.event-count state)) (cast u8 0)
+      (let [position (event-position (load (p/index (.events state) index)))]
+        (if (= position (+ (current-position state) (cast u32 distance)))
+            (source-byte state position) (cast u8 0))))))
+
+(defn advance-count! [(state (ptr ParseState)) (count i64)] (-> i64)
+  (let [(mut i) 0]
+    (loop
+      (if (>= (load i) count) (break)
+        (do (advance! state) (set! i (+ (load i) 1)))))
+    0))
 
 (defn advance! [(state (ptr ParseState))] (-> i64)
   (if (< (.event-index state) (.event-count state))
@@ -178,6 +207,81 @@
               (cast u8 HIR-NUMBER) (cast u8 HIR-IDENTIFIER))
           start end (cast u32 0) (cast u32 0) (cast u32 0)))))
 
+(defn parse-string-node! [(state (ptr ParseState))] (-> u32)
+  (let [start (current-position state) quote (current-byte state)
+        (mut at) (+ (cast i64 start) 1) (mut escaped) false (mut closed) false]
+    (loop
+      (if (or (>= (load at) (.source-size state)) (load closed)) (break)
+        (let [byte (load (p/index (.source state) (load at)))]
+          (cond (load escaped) (store! escaped false)
+                (= byte (cast u8 92)) (store! escaped true)
+                (= byte quote) (store! closed true)
+                :else 0)
+          (set! at (+ (load at) 1)))))
+    (if (not (load closed)) (fail! state PARSE-EXPECTED)
+      (do
+        ;; Consume every raw quote event through the actual unescaped closer.
+        (loop
+          (if (or (>= (.event-index state) (.event-count state))
+                  (>= (cast i64 (current-position state)) (load at)))
+              (break) (advance! state)))
+        (emit-node! state (cast u8 HIR-STRING) start (cast u32 (load at))
+                    (cast u32 0) (cast u32 0) (cast u32 0))))))
+
+(defn node-start [(state (ptr ParseState)) (node u32)] (-> u32)
+  (load (p/index (.starts (.arena state)) (cast i64 node))))
+
+(defn node-end [(state (ptr ParseState)) (node u32)] (-> u32)
+  (load (p/index (.ends (.arena state)) (cast i64 node))))
+
+(defn parse-array! [(state (ptr ParseState))] (-> u32)
+  (let [start (current-position state) _open (advance! state)
+        (mut elements) (empty-edge-list)]
+    (if (= (current-byte state) (spec/array-production-terminal 2)) 0
+      (loop
+        (store! elements
+          (append-edge! state (load elements) (parse-expression! state 0)))
+        (if (!= (.error state) PARSE-OK) (break)
+          (if (= (current-byte state) (spec/array-production-terminal 1))
+              (do (advance! state)
+                  (if (= (current-byte state) (spec/array-production-terminal 2))
+                      (break) 0))
+              (break)))))
+    (let [end-position (current-position state) finished (load elements)]
+      (if (consume-byte! state (spec/array-production-terminal 2))
+          (emit-node! state (cast u8 HIR-ARRAY) start (+ end-position (cast u32 1))
+                      (.head finished) (.tail finished) (.count finished))
+          (cast u32 INVALID-NODE)))))
+
+(defn parse-property! [(state (ptr ParseState))] (-> u32)
+  (let [start (current-position state)
+        name (if (= (event-kind (current-event state)) (cast u8 tape/EVENT-LITERAL))
+               (parse-string-node! state) (parse-word-node! state))]
+    (if (consume-byte! state (spec/property-production-terminal 1))
+        (let [value (parse-expression! state 0)]
+          (emit-node! state (cast u8 HIR-PROPERTY) start (node-end state value)
+                      name value (cast u32 0)))
+        (cast u32 INVALID-NODE))))
+
+(defn parse-object! [(state (ptr ParseState))] (-> u32)
+  (let [start (current-position state) _open (advance! state)
+        (mut properties) (empty-edge-list)]
+    (if (= (current-byte state) (spec/object-production-terminal 2)) 0
+      (loop
+        (store! properties
+          (append-edge! state (load properties) (parse-property! state)))
+        (if (!= (.error state) PARSE-OK) (break)
+          (if (= (current-byte state) (spec/object-production-terminal 1))
+              (do (advance! state)
+                  (if (= (current-byte state) (spec/object-production-terminal 2))
+                      (break) 0))
+              (break)))))
+    (let [end-position (current-position state) finished (load properties)]
+      (if (consume-byte! state (spec/object-production-terminal 2))
+          (emit-node! state (cast u8 HIR-OBJECT) start (+ end-position (cast u32 1))
+                      (.head finished) (.tail finished) (.count finished))
+          (cast u32 INVALID-NODE)))))
+
 (defn parse-primary! [(state (ptr ParseState))] (-> u32)
   (if (>= (.event-index state) (.event-count state))
       (fail! state PARSE-UNEXPECTED)
@@ -186,12 +290,23 @@
         (cond
           (= form spec/form-word)
             (parse-word-node! state)
+          (= form spec/form-string) (parse-string-node! state)
           (= form spec/form-group)
             (do (advance! state)
                 (let [value (parse-expression! state 0)]
                   (if (consume-byte! state
                         (spec/group-production-terminal 2))
                       value (cast u32 INVALID-NODE))))
+          (or (= form spec/form-unary-bang)
+              (= form spec/form-unary-minus)
+              (= form spec/form-unary-plus))
+            (let [start (current-position state) operator (current-byte state)]
+              (advance! state)
+              (let [argument (parse-expression! state 70)]
+                (emit-node! state (cast u8 HIR-UNARY) start (node-end state argument)
+                            argument (cast u32 0) (cast u32 operator))))
+          (= form spec/form-array) (parse-array! state)
+          (= form spec/form-object) (parse-object! state)
           (= form spec/form-jsx) (parse-jsx-element! state)
           :else (fail! state PARSE-UNEXPECTED)))))
 
@@ -218,30 +333,46 @@
                           (.head finished) (.count finished)))
             (cast u32 INVALID-NODE))))))
 
+(defn parse-member! [(state (ptr ParseState)) (object u32)] (-> u32)
+  (let [start (node-start state object) _dot (advance! state)
+        property (parse-word-node! state)]
+    (emit-node! state (cast u8 HIR-MEMBER) start (node-end state property)
+                object property (cast u32 0))))
+
 (defn parse-postfix! [(state (ptr ParseState))] (-> u32)
   (let [(mut value) (parse-primary! state)]
     (loop
-      (if (or (!= (.error state) PARSE-OK)
-              (!= (spec/postfix-form (event-kind (current-event state))
-                                     (current-byte state))
-                  spec/form-call))
-          (break)
-          (store! value (parse-call! state (load value)))))
+      (let [form (spec/postfix-form (event-kind (current-event state))
+                                    (current-byte state))]
+        (cond (!= (.error state) PARSE-OK) (break)
+              (= form spec/form-call)
+                (store! value (parse-call! state (load value)))
+              (= form spec/form-member)
+                (store! value (parse-member! state (load value)))
+              :else (break))))
     (load value)))
 
 (defn parse-expression! [(state (ptr ParseState)) (minimum i64)] (-> u32)
   (let [(mut left) (parse-postfix! state)]
     (loop
-      (let [precedence (if (= (.error state) PARSE-OK)
-                         (spec/binary-precedence (current-byte state)) 0)]
+      (let [byte0 (current-byte state)
+            lookahead (spec/binary-lookahead byte0)
+            byte1 (if (> lookahead 1) (adjacent-event-byte state 1) (cast u8 0))
+            byte2 (if (> lookahead 2) (adjacent-event-byte state 2) (cast u8 0))
+            info (if (= (.error state) PARSE-OK)
+                   (spec/binary-info byte0 byte1 byte2) 0)
+            precedence (/ info 256)]
         (if (or (= precedence 0) (< precedence minimum)) (break)
-          (let [operator (current-byte state)]
-            (advance! state)
+          (let [width (% info 256)
+                operator (cast u32 (p/ior (cast u64 byte0)
+                           (p/ior (p/ishl (cast u64 byte1) (cast u64 8))
+                                  (p/ishl (cast u64 byte2) (cast u64 16)))))]
+            (advance-count! state width)
             (let [right (parse-expression! state (+ precedence 1))
                   start (load (p/index (.starts (.arena state)) (cast i64 (load left))))
                   end (load (p/index (.ends (.arena state)) (cast i64 right)))]
               (store! left (emit-node! state (cast u8 HIR-BINARY) start end (load left) right
-                            (cast u32 operator))))))))
+                            operator)))))))
     (if (and (<= minimum 10) (= (.error state) PARSE-OK)
              (= (current-byte state)
                 (spec/conditional-production-terminal 0)))
@@ -255,24 +386,70 @@
                   (emit-node! state (cast u8 HIR-CONDITIONAL) start end
                               (load left) consequent alternate))
                 (cast u32 INVALID-NODE))))
-        (load left))))
+        (if (and (<= minimum 5) (= (.error state) PARSE-OK)
+                 (= (current-byte state) (spec/assignment-production-terminal 1))
+                 (!= (adjacent-event-byte state 1)
+                     (spec/assignment-production-terminal 1)))
+            (let [start (node-start state (load left))]
+              (advance! state)
+              (let [right (parse-expression! state 0)]
+                (emit-node! state (cast u8 HIR-ASSIGNMENT) start (node-end state right)
+                            (load left) right (cast u32 0))))
+            (load left)))))
 
 (defn parse-jsx-attribute! [(state (ptr ParseState))] (-> u32)
   (let [start (current-position state) name (parse-word-node! state)]
-    (if (consume-byte! state
-          (spec/jsx-attribute-production-terminal 1))
-        (if (consume-byte! state
-              (spec/jsx-attribute-production-terminal 2))
-            (let [value (parse-expression! state 0)
-                  end-position (current-position state)]
-              (if (consume-byte! state
-                    (spec/jsx-attribute-production-terminal 4))
-                  (emit-node! state (cast u8 HIR-JSX-ATTRIBUTE)
-                              start (+ end-position (cast u32 1))
-                              name value (cast u32 0))
-                  (cast u32 INVALID-NODE)))
-            (fail! state PARSE-EXPECTED))
+    (if (consume-byte! state (spec/jsx-attribute-production-terminal 1))
+        (if (= (event-kind (current-event state)) (cast u8 tape/EVENT-LITERAL))
+            (let [value (parse-string-node! state)]
+              (emit-node! state (cast u8 HIR-JSX-ATTRIBUTE)
+                          start (node-end state value) name value (cast u32 0)))
+            (if (consume-byte! state (spec/jsx-attribute-production-terminal 2))
+                (let [value (parse-expression! state 0)
+                      end-position (current-position state)]
+                  (if (consume-byte! state (spec/jsx-attribute-production-terminal 4))
+                      (emit-node! state (cast u8 HIR-JSX-ATTRIBUTE)
+                                  start (+ end-position (cast u32 1))
+                                  name value (cast u32 0))
+                      (cast u32 INVALID-NODE)))
+                (fail! state PARSE-EXPECTED)))
         (cast u32 INVALID-NODE))))
+
+(defn join-edge-lists! [(state (ptr ParseState)) (left EdgeList) (right EdgeList)] (-> u32)
+  (if (= (.head left) (cast u32 INVALID-EDGE)) (.head right)
+    (do
+      (if (= (.head right) (cast u32 INVALID-EDGE)) 0
+        (store! (p/index (.edge-next (.arena state)) (cast i64 (.tail left))) (.head right)))
+      (.head left))))
+
+(defn same-spelling? [(state (ptr ParseState)) (left u32) (right u32)] (-> bool)
+  (let [left-start (node-start state left) left-end (node-end state left)
+        right-start (node-start state right) right-end (node-end state right)
+        length (- (cast i64 left-end) (cast i64 left-start))]
+    (if (!= length (- (cast i64 right-end) (cast i64 right-start))) false
+      (let [(mut i) 0 (mut same) true]
+        (loop
+          (if (or (>= (load i) length) (not (load same))) (break)
+            (do
+              (if (!= (source-byte state (+ left-start (cast u32 (load i))))
+                      (source-byte state (+ right-start (cast u32 (load i)))))
+                  (store! same false) 0)
+              (set! i (+ (load i) 1)))))
+        (load same)))))
+
+(defn parse-jsx-text! [(state (ptr ParseState))] (-> u32)
+  (let [start (current-position state) (mut end) start]
+    (loop
+      (if (or (>= (.event-index state) (.event-count state))
+              (= (current-byte state) (spec/terminal-byte spec/less-than))
+              (= (current-byte state) (spec/terminal-byte spec/lbrace)))
+          (break)
+          (do (store! end (word-end state (current-position state)))
+              (if (= (load end) (current-position state))
+                  (store! end (+ (current-position state) (cast u32 1))) 0)
+              (advance! state))))
+    (emit-node! state (cast u8 HIR-JSX-TEXT) start (load end)
+                (cast u32 0) (cast u32 0) (cast u32 0))))
 
 (defn parse-jsx-element! [(state (ptr ParseState))] (-> u32)
   (let [start (current-position state)]
@@ -287,8 +464,7 @@
             (break)
             (store! attributes
               (append-edge! state (load attributes) (parse-jsx-attribute! state)))))
-      (if (= (current-byte state)
-             (spec/jsx-element-production-terminal 3))
+      (if (= (current-byte state) (spec/jsx-element-production-terminal 3))
           (let [_slash (advance! state) end-position (current-position state)]
             (if (consume-byte! state
                   (spec/jsx-element-production-terminal 4))
@@ -297,12 +473,57 @@
                               start (+ end-position (cast u32 1))
                               name (.head finished) (.count finished)))
                 (cast u32 INVALID-NODE)))
-          (fail! state PARSE-EXPECTED)))))
+          (if (consume-byte! state (spec/jsx-open-element-production-terminal 3))
+              (let [(mut children) (empty-edge-list)]
+                (loop
+                  (if (or (!= (.error state) PARSE-OK)
+                          (and (= (current-byte state) (spec/terminal-byte spec/less-than))
+                               (= (adjacent-event-byte state 1)
+                                  (spec/terminal-byte spec/slash))))
+                      (break)
+                      (let [child
+                            (cond
+                              (= (current-byte state) (spec/terminal-byte spec/less-than))
+                                (parse-jsx-element! state)
+                              (= (current-byte state) (spec/terminal-byte spec/lbrace))
+                                (do (advance! state)
+                                    (let [value (parse-expression! state 0)]
+                                      (if (consume-byte! state
+                                            (spec/jsx-expression-child-production-terminal 2))
+                                          value (cast u32 INVALID-NODE))))
+                              :else (parse-jsx-text! state))]
+                        (store! children (append-edge! state (load children) child)))))
+                (if (and (consume-byte! state (spec/jsx-close-element-production-terminal 0))
+                         (consume-byte! state (spec/jsx-close-element-production-terminal 1)))
+                    (let [closing-name (parse-word-node! state)
+                          end-position (current-position state)]
+                      (if (and (same-spelling? state name closing-name)
+                               (consume-byte! state
+                                 (spec/jsx-close-element-production-terminal 3)))
+                          (let [finished-attributes (load attributes)
+                                finished-children (load children)
+                                combined-head (join-edge-lists! state
+                                                finished-attributes finished-children)
+                                counts (cast u32 (p/ior
+                                         (cast u64 (.count finished-attributes))
+                                         (p/ishl (cast u64 (.count finished-children))
+                                                  (cast u64 16))))]
+                            (emit-node! state (cast u8 HIR-JSX-ELEMENT)
+                              start (+ end-position (cast u32 1))
+                              name combined-head counts))
+                          (fail! state PARSE-EXPECTED)))
+                    (cast u32 INVALID-NODE)))
+              (fail! state PARSE-EXPECTED))))))
 
-(defn parse-variable! [(state (ptr ParseState))] (-> u32)
+(defn current-keyword? [(state (ptr ParseState)) (keyword (slice u8))] (-> bool)
+  (if (or (>= (.event-index state) (.event-count state))
+          (!= (event-kind (current-event state)) (cast u8 tape/EVENT-WORD))) false
+    (let [start (current-position state)]
+      (word-equals? state start (word-end state start) keyword))))
+
+(defn parse-variable-keyword! [(state (ptr ParseState)) (keyword (slice u8))] (-> u32)
   (let [start (current-position state) keyword-end (word-end state start)]
-    (if (not (word-equals? state start keyword-end
-               (spec/variable-production-keyword 0)))
+    (if (not (word-equals? state start keyword-end keyword))
         (fail! state PARSE-UNEXPECTED)
         (do
           (advance! state)
@@ -319,6 +540,115 @@
                       (cast u32 INVALID-NODE)))
                 (cast u32 INVALID-NODE)))))))
 
+(defn parse-variable! [(state (ptr ParseState))] (-> u32)
+  (parse-variable-keyword! state (spec/variable-production-keyword 0)))
+
+(defn parse-expression-statement! [(state (ptr ParseState))] (-> u32)
+  (let [start (current-position state) expression (parse-expression! state 0)
+        end-position (current-position state)]
+    (if (consume-byte! state (spec/expression-statement-production-terminal 1))
+        (emit-node! state (cast u8 HIR-EXPRESSION-STATEMENT)
+                    start (+ end-position (cast u32 1)) expression
+                    (cast u32 0) (cast u32 0))
+        (cast u32 INVALID-NODE))))
+
+(defn parse-return! [(state (ptr ParseState))] (-> u32)
+  (let [start (current-position state)]
+    (advance! state)
+    (let [value (parse-expression! state 0) end-position (current-position state)]
+      (if (consume-byte! state (spec/return-production-terminal 2))
+          (emit-node! state (cast u8 HIR-RETURN) start (+ end-position (cast u32 1))
+                      value (cast u32 0) (cast u32 0))
+          (cast u32 INVALID-NODE)))))
+
+(defn parse-block! [(state (ptr ParseState))] (-> u32)
+  (let [start (current-position state) _open (advance! state)
+        (mut statements) (empty-edge-list)]
+    (loop
+      (if (or (!= (.error state) PARSE-OK)
+              (>= (.event-index state) (.event-count state))
+              (= (current-byte state) (spec/block-production-terminal 2)))
+          (break)
+          (store! statements
+            (append-edge! state (load statements) (parse-statement! state)))))
+    (let [end-position (current-position state) finished (load statements)]
+      (if (consume-byte! state (spec/block-production-terminal 2))
+          (emit-node! state (cast u8 HIR-BLOCK) start (+ end-position (cast u32 1))
+                      (.head finished) (.tail finished) (.count finished))
+          (cast u32 INVALID-NODE)))))
+
+(defn parse-if! [(state (ptr ParseState))] (-> u32)
+  (let [start (current-position state) _keyword (advance! state)]
+    (if (consume-byte! state (spec/if-production-terminal 1))
+        (let [test (parse-expression! state 0)]
+          (if (consume-byte! state (spec/if-production-terminal 3))
+              (let [consequent (parse-statement! state)
+                    (mut alternate) (cast u32 INVALID-NODE)]
+                (if (current-keyword? state (spec/else-clause-production-keyword 0))
+                    (do (advance! state)
+                        (store! alternate (parse-statement! state))) 0)
+                (emit-node! state (cast u8 HIR-IF) start
+                            (if (= (load alternate) (cast u32 INVALID-NODE))
+                                (node-end state consequent) (node-end state (load alternate)))
+                            test consequent (load alternate)))
+              (cast u32 INVALID-NODE)))
+        (cast u32 INVALID-NODE))))
+
+(defn parse-while! [(state (ptr ParseState))] (-> u32)
+  (let [start (current-position state) _keyword (advance! state)]
+    (if (consume-byte! state (spec/while-production-terminal 1))
+        (let [test (parse-expression! state 0)]
+          (if (consume-byte! state (spec/while-production-terminal 3))
+              (let [body (parse-statement! state)]
+                (emit-node! state (cast u8 HIR-WHILE) start (node-end state body)
+                            test body (cast u32 0)))
+              (cast u32 INVALID-NODE)))
+        (cast u32 INVALID-NODE))))
+
+(defn parse-function! [(state (ptr ParseState))] (-> u32)
+  (let [start (current-position state) _keyword (advance! state)
+        name (parse-word-node! state)]
+    (if (consume-byte! state (spec/function-production-terminal 2))
+        (let [(mut parameters) (empty-edge-list)]
+          (if (= (current-byte state) (spec/function-production-terminal 4)) 0
+            (loop
+              (store! parameters
+                (append-edge! state (load parameters) (parse-word-node! state)))
+              (if (!= (.error state) PARSE-OK) (break)
+                (if (= (current-byte state) (spec/function-production-terminal 3))
+                    (advance! state) (break)))))
+          (if (consume-byte! state (spec/function-production-terminal 4))
+              (let [finished (load parameters)
+                    parameter-node
+                      (emit-node! state (cast u8 HIR-PARAMETERS) start
+                                  (current-position state) (.head finished)
+                                  (.tail finished) (.count finished))
+                    body (parse-block! state)]
+                (emit-node! state (cast u8 HIR-FUNCTION) start (node-end state body)
+                            name parameter-node body))
+              (cast u32 INVALID-NODE)))
+        (cast u32 INVALID-NODE))))
+
+(defn parse-statement! [(state (ptr ParseState))] (-> u32)
+  (cond
+    (= (current-byte state) (spec/block-production-terminal 0))
+      (parse-block! state)
+    (current-keyword? state (spec/variable-production-keyword 0))
+      (parse-variable-keyword! state (spec/variable-production-keyword 0))
+    (current-keyword? state (spec/let-production-keyword 0))
+      (parse-variable-keyword! state (spec/let-production-keyword 0))
+    (current-keyword? state (spec/var-production-keyword 0))
+      (parse-variable-keyword! state (spec/var-production-keyword 0))
+    (current-keyword? state (spec/return-production-keyword 0))
+      (parse-return! state)
+    (current-keyword? state (spec/if-production-keyword 0))
+      (parse-if! state)
+    (current-keyword? state (spec/while-production-keyword 0))
+      (parse-while! state)
+    (current-keyword? state (spec/function-production-keyword 0))
+      (parse-function! state)
+    :else (parse-expression-statement! state)))
+
 (defn parse-program!
   [(source (ptr u8)) (source-size i64) (events (ptr u32)) (event-count i64)
    (arena (ptr HirArena))] (-> ParseResult)
@@ -332,7 +662,7 @@
                 (!= (.error state) PARSE-OK))
             (break)
             (store! statements
-              (append-edge! state (load statements) (parse-variable! state)))))
+              (append-edge! state (load statements) (parse-statement! state)))))
       (let [finished (load statements)
             root (if (= (.error state) PARSE-OK)
                    (emit-node! state (cast u8 HIR-PROGRAM)

@@ -1,6 +1,7 @@
 (module experiments.react-hir-frontend.grammar)
 
 (import "coil.primitive" :as p)
+(import "coil.slice" :use [slice-get])
 
 ;; Grammar data stays declarative. The metaprogram below validates one unified
 ;; S-expression frontend description and lowers it to straight-line queries.
@@ -91,7 +92,7 @@
         (loop
           (if (>= (load i) (p/code-count groups)) (break)
             (let [group (p/code-nth groups (load i))]
-              (if (not (and (p/code-list? group) (>= (p/code-count group) 4)
+              (if (not (and (p/code-list? group) (>= (p/code-count group) 3)
                             (grammar-symbol? (p/code-nth group 0) "left")
                             (p/code-int? (p/code-nth group 1))
                             (> (p/code-int (p/code-nth group 1)) 0)))
@@ -99,8 +100,10 @@
                   (let [(mut terminal-index) 2]
                     (loop
                       (if (>= (load terminal-index) (p/code-count group)) (break)
-                        (do (terminal-byte-by-name terminals
-                              (p/code-nth group (load terminal-index)))
+                        (do (let [lexeme (p/code-nth group (load terminal-index))]
+                              (if (p/code-sym? lexeme)
+                                  (terminal-byte-by-name terminals lexeme)
+                                  (operator-lexeme-width lexeme)))
                             (set! terminal-index (+ (load terminal-index) 1)))))))
               (set! i (+ (load i) 1)))))
         0)))
@@ -175,34 +178,71 @@
           (set! i (+ (load i) 1)))))
     0))
 
-(defn operator-terminal-precedence
-  [(groups Code) (terminal Code) (group-index i64)] (-> i64)
-  (if (>= group-index (p/code-count groups)) 0
-    (let [group (p/code-nth groups group-index)]
-      (if (not (and (p/code-list? group) (>= (p/code-count group) 4)
-                    (grammar-symbol? (p/code-nth group 0) "left")
-                    (p/code-int? (p/code-nth group 1))))
-          (do (p/report group "operator group expects (left PRECEDENCE TERMINAL ...)") 0)
-          (let [(mut i) 2 (mut found) false]
-            (loop
-              (if (or (>= (load i) (p/code-count group)) (load found)) (break)
-                (do
-                  (if (p/free-identifier=? (p/code-nth group (load i)) terminal)
-                      (store! found true) 0)
-                  (set! i (+ (load i) 1)))))
-            (if (load found) (p/code-int (p/code-nth group 1))
-              (operator-terminal-precedence groups terminal (+ group-index 1))))))))
+(defn operator-lexeme-width [(lexeme Code)] (-> i64)
+  (cond (p/code-sym? lexeme) 1
+        (p/code-string? lexeme)
+          (let [text (p/code-str lexeme)]
+            (if (and (> (len text) 0) (<= (len text) 3)) (len text)
+              (do (p/report lexeme "operator string width must be in [1, 3]") 1)))
+        :else (do (p/report lexeme "operator must name a terminal or be a string") 1)))
 
-(defn compile-precedence-dispatch
-  [(terminals Code) (groups Code) (index i64) (byte Code)] (-> Code)
-  (if (>= index (p/code-count terminals)) `0
-    (let [terminal (terminal-entry-name (p/code-nth terminals index))
-          precedence (operator-terminal-precedence groups terminal 0)]
-      (if (= precedence 0)
-          (compile-precedence-dispatch terminals groups (+ index 1) byte)
-          `(if (= ~byte (cast u8 ~(terminal-entry-byte (p/code-nth terminals index))))
-               ~precedence
-               ~(compile-precedence-dispatch terminals groups (+ index 1) byte))))))
+(defn compile-operator-condition
+  [(lexeme Code) (terminals Code) (byte0 Code) (byte1 Code) (byte2 Code)] (-> Code)
+  (if (p/code-sym? lexeme)
+      `(= ~byte0 (cast u8 ~(terminal-byte-by-name terminals lexeme)))
+      (let [text (p/code-str lexeme) width (operator-lexeme-width lexeme)
+            first `(= ~byte0 (cast u8 ~(cast i64 (slice-get text 0))))]
+        (if (= width 1) first
+          (let [second `(and ~first (= ~byte1 (cast u8 ~(cast i64 (slice-get text 1)))))]
+            (if (= width 2) second
+              `(and ~second (= ~byte2 (cast u8 ~(cast i64 (slice-get text 2)))))))))))
+
+(defn compile-operator-group
+  [(groups Code) (terminals Code) (group-index i64) (lexeme-index i64)
+   (byte0 Code) (byte1 Code) (byte2 Code) (want-width bool)] (-> Code)
+  (if (>= group-index (p/code-count groups)) `0
+    (let [group (p/code-nth groups group-index)]
+      (if (>= lexeme-index (p/code-count group))
+          (compile-operator-group groups terminals (+ group-index 1) 2
+                                  byte0 byte1 byte2 want-width)
+          (let [lexeme (p/code-nth group lexeme-index)
+                value (if want-width (operator-lexeme-width lexeme)
+                        (p/code-int (p/code-nth group 1)))]
+            `(if ~(compile-operator-condition lexeme terminals byte0 byte1 byte2)
+                 ~value
+                 ~(compile-operator-group groups terminals group-index (+ lexeme-index 1)
+                                           byte0 byte1 byte2 want-width)))))))
+
+(defn compile-operator-info
+  [(groups Code) (terminals Code) (group-index i64) (lexeme-index i64)
+   (byte0 Code) (byte1 Code) (byte2 Code)] (-> Code)
+  (if (>= group-index (p/code-count groups)) `0
+    (let [group (p/code-nth groups group-index)]
+      (if (>= lexeme-index (p/code-count group))
+          (compile-operator-info groups terminals (+ group-index 1) 2 byte0 byte1 byte2)
+          (let [lexeme (p/code-nth group lexeme-index)
+                precedence (p/code-int (p/code-nth group 1))
+                width (operator-lexeme-width lexeme)
+                info (+ (* precedence 256) width)]
+            `(if ~(compile-operator-condition lexeme terminals byte0 byte1 byte2)
+                 ~info
+                 ~(compile-operator-info groups terminals group-index (+ lexeme-index 1)
+                                         byte0 byte1 byte2)))))))
+
+(defn compile-operator-lookahead
+  [(groups Code) (group-index i64) (lexeme-index i64) (byte0 Code)] (-> Code)
+  (if (>= group-index (p/code-count groups)) `1
+    (let [group (p/code-nth groups group-index)]
+      (if (>= lexeme-index (p/code-count group))
+          (compile-operator-lookahead groups (+ group-index 1) 2 byte0)
+          (let [lexeme (p/code-nth group lexeme-index)
+                width (operator-lexeme-width lexeme)]
+            (if (or (p/code-sym? lexeme) (= width 1))
+                (compile-operator-lookahead groups group-index (+ lexeme-index 1) byte0)
+                (let [text (p/code-str lexeme)]
+                  `(if (= ~byte0 (cast u8 ~(cast i64 (slice-get text 0)))) ~width
+                     ~(compile-operator-lookahead groups group-index
+                                                  (+ lexeme-index 1) byte0)))))))))
 
 (defn form-result-symbol [(entry Code)] (-> Code)
   (if (and (p/code-list? entry) (= (p/code-count entry) 3)
@@ -324,7 +364,7 @@
     (if (not (and (p/code-sym? name) (= (p/code-count sections) 6)
                   (= (p/code-count terminal-section) 3)
                   (= (p/code-count event-section) 2)
-                  (= (p/code-count operator-section) 3)
+                  (= (p/code-count operator-section) 6)
                   (= (p/code-count primary-section) 3)
                   (= (p/code-count postfix-section) 3)
                   (= (p/code-count production-section) 4)))
@@ -334,7 +374,10 @@
               terminals (p/code-nth terminal-section 2)
               events (p/code-nth event-section 1)
               precedence-function (p/code-nth operator-section 1)
-              operator-groups (p/code-nth operator-section 2)
+              width-function (p/code-nth operator-section 2)
+              info-function (p/code-nth operator-section 3)
+              lookahead-function (p/code-nth operator-section 4)
+              operator-groups (p/code-nth operator-section 5)
               primary-function (p/code-nth primary-section 1)
               primary-entries (p/code-nth primary-section 2)
               postfix-function (p/code-nth postfix-section 1)
@@ -345,6 +388,8 @@
               definitions (p/code-list-new)
               terminal-id (p/fresh-identifier "terminal-id")
               operator-byte-code (p/fresh-identifier "operator-byte")
+              operator-byte1-code (p/fresh-identifier "operator-byte1")
+              operator-byte2-code (p/fresh-identifier "operator-byte2")
               event-kind-code (p/fresh-identifier "event-kind")
               form-byte-code (p/fresh-identifier "form-byte")
               production-id (p/fresh-identifier "production-id")
@@ -393,8 +438,28 @@
             `(defn ~terminal-function :inline (Always) [(~terminal-id i64)] (-> u8)
                ~(compile-index-dispatch terminals 0 terminal-id true)))
           (p/code-list-push! definitions
-            `(defn ~precedence-function :inline (Always) [(~operator-byte-code u8)] (-> i64)
-               ~(compile-precedence-dispatch terminals operator-groups 0 operator-byte-code)))
+            `(defn ~precedence-function :inline (Always)
+               [(~operator-byte-code u8) (~operator-byte1-code u8) (~operator-byte2-code u8)]
+               (-> i64)
+               ~(compile-operator-group operator-groups terminals 0 2
+                                        operator-byte-code operator-byte1-code operator-byte2-code
+                                        false)))
+          (p/code-list-push! definitions
+            `(defn ~width-function :inline (Always)
+               [(~operator-byte-code u8) (~operator-byte1-code u8) (~operator-byte2-code u8)]
+               (-> i64)
+               ~(compile-operator-group operator-groups terminals 0 2
+                                        operator-byte-code operator-byte1-code operator-byte2-code
+                                        true)))
+          (p/code-list-push! definitions
+            `(defn ~info-function :inline (Always)
+               [(~operator-byte-code u8) (~operator-byte1-code u8) (~operator-byte2-code u8)]
+               (-> i64)
+               ~(compile-operator-info operator-groups terminals 0 2
+                                       operator-byte-code operator-byte1-code operator-byte2-code)))
+          (p/code-list-push! definitions
+            `(defn ~lookahead-function :inline (Always) [(~operator-byte-code u8)] (-> i64)
+               ~(compile-operator-lookahead operator-groups 0 2 operator-byte-code)))
           (p/code-list-push! definitions
             `(defn ~primary-function :inline (Always)
                [(~event-kind-code u8) (~form-byte-code u8)] (-> i64)

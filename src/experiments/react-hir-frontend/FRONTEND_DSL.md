@@ -8,7 +8,9 @@ The sections have these roles:
 
 - `terminals` gives source bytes stable symbolic names.
 - `events` names the packed scanner event kinds consumed by grammar dispatch.
-- `operators` groups terminal names by associativity and precedence.
+- `operators` groups named one-byte terminals or one-to-three-byte string
+  lexemes by associativity and precedence. It generates longest-match width,
+  precedence, combined-info, and lookahead queries.
 - The two `forms` sections select primary and postfix parser forms from an event
   kind or named terminal.
 - `productions` describes ordered grammar atoms. Supported atoms are `terminal`,

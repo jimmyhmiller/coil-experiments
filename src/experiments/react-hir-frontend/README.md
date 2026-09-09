@@ -29,6 +29,9 @@ The implemented pipeline is:
    layout whose low three bits hold the kind and whose upper 29 bits hold the
    file-relative position. Inputs at or above 512 MiB report overflow before
    writing and can use the unrestricted split layout.
+   A grammar-oriented packed variant additionally emits only lexically valid
+   single/double-quote boundary events, keeping string contents sparse while
+   enabling lazy literal parsing.
 8. `frontend_spec.coil` is the single readable language definition for the
    implemented parser slice. It declares named terminals, precedence groups,
    primary/postfix dispatch, and complete production shapes.
@@ -48,20 +51,25 @@ All bitmap-producing entry points accept an explicit valid byte count. SIMD
 tail fill bytes therefore cannot appear as source events. Tape writes report
 unconsumed bits when the destination capacity is exhausted.
 
-The first executable grammar slice accepts `const` declarations, identifiers,
-integer-shaped number spans, parenthesized and precedence-aware binary
-expressions, calls, conditional expressions, and self-closing JSX elements with
-expression-valued attributes. It parses this complete path today:
+The executable grammar now accepts `const`/`let`/`var` declarations; function
+declarations and parameters; blocks; return, if/else, while, and expression
+statements; identifiers, integer-shaped number spans, escaped quoted strings,
+unary expressions, assignment, arrays, objects and properties, member access,
+calls, conditionals, and generated longest-match compound binary operators;
+plus self-closing and nested JSX, JSX text, expression children, and string or
+expression-valued attributes. The focused broad regression combines all of
+these constructs.
 
 ```js
 const result = condition ? foo(a + b) : <Component value={x} />;
 ```
 
-The lexical state machine still treats an entire template literal as string
-content. Strings as grammar values, template `${...}` transitions, regexp
-literals, full numeric syntax, Unicode identifiers, general statements,
-non-self-closing JSX, TypeScript, scope construction, and the final React
-compiler HIR schema remain explicit future stages.
+The remaining explicit frontier includes template `${...}` transitions, regexp
+literals, complete numeric and operator syntax, automatic semicolon insertion,
+declaration lists/destructuring, for/do/switch/try/class/import/export/arrow and
+async/generator forms, optional/computed access, spreads, TypeScript, Unicode
+identifiers, scope construction, recovery, and the final React compiler HIR
+schema.
 
 ## Benchmark
 
@@ -82,7 +90,10 @@ packed layout.
 
 `benchmarks/run-react-hir-parse.sh` measures the real parser slice over a
 supported repeated program. On the local Apple M2 Max, the initial implementation
-measures about 0.72 GB/s for packed-tape-to-HIR and 0.40 GB/s for complete
-text-to-packed-tape-to-HIR. This is an honest materialized HIR benchmark, but it
-is a language subset and is not yet semantically comparable to Oxc's full
-JavaScript/TypeScript parser.
+measured about 0.72 GB/s for packed-tape-to-HIR and 0.40 GB/s for complete
+text-to-packed-tape-to-HIR. After the coverage expansion above, a five-run
+checkpoint measures 0.588 GB/s for parse-tape-to-HIR and 0.338 GB/s end to end.
+The additional cost includes compound-operator lookahead and the literal-aware
+parse tape; it is retained honestly rather than benchmarked through the former
+narrow path. This remains a language subset and is not yet semantically
+comparable to Oxc's full JavaScript/TypeScript parser.
