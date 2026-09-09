@@ -5,16 +5,19 @@ directly into the semantic structures needed by React HIR.
 
 The implemented pipeline is:
 
-1. `dsl.coil` compiles target-neutral S-expression byte classes to generic
-   `coil.simd` classifiers.
-2. `structural.coil` produces width-independent scalar bitmaps.
-3. `lexical.coil` uses SIMD to build a bitmap of state-changing bytes, visits
+1. `dsl.coil` provides the primitive byte-class expression compiler.
+2. `program.coil` compiles a complete named classification graph, including
+   shared predicates and a requested output projection, into one fused generic
+   `coil.simd` bitmap kernel.
+3. `structural.coil` specifies the JavaScript graph once and produces
+   width-independent scalar bitmaps from the generated kernel.
+4. `lexical.coil` uses SIMD to build a bitmap of state-changing bytes, visits
    only those sparse events, and assigns the ordinary spans between them in one
    operation. It carries quote, escape, line-comment, and block-comment state
    across chunks. A retained scalar implementation is the differential oracle;
    a one-byte overlap resolves comment openers at boundaries.
-4. `frontend.coil` shields structural events inside strings and comments.
-5. `tape.coil` stably compacts visible events into caller-owned position/kind
+5. `frontend.coil` shields structural events inside strings and comments.
+6. `tape.coil` stably compacts visible events into caller-owned position/kind
    arrays without imposing an allocation strategy.
 
 All bitmap-producing entry points accept an explicit valid byte count. SIMD
