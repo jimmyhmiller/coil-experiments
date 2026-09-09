@@ -19,12 +19,11 @@
 (defn bit-present? [(bits u64) (bit u64)] (-> bool)
   (!= (p/iand bits bit) (cast u64 0)))
 
-(defn event-kind [(chunk structural/StructuralChunk) (bit u64)] (-> u8)
-  (cond (bit-present? (.word-start-bits chunk) bit) (cast u8 EVENT-WORD)
-        (bit-present? (.jsx-marker-bits chunk) bit) (cast u8 EVENT-JSX-CANDIDATE)
-        (bit-present? (.delimiter-bits chunk) bit) (cast u8 EVENT-DELIMITER)
-        (bit-present? (.operator-bits chunk) bit) (cast u8 EVENT-OPERATOR)
-        :else (cast u8 EVENT-PUNCTUATION)))
+(defn event-kind-from-planes :inline (Always)
+  [(plane0 u64) (plane1 u64) (plane2 u64) (bit u64)] (-> u8)
+  (+ (if (bit-present? plane0 bit) (cast u8 1) (cast u8 0))
+     (+ (if (bit-present? plane1 bit) (cast u8 2) (cast u8 0))
+        (if (bit-present? plane2 bit) (cast u8 4) (cast u8 0)))))
 
 ;; Stable source-order bitmap compaction. Positions and kinds are parallel caller-
 ;; owned buffers, which keeps allocation policy out of the parsing kernel.
@@ -34,7 +33,18 @@
    (positions (ptr u32))
    (kinds (ptr u8))
    (capacity i64)] (-> TapeWrite)
-  (let [(mut bits) (p/ior (.word-start-bits chunk) (.punctuation-bits chunk))
+  (let [word (.word-start-bits chunk)
+        punctuation (.punctuation-bits chunk)
+        jsx (p/iand punctuation (.jsx-marker-bits chunk))
+        after-jsx (p/iand punctuation (p/inot jsx))
+        delimiter (p/iand after-jsx (.delimiter-bits chunk))
+        after-delimiter (p/iand after-jsx (p/inot delimiter))
+        operator (p/iand after-delimiter (.operator-bits chunk))
+        plain (p/iand after-delimiter (p/inot operator))
+        plane0 (p/ior word (p/ior jsx operator))
+        plane1 (p/ior operator plain)
+        plane2 (p/ior jsx delimiter)
+        (mut bits) (p/ior word punctuation)
         limit (cond (< capacity 0) 0 :else capacity)
         (mut count) 0]
     (loop
@@ -44,13 +54,48 @@
                 bit (p/ishl (cast u64 1) (cast u64 index))]
             (store! (p/index positions (load count))
                     (+ base-offset (cast u32 index)))
-            (store! (p/index kinds (load count)) (event-kind chunk bit))
+            (store! (p/index kinds (load count))
+                    (event-kind-from-planes plane0 plane1 plane2 bit))
             (set! count (+ (load count) 1))
             (store! bits (p/iand (load bits)
                                  (p/isub (load bits) (cast u64 1)))))))
     (TapeWrite :count (load count)
                :remaining (load bits)
                :complete (= (load bits) (cast u64 0)))))
+
+;; Fast path for callers that reserve one output slot per source byte. It has
+;; the same source order and tag encoding as the resumable writer, but capacity
+;; exhaustion is impossible and the hot loop returns only its write count.
+(defn write-structural-tape-full :inline (Always)
+  [(chunk structural/StructuralChunk)
+   (base-offset u32)
+   (positions (ptr u32))
+   (kinds (ptr u8))] (-> i64)
+  (let [word (.word-start-bits chunk)
+        punctuation (.punctuation-bits chunk)
+        jsx (p/iand punctuation (.jsx-marker-bits chunk))
+        after-jsx (p/iand punctuation (p/inot jsx))
+        delimiter (p/iand after-jsx (.delimiter-bits chunk))
+        after-delimiter (p/iand after-jsx (p/inot delimiter))
+        operator (p/iand after-delimiter (.operator-bits chunk))
+        plain (p/iand after-delimiter (p/inot operator))
+        plane0 (p/ior word (p/ior jsx operator))
+        plane1 (p/ior operator plain)
+        plane2 (p/ior jsx delimiter)
+        (mut bits) (p/ior word punctuation)
+        (mut count) 0]
+    (loop
+      (if (= (load bits) (cast u64 0)) (break)
+        (let [index (cast i64 (p/ctz (load bits)))
+              bit (p/ishl (cast u64 1) (cast u64 index))]
+          (store! (p/index positions (load count))
+                  (+ base-offset (cast u32 index)))
+          (store! (p/index kinds (load count))
+                  (event-kind-from-planes plane0 plane1 plane2 bit))
+          (set! count (+ (load count) 1))
+          (store! bits (p/iand (load bits)
+                               (p/isub (load bits) (cast u64 1)))))))
+    (load count)))
 
 ;; Width-specialized hot path. When the caller has room for the chunk,
 ;; positions and tags are compacted with SIMD rather than one ctz/store
