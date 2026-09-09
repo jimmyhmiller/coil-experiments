@@ -25,6 +25,8 @@ The implemented pipeline is:
    sparse bitmap iteration and compile-time tag bitplanes.
 7. `pipeline.coil` is the complete buffer API: it scans bulk 64-byte chunks,
    handles the safe partial tail, carries state, and materializes the tape.
+   It offers split position/kind arrays and a faster packed `u64` event layout
+   whose low three bits hold the kind and whose upper bits hold the position.
 
 All bitmap-producing entry points accept an explicit valid byte count. SIMD
 tail fill bytes therefore cannot appear as source events. Tape writes report
@@ -50,4 +52,5 @@ Without a path it uses the built-in 1 MiB synthetic source. File measurements
 run the full-width bulk prefix; a production call to `scan-source-to-tape64`
 also processes the at-most-63-byte tail. On the local Apple M2 Max, the
 235,245-byte shadcn TSX corpus reaches a five-run median near 1.12 GB/s for the
-fully materialized source-to-tape pipeline.
+fully materialized split source-to-tape pipeline and about 1.18 GB/s for the
+packed layout.
