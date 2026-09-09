@@ -1,0 +1,162 @@
+(module react-hir-frontend-benchmark)
+
+(import "coil.simd" :as v)
+(import "coil.primitive" :as p)
+(import "coil.slice" :use [slice-data slice-get])
+(import "experiments.react-hir-frontend.structural" :as structural)
+(import "experiments.react-hir-frontend.lexical" :as lexical)
+(import "experiments.react-hir-frontend.frontend" :as frontend)
+(import "experiments.react-hir-frontend.tape" :as tape)
+
+(extern malloc :cc c [i64] (-> (ptr u8)))
+(extern free :cc c [(ptr u8)] (-> i64))
+(extern clock_gettime :cc c [i32 (ptr Timespec)] (-> i32))
+(extern printf :cc c [(ptr i8) ...] (-> i32))
+
+(defstruct Timespec [(seconds i64) (nanos i64)])
+(defstruct Measurement [(elapsed i64) (checksum u64)])
+
+(defn structural-checksum [(chunk structural/StructuralChunk)] (-> u64)
+  (p/ixor (.word-bits chunk)
+    (p/ixor (.word-start-bits chunk)
+      (p/ixor (.whitespace-bits chunk)
+        (p/ixor (.punctuation-bits chunk)
+          (p/ixor (.operator-bits chunk)
+            (p/ixor (.operator-adjacent-bits chunk)
+              (p/ixor (.quote-bits chunk)
+                (p/ixor (.slash-bits chunk)
+                  (p/ixor (.backtick-bits chunk)
+                    (p/ixor (.delimiter-bits chunk) (.jsx-marker-bits chunk))))))))))))
+
+(defn lexical-checksum [(chunk lexical/LexicalChunk)] (-> u64)
+  (p/ixor (.code-bits chunk)
+    (p/ixor (.string-bits chunk)
+      (p/ixor (.comment-bits chunk)
+        (p/ixor (.newline-bits chunk) (cast u64 (.mode (.state chunk))))))))
+
+(defn monotonic-nanos [] (-> i64)
+  (let [time (p/alloc-stack Timespec)]
+    (clock_gettime 6 time)
+    (+ (* (load (field time seconds)) 1000000000)
+       (load (field time nanos)))))
+
+(defn fill-source! [(buffer (ptr u8)) (size i64)] (-> i64)
+  (let [pattern "const node = flag ? <X a={42}/> : 'text'; // comment\n"
+        (mut i) 0]
+    (loop
+      (if (>= (load i) size) (break)
+        (do
+          (store! (p/index buffer (load i))
+                  (slice-get pattern (% (load i) (len pattern))))
+          (set! i (+ (load i) 1)))))
+    size))
+
+(defn measure-structural [N] [(buffer (ptr u8)) (size i64) (rounds i64)] (-> Measurement)
+  (let [width (v/vlanes (v/vzero [u8 N]))
+        start (monotonic-nanos)
+        (mut checksum) (cast u64 0)
+        (mut round) 0]
+    (loop
+      (if (>= (load round) rounds) (break)
+        (let [(mut offset) 0]
+          (loop
+            (if (>= (load offset) size) (break)
+              (let [bytes (v/vloadu [u8 N] (p/index buffer (load offset)))
+                    chunk (structural/classify-structural bytes width false)]
+                (store! checksum (p/ixor (load checksum) (structural-checksum chunk)))
+                (set! offset (+ (load offset) width)))))
+          (set! round (+ (load round) 1)))))
+    (Measurement :elapsed (- (monotonic-nanos) start) :checksum (load checksum))))
+
+(defn measure-lexical [(buffer (ptr u8)) (size i64) (rounds i64)] (-> Measurement)
+  (let [start (monotonic-nanos)
+        (mut checksum) (cast u64 0)
+        (mut round) 0]
+    (loop
+      (if (>= (load round) rounds) (break)
+        (let [(mut offset) 0
+              (mut state) (lexical/lexical-initial-state)]
+          (loop
+            (if (>= (load offset) size) (break)
+              (let [bytes (v/vloadu [u8 (const 32)] (p/index buffer (load offset)))
+                    has-next (< (+ (load offset) 32) size)
+                    next (if has-next (load (p/index buffer (+ (load offset) 32))) (cast u8 0))
+                    chunk (lexical/classify-lexical bytes 32 next has-next (load state))]
+                (store! state (.state chunk))
+                (store! checksum (p/ixor (load checksum) (lexical-checksum chunk)))
+                (set! offset (+ (load offset) 32)))))
+          (set! round (+ (load round) 1)))))
+    (Measurement :elapsed (- (monotonic-nanos) start) :checksum (load checksum))))
+
+(defn measure-frontend [(buffer (ptr u8)) (size i64) (rounds i64)] (-> Measurement)
+  (let [start (monotonic-nanos)
+        (mut checksum) (cast u64 0)
+        (mut round) 0]
+    (loop
+      (if (>= (load round) rounds) (break)
+        (let [(mut offset) 0
+              (mut state) (frontend/frontend-initial-state)]
+          (loop
+            (if (>= (load offset) size) (break)
+              (let [bytes (v/vloadu [u8 (const 32)] (p/index buffer (load offset)))
+                    has-next (< (+ (load offset) 32) size)
+                    next (if has-next (load (p/index buffer (+ (load offset) 32))) (cast u8 0))
+                    chunk (frontend/classify-frontend bytes 32 next has-next (load state))]
+                (store! state (.state chunk))
+                (store! checksum
+                        (p/ixor (load checksum)
+                          (p/ixor (structural-checksum (.raw chunk))
+                            (p/ixor (structural-checksum (.code chunk))
+                                    (lexical-checksum (.lexical chunk))))))
+                (set! offset (+ (load offset) 32)))))
+          (set! round (+ (load round) 1)))))
+    (Measurement :elapsed (- (monotonic-nanos) start) :checksum (load checksum))))
+
+(defn measure-tape [(buffer (ptr u8)) (size i64) (rounds i64)] (-> Measurement)
+  (let [positions (p/alloc-stack (array u32 64))
+        kinds (p/alloc-stack (array u8 64))
+        start (monotonic-nanos)
+        (mut checksum) (cast u64 0)
+        (mut round) 0]
+    (loop
+      (if (>= (load round) rounds) (break)
+        (let [(mut offset) 0
+              (mut state) (frontend/frontend-initial-state)]
+          (loop
+            (if (>= (load offset) size) (break)
+              (let [bytes (v/vloadu [u8 (const 32)] (p/index buffer (load offset)))
+                    has-next (< (+ (load offset) 32) size)
+                    next (if has-next (load (p/index buffer (+ (load offset) 32))) (cast u8 0))
+                    chunk (frontend/classify-frontend bytes 32 next has-next (load state))
+                    written (tape/write-structural-tape
+                              (.code chunk) (cast u32 (load offset))
+                              (p/cast (ptr u32) positions) (p/cast (ptr u8) kinds) 64)]
+                (store! state (.state chunk))
+                (store! checksum (p/ixor (load checksum) (cast u64 (.count written))))
+                (set! offset (+ (load offset) 32)))))
+          (set! round (+ (load round) 1)))))
+    (Measurement :elapsed (- (monotonic-nanos) start) :checksum (load checksum))))
+
+(defn report [(name (ptr i8)) (bytes i64) (measurement Measurement)] (-> i64)
+  (let [gbps (/ (cast f64 bytes) (cast f64 (.elapsed measurement)))]
+    (printf c"%-12s %8.3f GB/s  %10lld ns  checksum=%llu\n"
+            name gbps (.elapsed measurement) (.checksum measurement)))
+  0)
+
+(defn main [] (-> i64)
+  (let [size (* 1024 1024)
+        ;; Odd rounds keep XOR checksums nonzero and observable.
+        rounds 255
+        bytes (* size rounds)
+        buffer (malloc size)]
+    (fill-source! buffer size)
+    (printf c"hot-cache kernel benchmark: %lld MiB per stage; fused stages use 32-byte chunks\n"
+            (/ bytes (* 1024 1024)))
+    (report c"structural16" bytes (measure-structural [(const 16)] buffer size rounds))
+    (report c"structural32" bytes (measure-structural [(const 32)] buffer size rounds))
+    (report c"structural64" bytes (measure-structural [(const 64)] buffer size rounds))
+    (report c"lexical32" bytes (measure-lexical buffer size rounds))
+    (report c"frontend32" bytes (measure-frontend buffer size rounds))
+    (report c"+ tape32" bytes (measure-tape buffer size rounds))
+    (free buffer)
+    0))
