@@ -10,11 +10,36 @@
 
 (extern malloc :cc c [i64] (-> (ptr u8)))
 (extern free :cc c [(ptr u8)] (-> i64))
+(extern fopen :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+(extern fseek :cc c [(ptr i8) i64 i32] (-> i32))
+(extern ftell :cc c [(ptr i8)] (-> i64))
+(extern rewind :cc c [(ptr i8)] (-> void))
+(extern fread :cc c [(ptr i8) i64 i64 (ptr i8)] (-> i64))
+(extern fclose :cc c [(ptr i8)] (-> i32))
+(extern memset :cc c [(ptr i8) i32 i64] (-> (ptr i8)))
 (extern clock_gettime :cc c [i32 (ptr Timespec)] (-> i32))
 (extern printf :cc c [(ptr i8) ...] (-> i32))
 
 (defstruct Timespec [(seconds i64) (nanos i64)])
 (defstruct Measurement [(elapsed i64) (checksum u64)])
+(defstruct Input [(data (ptr u8)) (size i64)])
+
+(defn empty-input [] (-> Input)
+  (Input :data (p/cast (ptr u8) 0) :size 0))
+
+(defn load-input [(path (ptr i8))] (-> Input)
+  (let [file (fopen path c"rb")]
+    (if (= (p/cast i64 file) 0)
+        (Input :data (p/cast (ptr u8) 0) :size 0)
+        (do
+          (fseek file 0 (cast i32 2))
+          (let [size (ftell file)
+                buffer (malloc (+ size 64))]
+            (rewind file)
+            (let [read (fread (p/cast (ptr i8) buffer) 1 size file)]
+              (fclose file)
+              (memset (p/cast (ptr i8) (p/index buffer read)) 0 64)
+              (Input :data buffer :size read)))))))
 
 (defn structural-checksum [(chunk structural/StructuralChunk)] (-> u64)
   (p/ixor (.word-bits chunk)
@@ -51,7 +76,7 @@
           (set! i (+ (load i) 1)))))
     size))
 
-(defn measure-structural [N] [(buffer (ptr u8)) (size i64) (rounds i64)] (-> Measurement)
+(defn measure-structural :inline (Never) [N] [(buffer (ptr u8)) (size i64) (rounds i64)] (-> Measurement)
   (let [width (v/vlanes (v/vzero [u8 N]))
         start (monotonic-nanos)
         (mut checksum) (cast u64 0)
@@ -68,7 +93,7 @@
           (set! round (+ (load round) 1)))))
     (Measurement :elapsed (- (monotonic-nanos) start) :checksum (load checksum))))
 
-(defn measure-lexical [(buffer (ptr u8)) (size i64) (rounds i64)] (-> Measurement)
+(defn measure-lexical :inline (Never) [(buffer (ptr u8)) (size i64) (rounds i64)] (-> Measurement)
   (let [start (monotonic-nanos)
         (mut checksum) (cast u64 0)
         (mut round) 0]
@@ -88,7 +113,7 @@
           (set! round (+ (load round) 1)))))
     (Measurement :elapsed (- (monotonic-nanos) start) :checksum (load checksum))))
 
-(defn measure-frontend [N] [(buffer (ptr u8)) (size i64) (rounds i64)] (-> Measurement)
+(defn measure-frontend :inline (Never) [N] [(buffer (ptr u8)) (size i64) (rounds i64)] (-> Measurement)
   (let [width (v/vlanes (v/vzero [u8 N]))
         start (monotonic-nanos)
         (mut checksum) (cast u64 0)
@@ -113,7 +138,7 @@
           (set! round (+ (load round) 1)))))
     (Measurement :elapsed (- (monotonic-nanos) start) :checksum (load checksum))))
 
-(defn measure-tape [N] [(buffer (ptr u8)) (size i64) (rounds i64)] (-> Measurement)
+(defn measure-tape :inline (Never) [N] [(buffer (ptr u8)) (size i64) (rounds i64)] (-> Measurement)
   (let [width (v/vlanes (v/vzero [u8 N]))
         positions (p/alloc-stack (array u32 64))
         kinds (p/alloc-stack (array u8 64))
@@ -139,7 +164,7 @@
           (set! round (+ (load round) 1)))))
     (Measurement :elapsed (- (monotonic-nanos) start) :checksum (load checksum))))
 
-(defn measure-tape-simd [N] [(buffer (ptr u8)) (size i64) (rounds i64)] (-> Measurement)
+(defn measure-tape-simd :inline (Never) [N] [(buffer (ptr u8)) (size i64) (rounds i64)] (-> Measurement)
   (let [width (v/vlanes (v/vzero [u8 N]))
         positions (p/alloc-stack (array u32 64))
         kinds (p/alloc-stack (array u8 64))
@@ -165,7 +190,7 @@
           (set! round (+ (load round) 1)))))
     (Measurement :elapsed (- (monotonic-nanos) start) :checksum (load checksum))))
 
-(defn measure-tape32-scalar [(buffer (ptr u8)) (size i64) (rounds i64)] (-> Measurement)
+(defn measure-tape32-scalar :inline (Never) [(buffer (ptr u8)) (size i64) (rounds i64)] (-> Measurement)
   (let [positions (p/alloc-stack (array u32 64))
         kinds (p/alloc-stack (array u8 64))
         start (monotonic-nanos)
@@ -196,14 +221,23 @@
             name gbps (.elapsed measurement) (.checksum measurement)))
   0)
 
-(defn main [] (-> i64)
-  (let [size (* 1024 1024)
-        ;; Odd rounds keep XOR checksums nonzero and observable.
-        rounds 255
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (let [file-input (if (> argc 1) (load-input (load (p/index argv 1)))
+                     (empty-input))
+        raw-size (if (> argc 1) (.size file-input) (* 1024 1024))
+        ;; Benchmark the common full-width bulk path. A production driver runs
+        ;; the at-most-63-byte tail once, outside this loop.
+        size (- raw-size (% raw-size 64))
+        ;; Keep the total near 255 MiB and odd so XOR checksums stay observable.
+        estimated (if (= size 0) 1 (/ (* (* 255 1024) 1024) size))
+        rounds (let [r (if (< estimated 1) 1 estimated)]
+                 (if (= (% r 2) 0) (+ r 1) r))
         bytes (* size rounds)
-        buffer (malloc size)]
-    (fill-source! buffer size)
-    (printf c"hot-cache kernel benchmark: %lld MiB per stage; fused stages use 32-byte chunks\n"
+        buffer (if (> argc 1) (.data file-input) (malloc (+ size 64)))]
+    (if (> argc 1) 0 (do (fill-source! buffer size)
+                          (memset (p/cast (ptr i8) (p/index buffer size)) 0 64)
+                          0))
+    (printf c"hot-cache kernel benchmark: %lld MiB per stage; widths are compile-time-specialized\n"
             (/ bytes (* 1024 1024)))
     (report c"structural16" bytes (measure-structural [(const 16)] buffer size rounds))
     (report c"structural32" bytes (measure-structural [(const 32)] buffer size rounds))
