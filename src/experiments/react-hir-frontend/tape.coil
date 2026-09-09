@@ -1,6 +1,7 @@
 (module experiments.react-hir-frontend.tape)
 
 (import "coil.primitive" :as p)
+(import "coil.simd" :as v)
 (import "experiments.react-hir-frontend.structural" :as structural)
 
 (const EVENT-WORD i64 1)
@@ -50,3 +51,54 @@
     (TapeWrite :count (load count)
                :remaining (load bits)
                :complete (= (load bits) (cast u64 0)))))
+
+;; Width-specialized hot path. When the caller has room for the chunk,
+;; positions and tags are compacted with SIMD rather than one ctz/store
+;; iteration per event. The scalar writer preserves the exact
+;; capacity/resumption contract for short output buffers.
+(defn write-structural-tape-simd :inline (Always) [N]
+  [(chunk structural/StructuralChunk)
+   (base-offset u32)
+   (positions (ptr u32))
+   (kinds (ptr u8))
+   (capacity i64)] (-> TapeWrite)
+  (let [width (v/vlanes (v/vzero [u8 N]))
+        bits (p/iand (p/ior (.word-start-bits chunk) (.punctuation-bits chunk))
+                     (v/bits-low width))
+        active (v/bits->mask [N] bits)
+        needed (v/mask-count active)]
+    (if (< capacity needed)
+        (write-structural-tape chunk base-offset positions kinds capacity)
+        (let [position-values
+                (v/vadd (v/viota [u32 N])
+                        (v/vsplat [u32 N] base-offset))
+              operator (v/bits->mask [N] (.operator-bits chunk))
+              delimiter (v/bits->mask [N] (.delimiter-bits chunk))
+              jsx (v/bits->mask [N] (.jsx-marker-bits chunk))
+              word (v/bits->mask [N] (.word-start-bits chunk))
+              tag0 (v/vsplat [u8 N] (cast u8 EVENT-PUNCTUATION))
+              tag1 (v/vselect operator
+                       (v/vsplat [u8 N] (cast u8 EVENT-OPERATOR)) tag0)
+              tag2 (v/vselect delimiter
+                       (v/vsplat [u8 N] (cast u8 EVENT-DELIMITER)) tag1)
+              tag3 (v/vselect jsx
+                       (v/vsplat [u8 N] (cast u8 EVENT-JSX-CANDIDATE)) tag2)
+              tags (v/vselect word
+                     (v/vsplat [u8 N] (cast u8 EVENT-WORD)) tag3)
+              position-count (v/vcompress-store positions active position-values)
+              kind-count (v/vcompress-store kinds active tags)]
+          (TapeWrite :count position-count
+                     :remaining (cast u64 0)
+                     :complete (= position-count kind-count))))))
+
+(defn write-structural-tape32 :inline (Always)
+  [(chunk structural/StructuralChunk) (base-offset u32)
+   (positions (ptr u32)) (kinds (ptr u8)) (capacity i64)] (-> TapeWrite)
+  (write-structural-tape-simd [(const 32)]
+    chunk base-offset positions kinds capacity))
+
+(defn write-structural-tape64 :inline (Always)
+  [(chunk structural/StructuralChunk) (base-offset u32)
+   (positions (ptr u32)) (kinds (ptr u8)) (capacity i64)] (-> TapeWrite)
+  (write-structural-tape-simd [(const 64)]
+    chunk base-offset positions kinds capacity))
