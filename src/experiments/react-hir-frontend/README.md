@@ -8,8 +8,11 @@ The implemented pipeline is:
 1. `dsl.coil` compiles target-neutral S-expression byte classes to generic
    `coil.simd` classifiers.
 2. `structural.coil` produces width-independent scalar bitmaps.
-3. `lexical.coil` carries quote, escape, line-comment, and block-comment state
-   across chunks. A one-byte overlap resolves comment openers at boundaries.
+3. `lexical.coil` uses SIMD to build a bitmap of state-changing bytes, visits
+   only those sparse events, and assigns the ordinary spans between them in one
+   operation. It carries quote, escape, line-comment, and block-comment state
+   across chunks. A retained scalar implementation is the differential oracle;
+   a one-byte overlap resolves comment openers at boundaries.
 4. `frontend.coil` shields structural events inside strings and comments.
 5. `tape.coil` stably compacts visible events into caller-owned position/kind
    arrays without imposing an allocation strategy.
