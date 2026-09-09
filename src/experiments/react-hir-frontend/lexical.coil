@@ -1,0 +1,127 @@
+(module experiments.react-hir-frontend.lexical)
+
+(import "coil.simd" :as v)
+(import "coil.primitive" :as p)
+
+;; Modes are scalar because transitions are rare and stateful. Classification
+;; remains bitmap-oriented so this can later be replaced by prefix/CLMUL kernels
+;; without changing the downstream interface.
+(const MODE-CODE i64 0)
+(const MODE-SINGLE-QUOTE i64 1)
+(const MODE-DOUBLE-QUOTE i64 2)
+(const MODE-TEMPLATE i64 3)
+(const MODE-LINE-COMMENT i64 4)
+(const MODE-BLOCK-COMMENT i64 5)
+
+(defstruct LexicalState
+  [(mode i64)
+   ;; Meaningful in a quoted/template mode. It carries an odd trailing '\\'.
+   (escaped bool)
+   ;; Meaningful in block comments and permits `*/` across a chunk boundary.
+   (block-star bool)])
+
+(defstruct LexicalChunk
+  [(code-bits u64)
+   (string-bits u64)
+   (comment-bits u64)
+   (newline-bits u64)
+   (state LexicalState)])
+
+(defn lexical-initial-state [] (-> LexicalState)
+  (LexicalState :mode MODE-CODE :escaped false :block-star false))
+
+(defn set-bit [(bits u64) (index i64)] (-> u64)
+  (p/ior bits (p/ishl (cast u64 1) (cast u64 index))))
+
+;; `next-byte` is a one-byte overlap. It is consulted only when the last valid
+;; byte is `/`, allowing comment openers to be recognized across chunk boundaries
+;; without retroactively patching an already-emitted bitmap.
+(defn classify-lexical [N]
+  [(bytes (vec u8 N))
+   (valid-count i64)
+   (next-byte u8)
+   (has-next bool)
+   (initial LexicalState)] (-> LexicalChunk)
+  (let [width (v/vlanes bytes)
+        count (cond (< valid-count 0) 0
+                    (> valid-count width) width
+                    (> valid-count 64) 64
+                    :else valid-count)
+        (mut mode) (.mode initial)
+        (mut escaped) (.escaped initial)
+        (mut block-star) (.block-star initial)
+        (mut code) (cast u64 0)
+        (mut strings) (cast u64 0)
+        (mut comments) (cast u64 0)
+        (mut newlines) (cast u64 0)
+        (mut i) 0]
+    (loop
+      (if (>= (load i) count) (break)
+        (let [index (load i)
+              byte (v/vextract bytes index)
+              next (if (< (+ index 1) count)
+                       (v/vextract bytes (+ index 1))
+                       next-byte)
+              next-valid (or (< (+ index 1) count) has-next)]
+          (if (= byte (cast u8 10))
+              (store! newlines (set-bit (load newlines) index))
+              0)
+          (cond
+            (= (load mode) MODE-CODE)
+              (cond
+                (= byte (cast u8 39))
+                  (do (store! strings (set-bit (load strings) index))
+                      (store! mode MODE-SINGLE-QUOTE)
+                      (store! escaped false))
+                (= byte (cast u8 34))
+                  (do (store! strings (set-bit (load strings) index))
+                      (store! mode MODE-DOUBLE-QUOTE)
+                      (store! escaped false))
+                (= byte (cast u8 96))
+                  (do (store! strings (set-bit (load strings) index))
+                      (store! mode MODE-TEMPLATE)
+                      (store! escaped false))
+                (and (= byte (cast u8 47)) next-valid (= next (cast u8 47)))
+                  (do (store! comments (set-bit (load comments) index))
+                      (store! mode MODE-LINE-COMMENT))
+                (and (= byte (cast u8 47)) next-valid (= next (cast u8 42)))
+                  (do (store! comments (set-bit (load comments) index))
+                      (store! mode MODE-BLOCK-COMMENT)
+                      (store! block-star false))
+                :else (store! code (set-bit (load code) index)))
+            (= (load mode) MODE-LINE-COMMENT)
+              (if (or (= byte (cast u8 10)) (= byte (cast u8 13)))
+                  (do (store! code (set-bit (load code) index))
+                      (store! mode MODE-CODE))
+                  (store! comments (set-bit (load comments) index)))
+            (= (load mode) MODE-BLOCK-COMMENT)
+              (do
+                (store! comments (set-bit (load comments) index))
+                (if (and (load block-star) (= byte (cast u8 47)))
+                    (do (store! mode MODE-CODE) (store! block-star false))
+                    (store! block-star (= byte (cast u8 42)))))
+            :else
+              (do
+                (store! strings (set-bit (load strings) index))
+                (if (load escaped)
+                    (store! escaped false)
+                    (cond (= byte (cast u8 92)) (store! escaped true)
+                          (and (= (load mode) MODE-SINGLE-QUOTE)
+                               (= byte (cast u8 39)))
+                            (store! mode MODE-CODE)
+                          (and (= (load mode) MODE-DOUBLE-QUOTE)
+                               (= byte (cast u8 34)))
+                            (store! mode MODE-CODE)
+                          (and (= (load mode) MODE-TEMPLATE)
+                               (= byte (cast u8 96)))
+                            (store! mode MODE-CODE)
+                          :else 0))))
+          (set! i (+ (load i) 1)))))
+    (LexicalChunk
+      :code-bits (load code)
+      :string-bits (load strings)
+      :comment-bits (load comments)
+      :newline-bits (load newlines)
+      :state (LexicalState :mode (load mode)
+                           :escaped (load escaped)
+                           :block-star (load block-star)))))
