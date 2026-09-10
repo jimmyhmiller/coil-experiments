@@ -46,6 +46,16 @@ The implemented pipeline is:
    directly into caller-owned structure-of-arrays storage, with linked edge
    records for variable-length child lists. No token array, CST, or JavaScript
    AST is constructed.
+11. `ir.coil` defines the target semantic IR independently of the temporary
+    syntax arena: regions, basic blocks, block parameters, operations, SSA
+    results and operands, explicit terminators/successors, nested-region
+    ownership, scopes, bindings, references, captures, and source spans. Its
+    verifier checks structural ranges, terminator placement, successor arity,
+    same-block definition order, and cross-block dominance using a scalable
+    caller-owned bitset. Its capacity-safe native printer emits deterministic
+    textual IR. `ir_test.coil` exercises a real diamond CFG whose branch-local
+    values merge through a join block parameter, plus negative arity and
+    dominance cases.
 
 All bitmap-producing entry points accept an explicit valid byte count. SIMD
 tail fill bytes therefore cannot appear as source events. Tape writes report
@@ -70,6 +80,17 @@ declaration lists/destructuring, for/do/switch/try/class/import/export/arrow and
 async/generator forms, optional/computed access, spreads, TypeScript, Unicode
 identifiers, scope construction, recovery, and the final React compiler HIR
 schema.
+
+The SSA/CFG schema and verifier exist, but `parser.coil` has not yet been
+switched from its syntax-node `HirArena` to direct construction of that IR.
+Until that migration, the parser benchmark measures the syntax arena rather
+than text-to-verified-SSA throughput.
+
+The SIMD frontend requires the combined compiler at Coil branch
+`simd-foundation` commit `d51cfcc` or later. That revision includes both generic
+SIMD support and typed narrow-integer constant lowering. Older artifacts emit
+invalid LLVM call signatures for these constants; their ARM backend can instead
+produce ABI-corrupt behavior that appeared as overwritten fixture storage.
 
 ## Benchmark
 
