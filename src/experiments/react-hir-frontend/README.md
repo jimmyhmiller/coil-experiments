@@ -111,7 +111,8 @@ All bitmap-producing entry points accept an explicit valid byte count. SIMD
 tail fill bytes therefore cannot appear as source events. Tape writes report
 unconsumed bits when the destination capacity is exhausted.
 
-The executable grammar now accepts `const`/`let`/`var` declarations; function
+The executable grammar now accepts initialized and comma-separated
+`const`/`let`/`var` declarations, plus uninitialized `let`/`var`; function
 declarations and parameters; blocks; valued and empty return, empty, debugger,
 if/else, while, and expression statements; identifiers, boolean and null
 literals, `this`, integer-shaped number spans, escaped quoted strings,
