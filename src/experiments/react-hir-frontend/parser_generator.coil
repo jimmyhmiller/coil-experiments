@@ -4,6 +4,8 @@
 (import "coil.slice" :use [slice-get])
 (import "experiments.react-hir-frontend.frontend-spec" :as syntax)
 (import "experiments.react-hir-frontend.ir" :as ir)
+(import "experiments.react-hir-frontend.tape" :as tape)
+(import "experiments.react-hir-frontend.ir-builder" :as builder)
 
 (defn generator-symbol? [(value Code) (name (slice u8))] (-> bool)
   (and (p/code-sym? value) (= (p/code-sym value) name)))
@@ -89,6 +91,86 @@
                (~emit-list-code ~state ~opcode start
                  (+ end-position (cast u32 1)) mark))))))))
 
+(defn compile-word-value [(backend Code) (production Code)] (-> Code)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 5)
+                (generator-form? production "word-value")))
+      (generator-fail production "invalid word-value production")
+    (let [state-type (backend-value backend "state-type")
+          result-type (backend-value backend "expression-result-type")
+          function-name (backend-value backend "parse-word")
+          event-kind-code (backend-value backend "event-kind")
+          current-event-code (backend-value backend "current-event")
+          current-position-code (backend-value backend "current-position")
+          word-end-code (backend-value backend "word-end")
+          source-byte-code (backend-value backend "source-byte")
+          advance-code (backend-value backend "advance")
+          fail-code (backend-value backend "fail")
+          emit-code (backend-value backend "emit-value-op")
+          find-binding-code (backend-value backend "find-binding")
+          check-build-code (backend-value backend "check-build")
+          ensure-capture-code (backend-value backend "ensure-capture")
+          unexpected-error (backend-value backend "unexpected-error")
+          word-event (field-value production "event")
+          number-op (field-value production "number-op")
+          identifier-op (field-value production "identifier-op")
+          state (p/fresh-identifier "state")]
+      `(defn ~function-name [(~state (ptr ~state-type))] (-> ~result-type)
+         (if (or (>= (.event-index ~state) (.event-count ~state))
+                 (!= (~event-kind-code (~current-event-code ~state))
+                     (cast u8 ~word-event)))
+             (~fail-code ~state ~unexpected-error)
+           (let [start (~current-position-code ~state)
+                 end (~word-end-code ~state start)
+                 first (~source-byte-code ~state start)]
+             (~advance-code ~state)
+             (if (and (>= first (cast u8 48)) (<= first (cast u8 57)))
+                 (~emit-code ~state ~number-op start end)
+               (let [result (~emit-code ~state ~identifier-op start end)
+                     binding (~find-binding-code ~state start end)]
+                 (if (!= binding (cast u32 ir/INVALID-ID))
+                     (let [reference (builder/add-reference! (.builder ~state)
+                                                              binding start end)]
+                       (~check-build-code ~state reference)
+                       (~ensure-capture-code ~state binding)) 0)
+                 result))))))))
+
+(defn compile-quoted-value [(backend Code) (production Code)] (-> Code)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 3)
+                (generator-form? production "quoted-value")))
+      (generator-fail production "invalid quoted-value production")
+    (let [state-type (backend-value backend "state-type")
+          result-type (backend-value backend "expression-result-type")
+          function-name (backend-value backend "parse-string")
+          current-position-code (backend-value backend "current-position")
+          current-byte-code (backend-value backend "current-byte")
+          advance-code (backend-value backend "advance")
+          fail-code (backend-value backend "fail")
+          emit-code (backend-value backend "emit-value-op")
+          expected-error (backend-value backend "expected-error")
+          opcode (field-value production "emit-op")
+          state (p/fresh-identifier "state")]
+      `(defn ~function-name [(~state (ptr ~state-type))] (-> ~result-type)
+         (let [start (~current-position-code ~state)
+               quote (~current-byte-code ~state)
+               (mut at) (+ (cast i64 start) 1)
+               (mut escaped) false (mut closed) false]
+           (loop
+             (if (or (>= (load at) (.source-size ~state)) (load closed)) (break)
+               (let [byte (load (p/index (.source ~state) (load at)))]
+                 (cond (load escaped) (store! escaped false)
+                       (= byte (cast u8 92)) (store! escaped true)
+                       (= byte quote) (store! closed true)
+                       :else 0)
+                 (set! at (+ (load at) 1)))))
+           (if (not (load closed)) (~fail-code ~state ~expected-error)
+             (do
+               (loop
+                 (if (or (>= (.event-index ~state) (.event-count ~state))
+                         (>= (cast i64 (~current-position-code ~state)) (load at)))
+                     (break)
+                   (~advance-code ~state)))
+               (~emit-code ~state ~opcode start (cast u32 (load at))))))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Semantic parser DSL specification
 ;; ---------------------------------------------------------------------------
@@ -97,7 +179,13 @@
 ;; specification share a module until compile-time library linkage is added.
 (defn define-frontend-parser [(backend Code)] (-> Code)
   (let [productions
-          `[(separated-value array-expression
+          `[(word-value identifier-or-number
+        (event tape/EVENT-WORD)
+        (number-op ir/OP-JS-NUMBER)
+        (identifier-op ir/OP-JS-IDENTIFIER))
+      (quoted-value string-expression
+        (emit-op ir/OP-JS-STRING))
+      (separated-value array-expression
         (open (syntax/array-production-terminal 0))
         (separator (syntax/array-production-terminal 1))
         (close (syntax/array-production-terminal 2))
@@ -107,13 +195,17 @@
     (loop
       (if (>= (load i) (p/code-count productions)) (break)
         (let [production (p/code-nth productions (load i))]
-          (if (generator-form? production "separated-value")
-              (do
-                (p/code-list-push! definitions
-                  (compile-separated-value backend production))
-                0)
-            (do
-              (generator-fail production "unknown generated production kind")
-              0))
+          (cond
+            (generator-form? production "word-value")
+              (do (p/code-list-push! definitions
+                    (compile-word-value backend production)) 0)
+            (generator-form? production "quoted-value")
+              (do (p/code-list-push! definitions
+                    (compile-quoted-value backend production)) 0)
+            (generator-form? production "separated-value")
+              (do (p/code-list-push! definitions
+                    (compile-separated-value backend production)) 0)
+            :else
+              (do (generator-fail production "unknown generated production kind") 0))
           (set! i (+ (load i) 1)))))
     (let [forms (p/code-list-done definitions)] `(do ~@forms))))
