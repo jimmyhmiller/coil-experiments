@@ -62,14 +62,16 @@ runtime interpreter or production tables.
 No handwritten `parse-*` definition remains in `direct_parser.coil`.
 `benchmarks/check-generated-direct-parser.sh` enforces both halves of that
 contract: the runtime source must contain none, while macro expansion must
-contain all 18 expected generated definitions.
+contain all 35 expected generated definitions.
 
 Language-coverage changes additionally run through `react-hir-check`, which
 executes the generated parser and the complete IR verifier for one source file.
+`benchmarks/check-react-hir-syntax-fixtures.sh` runs the permanent focused
+syntax fixtures through that full path.
 `run-typescript-coverage.sh` uses Oxc only as a validity filter for the external
 TypeScript/TSX corpus, then reports whole-file and byte-weighted Coil coverage.
-The 80% target requires both measurements to pass so a large number of tiny
-fixtures or a few generated large files cannot distort the result.
+Those corpus measurements are tracked separately from syntax-feature coverage;
+opaque acceptance does not count as structured language support.
 
 `benchmarks/check-typescript-generated-core.sh` permanently covers the first
 TypeScript slice: directives, every import-clause shape, type-only imports,

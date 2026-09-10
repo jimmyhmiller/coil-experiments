@@ -26,8 +26,8 @@ for production in \
   type-assertion \
   prefix-keyword template
 do
-  if ! awk '/^\(defn$/ { getline; sub(/^[[:space:]]*/, ""); print }' \
-      "$scratch_file" | rg -qx "parse-$production!"; then
+  if ! rg -Uq "\(defn\\*?[[:space:]]+parse-$production!([[:space:]]|$)" \
+      "$scratch_file"; then
     printf '%s\n' "generated definition missing: parse-$production!" >&2
     exit 1
   fi
