@@ -4,6 +4,8 @@
 (import "coil.slice" :use [slice-data])
 (import "experiments.react-hir-frontend.ir" :as ir)
 (import "experiments.react-hir-frontend.ir-builder" :as b)
+(import "experiments.react-hir-frontend.ir-storage" :as storage)
+(import "experiments.react-hir-frontend.ir-text-parser" :as ir-text)
 
 (defn byte-eq? [(actual (ptr u8)) (expected (slice u8)) (count i64)] (-> bool)
   (if (!= count (len expected)) false
@@ -16,6 +18,16 @@
                 (store! same false) 0)
             (set! i (+ (load i) 1)))))
       (load same))))
+
+(defn ptr-byte-eq? [(left (ptr u8)) (right (ptr u8)) (count i64)] (-> bool)
+  (let [(mut i) 0 (mut same) true]
+    (loop
+      (if (or (>= (load i) count) (not (load same))) (break)
+        (do
+          (if (!= (load (p/index left (load i))) (load (p/index right (load i))))
+              (store! same false) 0)
+          (set! i (+ (load i) 1)))))
+    (load same)))
 
 (defn test-interleaved-nested-construction [] (-> i64)
   (let [source "js.functionjs.inner"
@@ -77,7 +89,14 @@
         builder (p/alloc-stack b/IrBuilder)
         dom (p/alloc-stack (array u64 4))
         verify-scratch (p/alloc-stack ir/VerifyScratch)
-        output (p/alloc-stack (array u8 512))]
+        output (p/alloc-stack (array u8 512))
+        roundtrip-memory (p/alloc-stack (array u64 2048))
+        roundtrip-arena (p/alloc-stack ir/IrArena)
+        roundtrip-scratch (p/alloc-stack b/BuilderScratch)
+        roundtrip-builder (p/alloc-stack b/IrBuilder)
+        roundtrip-dom (p/alloc-stack (array u64 4))
+        roundtrip-verify (p/alloc-stack ir/VerifyScratch)
+        roundtrip-output (p/alloc-stack (array u8 512))]
     (store! arena (ir/IrArena
       :source-size (cast u32 19)
       :region-parent-ops (p/cast (ptr u32) region-parent)
@@ -185,9 +204,37 @@
     (let [verified (ir/verify-ir arena verify-scratch)]
       (assert-eq (.error verified) ir/VERIFY-OK))
     (let [printed (ir/print-ir! arena (slice-data source) (p/cast (ptr u8) output) 512)
-          expected "region 0 {\n^0():\n  %0 = js.function loc(0:19)\n  js.return %0 loc(19:19)\n}\nregion 1 {\n^1():\n  js.return loc(11:19)\n}\n"]
+          expected "source_size 19\nregion 0 parent(none) {\n^0():\n  %0 = js.function regions(1) loc(0:19)\n  js.return %0 loc(19:19)\n}\nregion 1 parent(0) {\n^1():\n  js.return loc(11:19)\n}\nscope 0 parent(none) loc(0:19)\nscope 1 parent(0) loc(11:19)\nbinding 0 scope(0) name(0:11)\nreference 0 binding(0) loc(11:19)\ncapture 0 scope(1) binding(0)\n"]
       (assert-eq (.error printed) ir/PRINT-OK)
-      (assert (byte-eq? (p/cast (ptr u8) output) expected (.count printed))))
+      (assert (byte-eq? (p/cast (ptr u8) output) expected (.count printed)))
+      (let [caps (b/BuilderCapacities
+                   :regions (cast u32 4) :region-block-refs (cast u32 8)
+                   :blocks (cast u32 8) :block-op-refs (cast u32 16)
+                   :ops (cast u32 16) :op-region-refs (cast u32 8)
+                   :values (cast u32 16) :operands (cast u32 16)
+                   :successors (cast u32 8) :successor-args (cast u32 8)
+                   :scopes (cast u32 8) :bindings (cast u32 8)
+                   :references (cast u32 8) :captures (cast u32 8))
+            initialized (storage/initialize! roundtrip-arena roundtrip-scratch
+                          roundtrip-builder (p/cast (ptr u8) roundtrip-memory) 16384
+                          (cast u32 0) caps)]
+        (assert-eq (.error initialized) storage/STORAGE-OK)
+        (let [parsed (ir-text/parse-ir-text! (p/cast (ptr u8) output)
+                                             (.count printed) roundtrip-builder)]
+          (assert-eq (.error parsed) ir-text/IR-TEXT-OK))
+        (store! roundtrip-verify
+          (ir/VerifyScratch :dominators (p/cast (ptr u64) roundtrip-dom)
+                            :dominator-word-capacity 4))
+        (let [verified-roundtrip (ir/verify-ir roundtrip-arena roundtrip-verify)]
+          (assert-eq (.error verified-roundtrip) ir/VERIFY-OK))
+        (let [printed-roundtrip (ir/print-ir! roundtrip-arena
+                                  (p/cast (ptr u8) output)
+                                  (p/cast (ptr u8) roundtrip-output) 512)]
+          (assert-eq (.error printed-roundtrip) ir/PRINT-OK)
+          (assert-eq (.count printed-roundtrip) (.count printed))
+          (assert (ptr-byte-eq? (p/cast (ptr u8) output)
+                                (p/cast (ptr u8) roundtrip-output)
+                                (.count printed))))))
     ;; Finalization is idempotent, but mutation after it is rejected.
     (assert-eq (b/finalize-membership! builder) b/BUILD-OK)
     (let [late-region (b/add-region! builder (cast u32 ir/INVALID-ID))]

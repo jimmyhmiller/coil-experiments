@@ -80,6 +80,13 @@ The implemented pipeline is:
     stability for operation kinds, compact attributes, operands, SSA counts,
     bindings, and references while allowing source locations to change under
     formatting.
+15. `ir_text_parser.coil` is the inverse of the native IR printer. It reads the
+    canonical text directly into `IrBuilder`, predeclaring blocks per region so
+    forward CFG edges need no syntax tree. The textual form now retains source
+    size, parent and nested-region ownership, compact operation attributes,
+    scopes, bindings, references, and captures. Byte-identical print/parse/print
+    tests cover both a CFG with a join block parameter and nested regions with
+    lexical capture metadata.
 
 All bitmap-producing entry points accept an explicit valid byte count. SIMD
 tail fill bytes therefore cannot appear as source events. Tape writes report
@@ -110,9 +117,9 @@ parser slice exist. The broader legacy `parser.coil` coverage has not yet been
 migrated, and the parser benchmark still measures its syntax arena rather than
 text-to-verified-SSA throughput. The next coverage work is direct calls,
 unary/assignment operations, loops, functions/captures, collections, and JSX.
-The JavaScript semantic round-trip gate has begun on the linear subset; the
-remaining proof work includes canonical textual-IR parsing and structural
-differential fixtures against `jsir-rs` on their shared subset.
+The JavaScript semantic round-trip gate has begun on the linear subset, and the
+canonical textual-IR round-trip gate now passes for CFG and nested semantic
+fixtures. Structural differential fixtures against `jsir-rs` remain open.
 
 The SIMD frontend requires the combined compiler at Coil branch
 `simd-foundation` commit `d51cfcc` or later. That revision includes both generic
