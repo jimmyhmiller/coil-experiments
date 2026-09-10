@@ -18,3 +18,10 @@ const increment = (value: number): number => value + 1
 const destructured = ({ left, right: local = 1, ...rest }, [first, ...tail]) => {
   return left + local
 }
+
+const View = ({ value, ...props }) => (
+  <section {...props} data-value={value}>
+    <span>{value}</span>
+    <br />
+  </section>
+)
