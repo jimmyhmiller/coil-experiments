@@ -803,6 +803,10 @@
            (let [first-event (~current-event-code ~state)
                  first-byte (~source-byte-code ~state (~event-position-code first-event))
                  (mut index) (.event-index ~state) (mut candidate) false]
+             (if (not (or (= (~event-kind-code first-event) (cast u8 ~word-event))
+                          (= first-byte ~open)))
+                 false
+               (do
              (if (= (~event-kind-code first-event) (cast u8 ~word-event))
                  (set! index (+ (load index) 1))
                (if (= first-byte ~open)
@@ -838,7 +842,7 @@
                                    (set! index (+ (load index) 1))))))
                            (load candidate))
                        false)))
-               false)))))))
+               false)))))))))
 
 (defn compile-binding-pattern [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 14)
@@ -872,6 +876,10 @@
       `(defn ~function-name
          [(~state (ptr ~state-type)) (allow-default bool) (pattern-stop-a u8) (pattern-stop-b u8)]
          (-> i64)
+         (if (and (= (~current-byte-code ~state) ~dot)
+                  (= (~adjacent-byte-code ~state 1) ~dot)
+                  (= (~adjacent-byte-code ~state 2) ~dot))
+             (do (~advance-count-code ~state 3) 0) 0)
          (let [start (~current-position-code ~state) end (~word-end-code ~state start)]
            (if (!= start end)
                (do
@@ -1069,6 +1077,7 @@
           advance-count-code (backend-value backend "advance-count")
           consume-code (backend-value backend "consume-byte")
           fail-code (backend-value backend "fail")
+          spans-equal-code (backend-value backend "spans-equal")
           push-value-code (backend-value backend "push-scratch-value")
           emit-list-code (backend-value backend "emit-scratch-list-op")
           ok-error (backend-value backend "ok-error")
@@ -1086,22 +1095,26 @@
       `(defn ~function-name [(~state (ptr ~state-type))] (-> ~result-type)
          (let [scratch (.scratch ~state) mark (.value-count scratch)
                start (~current-position-code ~state) _open (~advance-code ~state)
-               (mut fragment) false]
+               (mut fragment) false (mut tag-start) (cast u32 0)
+               (mut tag-end) (cast u32 0)]
            (if (= (~current-byte-code ~state) ~close)
                (store! fragment true)
              (let [name-start (~current-position-code ~state)
                    name-end (~word-end-code ~state name-start)]
                (if (= name-start name-end) (do (~fail-code ~state ~expected-error) 0)
                  (do
+                   (store! tag-start name-start)
+                   (store! tag-end name-end)
                    (~advance-code ~state)
                    (loop
                      (if (!= (~current-byte-code ~state) ~dot) (break)
                        (do
                          (~advance-code ~state)
-                         (let [part-start (~current-position-code ~state)]
-                           (if (= part-start (~word-end-code ~state part-start))
+                         (let [part-start (~current-position-code ~state)
+                               part-end (~word-end-code ~state part-start)]
+                           (if (= part-start part-end)
                                (do (~fail-code ~state ~expected-error) (break) 0)
-                             (~advance-code ~state))))))))))
+                             (do (store! tag-end part-end) (~advance-code ~state) 0))))))))))
            (loop
              (if (or (!= (.error ~state) ~ok-error)
                      (= (~current-byte-code ~state) ~close)
@@ -1173,9 +1186,29 @@
                          (~advance-code ~state))))))
                (~advance-count-code ~state 2)
                (if (not (load fragment))
-                   (loop
-                     (if (= (~current-byte-code ~state) ~close) (break)
-                       (~advance-code ~state))) 0)
+                   (let [closing-start (~current-position-code ~state)
+                         (mut closing-end) (~word-end-code ~state closing-start)]
+                     (if (= closing-start (load closing-end))
+                         (do (~fail-code ~state ~expected-error) 0)
+                       (do
+                         (~advance-code ~state)
+                         (loop
+                           (if (!= (~current-byte-code ~state) ~dot) (break)
+                             (do
+                               (~advance-code ~state)
+                               (let [part-start (~current-position-code ~state)
+                                     part-end (~word-end-code ~state part-start)]
+                                 (if (= part-start part-end)
+                                     (do (~fail-code ~state ~expected-error) (break) 0)
+                                   (do
+                                     (store! closing-end part-end)
+                                     (~advance-code ~state)
+                                     0))))))
+                         (if (not (~spans-equal-code ~state (load tag-start) (load tag-end)
+                                    closing-start (load closing-end)))
+                             (do (~fail-code ~state ~expected-error) 0) 0)))
+                     0)
+                 0)
                (let [end (~current-position-code ~state)]
                  (~consume-code ~state ~close)
                  (~emit-list-code ~state ~opcode start (+ end (cast u32 1)) mark)))))))))
@@ -1284,7 +1317,7 @@
            (load ~value-id))))))
 
 (defn compile-named-export [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 10)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 11)
                 (generator-form? production "named-export")))
       (generator-fail production "invalid named-export production")
     (let [state-type (backend-value backend "state-type")
@@ -1304,14 +1337,18 @@
           expected-error (backend-value backend "expected-error")
           open (field-value production "open") close (field-value production "close")
           comma (field-value production "separator") as-keyword (field-value production "as-keyword")
-          from-keyword (field-value production "from-keyword") opcode (field-value production "emit-op")
+          from-keyword (field-value production "from-keyword")
+          type-keyword (field-value production "type-keyword") opcode (field-value production "emit-op")
           state (p/fresh-identifier "state")]
       `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
          (let [start (~current-position-code ~state) _export (~advance-code ~state)]
            (~consume-code ~state ~open)
            (loop
              (if (= (~current-byte-code ~state) ~close) (break)
-               (let [name-start (~current-position-code ~state)
+               (do
+                 (if (~current-keyword-code ~state ~type-keyword)
+                     (do (~advance-code ~state) 0) 0)
+                 (let [name-start (~current-position-code ~state)
                      name-end (~word-end-code ~state name-start)]
                  (if (= name-start name-end)
                      (do (~fail-code ~state ~expected-error) (break) 0)
@@ -1326,7 +1363,7 @@
                                (do (~advance-code ~state) 0)))
                            0) 0)
                      (if (= (~current-byte-code ~state) ~comma)
-                         (do (~advance-code ~state) 0) (break)))))))
+                         (do (~advance-code ~state) 0) (break))))))))
            (~consume-code ~state ~close)
            (if (~current-keyword-code ~state ~from-keyword)
                (do (~advance-code ~state) (~parse-string-code ~state) 0) 0)
@@ -1524,8 +1561,34 @@
                  0))))
          0))))
 
+(defn compile-prefix-keyword-expression [(backend Code) (production Code)] (-> Code)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 5)
+                (generator-form? production "prefix-keyword-expression")))
+      (generator-fail production "invalid prefix keyword expression")
+    (let [state-type (backend-value backend "state-type")
+          result-type (backend-value backend "expression-result-type")
+          function-name (backend-value backend
+                          (p/code-sym (field-value production "function")))
+          current-position-code (backend-value backend "current-position")
+          word-end-code (backend-value backend "word-end")
+          advance-code (backend-value backend "advance")
+          parse-expression-code (backend-value backend "parse-expression")
+          check-build-code (backend-value backend "check-build")
+          precedence (field-value production "precedence")
+          opcode (field-value production "emit-op") state (p/fresh-identifier "state")]
+      `(defn ~function-name [(~state (ptr ~state-type))] (-> ~result-type)
+         (let [start (~current-position-code ~state) keyword-end (~word-end-code ~state start)
+               _keyword (~advance-code ~state) argument (~parse-expression-code ~state ~precedence)
+               arena (.arena (.builder ~state)) value (.value-count arena)
+               operation (builder/add-op! (.builder ~state) (.block ~state) ~opcode
+                            start keyword-end start (.end argument) (cast u32 1))]
+           (let [op (~check-build-code ~state operation)
+                 operand (builder/add-operand! (.builder ~state) op (.value argument))]
+             (~check-build-code ~state operand)
+             (~result-type :value value :start start :end (.end argument))))))))
+
 (defn compile-primary-dispatch [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 13)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 15)
                 (generator-form? production "primary-dispatch")))
       (generator-fail production "invalid primary-dispatch production")
     (let [state-type (backend-value backend "state-type")
@@ -1538,6 +1601,7 @@
           event-kind-code (backend-value backend "event-kind")
           current-byte-code (backend-value backend "current-byte")
           current-position-code (backend-value backend "current-position")
+          current-keyword-code (backend-value backend "current-keyword")
           advance-code (backend-value backend "advance")
           consume-code (backend-value backend "consume-byte")
           fail-code (backend-value backend "fail")
@@ -1560,12 +1624,32 @@
                          (p/code-sym (field-value production "arrow-parser")))
           jsx-parser (backend-value backend
                        (p/code-sym (field-value production "jsx-parser")))
-          state (p/fresh-identifier "state") form-id (p/fresh-identifier "form")]
+          prefix-keywords (field-value production "prefix-keywords")
+          prefix-parser (backend-value backend
+                          (p/code-sym (field-value production "prefix-parser")))
+          state (p/fresh-identifier "state") form-id (p/fresh-identifier "form")
+          prefix-byte (p/fresh-identifier "prefix-byte")]
       `(defn ~function-name [(~state (ptr ~state-type))] (-> ~result-type)
          (if (>= (.event-index ~state) (.event-count ~state))
              (~fail-code ~state ~unexpected-error)
            (if (~arrow-predicate ~state) (~arrow-parser ~state)
-             (let [~form-id (~dispatch-code (~event-kind-code (~current-event-code ~state))
+             (if (let [~prefix-byte (~current-byte-code ~state)]
+                   (cond
+                     ~@(let [clauses (p/code-list-new) (mut j) 0]
+                         (loop
+                           (if (>= (load j) (p/code-count prefix-keywords)) (break)
+                             (let [keyword-code (p/code-nth prefix-keywords (load j))
+                                   keyword-text (p/code-str keyword-code)]
+                               (p/code-list-push! clauses
+                                 `(= ~prefix-byte
+                                     (cast u8 ~(cast i64 (slice-get keyword-text 0)))))
+                               (p/code-list-push! clauses
+                                 `(~current-keyword-code ~state ~keyword-code))
+                               (set! j (+ (load j) 1)))))
+                         (p/code-list-done clauses))
+                     :else false))
+                 (~prefix-parser ~state)
+               (let [~form-id (~dispatch-code (~event-kind-code (~current-event-code ~state))
                                             (~current-byte-code ~state))]
              (cond
                (= ~form-id ~(p/code-nth forms 0)) (~word-parser ~state)
@@ -1601,7 +1685,7 @@
                (= ~form-id ~(p/code-nth forms 3)) (~array-parser ~state)
                (= ~form-id ~(p/code-nth forms 4)) (~object-parser ~state)
                (= ~form-id ~(p/code-nth forms 5)) (~jsx-parser ~state)
-               :else (~fail-code ~state ~unexpected-error)))))))))
+               :else (~fail-code ~state ~unexpected-error))))))))))
 
 (defn compile-program-root [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 5)
@@ -2251,6 +2335,7 @@
         (separator (syntax/object-production-terminal 1))
         (as-keyword "as")
         (from-keyword "from")
+        (type-keyword "type")
         (terminator-parser parse-statement-end)
         (emit-op ir/OP-JS-EXPORT))
       (statement-dispatch statement
@@ -2298,6 +2383,10 @@
         (terminator (syntax/variable-production-terminal 4))
         (terminator-parser parse-statement-end)
         (emit-op ir/OP-JS-DECLARE))
+      (prefix-keyword-expression javascript-prefix-keyword
+        (function parse-prefix-keyword)
+        (precedence 80)
+        (emit-op ir/OP-JS-PREFIX-KEYWORD))
       (primary-dispatch primary-expression
         (function parse-primary)
         (dispatch primary-form)
@@ -2311,7 +2400,9 @@
         (unary-op ir/OP-JS-UNARY)
         (arrow-predicate parse-arrow-lookahead)
         (arrow-parser parse-arrow)
-        (jsx-parser parse-jsx))
+        (jsx-parser parse-jsx)
+        (prefix-keywords ["new" "await" "typeof" "void" "delete" "yield"])
+        (prefix-parser parse-prefix-keyword))
       (program-root program
         (function parse-direct-program)
         (element-parser parse-statement)
@@ -2431,6 +2522,9 @@
             (generator-form? production "binding-declaration")
               (do (p/code-list-push! definitions
                     (compile-binding-declaration backend production)) 0)
+            (generator-form? production "prefix-keyword-expression")
+              (do (p/code-list-push! definitions
+                    (compile-prefix-keyword-expression backend production)) 0)
             (generator-form? production "primary-dispatch")
               (do (p/code-list-push! definitions
                     (compile-primary-dispatch backend production)) 0)

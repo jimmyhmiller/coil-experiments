@@ -24,6 +24,8 @@ const increment = (value: number): number => value + 1
 const [firstValue, secondValue] = [1, 2]
 const asserted = ({ value: firstValue } as any)
 const message = `value: ${firstValue}`
+const created = new Date()
+const kind = typeof created
 const destructured = ({ left, right: local = 1, ...rest }, [first, ...tail]) => {
   return left + local
 }
