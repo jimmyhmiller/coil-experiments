@@ -2,9 +2,10 @@ use std::{hint::black_box, time::Instant};
 
 use oxc_allocator::Allocator;
 use oxc_parser::Parser;
+use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
 
-const PATTERN: &str = "function compute(input) { let x = input + 10; while (x > 0) { x = x - 1; } if (x === 0) { return foo.state({value: [x, input]}); } else { return bar(input); } }\n";
+const PATTERN: &str = "{ function compute(input) { let x = input + 10; while (x > 0) { x = x - 1; } if (x === 0) { return foo.state({value: [x, input]}); } else { return bar(input); } } }\n";
 
 fn report(name: &str, bytes: usize, rounds: usize, elapsed: std::time::Duration) {
     let gbps = bytes as f64 * rounds as f64 / elapsed.as_nanos() as f64;
@@ -38,4 +39,44 @@ fn main() {
         black_box(parsed.program.body.len());
     }
     report("oxc cold parse", source.len(), rounds, start.elapsed());
+
+    let mut allocator = Allocator::default();
+    let start = Instant::now();
+    for _ in 0..rounds {
+        allocator.reset();
+        let parsed = Parser::new(&allocator, &source, source_type).parse();
+        assert!(parsed.errors.is_empty());
+        let result = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        assert!(result.errors.is_empty());
+        black_box(result.semantic.stats());
+    }
+    report(
+        "oxc parse+semantic",
+        source.len(),
+        rounds,
+        start.elapsed(),
+    );
+
+    let mut allocator = Allocator::default();
+    let start = Instant::now();
+    for _ in 0..rounds {
+        allocator.reset();
+        let parsed = Parser::new(&allocator, &source, source_type).parse();
+        assert!(parsed.errors.is_empty());
+        let result = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(result.errors.is_empty());
+        black_box(result.semantic.stats());
+        black_box(result.semantic.cfg());
+    }
+    report(
+        "oxc parse+semantic+cfg",
+        source.len(),
+        rounds,
+        start.elapsed(),
+    );
 }

@@ -20,6 +20,7 @@ publish = false
 [dependencies]
 oxc_allocator = { path = "$oxc_dir/crates/oxc_allocator" }
 oxc_parser = { path = "$oxc_dir/crates/oxc_parser" }
+oxc_semantic = { path = "$oxc_dir/crates/oxc_semantic", features = ["cfg"] }
 oxc_span = { path = "$oxc_dir/crates/oxc_span" }
 EOF
 
