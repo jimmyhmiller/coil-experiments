@@ -70,7 +70,16 @@ The implemented pipeline is:
     operations, SSA operands/results, lexical bindings/references, and a final
     terminator. `direct_parser_test.coil` runs that complete path, verifies the
     result, and checks deterministic textual IR including packed operator
-    immediates and declaration-name metadata.
+    immediates and declaration-name metadata. Direct `if` statements now build
+    condition, branch, and merge blocks with explicit successors. Conditional
+    expressions additionally merge their branch values through a join block
+    parameter and successor arguments.
+14. `js_printer.coil` regenerates normalized JavaScript for the implemented
+    linear subset by following SSA definitions rather than retained syntax
+    nodes. The regression suite proves JavaScript text-to-IR-to-JavaScript-to-IR
+    stability for operation kinds, compact attributes, operands, SSA counts,
+    bindings, and references while allowing source locations to change under
+    formatting.
 
 All bitmap-producing entry points accept an explicit valid byte count. SIMD
 tail fill bytes therefore cannot appear as source events. Tape writes report
@@ -100,9 +109,9 @@ The SSA/CFG schema, direct builder, verifier, printer, and a working direct
 parser slice exist. The broader legacy `parser.coil` coverage has not yet been
 migrated, and the parser benchmark still measures its syntax arena rather than
 text-to-verified-SSA throughput. The next coverage work is direct calls,
-unary/assignment operations, structured control flow, functions/captures,
-collections, and JSX. The target proof remains canonical IR-to-text stability,
-JavaScript text-to-IR-to-text-to-IR semantic stability, and structural
+unary/assignment operations, loops, functions/captures, collections, and JSX.
+The JavaScript semantic round-trip gate has begun on the linear subset; the
+remaining proof work includes canonical textual-IR parsing and structural
 differential fixtures against `jsir-rs` on their shared subset.
 
 The SIMD frontend requires the combined compiler at Coil branch

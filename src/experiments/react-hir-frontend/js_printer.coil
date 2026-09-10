@@ -1,0 +1,142 @@
+(module experiments.react-hir-frontend.js-printer)
+
+(import "coil.primitive" :as p)
+(import "coil.slice" :use [slice-data])
+(import "experiments.react-hir-frontend.ir" :as ir)
+
+(const JS-PRINT-OK i64 0)
+(const JS-PRINT-CAPACITY i64 1)
+(const JS-PRINT-UNSUPPORTED i64 2)
+(const JS-PRINT-INVALID-VALUE i64 3)
+
+(defstruct JsPrintBuffer
+  [(data (ptr u8)) (capacity i64) (count i64) (error i64)])
+
+(defstruct JsPrintResult [(count i64) (error i64)])
+
+(defn push-byte! [(buffer (ptr JsPrintBuffer)) (byte u8)] (-> i64)
+  (if (= (.error buffer) JS-PRINT-OK)
+      (if (>= (.count buffer) (.capacity buffer))
+          (set! (.error buffer) JS-PRINT-CAPACITY)
+        (do
+          (store! (p/index (.data buffer) (.count buffer)) byte)
+          (set! (.count buffer) (+ (.count buffer) 1)))) 0)
+  0)
+
+(defn push-static! [(buffer (ptr JsPrintBuffer)) (text (slice u8))] (-> i64)
+  (let [(mut i) 0]
+    (loop
+      (if (or (>= (load i) (len text)) (!= (.error buffer) JS-PRINT-OK)) (break)
+        (do
+          (push-byte! buffer (load (p/index (slice-data text) (load i))))
+          (set! i (+ (load i) 1))))))
+  0)
+
+(defn push-source! [(source (ptr u8)) (buffer (ptr JsPrintBuffer))
+                    (start u32) (end u32)] (-> i64)
+  (let [(mut at) start]
+    (loop
+      (if (or (>= (load at) end) (!= (.error buffer) JS-PRINT-OK)) (break)
+        (do
+          (push-byte! buffer (load (p/index source (cast i64 (load at)))))
+          (set! at (+ (load at) (cast u32 1)))))))
+  0)
+
+(defn print-operator! [(buffer (ptr JsPrintBuffer)) (immediate u64)] (-> i64)
+  (let [(mut remaining) immediate]
+    (loop
+      (if (= (load remaining) (cast u64 0)) (break)
+        (do
+          (push-byte! buffer (cast u8 (p/iand (load remaining) (cast u64 255))))
+          (set! remaining (p/ishr (load remaining) (cast u64 8)))))))
+  0)
+
+(defn print-value! [(arena (ptr ir/IrArena)) (source (ptr u8))
+                    (buffer (ptr JsPrintBuffer)) (value u32)] (-> i64)
+  (if (>= value (.value-count arena))
+      (set! (.error buffer) JS-PRINT-INVALID-VALUE)
+    (let [kind (load (p/index (.value-def-kinds arena) (cast i64 value)))
+          definition (load (p/index (.value-def-indices arena) (cast i64 value)))]
+      (if (!= kind (cast u8 ir/DEF-OP-RESULT))
+          (set! (.error buffer) JS-PRINT-UNSUPPORTED)
+        (let [opcode (load (p/index (.opcodes arena) (cast i64 definition)))
+              start (load (p/index (.op-starts arena) (cast i64 definition)))
+              end (load (p/index (.op-ends arena) (cast i64 definition)))
+              first (load (p/index (.op-first-operands arena) (cast i64 definition)))]
+          (cond
+            (or (= opcode (cast u16 ir/OP-JS-IDENTIFIER))
+                (= opcode (cast u16 ir/OP-JS-NUMBER))
+                (= opcode (cast u16 ir/OP-JS-STRING)))
+              (push-source! source buffer start end)
+            (= opcode (cast u16 ir/OP-JS-BINARY))
+              (do
+                (push-byte! buffer (cast u8 40))
+                (print-value! arena source buffer
+                  (load (p/index (.operands arena) (cast i64 first))))
+                (push-byte! buffer (cast u8 32))
+                (print-operator! buffer
+                  (load (p/index (.op-immediates arena) (cast i64 definition))))
+                (push-byte! buffer (cast u8 32))
+                (print-value! arena source buffer
+                  (load (p/index (.operands arena) (cast i64 (+ first (cast u32 1))))))
+                (push-byte! buffer (cast u8 41)))
+            (= opcode (cast u16 ir/OP-JS-UNARY))
+              (do
+                (print-operator! buffer
+                  (load (p/index (.op-immediates arena) (cast i64 definition))))
+                (print-value! arena source buffer
+                  (load (p/index (.operands arena) (cast i64 first)))))
+            :else (set! (.error buffer) JS-PRINT-UNSUPPORTED))))))
+  0)
+
+(defn print-declaration! [(arena (ptr ir/IrArena)) (source (ptr u8))
+                          (buffer (ptr JsPrintBuffer)) (op u32)] (-> i64)
+  (let [kind (load (p/index (.op-immediates arena) (cast i64 op)))
+        name-start (load (p/index (.op-name-starts arena) (cast i64 op)))
+        name-end (load (p/index (.op-name-ends arena) (cast i64 op)))
+        first (load (p/index (.op-first-operands arena) (cast i64 op)))]
+    (if (= kind ir/DECL-CONST) (push-static! buffer "const ")
+      (if (= kind ir/DECL-LET) (push-static! buffer "let ")
+        (if (= kind ir/DECL-VAR) (push-static! buffer "var ")
+          (set! (.error buffer) JS-PRINT-UNSUPPORTED))))
+    (push-source! source buffer name-start name-end)
+    (push-static! buffer " = ")
+    (print-value! arena source buffer
+      (load (p/index (.operands arena) (cast i64 first))))
+    (push-static! buffer ";\n")))
+
+(defn print-linear-program!
+  [(arena (ptr ir/IrArena)) (source (ptr u8)) (output (ptr u8)) (capacity i64)]
+  (-> JsPrintResult)
+  (let [buffer (p/alloc-stack JsPrintBuffer)]
+    (store! buffer (JsPrintBuffer :data output :capacity capacity :count 0
+                                  :error JS-PRINT-OK))
+    (if (or (!= (.region-count arena) (cast u32 1))
+            (= (.block-count arena) (cast u32 0)))
+        (set! (.error buffer) JS-PRINT-UNSUPPORTED)
+      (let [block (ir/region-block-at arena (cast u32 0) (cast u32 0))
+            count (load (p/index (.block-op-counts arena) (cast i64 block)))
+            (mut i) (cast u32 0)]
+        (loop
+          (if (or (>= (load i) count) (!= (.error buffer) JS-PRINT-OK)) (break)
+            (let [op (ir/block-op-at arena block (load i))
+                  opcode (load (p/index (.opcodes arena) (cast i64 op)))
+                  first (load (p/index (.op-first-operands arena) (cast i64 op)))]
+              (cond
+                (= opcode (cast u16 ir/OP-JS-DECLARE))
+                  (print-declaration! arena source buffer op)
+                (= opcode (cast u16 ir/OP-JS-EXPRESSION))
+                  (do
+                    (print-value! arena source buffer
+                      (load (p/index (.operands arena) (cast i64 first))))
+                    (push-static! buffer ";\n"))
+                (= opcode (cast u16 ir/OP-RETURN))
+                  (do
+                    (push-static! buffer "return ")
+                    (print-value! arena source buffer
+                      (load (p/index (.operands arena) (cast i64 first))))
+                    (push-static! buffer ";\n"))
+                (= opcode (cast u16 ir/OP-UNREACHABLE)) 0
+                :else 0)
+              (set! i (+ (load i) (cast u32 1))))))))
+    (JsPrintResult :count (.count buffer) :error (.error buffer))))
