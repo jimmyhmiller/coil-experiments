@@ -22,7 +22,8 @@ for production in \
   return expression-statement block if while function statement direct-program \
   type-annotation type-alias-body type-parameters type-alias statement-end import \
   type-arguments \
-  type-arguments-before-call arrow-lookahead binding-pattern arrow jsx named-export
+  type-arguments-before-call arrow-lookahead binding-pattern arrow jsx named-export interface \
+  type-assertion
 do
   if ! awk '/^\(defn$/ { getline; sub(/^[[:space:]]*/, ""); print }' \
       "$scratch_file" | rg -qx "parse-$production!"; then
@@ -31,4 +32,4 @@ do
   fi
 done
 
-printf '%s\n' 'all 31 direct-parser productions are generated'
+printf '%s\n' 'all 33 direct-parser productions are generated'

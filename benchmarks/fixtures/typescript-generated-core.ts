@@ -6,6 +6,8 @@ import * as Namespace from "namespace-module"
 import { runtime as local, type Erased } from "named-module"
 
 type Pair<T> = { left: T; right: T | null };
+interface Named<T> extends Pair<T> { name: string }
+declare module "generated-types" { interface Marker { ready: true } }
 
 export function combine<T>(a: number, b: number): number {
   let bits: number = (a & b) ^ (a | b)
@@ -19,6 +21,9 @@ export function renderPair({ left, right = 0 }: Pair<number>): number {
 }
 
 const increment = (value: number): number => value + 1
+const [firstValue, secondValue] = [1, 2]
+const asserted = ({ value: firstValue } as any)
+const message = `value: ${firstValue}`
 const destructured = ({ left, right: local = 1, ...rest }, [first, ...tail]) => {
   return left + local
 }
