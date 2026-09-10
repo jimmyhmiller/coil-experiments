@@ -75,6 +75,11 @@
 (const VERIFY-BINDING i64 24)
 (const VERIFY-REFERENCE i64 25)
 (const VERIFY-CAPTURE i64 26)
+(const VERIFY-BLOCK-OWNERSHIP i64 27)
+(const VERIFY-OP-OWNERSHIP i64 28)
+(const VERIFY-VALUE-OWNERSHIP i64 29)
+(const VERIFY-OPCODE i64 30)
+(const VERIFY-REGION-PARENT i64 31)
 
 (const PRINT-OK i64 0)
 (const PRINT-CAPACITY i64 1)
@@ -177,6 +182,36 @@
 
 (defn range-valid? [(first u32) (count u32) (limit u32)] (-> bool)
   (and (<= first limit) (<= count (- limit first))))
+
+(defn block-membership-count [(arena (ptr IrArena)) (wanted u32)] (-> u32)
+  (let [(mut at) (cast u32 0) (mut count) (cast u32 0)]
+    (loop
+      (if (>= (load at) (.region-block-ref-count arena)) (break)
+        (do
+          (if (= (load (p/index (.region-blocks arena) (cast i64 (load at)))) wanted)
+              (set! count (+ (load count) (cast u32 1))) 0)
+          (set! at (+ (load at) (cast u32 1))))))
+    (load count)))
+
+(defn op-membership-count [(arena (ptr IrArena)) (wanted u32)] (-> u32)
+  (let [(mut at) (cast u32 0) (mut count) (cast u32 0)]
+    (loop
+      (if (>= (load at) (.block-op-ref-count arena)) (break)
+        (do
+          (if (= (load (p/index (.block-ops arena) (cast i64 (load at)))) wanted)
+              (set! count (+ (load count) (cast u32 1))) 0)
+          (set! at (+ (load at) (cast u32 1))))))
+    (load count)))
+
+(defn region-child-membership-count [(arena (ptr IrArena)) (wanted u32)] (-> u32)
+  (let [(mut at) (cast u32 0) (mut count) (cast u32 0)]
+    (loop
+      (if (>= (load at) (.op-region-ref-count arena)) (break)
+        (do
+          (if (= (load (p/index (.op-regions arena) (cast i64 (load at)))) wanted)
+              (set! count (+ (load count) (cast u32 1))) 0)
+          (set! at (+ (load at) (cast u32 1))))))
+    (load count)))
 
 (defn region-block-at [(arena (ptr IrArena)) (region u32) (index u32)] (-> u32)
   (let [first (load (p/index (.region-first-blocks arena) (cast i64 region)))]
@@ -364,6 +399,89 @@
                               (store! changed true) 0)
                           (set! block (+ (load block) (cast u32 1))))))))))))))))
 
+;; Reachability is checked independently of dominance. Without this phase, a
+;; disconnected cycle retains the optimistic "all region members dominate me"
+;; initialization and can make invalid cross-block uses appear valid.
+(defn verify-reachability! [(arena (ptr IrArena)) (scratch (ptr VerifyScratch))]
+  (-> VerifyResult)
+  (let [words (p/idiv (+ (cast i64 (.block-count arena)) 63) 64)]
+    (if (> words (.dominator-word-capacity scratch))
+        (verify-error VERIFY-SCRATCH-CAPACITY (cast u32 INVALID-ID)
+                      (cast u32 INVALID-ID) (cast u32 INVALID-ID) (cast u32 words))
+      (do
+        (let [(mut word) 0]
+          (loop
+            (if (>= (load word) words) (break)
+              (do
+                (store! (p/index (.dominators scratch) (load word)) (cast u64 0))
+                (set! word (+ (load word) 1))))))
+        (let [(mut region) (cast u32 0)]
+          (loop
+            (if (>= (load region) (.region-count arena)) (break)
+              (let [entry (region-block-at arena (load region) (cast u32 0))
+                    word (p/idiv (cast i64 entry) 64)
+                    bit (p/irem (cast i64 entry) 64)]
+                (store! (p/index (.dominators scratch) word)
+                        (p/ior (load (p/index (.dominators scratch) word))
+                               (p/ishl (cast u64 1) (cast u64 bit))))
+                (set! region (+ (load region) (cast u32 1)))))))
+        (let [(mut changed) true]
+          (loop
+            (if (not (load changed)) (break)
+              (do
+                (store! changed false)
+                (let [(mut block) (cast u32 0)]
+                  (loop
+                    (if (>= (load block) (.block-count arena)) (break)
+                      (let [word (p/idiv (cast i64 (load block)) 64)
+                            bit (p/irem (cast i64 (load block)) 64)
+                            reachable (!= (p/iand
+                                             (load (p/index (.dominators scratch) word))
+                                             (p/ishl (cast u64 1) (cast u64 bit)))
+                                          (cast u64 0))]
+                        (if reachable
+                            (let [op-count (load (p/index (.block-op-counts arena)
+                                                         (cast i64 (load block))))
+                                  term (block-op-at arena (load block)
+                                                    (- op-count (cast u32 1)))
+                                  first (load (p/index (.op-first-successors arena)
+                                                       (cast i64 term)))
+                                  count (load (p/index (.op-successor-counts arena)
+                                                       (cast i64 term)))
+                                  (mut i) (cast u32 0)]
+                              (loop
+                                (if (>= (load i) count) (break)
+                                  (let [target (load (p/index (.successor-blocks arena)
+                                                              (cast i64 (+ first (load i)))))
+                                        target-word (p/idiv (cast i64 target) 64)
+                                        target-bit (p/irem (cast i64 target) 64)
+                                        mask (p/ishl (cast u64 1) (cast u64 target-bit))
+                                        old (load (p/index (.dominators scratch) target-word))]
+                                    (if (= (p/iand old mask) (cast u64 0))
+                                        (do
+                                          (store! (p/index (.dominators scratch) target-word)
+                                                  (p/ior old mask))
+                                          (store! changed true)) 0)
+                                    (set! i (+ (load i) (cast u32 1))))))) 0)
+                        (set! block (+ (load block) (cast u32 1)))))))))))
+        (let [(mut block) (cast u32 0) (mut result) (ok-result)]
+          (loop
+            (if (or (>= (load block) (.block-count arena))
+                    (!= (.error result) VERIFY-OK)) (break)
+              (let [word (p/idiv (cast i64 (load block)) 64)
+                    bit (p/irem (cast i64 (load block)) 64)]
+                (if (= (p/iand (load (p/index (.dominators scratch) word))
+                               (p/ishl (cast u64 1) (cast u64 bit)))
+                       (cast u64 0))
+                    (store! result
+                      (verify-error VERIFY-UNREACHABLE-BLOCK
+                                    (load (p/index (.block-regions arena)
+                                                   (cast i64 (load block))))
+                                    (load block) (cast u32 INVALID-ID)
+                                    (cast u32 INVALID-ID))) 0)
+                (set! block (+ (load block) (cast u32 1))))))
+          (load result))))))
+
 (defn verify-value-use [(arena (ptr IrArena)) (scratch (ptr VerifyScratch))
                        (words i64) (value u32) (use-block u32) (use-op u32)
                        (use-index u32)] (-> VerifyResult)
@@ -466,6 +584,111 @@
                   (set! i (+ (load i) (cast u32 1))))))
             (set! op (+ (load op) (cast u32 1)))))))
     (load result)))
+
+(defn value-membership-count [(arena (ptr IrArena)) (wanted u32)] (-> u32)
+  (let [(mut count) (cast u32 0) (mut block) (cast u32 0)]
+    (loop
+      (if (>= (load block) (.block-count arena)) (break)
+        (let [first (load (p/index (.block-first-params arena) (cast i64 (load block))))
+              amount (load (p/index (.block-param-counts arena) (cast i64 (load block))))]
+          (if (and (>= wanted first) (< wanted (+ first amount)))
+              (set! count (+ (load count) (cast u32 1))) 0)
+          (set! block (+ (load block) (cast u32 1))))))
+    (let [(mut op) (cast u32 0)]
+      (loop
+        (if (>= (load op) (.op-count arena)) (break)
+          (let [first (load (p/index (.op-first-results arena) (cast i64 (load op))))
+                amount (load (p/index (.op-result-counts arena) (cast i64 (load op))))]
+            (if (and (>= wanted first) (< wanted (+ first amount)))
+                (set! count (+ (load count) (cast u32 1))) 0)
+            (set! op (+ (load op) (cast u32 1)))))))
+    (load count)))
+
+(defn verify-unique-ownership [(arena (ptr IrArena))] (-> VerifyResult)
+  (let [(mut result) (ok-result) (mut block) (cast u32 0)]
+    (let [(mut at) (cast u32 0)]
+      (loop
+        (if (or (>= (load at) (.block-op-ref-count arena))
+                (!= (.error result) VERIFY-OK)) (break)
+          (do
+            (if (>= (load (p/index (.block-ops arena) (cast i64 (load at))))
+                    (.op-count arena))
+                (store! result
+                  (verify-error VERIFY-OP-OWNERSHIP (cast u32 INVALID-ID)
+                                (cast u32 INVALID-ID)
+                                (load (p/index (.block-ops arena) (cast i64 (load at))))
+                                (load at))) 0)
+            (set! at (+ (load at) (cast u32 1)))))))
+    (loop
+      (if (or (>= (load block) (.block-count arena))
+              (!= (.error result) VERIFY-OK)) (break)
+        (do
+          (if (!= (block-membership-count arena (load block)) (cast u32 1))
+              (store! result
+                (verify-error VERIFY-BLOCK-OWNERSHIP
+                              (load (p/index (.block-regions arena)
+                                             (cast i64 (load block))))
+                              (load block) (cast u32 INVALID-ID)
+                              (block-membership-count arena (load block)))) 0)
+          (set! block (+ (load block) (cast u32 1))))))
+    (let [(mut op) (cast u32 0)]
+      (loop
+        (if (or (>= (load op) (.op-count arena))
+                (!= (.error result) VERIFY-OK)) (break)
+          (do
+            (if (!= (op-membership-count arena (load op)) (cast u32 1))
+                (store! result
+                  (verify-error VERIFY-OP-OWNERSHIP (cast u32 INVALID-ID)
+                                (cast u32 INVALID-ID) (load op)
+                                (op-membership-count arena (load op)))) 0)
+            (set! op (+ (load op) (cast u32 1)))))))
+    (let [(mut value) (cast u32 0)]
+      (loop
+        (if (or (>= (load value) (.value-count arena))
+                (!= (.error result) VERIFY-OK)) (break)
+          (do
+            (if (!= (value-membership-count arena (load value)) (cast u32 1))
+                (store! result
+                  (verify-error VERIFY-VALUE-OWNERSHIP (cast u32 INVALID-ID)
+                                (cast u32 INVALID-ID) (cast u32 INVALID-ID)
+                                (load value))) 0)
+            (set! value (+ (load value) (cast u32 1)))))))
+    (let [(mut region) (cast u32 0)]
+      (loop
+        (if (or (>= (load region) (.region-count arena))
+                (!= (.error result) VERIFY-OK)) (break)
+          (let [parent (load (p/index (.region-parent-ops arena)
+                                      (cast i64 (load region))))
+                memberships (region-child-membership-count arena (load region))]
+            (if (if (= parent (cast u32 INVALID-ID))
+                    (!= memberships (cast u32 0))
+                  (!= memberships (cast u32 1)))
+                (store! result
+                  (verify-error VERIFY-REGION-PARENT (load region)
+                                (cast u32 INVALID-ID) parent memberships)) 0)
+          (set! region (+ (load region) (cast u32 1)))))))
+    (load result)))
+
+(defn verify-opcode-shape [(arena (ptr IrArena)) (region u32) (block u32) (op u32)]
+  (-> VerifyResult)
+  (let [opcode (load (p/index (.opcodes arena) (cast i64 op)))
+        operands (load (p/index (.op-operand-counts arena) (cast i64 op)))
+        results (load (p/index (.op-result-counts arena) (cast i64 op)))
+        successors (load (p/index (.op-successor-counts arena) (cast i64 op)))]
+    (if (or (= opcode (cast u16 OP-INVALID))
+            (and (= opcode (cast u16 OP-BR))
+                 (or (!= successors (cast u32 1)) (!= results (cast u32 0))))
+            (and (= opcode (cast u16 OP-COND-BR))
+                 (or (!= operands (cast u32 1)) (!= successors (cast u32 2))
+                     (!= results (cast u32 0))))
+            (and (= opcode (cast u16 OP-RETURN))
+                 (or (> operands (cast u32 1)) (!= successors (cast u32 0))
+                     (!= results (cast u32 0))))
+            (and (= opcode (cast u16 OP-UNREACHABLE))
+                 (or (!= operands (cast u32 0)) (!= successors (cast u32 0))
+                     (!= results (cast u32 0)))))
+        (verify-error VERIFY-OPCODE region block op (cast u32 opcode))
+      (ok-result))))
 
 (defn scope-ancestor? [(arena (ptr IrArena)) (ancestor u32) (scope u32)] (-> bool)
   (let [(mut current) scope (mut found) false]
@@ -574,13 +797,15 @@
                           (store! result (verify-error VERIFY-REGION-RANGE (load region)
                                                        block (cast u32 INVALID-ID)
                                                        (load block-index)))
-                      (if (!= (load (p/index (.block-regions arena)
-                                             (cast i64 block))) (load region))
-                          (store! result (verify-error VERIFY-BLOCK-REGION (load region)
-                                                       block (cast u32 INVALID-ID)
-                                                       (cast u32 INVALID-ID))) 0))
+                        (if (!= (load (p/index (.block-regions arena)
+                                               (cast i64 block))) (load region))
+                            (store! result (verify-error VERIFY-BLOCK-REGION (load region)
+                                                         block (cast u32 INVALID-ID)
+                                                         (cast u32 INVALID-ID))) 0))
                       (set! block-index (+ (load block-index) (cast u32 1)))))))))
           (set! region (+ (load region) (cast u32 1))))))
+    (if (= (.error result) VERIFY-OK)
+        (store! result (verify-unique-ownership arena)) 0)
     (if (!= (.error result) VERIFY-OK) (load result)
       (let [(mut block) (cast u32 0)]
         (loop
@@ -652,6 +877,9 @@
                                 (store! result (verify-op-owned-ranges arena region-id
                                                                        (load block) op))
                                 (if (= (.error result) VERIFY-OK)
+                                    (store! result (verify-opcode-shape arena region-id
+                                                                       (load block) op)) 0)
+                                (if (= (.error result) VERIFY-OK)
                                     (if (and (terminator? opcode) (not last))
                                         (store! result (verify-error VERIFY-TERMINATOR-POSITION
                                                                      region-id (load block) op
@@ -701,6 +929,8 @@
                                                        (load successor))) 0)))
                   (set! successor (+ (load successor) (cast u32 1))))))
             (if (!= (.error result) VERIFY-OK) (load result)
+              (let [reachability-result (verify-reachability! arena scratch)]
+                (if (!= (.error reachability-result) VERIFY-OK) reachability-result
               (let [dom-result (compute-dominators! arena scratch)]
                 (if (!= (.error dom-result) VERIFY-OK) dom-result
                   (let [words (p/idiv (+ (cast i64 (.block-count arena)) 63) 64)
@@ -755,7 +985,7 @@
                                         (set! ai (+ (load ai) (cast u32 1))))))
                                   (set! si (+ (load si) (cast u32 1))))))
                             (set! owner-op (+ (load owner-op) (cast u32 1))))))
-                    (load result))))))))))))))
+                    (load result))))))))))))))))
 
 (defn push-byte! [(buffer (ptr PrintBuffer)) (byte u8)] (-> i64)
   (if (!= (.error buffer) PRINT-OK) 0

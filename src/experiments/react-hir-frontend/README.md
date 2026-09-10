@@ -151,6 +151,37 @@ Coil derives the loop count from CFG backedges
 while JSIR reports its structured while operation. Broader differential
 fixtures remain open.
 
+## IR correctness gates
+
+`ir/verify-ir` is the authority for whether a successfully constructed arena
+is internally valid. It runs ordered phases so no later phase indexes through
+an unchecked identity or range:
+
+1. region, block, operation, operand, result, successor, child-region, and
+   source-span bounds;
+2. exact ownership of every dense block, operation, value, and nested region;
+3. terminator placement and opcode-specific control-flow cardinality;
+4. same-region successor targets, successor-argument arity, and independent
+   entry reachability (including rejection of disconnected cycles);
+5. fixed-point dominators, definition identity, same-block definition order,
+   cross-block dominance, and successor-argument uses;
+6. nested scope spans, bindings, references, and captures.
+
+The verifier returns a compact `VerifyResult` containing an error code and the
+most specific region, block, operation, and plane index available. The
+`react-hir-check` corpus executable runs it after every successful parse and
+uses a distinct exit status for parse and verification failures. Benchmarks do
+not include verifier time unless their name explicitly says `verified`.
+
+`ir_test.coil` contains a valid SSA diamond and mutation-based negative cases
+for successor arity, non-dominating uses, duplicate/missing block, operation,
+and value ownership, malformed control-flow opcodes, and unreachable blocks.
+`direct_parser_test.coil` additionally verifies source-derived CFG/scope IR and
+canonical IR print/parse/print stability. `run-jsir-differential.sh` supplies an
+independent structural oracle for the currently shared JSIR subset. Passing
+these gates establishes structural validity and cross-implementation agreement;
+it does not by itself prove complete JavaScript observational equivalence.
+
 The SIMD frontend requires the combined compiler at Coil branch
 `simd-foundation` commit `d51cfcc` or later. That revision includes both generic
 SIMD support and typed narrow-integer constant lowering. Older artifacts emit
