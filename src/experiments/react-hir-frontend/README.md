@@ -116,7 +116,7 @@ The executable grammar now accepts initialized and comma-separated
 declarations and parameters; blocks; valued and empty return, empty, debugger,
 if/else, while, and expression statements; identifiers, boolean and null
 literals, `this`, integer-shaped number spans, escaped quoted strings,
-unary expressions, assignment, arrays, objects and properties, member access,
+unary expressions, assignment, arrays, objects, named and shorthand properties, member access,
 computed member access,
 calls, conditionals, and generated longest-match compound binary operators;
 single-parameter and parenthesized block- or expression-bodied arrow functions;
