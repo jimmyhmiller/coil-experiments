@@ -14,6 +14,10 @@ export function combine<T>(a: number, b: number): number {
   return ~bits
 }
 
+export function renderPair({ left, right = 0 }: Pair<number>): number {
+  return left + right
+}
+
 const increment = (value: number): number => value + 1
 const destructured = ({ left, right: local = 1, ...rest }, [first, ...tail]) => {
   return left + local
@@ -25,3 +29,5 @@ const View = ({ value, ...props }) => (
     <br />
   </section>
 )
+
+export { View as PairView, renderPair }
