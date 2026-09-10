@@ -30,34 +30,34 @@ spellings for supported grammar productions do not appear in `parser.coil`.
 
 ## Semantic parser generator
 
-`parser_generator.coil` is the second compile-time layer. Its final, deliberately
-data-only section is the semantic parser specification. The first migrated form
-is:
+`parser_generator.coil` is the second compile-time layer. Its final,
+deliberately data-only section specifies every direct-parser production. The
+specification contains production kinds and semantic parameters, not arbitrary
+Coil function bodies. Generator algorithms currently include:
 
-```lisp
-(separated-value array-expression
-  (open (syntax/array-production-terminal 0))
-  (separator (syntax/array-production-terminal 1))
-  (close (syntax/array-production-terminal 2))
-  (element-precedence 0)
-  (emit-op ir/OP-JS-ARRAY))
-```
+- `word-value` and `quoted-value` for leaf values;
+- `separated-value`, `named-value`, `postfix-name`, and
+  `postfix-separated` for aggregates and postfix forms;
+- `primary-dispatch`, `postfix-chain`, and `precedence-expression` for
+  expression dispatch, Pratt recursion, conditionals, and assignment;
+- `terminated-expression`, `binding-declaration`, `statement-dispatch`, and
+  `scoped-repeat` for statements and lexical blocks;
+- `conditional-statement` and `loop-statement` for explicit CFG construction;
+- `function-declaration` for nested regions, scopes, parameters, captures, and
+  implicit returns;
+- `program-root` for root storage initialization, repetition, fallthrough, and
+  IR membership finalization.
 
-The metaprogram validates that form and generates the complete repetition,
-separator, error propagation, scratch lifetime, span construction, and direct
-IR-emission control flow as `parse-array-generated!`. The old handwritten
-`parse-array!` no longer exists. Nested-array tests exercise the generated path.
+The macro call in `direct_parser.coil` supplies named backend roles. These roles
+are primitive cursor/source queries, diagnostics, scratch storage, binding and
+capture support, and IR-builder operations. Role lookup happens at compile time;
+generated parsers are ordinary statically compiled Coil functions with no
+runtime interpreter or production tables.
 
-The generated code targets a narrow zero-cost backend ABI supplied at the macro
-call site: cursor position/current byte/advance/consume, diagnostic failure,
-expression recursion, scratch push, and list-operation emission. Language
-productions do not contain arbitrary Coil parsing code.
-
-`separated-value` is the first vertical slice, not the intended endpoint. Next
-generator forms must cover sequences, choices, bindings, optional/repeat,
-mode transitions, predicates, semantic metadata, regions, and CFG actions.
-Handwritten productions are migrated only by adding such generator capability
-and then deleting their old parser function.
+No handwritten `parse-*` definition remains in `direct_parser.coil`.
+`benchmarks/check-generated-direct-parser.sh` enforces both halves of that
+contract: the runtime source must contain none, while macro expansion must
+contain all 18 expected generated definitions.
 
 For now compiler and semantic specification share `parser_generator.coil`.
 Coil expands an imported `Code -> Code` helper as a nested macro before its
