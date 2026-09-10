@@ -177,6 +177,14 @@
         parser-scratch (p/alloc-stack parser/DirectParserScratch)
         verify-bits (p/alloc-stack (array u64 16))
         verify-scratch (p/alloc-stack ir/VerifyScratch)
+        canonical-a (p/alloc-stack (array u8 4096))
+        canonical-b (p/alloc-stack (array u8 4096))
+        roundtrip-memory (p/alloc-stack (array u64 4096))
+        roundtrip-arena (p/alloc-stack ir/IrArena)
+        roundtrip-builder-scratch (p/alloc-stack builder/BuilderScratch)
+        roundtrip-builder (p/alloc-stack builder/IrBuilder)
+        roundtrip-verify-bits (p/alloc-stack (array u64 16))
+        roundtrip-verify-scratch (p/alloc-stack ir/VerifyScratch)
         caps (builder/BuilderCapacities
           :regions (cast u32 4) :region-block-refs (cast u32 16)
           :blocks (cast u32 16) :block-op-refs (cast u32 64)
@@ -217,7 +225,36 @@
       (ir/VerifyScratch :dominators (p/cast (ptr u64) verify-bits)
                         :dominator-word-capacity 16))
     (let [verified (ir/verify-ir arena verify-scratch)]
-      (assert-eq (.error verified) ir/VERIFY-OK)))
+      (assert-eq (.error verified) ir/VERIFY-OK))
+    ;; A multi-block CFG must survive the canonical textual form exactly,
+    ;; including reciprocal successor targets and lexical metadata.
+    (let [first-print (ir/print-ir! arena (slice-data text)
+                                     (p/cast (ptr u8) canonical-a) 4096)
+          initialized-roundtrip (storage/initialize!
+                                  roundtrip-arena roundtrip-builder-scratch
+                                  roundtrip-builder
+                                  (p/cast (ptr u8) roundtrip-memory) 32768
+                                  (cast u32 0) caps)]
+      (assert-eq (.error first-print) ir/PRINT-OK)
+      (assert-eq (.error initialized-roundtrip) storage/STORAGE-OK)
+      (let [parsed-ir (ir-text/parse-ir-text! (p/cast (ptr u8) canonical-a)
+                                               (.count first-print)
+                                               roundtrip-builder)]
+        (assert-eq (.error parsed-ir) ir-text/IR-TEXT-OK))
+      (store! roundtrip-verify-scratch
+        (ir/VerifyScratch :dominators (p/cast (ptr u64) roundtrip-verify-bits)
+                          :dominator-word-capacity 16))
+      (let [verified-roundtrip (ir/verify-ir roundtrip-arena
+                                              roundtrip-verify-scratch)]
+        (assert-eq (.error verified-roundtrip) ir/VERIFY-OK))
+      (let [second-print (ir/print-ir! roundtrip-arena
+                           (p/cast (ptr u8) canonical-a)
+                           (p/cast (ptr u8) canonical-b) 4096)]
+        (assert-eq (.error second-print) ir/PRINT-OK)
+        (assert-eq (.count second-print) (.count first-print))
+        (assert (ptr-byte-eq? (p/cast (ptr u8) canonical-a)
+                              (p/cast (ptr u8) canonical-b)
+                              (.count first-print))))))
   0)
 
 (defn test-conditional-expression-uses-block-parameter [] (-> i64)
@@ -263,6 +300,61 @@
       (assert-eq (load (p/index (.operands arena) 1)) parameter))
     (assert-eq (load (p/index (.successor-args arena) 0)) (cast u32 1))
     (assert-eq (load (p/index (.successor-args arena) 1)) (cast u32 2))
+    (store! verify-scratch
+      (ir/VerifyScratch :dominators (p/cast (ptr u64) verify-bits)
+                        :dominator-word-capacity 16))
+    (let [verified (ir/verify-ir arena verify-scratch)]
+      (assert-eq (.error verified) ir/VERIFY-OK)))
+  0)
+
+(defn test-while-builds-cyclic-cfg [] (-> i64)
+  (let [text "let x = 1; while (x) { x = x - 1; } return x;"
+        events (p/alloc-stack (array u32 128))
+        memory (p/alloc-stack (array u64 4096))
+        arena (p/alloc-stack ir/IrArena)
+        builder-scratch (p/alloc-stack builder/BuilderScratch)
+        ir-builder (p/alloc-stack builder/IrBuilder)
+        parser-values (p/alloc-stack (array u32 128))
+        parser-scratch (p/alloc-stack parser/DirectParserScratch)
+        verify-bits (p/alloc-stack (array u64 16))
+        verify-scratch (p/alloc-stack ir/VerifyScratch)
+        caps (builder/BuilderCapacities
+          :regions (cast u32 4) :region-block-refs (cast u32 16)
+          :blocks (cast u32 16) :block-op-refs (cast u32 64)
+          :ops (cast u32 64) :op-region-refs (cast u32 4)
+          :values (cast u32 64) :operands (cast u32 128)
+          :successors (cast u32 32) :successor-args (cast u32 32)
+          :scopes (cast u32 16) :bindings (cast u32 32)
+          :references (cast u32 64) :captures (cast u32 16))
+        initialized (storage/initialize! arena builder-scratch ir-builder
+                      (p/cast (ptr u8) memory) 32768 (cast u32 (len text)) caps)
+        tape-result (pipeline/scan-source-to-parse-tape64
+          (slice-data text) (len text) (cast u32 0) (p/cast (ptr u32) events)
+          (frontend/frontend-initial-state))]
+    (assert-eq (.error initialized) storage/STORAGE-OK)
+    (store! parser-scratch (parser/DirectParserScratch
+      :values (p/cast (ptr u32) parser-values) :value-capacity 128 :value-count 0))
+    (let [parsed (parser/parse-direct-program!
+                   (slice-data text) (len text) (p/cast (ptr u32) events)
+                   (.count tape-result) ir-builder parser-scratch)]
+      (assert-eq (.error parsed) parser/DIRECT-PARSE-OK)
+      (assert-eq (.consumed-events parsed) (.count tape-result)))
+    (assert-eq (.region-count arena) (cast u32 1))
+    (assert-eq (.block-count arena) (cast u32 4))
+    (assert-eq (.op-count arena) (cast u32 14))
+    (assert-eq (.value-count arena) (cast u32 8))
+    (assert-eq (.scope-count arena) (cast u32 2))
+    (assert-eq (.binding-count arena) (cast u32 1))
+    (assert-eq (.reference-count arena) (cast u32 4))
+    (assert-eq (.successor-count arena) (cast u32 4))
+    ;; Entry → header, header → body/exit, and the body backedge → header.
+    (assert-eq (load (p/index (.successor-blocks arena) 0)) (cast u32 1))
+    (assert-eq (load (p/index (.successor-blocks arena) 1)) (cast u32 2))
+    (assert-eq (load (p/index (.successor-blocks arena) 2)) (cast u32 3))
+    (assert-eq (load (p/index (.successor-blocks arena) 3)) (cast u32 1))
+    (assert-eq (load (p/index (.opcodes arena) 2)) ir/OP-BR)
+    (assert-eq (load (p/index (.opcodes arena) 4)) ir/OP-COND-BR)
+    (assert-eq (load (p/index (.opcodes arena) 11)) ir/OP-BR)
     (store! verify-scratch
       (ir/VerifyScratch :dominators (p/cast (ptr u64) verify-bits)
                         :dominator-word-capacity 16))
@@ -476,6 +568,7 @@
   (test-storage_capacity_is_nonwriting)
   (test-if-else-builds-real-cfg)
   (test-conditional-expression-uses-block-parameter)
+  (test-while-builds-cyclic-cfg)
   (test-canonical-ir-text-roundtrip)
   (test-unary-nested-calls-and-assignment)
   (test-function-region-and-capture)

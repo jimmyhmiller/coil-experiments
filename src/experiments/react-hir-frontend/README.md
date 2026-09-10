@@ -74,7 +74,9 @@ The implemented pipeline is:
     verifies the result, and checks deterministic textual IR including packed
     operator immediates and declaration/function-name metadata. Direct `if`
     statements now build
-    condition, branch, and merge blocks with explicit successors. Conditional
+    condition, branch, and merge blocks with explicit successors. Direct
+    `while` statements build entry, header, body, and exit blocks with a real
+    backedge; the cyclic graph passes dominance verification. Conditional
     expressions additionally merge their branch values through a join block
     parameter and successor arguments.
 14. `js_printer.coil` regenerates normalized JavaScript for the implemented
@@ -89,8 +91,8 @@ The implemented pipeline is:
     forward CFG edges need no syntax tree. The textual form now retains source
     size, parent and nested-region ownership, compact operation attributes,
     scopes, bindings, references, and captures. Byte-identical print/parse/print
-    tests cover both a CFG with a join block parameter and nested regions with
-    lexical capture metadata.
+    tests cover a CFG with a join block parameter, a parsed multi-block
+    statement CFG, and nested regions with lexical capture metadata.
 
 All bitmap-producing entry points accept an explicit valid byte count. SIMD
 tail fill bytes therefore cannot appear as source events. Tape writes report
@@ -119,15 +121,19 @@ schema.
 The SSA/CFG schema, direct builder, verifier, printer, and a working direct
 parser slice exist. The broader legacy `parser.coil` coverage has not yet been
 migrated, and the parser benchmark still measures its syntax arena rather than
-text-to-verified-SSA throughput. The next coverage work is direct loops,
-collections, member access, JSX, and structured printing for multi-block CFGs.
+text-to-verified-SSA throughput. The next coverage work is collections, member
+access, JSX, loop-carried binding values, and structured printing for
+multi-block CFGs.
 The JavaScript semantic round-trip gate now covers linear expressions and
 functions with lexical captures, and the
 canonical textual-IR round-trip gate now passes for CFG and nested semantic
 fixtures. `benchmarks/run-jsir-differential.sh` runs the first live structural
 differential against the local `jsir-rs` frontend: both independently parse a
-shared declaration/unary/nested-call/assignment fixture and must emit the same
-backend-neutral semantic signature. Broader differential fixtures remain open.
+shared fixtures and must emit the same backend-neutral semantic signature. The
+current fixture includes a declaration, loop, binary mutation, assignment,
+identifier reads, and a call; Coil derives the loop count from CFG backedges
+while JSIR reports its structured while operation. Broader differential
+fixtures remain open.
 
 The SIMD frontend requires the combined compiler at Coil branch
 `simd-foundation` commit `d51cfcc` or later. That revision includes both generic

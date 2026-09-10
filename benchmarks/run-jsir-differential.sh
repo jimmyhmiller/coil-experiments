@@ -8,7 +8,7 @@ trap 'rm -rf "$scratch_dir"' EXIT INT TERM
 
 coil_compiler=${COIL_COMPILER:-coil}
 jsir_dir=${JSIR_RS_DIR:-$HOME/Documents/Code/open-source/jsir-rs/.worktrees/coil-differential}
-fixture='const x = -foo(1, bar(2)); x = bar(3);'
+fixture='let x = 3; while (x) { x = x - 1; } foo(x);'
 
 "$coil_compiler" build "$benchmark_dir/jsir-differential-coil.coil" --release \
   -o "$scratch_dir/coil-signature"
