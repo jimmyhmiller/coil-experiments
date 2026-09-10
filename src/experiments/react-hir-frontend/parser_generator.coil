@@ -250,6 +250,163 @@
                (~emit-list-code ~state ~opcode start
                  (+ end-position (cast u32 1)) mark))))))))
 
+(defn compile-numeric-value [(backend Code) (production Code)] (-> Code)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 16)
+                (generator-form? production "numeric-value")))
+      (generator-fail production "invalid numeric-value production")
+    (let [state-type (backend-value backend "state-type")
+          result-type (backend-value backend "expression-result-type")
+          function-name (backend-value backend
+                          (p/code-sym (field-value production "function")))
+          digit-function (field-value production "digit-function")
+          scan-function (field-value production "scan-function")
+          current-position-code (backend-value backend "current-position")
+          event-position-code (backend-value backend "event-position")
+          source-byte-code (backend-value backend "source-byte")
+          advance-code (backend-value backend "advance")
+          emit-code (backend-value backend "emit-value-op")
+          fail-code (backend-value backend "fail")
+          expected-error (backend-value backend "expected-error")
+          dot (field-value production "dot") separator (field-value production "separator")
+          exponent-lower (field-value production "exponent-lower")
+          exponent-upper (field-value production "exponent-upper")
+          plus (field-value production "plus") minus (field-value production "minus")
+          bigint (field-value production "bigint")
+          prefixes (field-value production "prefixes")
+          backslash (field-value production "backslash")
+          opcode (field-value production "emit-op")
+          bigint-opcode (field-value production "bigint-op")
+          state (p/fresh-identifier "state") byte-id (p/fresh-identifier "byte")
+          prefix-byte-id (p/fresh-identifier "prefix-byte")
+          number-at-id (p/fresh-identifier "number-at")
+          number-base-id (p/fresh-identifier "number-base")]
+      `(do
+         (defn ~digit-function :inline (Always) [(~byte-id u8) (base i64)] (-> i64)
+           (let [value
+                  (cond
+                    (and (>= ~byte-id (cast u8 48)) (<= ~byte-id (cast u8 57)))
+                      (- (cast i64 ~byte-id) 48)
+                    (and (>= ~byte-id (cast u8 65)) (<= ~byte-id (cast u8 70)))
+                      (+ (- (cast i64 ~byte-id) 65) 10)
+                    (and (>= ~byte-id (cast u8 97)) (<= ~byte-id (cast u8 102)))
+                      (+ (- (cast i64 ~byte-id) 97) 10)
+                    :else -1)]
+             (if (< value base) value -1)))
+         (defn ~scan-function :inline (Always)
+           [(~state (ptr ~state-type)) (initial u32) (base i64)] (-> u64)
+           (let [(mut at) initial (mut count) (cast u32 0) (mut scanning) true
+                 (mut used-separator) false]
+             (loop
+               (if (not (load scanning)) (break)
+                 (let [~byte-id (~source-byte-code ~state (load at))
+                       digit (~digit-function ~byte-id base)]
+                   (if (>= digit 0)
+                       (do
+                         (set! at (+ (load at) (cast u32 1)))
+                         (set! count (+ (load count) (cast u32 1))))
+                     (if (and (= ~byte-id ~separator) (> (load count) (cast u32 0))
+                              (>= (~digit-function
+                                    (~source-byte-code ~state
+                                      (+ (load at) (cast u32 1))) base) 0))
+                         (do (store! used-separator true)
+                             (set! at (+ (load at) (cast u32 1))) 0)
+                       (store! scanning false))))))
+             (p/ior (cast u64 (load at))
+               (p/ior (p/ishl (cast u64 (load count)) (cast u64 32))
+                 (if (load used-separator)
+                     (p/ishl (cast u64 1) (cast u64 63)) (cast u64 0))))))
+         (defn ~function-name [(~state (ptr ~state-type))] (-> ~result-type)
+           (let [start (~current-position-code ~state) first (~source-byte-code ~state start)
+                 (mut ~number-at-id) start (mut ~number-base-id) 10
+                 (mut fraction) false (mut exponent) false (mut is-bigint) false
+                 (mut valid) true]
+             (if (= first ~dot)
+                 (do (store! fraction true) (set! ~number-at-id (+ start (cast u32 1))) 0)
+               (if (= first (cast u8 48))
+                   (let [~prefix-byte-id (~source-byte-code ~state (+ start (cast u32 1)))]
+                     (cond
+                       ~@(let [clauses (p/code-list-new) (mut j) 0]
+                           (loop
+                             (if (>= (load j) (p/code-count prefixes)) (break)
+                               (let [entry (p/code-nth prefixes (load j))]
+                                 (p/code-list-push! clauses
+                                   `(or (= ~prefix-byte-id ~(p/code-nth entry 0))
+                                        (= ~prefix-byte-id ~(p/code-nth entry 1))))
+                                 (p/code-list-push! clauses
+                                   `(do (store! ~number-base-id ~(p/code-nth entry 2))
+                                        (set! ~number-at-id
+                                          (+ (load ~number-at-id) (cast u32 2))) 0))
+                                 (set! j (+ (load j) 1)))))
+                           (p/code-list-done clauses))
+                       :else 0)) 0))
+             (let [integer-scan (~scan-function ~state (load ~number-at-id)
+                                  (load ~number-base-id))
+                   integer-count (cast u32
+                     (p/iand (p/ishr integer-scan (cast u64 32))
+                             (cast u64 2147483647)))
+                   integer-separated
+                     (!= (p/iand integer-scan
+                           (p/ishl (cast u64 1) (cast u64 63))) (cast u64 0))]
+               (set! ~number-at-id (cast u32 integer-scan))
+               (if (and (not (load fraction)) (= integer-count (cast u32 0)))
+                   (store! valid false) 0)
+               (if (and (= first (cast u8 48)) (= (load ~number-base-id) 10)
+                        integer-separated)
+                   (store! valid false) 0)
+               (if (and (= (load ~number-base-id) 10)
+                        (= (~source-byte-code ~state (load ~number-at-id)) ~dot)
+                        (not (load fraction)))
+                   (do (store! fraction true)
+                       (set! ~number-at-id (+ (load ~number-at-id) (cast u32 1))) 0) 0)
+               (if (load fraction)
+                   (if (= first ~dot)
+                       (if (= integer-count (cast u32 0)) (store! valid false) 0)
+                     (let [fraction-scan (~scan-function ~state (load ~number-at-id) 10)]
+                       (set! ~number-at-id (cast u32 fraction-scan)))) 0)
+               (let [exponent-byte (~source-byte-code ~state (load ~number-at-id))]
+                 (if (and (= (load ~number-base-id) 10)
+                          (or (= exponent-byte ~exponent-lower)
+                              (= exponent-byte ~exponent-upper)))
+                     (do
+                       (store! exponent true)
+                       (set! ~number-at-id (+ (load ~number-at-id) (cast u32 1)))
+                       (let [sign (~source-byte-code ~state (load ~number-at-id))]
+                         (if (or (= sign ~plus) (= sign ~minus))
+                             (set! ~number-at-id
+                               (+ (load ~number-at-id) (cast u32 1))) 0))
+                       (let [exponent-scan (~scan-function ~state (load ~number-at-id) 10)
+                             exponent-count
+                               (cast u32 (p/ishr exponent-scan (cast u64 32)))]
+                         (set! ~number-at-id (cast u32 exponent-scan))
+                         (if (= exponent-count (cast u32 0)) (store! valid false) 0))
+                       0) 0))
+               (if (= (~source-byte-code ~state (load ~number-at-id)) ~bigint)
+                   (if (or (load fraction) (load exponent)
+                           (and (= first (cast u8 48))
+                                (= (load ~number-base-id) 10)
+                                (> integer-count (cast u32 1))))
+                       (store! valid false)
+                     (do (store! is-bigint true)
+                         (set! ~number-at-id
+                           (+ (load ~number-at-id) (cast u32 1))) 0)) 0)
+               (let [following (~source-byte-code ~state (load ~number-at-id))]
+                 (if (or (and (>= following (cast u8 48)) (<= following (cast u8 57)))
+                         (and (>= following (cast u8 65)) (<= following (cast u8 90)))
+                         (and (>= following (cast u8 97)) (<= following (cast u8 122)))
+                         (= following (cast u8 95)) (= following (cast u8 36))
+                         (= following ~backslash) (>= following (cast u8 128)))
+                     (store! valid false) 0))
+               (if (not (load valid)) (~fail-code ~state ~expected-error)
+                 (do
+                   (loop
+                     (if (or (>= (.event-index ~state) (.event-count ~state))
+                             (>= (~event-position-code
+                                   (load (p/index (.events ~state) (.event-index ~state))))
+                                 (load ~number-at-id))) (break)
+                       (~advance-code ~state)))
+                   (~emit-code ~state (if (load is-bigint) ~bigint-opcode ~opcode)
+                     start (load ~number-at-id)))))))))))
+
 (defn compile-word-value [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 6)
                 (generator-form? production "word-value")))
@@ -271,7 +428,8 @@
           ensure-capture-code (backend-value backend "ensure-capture")
           unexpected-error (backend-value backend "unexpected-error")
           word-event (field-value production "event")
-          number-op (field-value production "number-op")
+          number-parser (backend-value backend
+                          (p/code-sym (field-value production "number-parser")))
           identifier-op (field-value production "identifier-op")
           keyword-ops (field-value production "keyword-ops")
           state (p/fresh-identifier "state") first-id (p/fresh-identifier "first")]
@@ -281,11 +439,11 @@
                      (cast u8 ~word-event)))
              (~fail-code ~state ~unexpected-error)
            (let [start (~current-position-code ~state)
-                 end (~word-end-code ~state start)
                  ~first-id (~source-byte-code ~state start)]
-             (let [opcode
-                    (if (and (>= ~first-id (cast u8 48)) (<= ~first-id (cast u8 57)))
-                        ~number-op
+             (if (and (>= ~first-id (cast u8 48)) (<= ~first-id (cast u8 57)))
+                 (~number-parser ~state)
+               (let [end (~word-end-code ~state start)
+                     opcode
                       (cond
                         ~@(let [clauses (p/code-list-new) (mut j) 0]
                             (loop
@@ -309,7 +467,7 @@
                                         (p/code-list-push! clauses (p/code-nth entry 1)) 0))
                                   (set! j (+ (load j) 1)))))
                             (p/code-list-done clauses))
-                        :else ~identifier-op))]
+                        :else ~identifier-op)]
                (~advance-code ~state)
                (let [result (~emit-code ~state opcode start end)]
                  (if (= opcode ~identifier-op)
@@ -319,7 +477,7 @@
                                                                     binding start end)]
                              (~check-build-code ~state reference)
                              (~ensure-capture-code ~state binding)) 0)) 0)
-                 result))))))))
+                 result)))))))))
 
 (defn compile-quoted-value [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 3)
@@ -910,7 +1068,7 @@
                     `(~fail-code ~state ~expected-error))))))))))
 
 (defn compile-postfix-name [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 4)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 6)
                 (generator-form? production "postfix-name")))
       (generator-fail production "invalid postfix-name production")
     (let [state-type (backend-value backend "state-type")
@@ -918,20 +1076,45 @@
           function-role (field-value production "function")
           function-name (backend-value backend (p/code-sym function-role))
           current-position-code (backend-value backend "current-position")
+          source-byte-code (backend-value backend "source-byte")
           word-end-code (backend-value backend "word-end")
           advance-code (backend-value backend "advance")
           fail-code (backend-value backend "fail")
           check-build-code (backend-value backend "check-build")
           expected-error (backend-value backend "expected-error")
           opcode (field-value production "emit-op")
+          start-ranges (field-value production "identifier-start-ranges")
+          start-bytes (field-value production "identifier-start-bytes")
           state (p/fresh-identifier "state")
-          input (p/fresh-identifier "input")]
+          input (p/fresh-identifier "input")
+          first-byte-id (p/fresh-identifier "first-byte")
+          valid-start-id (p/fresh-identifier "valid-start")]
       `(defn ~function-name [(~state (ptr ~state-type)) (~input ~result-type)]
          (-> ~result-type)
          (let [_prefix (~advance-code ~state)
                name-start (~current-position-code ~state)
-               name-end (~word-end-code ~state name-start)]
-           (if (= name-start name-end) (~fail-code ~state ~expected-error)
+               name-end (~word-end-code ~state name-start)
+               ~first-byte-id (~source-byte-code ~state name-start)
+               ~valid-start-id
+                 (or
+                   ~@(let [clauses (p/code-list-new) (mut i) 0]
+                       (loop
+                         (if (>= (load i) (p/code-count start-ranges)) (break)
+                           (let [range (p/code-nth start-ranges (load i))]
+                             (p/code-list-push! clauses
+                               `(and (>= ~first-byte-id ~(p/code-nth range 0))
+                                     (<= ~first-byte-id ~(p/code-nth range 1))))
+                             (set! i (+ (load i) 1)))))
+                       (let [(mut j) 0]
+                         (loop
+                           (if (>= (load j) (p/code-count start-bytes)) (break)
+                             (do
+                               (p/code-list-push! clauses
+                                 `(= ~first-byte-id ~(p/code-nth start-bytes (load j))))
+                               (set! j (+ (load j) 1))))))
+                       (p/code-list-done clauses)))]
+           (if (or (= name-start name-end) (not ~valid-start-id))
+               (~fail-code ~state ~expected-error)
              (do
                (~advance-code ~state)
                (let [arena (.arena (.builder ~state)) value (.value-count arena)
@@ -2217,6 +2400,7 @@
           template-quote (field-value production "template-quote")
           array-parser (backend-value backend (p/code-sym (p/code-nth parsers 2)))
           object-parser (backend-value backend (p/code-sym (p/code-nth parsers 3)))
+          number-parser (backend-value backend (p/code-sym (p/code-nth parsers 4)))
           group-close (field-value production "group-close")
           group-op (field-value production "group-op")
           unary-forms (field-value production "unary-forms")
@@ -2360,6 +2544,7 @@
                (= ~form-id ~(p/code-nth forms 4)) (~object-parser ~state)
                (= ~form-id ~(p/code-nth forms 5)) (~jsx-parser ~state)
                (= ~form-id ~(p/code-nth forms 6)) (~regexp-parser ~state)
+               (= ~form-id ~(p/code-nth forms 7)) (~number-parser ~state)
                :else (~fail-code ~state ~unexpected-error))))))))))
 
 (defn compile-program-root [(backend Code) (production Code)] (-> Code)
@@ -3356,9 +3541,24 @@
 ;; specification share a module until compile-time library linkage is added.
 (defn define-frontend-parser [(backend Code)] (-> Code)
   (let [productions
-      `[(word-value identifier-or-number
+      `[(numeric-value javascript-number
+        (function parse-number)
+        (digit-function number-digit-value)
+        (scan-function scan-number-digits)
+        (dot (syntax/terminal-byte syntax/dot))
+        (separator 95)
+        (exponent-lower 101)
+        (exponent-upper 69)
+        (plus (syntax/terminal-byte syntax/plus))
+        (minus (syntax/terminal-byte syntax/minus))
+        (bigint 110)
+        (prefixes [[120 88 16] [98 66 2] [111 79 8]])
+        (backslash (syntax/terminal-byte syntax/backslash))
+        (emit-op ir/OP-JS-NUMBER)
+        (bigint-op ir/OP-JS-BIGINT))
+      (word-value identifier-or-number
         (event tape/EVENT-WORD)
-        (number-op ir/OP-JS-NUMBER)
+        (number-parser parse-number)
         (identifier-op ir/OP-JS-IDENTIFIER)
         (keyword-ops [["true" ir/OP-JS-BOOLEAN]
                       ["false" ir/OP-JS-BOOLEAN]
@@ -3500,6 +3700,8 @@
         (shorthand-parser parse-object-shorthand))
       (postfix-name member-expression
         (function parse-member)
+        (identifier-start-ranges [[65 90] [97 122]])
+        (identifier-start-bytes [95 36])
         (emit-op ir/OP-JS-MEMBER))
       (postfix-expression computed-member-expression
         (function parse-computed-member)
@@ -3705,8 +3907,8 @@
         (dispatch primary-form)
         (forms [syntax/form-word syntax/form-string syntax/form-group
                 syntax/form-array syntax/form-object syntax/form-jsx
-                syntax/form-regexp])
-        (parsers [parse-word parse-string parse-array parse-object])
+                syntax/form-regexp syntax/form-leading-dot-number])
+        (parsers [parse-word parse-string parse-array parse-object parse-number])
         (template-parser parse-template)
         (template-quote (syntax/terminal-byte syntax/backtick))
         (group-close (syntax/group-production-terminal 2))
@@ -3835,6 +4037,9 @@
       (if (>= (load i) (p/code-count productions)) (break)
         (let [production (p/code-nth productions (load i))]
           (cond
+            (generator-form? production "numeric-value")
+              (do (p/code-list-push! definitions
+                    (compile-numeric-value backend production)) 0)
             (generator-form? production "spread-value")
               (do (p/code-list-push! definitions
                     (compile-spread-value backend production)) 0)
