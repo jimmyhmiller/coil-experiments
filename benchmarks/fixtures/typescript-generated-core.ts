@@ -13,3 +13,8 @@ export function combine<T>(a: number, b: number): number {
   bits %= 97
   return ~bits
 }
+
+const increment = (value: number): number => value + 1
+const destructured = ({ left, right: local = 1, ...rest }, [first, ...tail]) => {
+  return left + local
+}
