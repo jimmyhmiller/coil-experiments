@@ -545,6 +545,46 @@
                    (~advance-code ~state)))
                (~emit-code ~state ~opcode start (cast u32 (load at))))))))))
 
+;; A static quoted property name is syntax, not a runtime string value. Keep
+;; its exact source span without materializing a dead SSA operation.
+(defn compile-quoted-span [(backend Code) (production Code)] (-> Code)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 4)
+                (generator-form? production "quoted-span")))
+      (generator-fail production "invalid quoted-span production")
+    (let [state-type (backend-value backend "state-type")
+          function-name (backend-value backend
+                          (p/code-sym (field-value production "function")))
+          current-position-code (backend-value backend "current-position")
+          current-byte-code (backend-value backend "current-byte")
+          advance-code (backend-value backend "advance")
+          fail-code (backend-value backend "fail")
+          expected-error (backend-value backend "expected-error")
+          backslash (field-value production "backslash")
+          state (p/fresh-identifier "state")]
+      `(defn ~function-name :inline (Never) [(~state (ptr ~state-type))] (-> u64)
+         (let [start (~current-position-code ~state)
+               quote (~current-byte-code ~state)
+               (mut at) (+ (cast i64 start) 1)
+               (mut escaped) false (mut closed) false]
+           (loop
+             (if (or (>= (load at) (.source-size ~state)) (load closed)) (break)
+               (let [byte (load (p/index (.source ~state) (load at)))]
+                 (cond (load escaped) (store! escaped false)
+                       (= byte (cast u8 ~backslash)) (store! escaped true)
+                       (= byte quote) (store! closed true)
+                       :else 0)
+                 (set! at (+ (load at) 1)))))
+           (if (not (load closed))
+               (do (~fail-code ~state ~expected-error) (cast u64 0))
+             (do
+               (loop
+                 (if (or (>= (.event-index ~state) (.event-count ~state))
+                         (>= (cast i64 (~current-position-code ~state)) (load at)))
+                     (break)
+                   (~advance-code ~state)))
+               (p/ior (cast u64 start)
+                      (p/ishl (cast u64 (load at)) (cast u64 32))))))))))
+
 ;; TypeScript annotations are erased from runtime SSA but retained as checked,
 ;; source-backed IR markers. This generated recognizer consumes a complete type
 ;; span while balancing every delimiter family, so commas and closing tokens in
@@ -1053,7 +1093,7 @@
              result))))))
 
 (defn compile-named-value [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 7)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 9)
                 (generator-form? production "named-value")))
       (generator-fail production "invalid named-value production")
     (let [state-type (backend-value backend "state-type")
@@ -1068,22 +1108,41 @@
           parse-expression-code (backend-value backend "parse-expression")
           shorthand-parser (backend-value backend
                              (p/code-sym (field-value production "shorthand-parser")))
+          quoted-key-parser (backend-value backend
+                              (p/code-sym (field-value production "quoted-key-parser")))
           match-byte-code (backend-value backend "match-byte")
           check-build-code (backend-value backend "check-build")
           expected-error (backend-value backend "expected-error")
           separator (field-value production "separator")
           opcode (field-value production "emit-op")
           allow-shorthand (field-value production "allow-shorthand")
+          quoted-key-bytes (field-value production "quoted-key-bytes")
           state (p/fresh-identifier "state")
           name-start-id (p/fresh-identifier "name-start")
           name-end-id (p/fresh-identifier "name-end")
+          quoted-key-id (p/fresh-identifier "quoted-key")
+          quoted-id (p/fresh-identifier "quoted")
           property-id (p/fresh-identifier "property-value")]
       `(defn ~function-name [(~state (ptr ~state-type))] (-> ~result-type)
-         (let [~name-start-id (~current-position-code ~state)
-               ~name-end-id (~word-end-code ~state ~name-start-id)]
+         (let [~quoted-id
+                 (or ~@(let [checks (p/code-list-new) (mut q) 0]
+                          (loop
+                            (if (>= (load q) (p/code-count quoted-key-bytes)) (break)
+                              (do
+                                (p/code-list-push! checks
+                                  `(= (~current-byte-code ~state)
+                                      ~(p/code-nth quoted-key-bytes (load q))))
+                                (set! q (+ (load q) 1)))))
+                          (p/code-list-done checks)))
+               ~quoted-key-id (if ~quoted-id (~quoted-key-parser ~state) (cast u64 0))
+               ~name-start-id (if ~quoted-id (cast u32 ~quoted-key-id)
+                                (~current-position-code ~state))
+               ~name-end-id (if ~quoted-id
+                              (cast u32 (p/ishr ~quoted-key-id (cast u64 32)))
+                              (~word-end-code ~state ~name-start-id))]
            (if (= ~name-start-id ~name-end-id) (~fail-code ~state ~expected-error)
              (do
-               (~advance-code ~state)
+               (if ~quoted-id 0 (~advance-code ~state))
                (if (~match-byte-code ~state ~separator)
                    (do
                      (let [~property-id (~parse-expression-code ~state 0)]
@@ -3950,6 +4009,9 @@
         (invalid-keywords ~(javascript-reserved-keywords)))
       (quoted-value string-expression
         (emit-op ir/OP-JS-STRING))
+      (quoted-span static-property-string
+        (function parse-property-name-string)
+        (backslash (syntax/terminal-byte syntax/backslash)))
       (template-value template-expression
         (function parse-template)
         (quote (syntax/terminal-byte syntax/backtick))
@@ -4080,7 +4142,10 @@
         (separator (syntax/property-production-terminal 1))
         (emit-op ir/OP-JS-PROPERTY)
         (allow-shorthand true)
-        (shorthand-parser parse-object-shorthand))
+        (shorthand-parser parse-object-shorthand)
+        (quoted-key-bytes [(syntax/terminal-byte syntax/single-quote)
+                           (syntax/terminal-byte syntax/double-quote)])
+        (quoted-key-parser parse-property-name-string))
       (postfix-name member-expression
         (function parse-member)
         (identifier-start-ranges [[65 90] [97 122]])
@@ -4459,6 +4524,9 @@
             (generator-form? production "quoted-value")
               (do (p/code-list-push! definitions
                     (compile-quoted-value backend production)) 0)
+            (generator-form? production "quoted-span")
+              (do (p/code-list-push! definitions
+                    (compile-quoted-span backend production)) 0)
             (generator-form? production "template-value")
               (do (p/code-list-push! definitions
                     (compile-template-value backend production)) 0)

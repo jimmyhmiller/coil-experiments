@@ -18,7 +18,7 @@ cd "$project_dir"
 "$coil_compiler" expand "$source_file" > "$scratch_file"
 
 for production in \
-  word string number spread regexp primary property object-shorthand object call member computed-member postfix expression declaration \
+  word string property-name-string number spread regexp primary property object-shorthand object call member computed-member postfix expression declaration \
   return throw break continue expression-statement block if while do-while for-kind classic-for iterator-for for switch function statement direct-program \
   type-annotation type-alias-body type-parameters type-alias statement-end import \
   type-arguments \
@@ -33,4 +33,4 @@ do
   fi
 done
 
-printf '%s\n' 'all 53 direct-parser productions are generated'
+printf '%s\n' 'all 54 direct-parser productions are generated'
