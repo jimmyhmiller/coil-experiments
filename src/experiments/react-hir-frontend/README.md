@@ -112,8 +112,9 @@ tail fill bytes therefore cannot appear as source events. Tape writes report
 unconsumed bits when the destination capacity is exhausted.
 
 The executable grammar now accepts `const`/`let`/`var` declarations; function
-declarations and parameters; blocks; valued and empty return, if/else, while, and expression
-statements; identifiers, integer-shaped number spans, escaped quoted strings,
+declarations and parameters; blocks; valued and empty return, empty, debugger,
+if/else, while, and expression statements; identifiers, boolean and null
+literals, `this`, integer-shaped number spans, escaped quoted strings,
 unary expressions, assignment, arrays, objects and properties, member access,
 calls, conditionals, and generated longest-match compound binary operators;
 plus self-closing and nested JSX, JSX text, expression children, and string or
