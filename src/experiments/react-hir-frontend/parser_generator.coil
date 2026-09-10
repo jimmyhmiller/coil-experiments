@@ -1561,6 +1561,60 @@
                  0))))
          0))))
 
+(defn compile-template-value [(backend Code) (production Code)] (-> Code)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 9)
+                (generator-form? production "template-value")))
+      (generator-fail production "invalid template value")
+    (let [state-type (backend-value backend "state-type")
+          result-type (backend-value backend "expression-result-type")
+          function-name (backend-value backend
+                          (p/code-sym (field-value production "function")))
+          current-position-code (backend-value backend "current-position")
+          current-byte-code (backend-value backend "current-byte")
+          adjacent-byte-code (backend-value backend "adjacent-event-byte")
+          source-byte-code (backend-value backend "source-byte")
+          advance-code (backend-value backend "advance")
+          advance-count-code (backend-value backend "advance-count")
+          consume-code (backend-value backend "consume-byte")
+          parse-expression-code (backend-value backend "parse-expression")
+          push-value-code (backend-value backend "push-scratch-value")
+          emit-list-code (backend-value backend "emit-scratch-list-op")
+          ok-error (backend-value backend "ok-error")
+          quote (field-value production "quote") dollar (field-value production "dollar")
+          open (field-value production "open") close (field-value production "close")
+          backslash (field-value production "backslash") opcode (field-value production "emit-op")
+          state (p/fresh-identifier "state")]
+      `(defn ~function-name [(~state (ptr ~state-type))] (-> ~result-type)
+         (let [scratch (.scratch ~state) mark (.value-count scratch)
+               start (~current-position-code ~state) _quote (~advance-code ~state)
+               (mut end) start]
+           (loop
+             (if (or (!= (.error ~state) ~ok-error)
+                     (>= (.event-index ~state) (.event-count ~state))) (break)
+               (let [position (~current-position-code ~state) byte (~current-byte-code ~state)
+                     (mut cursor) position (mut slashes) 0]
+                 (loop
+                   (if (or (<= (load cursor) start)
+                           (!= (~source-byte-code ~state (- (load cursor) (cast u32 1)))
+                               ~backslash)) (break)
+                     (do
+                       (set! cursor (- (load cursor) (cast u32 1)))
+                       (set! slashes (+ (load slashes) 1)))))
+                 (let [escaped (!= (p/iand (cast u64 (load slashes)) (cast u64 1))
+                                   (cast u64 0))]
+                   (if (and (= byte ~quote) (not escaped))
+                       (do (store! end (+ position (cast u32 1))) (break))
+                     (if (and (= byte ~dollar) (not escaped)
+                              (= (~adjacent-byte-code ~state 1) ~open))
+                         (do
+                           (~advance-count-code ~state 2)
+                           (let [value (~parse-expression-code ~state 0)]
+                             (~push-value-code ~state (.value value)))
+                           (do (~consume-code ~state ~close) 0))
+                       (~advance-code ~state)))))))
+           (~consume-code ~state ~quote)
+           (~emit-list-code ~state ~opcode start (load end) mark))))))
+
 (defn compile-prefix-keyword-expression [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 5)
                 (generator-form? production "prefix-keyword-expression")))
@@ -1588,7 +1642,7 @@
              (~result-type :value value :start start :end (.end argument))))))))
 
 (defn compile-primary-dispatch [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 15)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 17)
                 (generator-form? production "primary-dispatch")))
       (generator-fail production "invalid primary-dispatch production")
     (let [state-type (backend-value backend "state-type")
@@ -1612,6 +1666,9 @@
           forms (field-value production "forms") parsers (field-value production "parsers")
           word-parser (backend-value backend (p/code-sym (p/code-nth parsers 0)))
           string-parser (backend-value backend (p/code-sym (p/code-nth parsers 1)))
+          template-parser (backend-value backend
+                            (p/code-sym (field-value production "template-parser")))
+          template-quote (field-value production "template-quote")
           array-parser (backend-value backend (p/code-sym (p/code-nth parsers 2)))
           object-parser (backend-value backend (p/code-sym (p/code-nth parsers 3)))
           group-close (field-value production "group-close")
@@ -1653,7 +1710,9 @@
                                             (~current-byte-code ~state))]
              (cond
                (= ~form-id ~(p/code-nth forms 0)) (~word-parser ~state)
-               (= ~form-id ~(p/code-nth forms 1)) (~string-parser ~state)
+               (= ~form-id ~(p/code-nth forms 1))
+                 (if (= (~current-byte-code ~state) ~template-quote)
+                     (~template-parser ~state) (~string-parser ~state))
                (= ~form-id ~(p/code-nth forms 2))
                  (do
                    (~advance-code ~state)
@@ -2164,6 +2223,14 @@
         (identifier-op ir/OP-JS-IDENTIFIER))
       (quoted-value string-expression
         (emit-op ir/OP-JS-STRING))
+      (template-value template-expression
+        (function parse-template)
+        (quote (syntax/terminal-byte syntax/backtick))
+        (dollar (syntax/terminal-byte syntax/dollar))
+        (open (syntax/terminal-byte syntax/lbrace))
+        (close (syntax/terminal-byte syntax/rbrace))
+        (backslash (syntax/terminal-byte syntax/backslash))
+        (emit-op ir/OP-JS-TEMPLATE))
       (erased-type-span type-annotation
         (function parse-type-annotation)
         (prefix (syntax/property-production-terminal 1))
@@ -2393,6 +2460,8 @@
         (forms [syntax/form-word syntax/form-string syntax/form-group
                 syntax/form-array syntax/form-object syntax/form-jsx])
         (parsers [parse-word parse-string parse-array parse-object])
+        (template-parser parse-template)
+        (template-quote (syntax/terminal-byte syntax/backtick))
         (group-close (syntax/group-production-terminal 2))
         (unary-forms [syntax/form-unary-bang syntax/form-unary-minus
                       syntax/form-unary-plus syntax/form-unary-tilde])
@@ -2453,6 +2522,9 @@
             (generator-form? production "quoted-value")
               (do (p/code-list-push! definitions
                     (compile-quoted-value backend production)) 0)
+            (generator-form? production "template-value")
+              (do (p/code-list-push! definitions
+                    (compile-template-value backend production)) 0)
             (generator-form? production "erased-type-span")
               (do (p/code-list-push! definitions
                     (compile-erased-type-span backend production)) 0)
