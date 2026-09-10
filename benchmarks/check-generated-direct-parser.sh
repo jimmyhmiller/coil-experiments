@@ -19,7 +19,7 @@ cd "$project_dir"
 
 for production in \
   word string primary property object-shorthand object call member computed-member postfix expression declaration \
-  return throw break continue expression-statement block if while do-while function statement direct-program \
+  return throw break continue expression-statement block if while do-while for function statement direct-program \
   type-annotation type-alias-body type-parameters type-alias statement-end import \
   type-arguments \
   type-arguments-before-call arrow-lookahead binding-pattern arrow jsx named-export interface \
@@ -33,4 +33,4 @@ do
   fi
 done
 
-printf '%s\n' 'all 43 direct-parser productions are generated'
+printf '%s\n' 'all 44 direct-parser productions are generated'
