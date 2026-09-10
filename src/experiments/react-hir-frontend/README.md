@@ -119,7 +119,10 @@ text-to-verified-SSA throughput. The next coverage work is direct calls,
 unary/assignment operations, loops, functions/captures, collections, and JSX.
 The JavaScript semantic round-trip gate has begun on the linear subset, and the
 canonical textual-IR round-trip gate now passes for CFG and nested semantic
-fixtures. Structural differential fixtures against `jsir-rs` remain open.
+fixtures. `benchmarks/run-jsir-differential.sh` runs the first live structural
+differential against the local `jsir-rs` frontend: both independently parse a
+shared declaration/binary/use fixture and must emit the same backend-neutral
+semantic signature. Broader differential fixtures remain open.
 
 The SIMD frontend requires the combined compiler at Coil branch
 `simd-foundation` commit `d51cfcc` or later. That revision includes both generic
@@ -153,3 +156,13 @@ The additional cost includes compound-operator lookahead and the literal-aware
 parse tape; it is retained honestly rather than benchmarked through the former
 narrow path. This remains a language subset and is not yet semantically
 comparable to Oxc's full JavaScript/TypeScript parser.
+
+`benchmarks/run-jsir-differential.sh` requires `JSIR_RS_DIR` to point at a
+`jsir-rs` checkout containing the `coil_signature` example (local commit
+`5616a14` on the `coil-differential` worktree). It compares independent output,
+not a checked-in golden:
+
+```sh
+COIL_COMPILER=/path/to/coil \
+JSIR_RS_DIR=/path/to/jsir-rs benchmarks/run-jsir-differential.sh
+```
