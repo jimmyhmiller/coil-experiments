@@ -116,7 +116,9 @@ declarations and parameters; blocks; valued and empty return, empty, debugger,
 if/else, while, and expression statements; identifiers, boolean and null
 literals, `this`, integer-shaped number spans, escaped quoted strings,
 unary expressions, assignment, arrays, objects and properties, member access,
+computed member access,
 calls, conditionals, and generated longest-match compound binary operators;
+single-parameter and parenthesized block- or expression-bodied arrow functions;
 plus self-closing and nested JSX, JSX text, expression children, and string or
 expression-valued attributes. Focused source fixtures also verify that CFG
 fallthrough after `if`, `while`, and conditional expressions is terminated on

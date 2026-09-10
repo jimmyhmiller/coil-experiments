@@ -18,7 +18,7 @@ cd "$project_dir"
 "$coil_compiler" expand "$source_file" > "$scratch_file"
 
 for production in \
-  word string primary property object call member postfix expression declaration \
+  word string primary property object call member computed-member postfix expression declaration \
   return expression-statement block if while function statement direct-program \
   type-annotation type-alias-body type-parameters type-alias statement-end import \
   type-arguments \
@@ -33,4 +33,4 @@ do
   fi
 done
 
-printf '%s\n' 'all 36 direct-parser productions are generated'
+printf '%s\n' 'all 37 direct-parser productions are generated'
