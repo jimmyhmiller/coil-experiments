@@ -46,7 +46,12 @@ Coil function bodies. Generator algorithms currently include:
 - `function-declaration` for nested regions, scopes, parameters, captures, and
   implicit returns;
 - `program-root` for root storage initialization, repetition, fallthrough, and
-  IR membership finalization.
+  IR membership finalization;
+- `erased-type-span`, `erased-type-parameters`, and `erased-declaration` for
+  source-backed TypeScript annotations, generic parameters, and type aliases;
+- `statement-terminator` for explicit semicolons and JavaScript ASI boundaries;
+- `import-declaration` for side-effect, default, namespace, named, aliased, and
+  type-only imports, creating runtime bindings only for value imports.
 
 The macro call in `direct_parser.coil` supplies named backend roles. These roles
 are primitive cursor/source queries, diagnostics, scratch storage, binding and
@@ -65,6 +70,12 @@ executes the generated parser and the complete IR verifier for one source file.
 TypeScript/TSX corpus, then reports whole-file and byte-weighted Coil coverage.
 The 80% target requires both measurements to pass so a large number of tiny
 fixtures or a few generated large files cannot distort the result.
+
+`benchmarks/check-typescript-generated-core.sh` permanently covers the first
+TypeScript slice: directives, every import-clause shape, type-only imports,
+generic type aliases, annotations, generic functions, bitwise and shift
+operators, compound assignments, unary `~`, and ASI. Passing means the emitted
+IR also passes the complete verifier.
 
 For now compiler and semantic specification share `parser_generator.coil`.
 Coil expands an imported `Code -> Code` helper as a nested macro before its
