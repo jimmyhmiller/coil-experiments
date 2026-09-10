@@ -13,6 +13,8 @@ while (value < 10) {
 while (true) {
   while (false) {
     continue;
+    value = 99;
   }
   break;
+  value = 100;
 }
