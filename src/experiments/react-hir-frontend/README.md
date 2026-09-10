@@ -98,6 +98,14 @@ The implemented pipeline is:
     scopes, bindings, references, and captures. Byte-identical print/parse/print
     tests cover a CFG with a join block parameter, a parsed multi-block
     statement CFG, and nested regions with lexical capture metadata.
+16. `parser_generator.coil` begins the actual semantic parser-generator layer.
+    A declarative `separated-value` production now generates the full direct
+    array parser at Coil compile time: repetition, separators, caller-owned
+    scratch lifetime, diagnostics, spans, and IR emission. The handwritten
+    array parser was deleted, nested aggregate regressions pass through the
+    generated function, and macro expansion exposes the generated Coil for
+    inspection. Other productions remain handwritten until migrated through
+    general generator forms rather than construct-specific parser additions.
 
 All bitmap-producing entry points accept an explicit valid byte count. SIMD
 tail fill bytes therefore cannot appear as source events. Tape writes report

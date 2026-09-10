@@ -1,0 +1,106 @@
+(module experiments.react-hir-frontend.parser-generator)
+
+(import "coil.primitive" :as p)
+(import "coil.slice" :use [slice-get])
+(import "experiments.react-hir-frontend.frontend-spec" :as syntax)
+(import "experiments.react-hir-frontend.ir" :as ir)
+
+(defn generator-symbol? [(value Code) (name (slice u8))] (-> bool)
+  (and (p/code-sym? value) (= (p/code-sym value) name)))
+
+(defn generator-form? [(value Code) (name (slice u8))] (-> bool)
+  (and (p/code-list? value) (> (p/code-count value) 0)
+       (generator-symbol? (p/code-nth value 0) name)))
+
+(defn generator-fail [(at Code) (message (slice u8))] (-> Code)
+  (do (p/report at message) at))
+
+(defn field-value [(production Code) (name (slice u8))] (-> Code)
+  (let [(mut i) 2 (mut found) `false]
+    (loop
+      (if (>= (load i) (p/code-count production)) (break)
+        (let [field (p/code-nth production (load i))]
+          (if (and (p/code-list? field) (= (p/code-count field) 2)
+                   (generator-symbol? (p/code-nth field 0) name))
+              (do (store! found (p/code-nth field 1)) (break))
+            (set! i (+ (load i) 1))))))
+    (if (generator-symbol? (load found) "false")
+        (generator-fail production "generated production is missing a required field")
+      (load found))))
+
+;; Backend ABI:
+;; [State Result current-position current-byte advance! consume-byte! fail!
+;;  parse-expression! push-scratch-value! emit-scratch-list-op! ok-error
+;;  expected-error generated-array-name]
+;;
+;; This compiler owns the repetition, separator, closing-token, scratch-lifetime,
+;; and error-control algorithm. The backend supplies only primitive operations.
+(defn compile-separated-value [(backend Code) (production Code)] (-> Code)
+  (if (not (and (p/code-vector? backend) (= (p/code-count backend) 13)
+                (p/code-list? production) (= (p/code-count production) 7)
+                (generator-form? production "separated-value")
+                (p/code-sym? (p/code-nth production 1))))
+      (generator-fail production "invalid separated-value production")
+    (let [state-type (p/code-nth backend 0)
+          result-type (p/code-nth backend 1)
+          current-position-code (p/code-nth backend 2)
+          current-byte-code (p/code-nth backend 3)
+          advance-code (p/code-nth backend 4)
+          consume-code (p/code-nth backend 5)
+          fail-code (p/code-nth backend 6)
+          parse-expression-code (p/code-nth backend 7)
+          push-value-code (p/code-nth backend 8)
+          emit-list-code (p/code-nth backend 9)
+          ok-error (p/code-nth backend 10)
+          expected-error (p/code-nth backend 11)
+          function-name (p/code-nth backend 12)
+          open (field-value production "open")
+          separator (field-value production "separator")
+          close (field-value production "close")
+          precedence (field-value production "element-precedence")
+          opcode (field-value production "emit-op")
+          state (p/fresh-identifier "state")]
+      `(defn ~function-name [(~state (ptr ~state-type))] (-> ~result-type)
+         (let [scratch (.scratch ~state) mark (.value-count scratch)
+               start (~current-position-code ~state) _open (~advance-code ~state)]
+           (if (= (~current-byte-code ~state) ~close) 0
+             (loop
+               (let [element (~parse-expression-code ~state ~precedence)]
+                 (~push-value-code ~state (.value element))
+                 (if (!= (.error ~state) ~ok-error) (break)
+                   (if (= (~current-byte-code ~state) ~separator)
+                       (~advance-code ~state) (break))))))
+           (let [end-position (~current-position-code ~state)]
+             (if (not (~consume-code ~state ~close))
+                 (~fail-code ~state ~expected-error)
+               (~emit-list-code ~state ~opcode start
+                 (+ end-position (cast u32 1)) mark))))))))
+
+;; ---------------------------------------------------------------------------
+;; Semantic parser DSL specification
+;; ---------------------------------------------------------------------------
+;; Keep this data-only section at the end of the module. Coil currently expands
+;; an imported Code->Code helper as a nested macro too early, so compiler and
+;; specification share a module until compile-time library linkage is added.
+(defn define-frontend-parser [(backend Code)] (-> Code)
+  (let [productions
+          `[(separated-value array-expression
+        (open (syntax/array-production-terminal 0))
+        (separator (syntax/array-production-terminal 1))
+        (close (syntax/array-production-terminal 2))
+        (element-precedence 0)
+        (emit-op ir/OP-JS-ARRAY))]
+        definitions (p/code-list-new) (mut i) 0]
+    (loop
+      (if (>= (load i) (p/code-count productions)) (break)
+        (let [production (p/code-nth productions (load i))]
+          (if (generator-form? production "separated-value")
+              (do
+                (p/code-list-push! definitions
+                  (compile-separated-value backend production))
+                0)
+            (do
+              (generator-fail production "unknown generated production kind")
+              0))
+          (set! i (+ (load i) 1)))))
+    (let [forms (p/code-list-done definitions)] `(do ~@forms))))
