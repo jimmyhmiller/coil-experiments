@@ -1,0 +1,426 @@
+(module experiments.react-hir-frontend.ir-builder)
+
+(import "coil.primitive" :as p)
+(import "experiments.react-hir-frontend.ir" :as ir)
+
+(const BUILD-OK i64 0)
+(const BUILD-REGION-CAPACITY i64 1)
+(const BUILD-BLOCK-CAPACITY i64 2)
+(const BUILD-OP-CAPACITY i64 3)
+(const BUILD-VALUE-CAPACITY i64 4)
+(const BUILD-OPERAND-CAPACITY i64 5)
+(const BUILD-SUCCESSOR-CAPACITY i64 6)
+(const BUILD-SUCCESSOR-ARG-CAPACITY i64 7)
+(const BUILD-REGION-REF-CAPACITY i64 8)
+(const BUILD-BLOCK-REF-CAPACITY i64 9)
+(const BUILD-OP-REGION-CAPACITY i64 10)
+(const BUILD-SCOPE-CAPACITY i64 11)
+(const BUILD-BINDING-CAPACITY i64 12)
+(const BUILD-REFERENCE-CAPACITY i64 13)
+(const BUILD-CAPTURE-CAPACITY i64 14)
+(const BUILD-INVALID-OWNER i64 15)
+(const BUILD-NONCONTIGUOUS-FIELD i64 16)
+(const BUILD-ALREADY-FINALIZED i64 17)
+
+(defstruct BuilderCapacities
+  [(regions u32) (region-block-refs u32)
+   (blocks u32) (block-op-refs u32)
+   (ops u32) (op-region-refs u32)
+   (values u32) (operands u32)
+   (successors u32) (successor-args u32)
+   (scopes u32) (bindings u32) (references u32) (captures u32)])
+
+;; Intrusive staging links let parsing interleave parent and child regions. The
+;; finalization pass writes compact handle pools; it does not materialize or
+;; reinterpret syntax and is linear in the number of blocks and operations.
+(defstruct BuilderScratch
+  [(region-block-heads (ptr u32))
+   (region-block-tails (ptr u32))
+   (block-next-in-region (ptr u32))
+   (block-op-heads (ptr u32))
+   (block-op-tails (ptr u32))
+   (op-next-in-block (ptr u32))
+   (op-region-heads (ptr u32))
+   (op-region-tails (ptr u32))
+   (region-next-in-op (ptr u32))])
+
+(defstruct IrBuilder
+  [(arena (ptr ir/IrArena))
+   (scratch (ptr BuilderScratch))
+   (capacities BuilderCapacities)
+   (error i64)
+   (error-index u32)
+   (finalized bool)])
+
+(defstruct BuildResult [(id u32) (error i64)])
+
+(defn build-ok [(id u32)] (-> BuildResult)
+  (BuildResult :id id :error BUILD-OK))
+
+(defn fail! [(builder (ptr IrBuilder)) (error i64) (index u32)] (-> BuildResult)
+  (if (= (.error builder) BUILD-OK)
+      (do (set! (.error builder) error) (set! (.error-index builder) index)) 0)
+  (BuildResult :id (cast u32 ir/INVALID-ID) :error (.error builder)))
+
+(defn initialize-builder! [(builder (ptr IrBuilder)) (arena (ptr ir/IrArena))
+                           (scratch (ptr BuilderScratch))
+                           (capacities BuilderCapacities)] (-> i64)
+  (set! (.region-count arena) (cast u32 0))
+  (set! (.region-block-ref-count arena) (cast u32 0))
+  (set! (.block-count arena) (cast u32 0))
+  (set! (.block-op-ref-count arena) (cast u32 0))
+  (set! (.op-count arena) (cast u32 0))
+  (set! (.op-region-ref-count arena) (cast u32 0))
+  (set! (.operand-count arena) (cast u32 0))
+  (set! (.successor-count arena) (cast u32 0))
+  (set! (.successor-arg-count arena) (cast u32 0))
+  (set! (.value-count arena) (cast u32 0))
+  (set! (.scope-count arena) (cast u32 0))
+  (set! (.binding-count arena) (cast u32 0))
+  (set! (.reference-count arena) (cast u32 0))
+  (set! (.capture-count arena) (cast u32 0))
+  (store! builder (IrBuilder :arena arena :scratch scratch :capacities capacities
+                             :error BUILD-OK :error-index (cast u32 ir/INVALID-ID)
+                             :finalized false))
+  0)
+
+(defn add-region! [(builder (ptr IrBuilder)) (parent-op u32)] (-> BuildResult)
+  (let [arena (.arena builder) caps (.capacities builder)]
+    (if (or (!= (.error builder) BUILD-OK) (.finalized builder))
+        (fail! builder (if (.finalized builder) BUILD-ALREADY-FINALIZED (.error builder))
+               (.region-count arena))
+      (if (>= (.region-count arena) (.regions caps))
+          (fail! builder BUILD-REGION-CAPACITY (.region-count arena))
+        (if (and (!= parent-op (cast u32 ir/INVALID-ID))
+                 (>= parent-op (.op-count arena)))
+            (fail! builder BUILD-INVALID-OWNER parent-op)
+          (let [id (.region-count arena) scratch (.scratch builder)]
+            (store! (p/index (.region-parent-ops arena) (cast i64 id)) parent-op)
+            (store! (p/index (.region-first-blocks arena) (cast i64 id)) (cast u32 0))
+            (store! (p/index (.region-block-counts arena) (cast i64 id)) (cast u32 0))
+            (store! (p/index (.region-block-heads scratch) (cast i64 id))
+                    (cast u32 ir/INVALID-ID))
+            (store! (p/index (.region-block-tails scratch) (cast i64 id))
+                    (cast u32 ir/INVALID-ID))
+            (set! (.region-count arena) (+ id (cast u32 1)))
+            (build-ok id)))))))
+
+(defn add-block! [(builder (ptr IrBuilder)) (region u32)] (-> BuildResult)
+  (let [arena (.arena builder) caps (.capacities builder) scratch (.scratch builder)]
+    (if (or (!= (.error builder) BUILD-OK) (.finalized builder))
+        (fail! builder (if (.finalized builder) BUILD-ALREADY-FINALIZED (.error builder))
+               (.block-count arena))
+      (if (>= region (.region-count arena)) (fail! builder BUILD-INVALID-OWNER region)
+        (if (>= (.block-count arena) (.blocks caps))
+            (fail! builder BUILD-BLOCK-CAPACITY (.block-count arena))
+          (let [id (.block-count arena)
+                tail (load (p/index (.region-block-tails scratch) (cast i64 region)))]
+            (store! (p/index (.block-regions arena) (cast i64 id)) region)
+            (store! (p/index (.block-first-params arena) (cast i64 id))
+                    (.value-count arena))
+            (store! (p/index (.block-param-counts arena) (cast i64 id)) (cast u32 0))
+            (store! (p/index (.block-first-ops arena) (cast i64 id)) (cast u32 0))
+            (store! (p/index (.block-op-counts arena) (cast i64 id)) (cast u32 0))
+            (store! (p/index (.block-next-in-region scratch) (cast i64 id))
+                    (cast u32 ir/INVALID-ID))
+            (store! (p/index (.block-op-heads scratch) (cast i64 id))
+                    (cast u32 ir/INVALID-ID))
+            (store! (p/index (.block-op-tails scratch) (cast i64 id))
+                    (cast u32 ir/INVALID-ID))
+            (if (= tail (cast u32 ir/INVALID-ID))
+                (store! (p/index (.region-block-heads scratch) (cast i64 region)) id)
+              (store! (p/index (.block-next-in-region scratch) (cast i64 tail)) id))
+            (store! (p/index (.region-block-tails scratch) (cast i64 region)) id)
+            (let [count-p (p/index (.region-block-counts arena) (cast i64 region))]
+              (store! count-p (+ (load count-p) (cast u32 1))))
+            (set! (.block-count arena) (+ id (cast u32 1)))
+            (build-ok id)))))))
+
+(defn add-block-param! [(builder (ptr IrBuilder)) (block u32)] (-> BuildResult)
+  (let [arena (.arena builder) caps (.capacities builder)]
+    (if (>= block (.block-count arena)) (fail! builder BUILD-INVALID-OWNER block)
+      (if (>= (.value-count arena) (.values caps))
+          (fail! builder BUILD-VALUE-CAPACITY (.value-count arena))
+        (let [first-p (p/index (.block-first-params arena) (cast i64 block))
+              count-p (p/index (.block-param-counts arena) (cast i64 block))
+              id (.value-count arena)]
+          (if (!= id (+ (load first-p) (load count-p)))
+              (fail! builder BUILD-NONCONTIGUOUS-FIELD block)
+            (do
+              (store! (p/index (.value-def-kinds arena) (cast i64 id))
+                      (cast u8 ir/DEF-BLOCK-PARAM))
+              (store! (p/index (.value-def-indices arena) (cast i64 id)) id)
+              (store! count-p (+ (load count-p) (cast u32 1)))
+              (set! (.value-count arena) (+ id (cast u32 1)))
+              (build-ok id))))))))
+
+(defn add-op! [(builder (ptr IrBuilder)) (block u32) (opcode u16)
+              (name-start u32) (name-end u32) (start u32) (end u32)
+              (result-count u32)] (-> BuildResult)
+  (let [arena (.arena builder) caps (.capacities builder) scratch (.scratch builder)]
+    (if (>= block (.block-count arena)) (fail! builder BUILD-INVALID-OWNER block)
+      (if (>= (.op-count arena) (.ops caps))
+          (fail! builder BUILD-OP-CAPACITY (.op-count arena))
+        (if (> result-count (- (.values caps) (.value-count arena)))
+            (fail! builder BUILD-VALUE-CAPACITY (.value-count arena))
+          (let [id (.op-count arena) first-result (.value-count arena)
+                tail (load (p/index (.block-op-tails scratch) (cast i64 block)))]
+            (store! (p/index (.opcodes arena) (cast i64 id)) opcode)
+            (store! (p/index (.op-name-starts arena) (cast i64 id)) name-start)
+            (store! (p/index (.op-name-ends arena) (cast i64 id)) name-end)
+            (store! (p/index (.op-first-operands arena) (cast i64 id)) (.operand-count arena))
+            (store! (p/index (.op-operand-counts arena) (cast i64 id)) (cast u32 0))
+            (store! (p/index (.op-first-results arena) (cast i64 id)) first-result)
+            (store! (p/index (.op-result-counts arena) (cast i64 id)) result-count)
+            (store! (p/index (.op-first-successors arena) (cast i64 id))
+                    (.successor-count arena))
+            (store! (p/index (.op-successor-counts arena) (cast i64 id)) (cast u32 0))
+            (store! (p/index (.op-first-regions arena) (cast i64 id))
+                    (cast u32 0))
+            (store! (p/index (.op-region-counts arena) (cast i64 id)) (cast u32 0))
+            (store! (p/index (.op-region-heads scratch) (cast i64 id))
+                    (cast u32 ir/INVALID-ID))
+            (store! (p/index (.op-region-tails scratch) (cast i64 id))
+                    (cast u32 ir/INVALID-ID))
+            (store! (p/index (.op-starts arena) (cast i64 id)) start)
+            (store! (p/index (.op-ends arena) (cast i64 id)) end)
+            (store! (p/index (.op-next-in-block scratch) (cast i64 id))
+                    (cast u32 ir/INVALID-ID))
+            (if (= tail (cast u32 ir/INVALID-ID))
+                (store! (p/index (.block-op-heads scratch) (cast i64 block)) id)
+              (store! (p/index (.op-next-in-block scratch) (cast i64 tail)) id))
+            (store! (p/index (.block-op-tails scratch) (cast i64 block)) id)
+            (let [count-p (p/index (.block-op-counts arena) (cast i64 block))]
+              (store! count-p (+ (load count-p) (cast u32 1))))
+            (let [(mut value) first-result]
+              (loop
+                (if (>= (load value) (+ first-result result-count)) (break)
+                  (do
+                    (store! (p/index (.value-def-kinds arena) (cast i64 (load value)))
+                            (cast u8 ir/DEF-OP-RESULT))
+                    (store! (p/index (.value-def-indices arena) (cast i64 (load value))) id)
+                    (set! value (+ (load value) (cast u32 1))))))
+            (set! (.value-count arena) (+ first-result result-count))
+            (set! (.op-count arena) (+ id (cast u32 1)))
+            (build-ok id))))))))
+
+(defn add-operand! [(builder (ptr IrBuilder)) (op u32) (value u32)] (-> BuildResult)
+  (let [arena (.arena builder) caps (.capacities builder)]
+    (if (or (>= op (.op-count arena)) (>= value (.value-count arena)))
+        (fail! builder BUILD-INVALID-OWNER (if (>= op (.op-count arena)) op value))
+      (if (>= (.operand-count arena) (.operands caps))
+          (fail! builder BUILD-OPERAND-CAPACITY (.operand-count arena))
+        (let [first (load (p/index (.op-first-operands arena) (cast i64 op)))
+              count-p (p/index (.op-operand-counts arena) (cast i64 op))
+              id (.operand-count arena)]
+          (if (!= id (+ first (load count-p)))
+              (fail! builder BUILD-NONCONTIGUOUS-FIELD op)
+            (do
+              (store! (p/index (.operands arena) (cast i64 id)) value)
+              (store! count-p (+ (load count-p) (cast u32 1)))
+              (set! (.operand-count arena) (+ id (cast u32 1)))
+              (build-ok id))))))))
+
+(defn add-op-region! [(builder (ptr IrBuilder)) (op u32) (region u32)] (-> BuildResult)
+  (let [arena (.arena builder) scratch (.scratch builder)]
+    (if (or (>= op (.op-count arena)) (>= region (.region-count arena)))
+        (fail! builder BUILD-INVALID-OWNER (if (>= op (.op-count arena)) op region))
+      (if (!= (load (p/index (.region-parent-ops arena) (cast i64 region))) op)
+          (fail! builder BUILD-INVALID-OWNER region)
+        (let [tail (load (p/index (.op-region-tails scratch) (cast i64 op)))
+              count-p (p/index (.op-region-counts arena) (cast i64 op))]
+          (store! (p/index (.region-next-in-op scratch) (cast i64 region))
+                  (cast u32 ir/INVALID-ID))
+          (if (= tail (cast u32 ir/INVALID-ID))
+              (store! (p/index (.op-region-heads scratch) (cast i64 op)) region)
+            (store! (p/index (.region-next-in-op scratch) (cast i64 tail)) region))
+          (store! (p/index (.op-region-tails scratch) (cast i64 op)) region)
+          (store! count-p (+ (load count-p) (cast u32 1)))
+          (build-ok region))))))
+
+(defn add-successor! [(builder (ptr IrBuilder)) (op u32) (target-block u32)]
+  (-> BuildResult)
+  (let [arena (.arena builder) caps (.capacities builder)]
+    (if (or (>= op (.op-count arena)) (>= target-block (.block-count arena)))
+        (fail! builder BUILD-INVALID-OWNER
+               (if (>= op (.op-count arena)) op target-block))
+      (if (>= (.successor-count arena) (.successors caps))
+          (fail! builder BUILD-SUCCESSOR-CAPACITY (.successor-count arena))
+        (let [first (load (p/index (.op-first-successors arena) (cast i64 op)))
+              count-p (p/index (.op-successor-counts arena) (cast i64 op))
+              id (.successor-count arena)]
+          (if (!= id (+ first (load count-p)))
+              (fail! builder BUILD-NONCONTIGUOUS-FIELD op)
+            (do
+              (store! (p/index (.successor-blocks arena) (cast i64 id)) target-block)
+              (store! (p/index (.successor-first-args arena) (cast i64 id))
+                      (.successor-arg-count arena))
+              (store! (p/index (.successor-arg-counts arena) (cast i64 id)) (cast u32 0))
+              (store! count-p (+ (load count-p) (cast u32 1)))
+              (set! (.successor-count arena) (+ id (cast u32 1)))
+              (build-ok id))))))))
+
+(defn add-successor-arg! [(builder (ptr IrBuilder)) (successor u32) (value u32)]
+  (-> BuildResult)
+  (let [arena (.arena builder) caps (.capacities builder)]
+    (if (or (>= successor (.successor-count arena)) (>= value (.value-count arena)))
+        (fail! builder BUILD-INVALID-OWNER
+               (if (>= successor (.successor-count arena)) successor value))
+      (if (>= (.successor-arg-count arena) (.successor-args caps))
+          (fail! builder BUILD-SUCCESSOR-ARG-CAPACITY (.successor-arg-count arena))
+        (let [first (load (p/index (.successor-first-args arena) (cast i64 successor)))
+              count-p (p/index (.successor-arg-counts arena) (cast i64 successor))
+              id (.successor-arg-count arena)]
+          (if (!= id (+ first (load count-p)))
+              (fail! builder BUILD-NONCONTIGUOUS-FIELD successor)
+            (do
+              (store! (p/index (.successor-args arena) (cast i64 id)) value)
+              (store! count-p (+ (load count-p) (cast u32 1)))
+              (set! (.successor-arg-count arena) (+ id (cast u32 1)))
+              (build-ok id))))))))
+
+(defn add-scope! [(builder (ptr IrBuilder)) (parent u32) (start u32) (end u32)]
+  (-> BuildResult)
+  (let [arena (.arena builder) caps (.capacities builder)]
+    (if (and (!= parent (cast u32 ir/INVALID-ID)) (>= parent (.scope-count arena)))
+        (fail! builder BUILD-INVALID-OWNER parent)
+      (if (>= (.scope-count arena) (.scopes caps))
+          (fail! builder BUILD-SCOPE-CAPACITY (.scope-count arena))
+        (let [id (.scope-count arena)]
+          (store! (p/index (.scope-parents arena) (cast i64 id)) parent)
+          (store! (p/index (.scope-starts arena) (cast i64 id)) start)
+          (store! (p/index (.scope-ends arena) (cast i64 id)) end)
+          (set! (.scope-count arena) (+ id (cast u32 1)))
+          (build-ok id))))))
+
+(defn add-binding! [(builder (ptr IrBuilder)) (scope u32) (start u32) (end u32)]
+  (-> BuildResult)
+  (let [arena (.arena builder) caps (.capacities builder)]
+    (if (>= scope (.scope-count arena)) (fail! builder BUILD-INVALID-OWNER scope)
+      (if (>= (.binding-count arena) (.bindings caps))
+          (fail! builder BUILD-BINDING-CAPACITY (.binding-count arena))
+        (let [id (.binding-count arena)]
+          (store! (p/index (.binding-scopes arena) (cast i64 id)) scope)
+          (store! (p/index (.binding-name-starts arena) (cast i64 id)) start)
+          (store! (p/index (.binding-name-ends arena) (cast i64 id)) end)
+          (set! (.binding-count arena) (+ id (cast u32 1)))
+          (build-ok id))))))
+
+(defn add-reference! [(builder (ptr IrBuilder)) (binding u32) (start u32) (end u32)]
+  (-> BuildResult)
+  (let [arena (.arena builder) caps (.capacities builder)]
+    (if (>= binding (.binding-count arena)) (fail! builder BUILD-INVALID-OWNER binding)
+      (if (>= (.reference-count arena) (.references caps))
+          (fail! builder BUILD-REFERENCE-CAPACITY (.reference-count arena))
+        (let [id (.reference-count arena)]
+          (store! (p/index (.reference-bindings arena) (cast i64 id)) binding)
+          (store! (p/index (.reference-starts arena) (cast i64 id)) start)
+          (store! (p/index (.reference-ends arena) (cast i64 id)) end)
+          (set! (.reference-count arena) (+ id (cast u32 1)))
+          (build-ok id))))))
+
+(defn add-capture! [(builder (ptr IrBuilder)) (scope u32) (binding u32)]
+  (-> BuildResult)
+  (let [arena (.arena builder) caps (.capacities builder)]
+    (if (or (>= scope (.scope-count arena)) (>= binding (.binding-count arena)))
+        (fail! builder BUILD-INVALID-OWNER
+               (if (>= scope (.scope-count arena)) scope binding))
+      (if (>= (.capture-count arena) (.captures caps))
+          (fail! builder BUILD-CAPTURE-CAPACITY (.capture-count arena))
+        (let [id (.capture-count arena)]
+          (store! (p/index (.capture-scopes arena) (cast i64 id)) scope)
+          (store! (p/index (.capture-bindings arena) (cast i64 id)) binding)
+          (set! (.capture-count arena) (+ id (cast u32 1)))
+          (build-ok id))))))
+
+(defn finalize-membership! [(builder (ptr IrBuilder))] (-> i64)
+  (let [arena (.arena builder) caps (.capacities builder) scratch (.scratch builder)]
+    (if (!= (.error builder) BUILD-OK) (.error builder)
+      (if (.finalized builder) BUILD-OK
+        (do
+          (let [(mut region) (cast u32 0)]
+            (loop
+              (if (or (>= (load region) (.region-count arena))
+                      (!= (.error builder) BUILD-OK)) (break)
+                (let [count (load (p/index (.region-block-counts arena)
+                                           (cast i64 (load region))))
+                      (mut block) (load (p/index (.region-block-heads scratch)
+                                                  (cast i64 (load region))))
+                      (mut i) (cast u32 0)]
+                  (if (> count (- (.region-block-refs caps)
+                                  (.region-block-ref-count arena)))
+                      (do
+                        (fail! builder BUILD-REGION-REF-CAPACITY (load region))
+                        0)
+                    (do
+                      (store! (p/index (.region-first-blocks arena)
+                                       (cast i64 (load region)))
+                              (.region-block-ref-count arena))
+                      (loop
+                        (if (>= (load i) count) (break)
+                          (do
+                            (store! (p/index (.region-blocks arena)
+                                             (cast i64 (.region-block-ref-count arena)))
+                                    (load block))
+                            (set! (.region-block-ref-count arena)
+                                  (+ (.region-block-ref-count arena) (cast u32 1)))
+                            (set! block (load (p/index (.block-next-in-region scratch)
+                                                       (cast i64 (load block)))))
+                            (set! i (+ (load i) (cast u32 1))))))))
+                  (set! region (+ (load region) (cast u32 1)))))))
+          (let [(mut block) (cast u32 0)]
+            (loop
+              (if (or (>= (load block) (.block-count arena))
+                      (!= (.error builder) BUILD-OK)) (break)
+                (let [count (load (p/index (.block-op-counts arena)
+                                           (cast i64 (load block))))
+                      (mut op) (load (p/index (.block-op-heads scratch)
+                                               (cast i64 (load block))))
+                      (mut i) (cast u32 0)]
+                  (if (> count (- (.block-op-refs caps) (.block-op-ref-count arena)))
+                      (do
+                        (fail! builder BUILD-BLOCK-REF-CAPACITY (load block))
+                        0)
+                    (do
+                      (store! (p/index (.block-first-ops arena) (cast i64 (load block)))
+                              (.block-op-ref-count arena))
+                      (loop
+                        (if (>= (load i) count) (break)
+                          (do
+                            (store! (p/index (.block-ops arena)
+                                             (cast i64 (.block-op-ref-count arena)))
+                                    (load op))
+                            (set! (.block-op-ref-count arena)
+                                  (+ (.block-op-ref-count arena) (cast u32 1)))
+                            (set! op (load (p/index (.op-next-in-block scratch)
+                                                    (cast i64 (load op)))))
+                            (set! i (+ (load i) (cast u32 1))))))))
+                  (set! block (+ (load block) (cast u32 1)))))))
+          (let [(mut op) (cast u32 0)]
+            (loop
+              (if (or (>= (load op) (.op-count arena))
+                      (!= (.error builder) BUILD-OK)) (break)
+                (let [count (load (p/index (.op-region-counts arena)
+                                           (cast i64 (load op))))
+                      (mut region) (load (p/index (.op-region-heads scratch)
+                                                   (cast i64 (load op))))
+                      (mut i) (cast u32 0)]
+                  (if (> count (- (.op-region-refs caps) (.op-region-ref-count arena)))
+                      (do (fail! builder BUILD-OP-REGION-CAPACITY (load op)) 0)
+                    (do
+                      (store! (p/index (.op-first-regions arena) (cast i64 (load op)))
+                              (.op-region-ref-count arena))
+                      (loop
+                        (if (>= (load i) count) (break)
+                          (do
+                            (store! (p/index (.op-regions arena)
+                                             (cast i64 (.op-region-ref-count arena)))
+                                    (load region))
+                            (set! (.op-region-ref-count arena)
+                                  (+ (.op-region-ref-count arena) (cast u32 1)))
+                            (set! region (load (p/index (.region-next-in-op scratch)
+                                                       (cast i64 (load region)))))
+                            (set! i (+ (load i) (cast u32 1))))))))
+                  (set! op (+ (load op) (cast u32 1)))))))
+          (if (= (.error builder) BUILD-OK) (set! (.finalized builder) true) 0)
+          (.error builder))))))

@@ -51,11 +51,18 @@ The implemented pipeline is:
     results and operands, explicit terminators/successors, nested-region
     ownership, scopes, bindings, references, captures, and source spans. Its
     verifier checks structural ranges, terminator placement, successor arity,
-    same-block definition order, and cross-block dominance using a scalable
-    caller-owned bitset. Its capacity-safe native printer emits deterministic
-    textual IR. `ir_test.coil` exercises a real diamond CFG whose branch-local
-    values merge through a join block parameter, plus negative arity and
-    dominance cases.
+    reciprocal region/value ownership, same-region CFG edges, same-block
+    definition order, and cross-block dominance using a scalable caller-owned
+    bitset. Its capacity-safe native printer emits deterministic textual IR.
+    `ir_test.coil` exercises a real diamond CFG whose branch-local values merge
+    through a join block parameter, plus negative arity and dominance cases.
+12. `ir_builder.coil` is the allocation-free direct-construction API intended
+    for parser actions. Parsing may interleave parent operations with blocks,
+    operations, and regions nested beneath them. Intrusive staging links are
+    compacted into stable handle pools in one linear finalization pass; no AST
+    is materialized. `ir_builder_test.coil` constructs such an interleaved
+    nested program, including lexical binding/reference/capture identities,
+    verifies it, and checks its exact textual IR.
 
 All bitmap-producing entry points accept an explicit valid byte count. SIMD
 tail fill bytes therefore cannot appear as source events. Tape writes report
@@ -81,10 +88,12 @@ async/generator forms, optional/computed access, spreads, TypeScript, Unicode
 identifiers, scope construction, recovery, and the final React compiler HIR
 schema.
 
-The SSA/CFG schema and verifier exist, but `parser.coil` has not yet been
-switched from its syntax-node `HirArena` to direct construction of that IR.
-Until that migration, the parser benchmark measures the syntax arena rather
-than text-to-verified-SSA throughput.
+The SSA/CFG schema, direct builder, verifier, and printer exist, but
+`parser.coil` has not yet been switched from its syntax-node `HirArena` to the
+builder. Until that migration, the parser benchmark measures the syntax arena
+rather than text-to-verified-SSA throughput. The target proof is canonical
+IR-to-text stability, JavaScript text-to-IR-to-text-to-IR semantic stability,
+and structural differential fixtures against `jsir-rs` on their shared subset.
 
 The SIMD frontend requires the combined compiler at Coil branch
 `simd-foundation` commit `d51cfcc` or later. That revision includes both generic
