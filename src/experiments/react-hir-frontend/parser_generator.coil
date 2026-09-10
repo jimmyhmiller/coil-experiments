@@ -407,8 +407,14 @@
                    (~emit-code ~state (if (load is-bigint) ~bigint-opcode ~opcode)
                      start (load ~number-at-id)))))))))))
 
+(defn keyword-dispatch-key [(keyword Code)] (-> i64)
+  (let [text (p/code-str keyword)]
+    (p/ior (cast i64 (slice-get text 0))
+      (p/ior (p/ishl (len text) 8)
+             (p/ishl (cast i64 (slice-get text 1)) 16)))))
+
 (defn compile-word-value [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 6)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 7)
                 (generator-form? production "word-value")))
       (generator-fail production "invalid word-value production")
     (let [state-type (backend-value backend "state-type")
@@ -418,11 +424,11 @@
           current-event-code (backend-value backend "current-event")
           current-position-code (backend-value backend "current-position")
           word-end-code (backend-value backend "word-end")
+          span-equals-code (backend-value backend "span-equals")
           source-byte-code (backend-value backend "source-byte")
           advance-code (backend-value backend "advance")
           fail-code (backend-value backend "fail")
           emit-code (backend-value backend "emit-value-op")
-          current-keyword-code (backend-value backend "current-keyword")
           find-binding-code (backend-value backend "find-binding")
           check-build-code (backend-value backend "check-build")
           ensure-capture-code (backend-value backend "ensure-capture")
@@ -432,17 +438,25 @@
                           (p/code-sym (field-value production "number-parser")))
           identifier-op (field-value production "identifier-op")
           keyword-ops (field-value production "keyword-ops")
-          state (p/fresh-identifier "state") first-id (p/fresh-identifier "first")]
+          invalid-keywords (field-value production "invalid-keywords")
+          state (p/fresh-identifier "state") first-id (p/fresh-identifier "first")
+          start-id (p/fresh-identifier "start") end-id (p/fresh-identifier "end")
+          reserved-key-id (p/fresh-identifier "reserved-key")]
       `(defn ~function-name [(~state (ptr ~state-type))] (-> ~result-type)
          (if (or (>= (.event-index ~state) (.event-count ~state))
                  (!= (~event-kind-code (~current-event-code ~state))
                      (cast u8 ~word-event)))
              (~fail-code ~state ~unexpected-error)
-           (let [start (~current-position-code ~state)
-                 ~first-id (~source-byte-code ~state start)]
+           (let [~start-id (~current-position-code ~state)
+                 ~first-id (~source-byte-code ~state ~start-id)]
              (if (and (>= ~first-id (cast u8 48)) (<= ~first-id (cast u8 57)))
                  (~number-parser ~state)
-               (let [end (~word-end-code ~state start)
+               (let [~end-id (~word-end-code ~state ~start-id)
+                     ~reserved-key-id
+                       (p/ior (cast i64 ~first-id)
+                         (p/ior (p/ishl (- (cast i64 ~end-id) (cast i64 ~start-id)) 8)
+                           (p/ishl (cast i64 (~source-byte-code ~state
+                                               (+ ~start-id (cast u32 1)))) 16)))
                      opcode
                       (cond
                         ~@(let [clauses (p/code-list-new) (mut j) 0]
@@ -462,22 +476,37 @@
                                           `(and (= ~first-id
                                                     (cast u8 ~(cast i64
                                                       (slice-get keyword-text 0))))
-                                                (~current-keyword-code ~state
+                                                (~span-equals-code ~state ~start-id ~end-id
                                                   ~(p/code-nth entry 0)))))
                                         (p/code-list-push! clauses (p/code-nth entry 1)) 0))
                                   (set! j (+ (load j) 1)))))
                             (p/code-list-done clauses))
-                        :else ~identifier-op)]
-               (~advance-code ~state)
-               (let [result (~emit-code ~state opcode start end)]
-                 (if (= opcode ~identifier-op)
-                     (let [binding (~find-binding-code ~state start end)]
-                       (if (!= binding (cast u32 ir/INVALID-ID))
-                           (let [reference (builder/add-reference! (.builder ~state)
-                                                                    binding start end)]
-                             (~check-build-code ~state reference)
-                             (~ensure-capture-code ~state binding)) 0)) 0)
-                 result)))))))))
+                        :else ~identifier-op)
+                     invalid-identifier
+                       (and (= opcode ~identifier-op)
+                            (or ~@(let [checks (p/code-list-new) (mut j) 0]
+                                    (loop
+                                      (if (>= (load j) (p/code-count invalid-keywords)) (break)
+                                        (let [keyword (p/code-nth invalid-keywords (load j))]
+                                          (p/code-list-push! checks
+                                            `(and (= ~reserved-key-id
+                                                     ~(keyword-dispatch-key keyword))
+                                                  (~span-equals-code ~state ~start-id ~end-id
+                                                    ~keyword)))
+                                          (set! j (+ (load j) 1)))))
+                                    (p/code-list-done checks))))]
+               (if invalid-identifier (~fail-code ~state ~unexpected-error)
+                 (do
+                   (~advance-code ~state)
+                   (let [result (~emit-code ~state opcode ~start-id ~end-id)]
+                     (if (= opcode ~identifier-op)
+                         (let [binding (~find-binding-code ~state ~start-id ~end-id)]
+                           (if (!= binding (cast u32 ir/INVALID-ID))
+                               (let [reference (builder/add-reference! (.builder ~state)
+                                                                        binding ~start-id ~end-id)]
+                                 (~check-build-code ~state reference)
+                                 (~ensure-capture-code ~state binding)) 0)) 0)
+                     result)))))))))))
 
 (defn compile-quoted-value [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 3)
@@ -1432,7 +1461,7 @@
                false)))))))))
 
 (defn compile-binding-pattern [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 15)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 16)
                 (generator-form? production "binding-pattern")))
       (generator-fail production "invalid binding-pattern production")
     (let [state-type (backend-value backend "state-type")
@@ -1442,6 +1471,8 @@
           current-byte-code (backend-value backend "current-byte")
           adjacent-byte-code (backend-value backend "adjacent-event-byte")
           word-end-code (backend-value backend "word-end")
+          span-equals-code (backend-value backend "span-equals")
+          source-byte-code (backend-value backend "source-byte")
           advance-code (backend-value backend "advance")
           advance-count-code (backend-value backend "advance-count")
           consume-code (backend-value backend "consume-byte")
@@ -1460,7 +1491,15 @@
           greater (field-value production "greater")
           dot (field-value production "rest-byte")
           parameter-close (field-value production "parameter-close")
-          state (p/fresh-identifier "state")]
+          invalid-keywords (field-value production "invalid-keywords")
+          state (p/fresh-identifier "state")
+          binding-start-id (p/fresh-identifier "binding-start")
+          binding-end-id (p/fresh-identifier "binding-end")
+          binding-key-id (p/fresh-identifier "binding-key")
+          property-start-id (p/fresh-identifier "property-start")
+          property-end-id (p/fresh-identifier "property-end")
+          property-key-id (p/fresh-identifier "property-key")
+          property-invalid-id (p/fresh-identifier "property-invalid")]
       `(defn ~function-name
          [(~state (ptr ~state-type)) (allow-default bool) (pattern-stop-a u8) (pattern-stop-b u8)]
          (-> i64)
@@ -1468,12 +1507,31 @@
                   (= (~adjacent-byte-code ~state 1) ~dot)
                   (= (~adjacent-byte-code ~state 2) ~dot))
              (do (~advance-count-code ~state 3) 0) 0)
-         (let [start (~current-position-code ~state) end (~word-end-code ~state start)]
-           (if (!= start end)
+         (let [~binding-start-id (~current-position-code ~state)
+               ~binding-end-id (~word-end-code ~state ~binding-start-id)
+               ~binding-key-id
+                 (p/ior (cast i64 (~source-byte-code ~state ~binding-start-id))
+                   (p/ior
+                     (p/ishl (- (cast i64 ~binding-end-id)
+                                (cast i64 ~binding-start-id)) 8)
+                     (p/ishl (cast i64 (~source-byte-code ~state
+                                         (+ ~binding-start-id (cast u32 1)))) 16)))]
+           (if (and (!= ~binding-start-id ~binding-end-id)
+                    (not (or ~@(let [checks (p/code-list-new) (mut j) 0]
+                                (loop
+                                  (if (>= (load j) (p/code-count invalid-keywords)) (break)
+                                    (let [keyword (p/code-nth invalid-keywords (load j))]
+                                      (p/code-list-push! checks
+                                        `(and (= ~binding-key-id
+                                                 ~(keyword-dispatch-key keyword))
+                                              (~span-equals-code ~state ~binding-start-id
+                                                ~binding-end-id ~keyword)))
+                                      (set! j (+ (load j) 1)))))
+                                (p/code-list-done checks)))))
                (do
                  (~advance-code ~state)
                  (let [binding (builder/add-binding! (.builder ~state) (.scope ~state)
-                                                     start end)]
+                                                     ~binding-start-id ~binding-end-id)]
                    (~check-build-code ~state binding))
                  (if (= (~current-byte-code ~state) ~question)
                      (do (~advance-code ~state) 0) 0)
@@ -1492,20 +1550,45 @@
                                  (= (~adjacent-byte-code ~state 1) ~dot)
                                  (= (~adjacent-byte-code ~state 2) ~dot))
                              (do (~advance-count-code ~state 3) 0) 0)
-                         (let [property-start (~current-position-code ~state)
-                               property-end (~word-end-code ~state property-start)]
-                           (if (= property-start property-end)
+                         (let [~property-start-id (~current-position-code ~state)
+                               ~property-end-id (~word-end-code ~state ~property-start-id)
+                               ~property-key-id
+                                 (p/ior (cast i64 (~source-byte-code ~state ~property-start-id))
+                                   (p/ior
+                                     (p/ishl (- (cast i64 ~property-end-id)
+                                                (cast i64 ~property-start-id)) 8)
+                                     (p/ishl (cast i64 (~source-byte-code ~state
+                                               (+ ~property-start-id (cast u32 1)))) 16)))
+                               ~property-invalid-id
+                                 (or ~@(let [checks (p/code-list-new) (mut j) 0]
+                                          (loop
+                                            (if (>= (load j)
+                                                    (p/code-count invalid-keywords)) (break)
+                                              (let [keyword
+                                                      (p/code-nth invalid-keywords (load j))]
+                                                (p/code-list-push! checks
+                                                  `(and (= ~property-key-id
+                                                           ~(keyword-dispatch-key keyword))
+                                                        (~span-equals-code ~state
+                                                          ~property-start-id ~property-end-id
+                                                          ~keyword)))
+                                                (set! j (+ (load j) 1)))))
+                                          (p/code-list-done checks)))]
+                           (if (= ~property-start-id ~property-end-id)
                                (do (~fail-code ~state ~expected-error) (break) 0)
                              (do
                                (~advance-code ~state)
                                (if (= (~current-byte-code ~state) ~colon)
                                    (do (~advance-code ~state)
                                        (~function-name ~state true ~comma ~object-close) 0)
-                                 (do
-                                   (let [binding (builder/add-binding! (.builder ~state)
-                                                     (.scope ~state) property-start property-end)]
-                                     (~check-build-code ~state binding))
-                                   0))
+                                 (if ~property-invalid-id
+                                     (do (~fail-code ~state ~expected-error) 0)
+                                   (do
+                                     (let [binding (builder/add-binding! (.builder ~state)
+                                                       (.scope ~state) ~property-start-id
+                                                       ~property-end-id)]
+                                       (~check-build-code ~state binding))
+                                     0)))
                                (if (= (~current-byte-code ~state) ~equals)
                                    (do (~advance-code ~state)
                                        (~parse-expression-code ~state 0) 0) 0))))
@@ -3084,7 +3167,7 @@
            (~iterator-code ~state))))))
 
 (defn compile-iterator-for-statement [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 19)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 20)
                 (generator-form? production "iterator-for-statement")))
       (generator-fail production "invalid iterator-for-statement production")
     (let [state-type (backend-value backend "state-type")
@@ -3114,6 +3197,7 @@
           declaration-kinds (field-value production "declaration-kinds")
           equals (field-value production "equals") comma (field-value production "comma")
           target-ops (field-value production "target-ops")
+          target-precedence (field-value production "target-precedence")
           declare-op (field-value production "declare-op")
           assign-op (field-value production "assign-op")
           iterator-init-op (field-value production "iterator-init-op")
@@ -3165,7 +3249,7 @@
                            `(cond ~@(p/code-list-done clauses) :else 0))
                        (~advance-code ~state)
                        (~pattern-parser ~state false ~equals ~comma))
-                   (let [target (~parse-expression-code ~state 0)
+                   (let [target (~parse-expression-code ~state ~target-precedence)
                          definition-kind
                            (load (p/index (.value-def-kinds arena)
                                           (cast i64 (.value target))))
@@ -3508,8 +3592,43 @@
              ~(compile-assignment-condition operators (+ index 1) state
                 current-byte-code adjacent-byte-code)))))))
 
+(defn compile-word-operator-info [(backend Code) (production Code)] (-> Code)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 5)
+                (generator-form? production "word-operator-info")))
+      (generator-fail production "invalid word-operator-info production")
+    (let [state-type (backend-value backend "state-type")
+          function-name (backend-value backend
+                          (p/code-sym (field-value production "function")))
+          current-event-code (backend-value backend "current-event")
+          event-kind-code (backend-value backend "event-kind")
+          current-position-code (backend-value backend "current-position")
+          word-end-code (backend-value backend "word-end")
+          span-equals-code (backend-value backend "span-equals")
+          word-event (field-value production "word-event")
+          word-operators (field-value production "word-operators")
+          state (p/fresh-identifier "state")
+          start (p/fresh-identifier "word-start")
+          end (p/fresh-identifier "word-end")]
+      `(defn ~function-name :inline (Never) [(~state (ptr ~state-type))] (-> i64)
+         (if (!= (~event-kind-code (~current-event-code ~state))
+                 (cast u8 ~word-event)) 0
+           (let [~start (~current-position-code ~state)
+                 ~end (~word-end-code ~state ~start)]
+             (cond
+               ~@(let [clauses (p/code-list-new) (mut w) 0]
+                   (loop
+                     (if (>= (load w) (p/code-count word-operators)) (break)
+                       (let [entry (p/code-nth word-operators (load w))]
+                         (p/code-list-push! clauses
+                           `(~span-equals-code ~state ~start ~end ~(p/code-nth entry 0)))
+                         (p/code-list-push! clauses `(+ (* ~(p/code-nth entry 1) 256) 1))
+                         (set! w (+ (load w) 1)))))
+                   (p/code-list-push! clauses `:else)
+                   (p/code-list-push! clauses `0)
+                   (p/code-list-done clauses)))))))))
+
 (defn compile-precedence-expression [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 19)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 20)
                 (generator-form? production "precedence-expression")))
       (generator-fail production "invalid precedence-expression production")
     (let [state-type (backend-value backend "state-type")
@@ -3520,6 +3639,7 @@
                            (p/code-sym (field-value production "operand-parser")))
           current-byte-code (backend-value backend "current-byte")
           adjacent-byte-code (backend-value backend "adjacent-event-byte")
+          word-end-code (backend-value backend "word-end")
           lookahead-code (backend-value backend "binary-lookahead")
           info-code (backend-value backend "binary-info")
           advance-count-code (backend-value backend "advance-count")
@@ -3543,23 +3663,33 @@
           assignment-operators (field-value production "assignment-operators")
           assignment-op (field-value production "assignment-op")
           short-circuit-operators (field-value production "short-circuit-operators")
+          word-info-function (backend-value backend
+                               (p/code-sym (field-value production "word-info-function")))
           nullish-op (field-value production "nullish-op")
           branch-op (field-value production "branch-op")
           state (p/fresh-identifier "state") minimum (p/fresh-identifier "minimum")
           byte0-id (p/fresh-identifier "byte0")
-          immediate-id (p/fresh-identifier "immediate")]
+          immediate-id (p/fresh-identifier "immediate")
+          operator-start-id (p/fresh-identifier "operator-start")
+          operator-end-id (p/fresh-identifier "operator-end")
+          word-info-id (p/fresh-identifier "word-info")]
       `(defn ~function-name [(~state (ptr ~state-type)) (~minimum i64)] (-> ~result-type)
          (let [(mut left) (~postfix-parser ~state) (mut logical-family) 0]
            (loop
              (let [~byte0-id (~current-byte-code ~state)
+                   ~word-info-id
+                     (if (= ~byte0-id (cast u8 105))
+                         (~word-info-function ~state)
+                       0)
                    lookahead (~lookahead-code ~byte0-id)
                    byte1 (if (> lookahead 1) (~adjacent-byte-code ~state 1) (cast u8 0))
                    byte2 (if (> lookahead 2) (~adjacent-byte-code ~state 2) (cast u8 0))
                    raw-info (if (= (.error ~state) ~ok-error)
-                                (~info-code ~byte0-id byte1 byte2) 0)
+                                (if (> ~word-info-id 0) ~word-info-id
+                                  (~info-code ~byte0-id byte1 byte2)) 0)
                    raw-meta (% raw-info 256)
                    raw-width (% raw-meta 128)
-                   info (if (or (and (> raw-width 0)
+                   info (if (or (and (= ~word-info-id 0) (> raw-width 0)
                                      (= (~adjacent-byte-code ~state raw-width)
                                         (cast u8 61)))
                                 (and (= raw-width 1)
@@ -3581,9 +3711,16 @@
                  (let [meta (% info 256)
                        width (% meta 128)
                        right-associative (>= meta 128)
-                       ~immediate-id (p/ior (cast u64 ~byte0-id)
-                                   (p/ior (p/ishl (cast u64 byte1) (cast u64 8))
-                                          (p/ishl (cast u64 byte2) (cast u64 16))))
+                       word-operator (> ~word-info-id 0)
+                       ~operator-start-id (if word-operator
+                                            (~current-position-code ~state) (cast u32 0))
+                       ~operator-end-id (if word-operator
+                                          (~word-end-code ~state ~operator-start-id)
+                                          (cast u32 0))
+                       ~immediate-id (if (> ~word-info-id 0) (cast u64 0)
+                         (p/ior (cast u64 ~byte0-id)
+                           (p/ior (p/ishl (cast u64 byte1) (cast u64 8))
+                                  (p/ishl (cast u64 byte2) (cast u64 16)))))
                        short-mode
                          (cond
                            ~@(let [clauses (p/code-list-new) (mut k) 0]
@@ -3673,7 +3810,11 @@
                                        (if right-associative precedence (+ precedence 1)))
                                arena (.arena (.builder ~state)) value (.value-count arena)
                                operation (builder/add-op! (.builder ~state) (.block ~state)
-                                            ~binary-op (cast u32 0) (cast u32 0)
+                                            ~binary-op
+                                            (if (> ~word-info-id 0) ~operator-start-id
+                                              (cast u32 0))
+                                            (if (> ~word-info-id 0) ~operator-end-id
+                                              (cast u32 0))
                                             (.start old-left) (.end right) (cast u32 1))]
                            (let [op (~check-build-code ~state operation)
                                  lhs (builder/add-operand! (.builder ~state) op (.value old-left))
@@ -3775,6 +3916,11 @@
 ;; Keep this data-only section at the end of the module. Coil currently expands
 ;; an imported Code->Code helper as a nested macro too early, so compiler and
 ;; specification share a module until compile-time library linkage is added.
+(defn javascript-reserved-keywords [] (-> Code)
+  ;; Word-form binary operators must not fall back to IdentifierReference or
+  ;; binding grammar; `default` is also forbidden as a shorthand binding.
+  `["in" "default" "instanceof"])
+
 (defn define-frontend-parser [(backend Code)] (-> Code)
   (let [productions
       `[(numeric-value javascript-number
@@ -3800,7 +3946,8 @@
                       ["false" ir/OP-JS-BOOLEAN]
                       ["null" ir/OP-JS-NULL]
                       ["this" ir/OP-JS-THIS]
-                      ["super" ir/OP-JS-SUPER]]))
+                      ["super" ir/OP-JS-SUPER]])
+        (invalid-keywords ~(javascript-reserved-keywords)))
       (quoted-value string-expression
         (emit-op ir/OP-JS-STRING))
       (template-value template-expression
@@ -3981,7 +4128,8 @@
         (greater (syntax/terminal-byte syntax/greater-than))
         (optional (syntax/terminal-byte syntax/question))
         (rest-byte (syntax/terminal-byte syntax/dot))
-        (parameter-close (syntax/group-production-terminal 2)))
+        (parameter-close (syntax/group-production-terminal 2))
+        (invalid-keywords ~(javascript-reserved-keywords)))
       (arrow-expression arrow-function
         (function parse-arrow)
         (pattern-parser parse-binding-pattern)
@@ -4235,6 +4383,7 @@
         (comma (syntax/call-production-terminal 1))
         (target-ops [ir/OP-JS-IDENTIFIER ir/OP-JS-MEMBER
                      ir/OP-JS-COMPUTED-MEMBER ir/OP-TS-NON-NULL])
+        (target-precedence 81)
         (pattern-parser parse-binding-pattern)
         (declare-op ir/OP-JS-DECLARE)
         (assign-op ir/OP-JS-ASSIGN)
@@ -4264,6 +4413,10 @@
         (pattern-parser parse-binding-pattern)
         (emit-op ir/OP-JS-FUNCTION)
         (fallthrough-op ir/OP-RETURN))
+      (word-operator-info word-operator
+        (function parse-word-operator-info)
+        (word-operators [["in" 40] ["instanceof" 40]])
+        (word-event tape/EVENT-WORD))
       (precedence-expression expression
         (function parse-expression)
         (operand-parser parse-postfix)
@@ -4283,6 +4436,7 @@
         (assignment-op ir/OP-JS-ASSIGN)
         ;; [packed-byte-immediate lowering-mode]: 1=&&, 2=||, 3=??.
         (short-circuit-operators [[9766 1] [31868 2] [16191 3]])
+        (word-info-function parse-word-operator-info)
         (nullish-op ir/OP-JS-IS-NULLISH)
         (branch-op ir/OP-COND-BR))]
         definitions (p/code-list-new) (mut i) 0]
@@ -4437,6 +4591,9 @@
             (generator-form? production "precedence-expression")
               (do (p/code-list-push! definitions
                     (compile-precedence-expression backend production)) 0)
+            (generator-form? production "word-operator-info")
+              (do (p/code-list-push! definitions
+                    (compile-word-operator-info backend production)) 0)
             :else
               (do (generator-fail production "unknown generated production kind") 0))
           (set! i (+ (load i) 1)))))
