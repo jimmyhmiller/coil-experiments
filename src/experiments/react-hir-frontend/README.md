@@ -66,13 +66,13 @@ The implemented pipeline is:
 13. `ir_storage.coil` maps one aligned caller-owned byte buffer into every IR
     and builder plane from explicit capacities. `direct_parser.coil` is the
     first real AST-free text-to-SSA path: it consumes the SIMD parse tape and
-    directly emits literal/identifier/unary/binary/call/member/assignment/declaration/
+    directly emits literal/identifier/unary/binary/call/member/array/assignment/declaration/
     expression/return operations, SSA operands/results, lexical bindings/
     references/captures, functions with nested regions, and final terminators.
     Non-computed member properties retain their source name on the member op
     without becoming lexical identifier references.
     Caller-owned scratch preserves variable-length call operands without an AST
-    and supports nested calls. `direct_parser_test.coil` runs that complete path,
+    and supports nested calls and arrays. `direct_parser_test.coil` runs that complete path,
     verifies the result, and checks deterministic textual IR including packed
     operator immediates and declaration/function-name metadata. Direct `if`
     statements now build
@@ -124,7 +124,7 @@ The SSA/CFG schema, direct builder, verifier, printer, and a working direct
 parser slice exist. The broader legacy `parser.coil` coverage has not yet been
 migrated, and the parser benchmark still measures its syntax arena rather than
 text-to-verified-SSA throughput. The next coverage work is collections, member
-access variants, collections, JSX, and structured printing for multi-block
+access variants, object literals, JSX, and structured printing for multi-block
 CFGs. As in JSIR's current JavaScript dialect, expression results have SSA
 identities while mutable bindings remain explicit l-value/assignment semantics;
 the generic block-argument machinery is used when values genuinely merge.
@@ -135,7 +135,7 @@ fixtures. `benchmarks/run-jsir-differential.sh` runs the first live structural
 differential against the local `jsir-rs` frontend: both independently parse a
 shared fixtures and must emit the same backend-neutral semantic signature. The
 current fixture includes a declaration, loop, binary mutation, assignment,
-identifier reads, member access, and a call; Coil derives the loop count from CFG backedges
+identifier reads, member access, an array, and a call; Coil derives the loop count from CFG backedges
 while JSIR reports its structured while operation. Broader differential
 fixtures remain open.
 
