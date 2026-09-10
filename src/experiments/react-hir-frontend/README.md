@@ -63,6 +63,14 @@ The implemented pipeline is:
     is materialized. `ir_builder_test.coil` constructs such an interleaved
     nested program, including lexical binding/reference/capture identities,
     verifies it, and checks its exact textual IR.
+13. `ir_storage.coil` maps one aligned caller-owned byte buffer into every IR
+    and builder plane from explicit capacities. `direct_parser.coil` is the
+    first real AST-free text-to-SSA path: it consumes the SIMD parse tape and
+    directly emits literal/identifier/binary/declaration/expression/return
+    operations, SSA operands/results, lexical bindings/references, and a final
+    terminator. `direct_parser_test.coil` runs that complete path, verifies the
+    result, and checks deterministic textual IR including packed operator
+    immediates and declaration-name metadata.
 
 All bitmap-producing entry points accept an explicit valid byte count. SIMD
 tail fill bytes therefore cannot appear as source events. Tape writes report
@@ -88,12 +96,14 @@ async/generator forms, optional/computed access, spreads, TypeScript, Unicode
 identifiers, scope construction, recovery, and the final React compiler HIR
 schema.
 
-The SSA/CFG schema, direct builder, verifier, and printer exist, but
-`parser.coil` has not yet been switched from its syntax-node `HirArena` to the
-builder. Until that migration, the parser benchmark measures the syntax arena
-rather than text-to-verified-SSA throughput. The target proof is canonical
-IR-to-text stability, JavaScript text-to-IR-to-text-to-IR semantic stability,
-and structural differential fixtures against `jsir-rs` on their shared subset.
+The SSA/CFG schema, direct builder, verifier, printer, and a working direct
+parser slice exist. The broader legacy `parser.coil` coverage has not yet been
+migrated, and the parser benchmark still measures its syntax arena rather than
+text-to-verified-SSA throughput. The next coverage work is direct calls,
+unary/assignment operations, structured control flow, functions/captures,
+collections, and JSX. The target proof remains canonical IR-to-text stability,
+JavaScript text-to-IR-to-text-to-IR semantic stability, and structural
+differential fixtures against `jsir-rs` on their shared subset.
 
 The SIMD frontend requires the combined compiler at Coil branch
 `simd-foundation` commit `d51cfcc` or later. That revision includes both generic
