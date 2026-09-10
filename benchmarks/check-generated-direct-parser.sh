@@ -24,7 +24,7 @@ for production in \
   type-arguments \
   type-arguments-before-call arrow-lookahead binding-pattern arrow jsx named-export interface \
   type-assertion \
-  prefix-keyword template debugger non-null postfix-update-lookahead postfix-update
+  prefix-keyword template debugger non-null postfix-update-lookahead postfix-update optional-postfix
 do
   if ! rg -Uq "\(defn\\*?[[:space:]]+parse-$production!([[:space:]]|$)" \
       "$scratch_file"; then
@@ -33,4 +33,4 @@ do
   fi
 done
 
-printf '%s\n' 'all 54 direct-parser productions are generated'
+printf '%s\n' 'all 55 direct-parser productions are generated'
