@@ -20,7 +20,9 @@ cd "$project_dir"
 for production in \
   word string primary property object call member postfix expression declaration \
   return expression-statement block if while function statement direct-program \
-  type-annotation type-alias-body type-parameters type-alias statement-end import
+  type-annotation type-alias-body type-parameters type-alias statement-end import \
+  type-arguments \
+  type-arguments-before-call
 do
   if ! awk '/^\(defn$/ { getline; sub(/^[[:space:]]*/, ""); print }' \
       "$scratch_file" | rg -qx "parse-$production!"; then
@@ -29,4 +31,4 @@ do
   fi
 done
 
-printf '%s\n' 'all 24 direct-parser productions are generated'
+printf '%s\n' 'all 26 direct-parser productions are generated'

@@ -662,8 +662,63 @@
                (~emit-code ~state ~opcode ~input
                  (+ end-position (cast u32 1)) mark))))))))
 
+(defn compile-postfix-type-arguments [(backend Code) (production Code)] (-> Code)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 5)
+                (generator-form? production "postfix-type-arguments")))
+      (generator-fail production "invalid postfix-type-arguments production")
+    (let [state-type (backend-value backend "state-type")
+          result-type (backend-value backend "expression-result-type")
+          function-name (backend-value backend
+                          (p/code-sym (field-value production "function")))
+          type-parser (backend-value backend
+                        (p/code-sym (field-value production "type-parser")))
+          current-position-code (backend-value backend "current-position")
+          check-build-code (backend-value backend "check-build")
+          opcode (field-value production "emit-op")
+          state (p/fresh-identifier "state") input (p/fresh-identifier "input")]
+      `(defn ~function-name [(~state (ptr ~state-type)) (~input ~result-type)]
+         (-> ~result-type)
+         (let [_types (~type-parser ~state)
+               end (~current-position-code ~state)
+               arena (.arena (.builder ~state)) value (.value-count arena)
+               operation-result (builder/add-op! (.builder ~state) (.block ~state)
+                                  ~opcode (cast u32 0) (cast u32 0)
+                                  (.start ~input) end (cast u32 1))]
+           (let [op (~check-build-code ~state operation-result)
+                 operand (builder/add-operand! (.builder ~state) op (.value ~input))]
+             (~check-build-code ~state operand)
+             (~result-type :value value :start (.start ~input) :end end)))))))
+
+(defn compile-postfix-lookahead [(backend Code) (production Code)] (-> Code)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 6)
+                (generator-form? production "postfix-lookahead")))
+      (generator-fail production "invalid postfix-lookahead production")
+    (let [state-type (backend-value backend "state-type")
+          function-name (backend-value backend
+                          (p/code-sym (field-value production "function")))
+          event-position-code (backend-value backend "event-position")
+          source-byte-code (backend-value backend "source-byte")
+          open (field-value production "open") close (field-value production "close")
+          follow (field-value production "follow") state (p/fresh-identifier "state")]
+      `(defn ~function-name :inline (Always) [(~state (ptr ~state-type))] (-> bool)
+         (let [(mut index) (.event-index ~state) (mut depth) 0 (mut closed) false]
+           (loop
+             (if (or (>= (load index) (.event-count ~state)) (load closed)) (break)
+               (let [event (load (p/index (.events ~state) (load index)))
+                     byte (~source-byte-code ~state (~event-position-code event))]
+                 (if (= byte ~open) (set! depth (+ (load depth) 1))
+                   (if (= byte ~close)
+                       (do
+                         (set! depth (- (load depth) 1))
+                         (if (= (load depth) 0) (store! closed true) 0)) 0))
+                 (set! index (+ (load index) 1)))))
+           (if (and (load closed) (< (load index) (.event-count ~state)))
+               (let [event (load (p/index (.events ~state) (load index)))]
+                 (= (~source-byte-code ~state (~event-position-code event)) ~follow))
+             false))))))
+
 (defn compile-postfix-chain [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 9)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 6)
                 (generator-form? production "postfix-chain")))
       (generator-fail production "invalid postfix-chain production")
     (let [state-type (backend-value backend "state-type")
@@ -678,29 +733,40 @@
           current-event-code (backend-value backend "current-event")
           event-kind-code (backend-value backend "event-kind")
           ok-error (backend-value backend "ok-error")
-          first-form (field-value production "first-form")
-          first-parser-role (field-value production "first-parser")
-          first-parser (backend-value backend (p/code-sym first-parser-role))
-          second-form (field-value production "second-form")
-          second-parser-role (field-value production "second-parser")
-          second-parser (backend-value backend (p/code-sym second-parser-role))
-          state (p/fresh-identifier "state")]
+          forms (field-value production "forms")
+          state (p/fresh-identifier "state") value-id (p/fresh-identifier "value")
+          form-id (p/fresh-identifier "form")]
       `(defn ~function-name [(~state (ptr ~state-type))] (-> ~result-type)
-         (let [(mut value) (~primary-code ~state)]
+         (let [(mut ~value-id) (~primary-code ~state)]
            (loop
-             (let [form (~dispatch-code
+             (let [~form-id (~dispatch-code
                           (if (< (.event-index ~state) (.event-count ~state))
                               (~event-kind-code (~current-event-code ~state))
                             (cast u8 0))
                           (~current-byte-code ~state))]
                (if (!= (.error ~state) ~ok-error) (break)
                  (cond
-                   (= form ~first-form)
-                     (store! value (~first-parser ~state (load value)))
-                   (= form ~second-form)
-                     (store! value (~second-parser ~state (load value)))
+                   ~@(let [clauses (p/code-list-new) (mut j) 0]
+                       (loop
+                         (if (>= (load j) (p/code-count forms)) (break)
+                             (let [entry (p/code-nth forms (load j))
+                                 parser-code (backend-value backend
+                                               (p/code-sym (p/code-nth entry 1)))
+                                 predicate (p/code-nth entry 2)
+                                 predicate-code
+                                   (if (generator-symbol? predicate "always") `true
+                                     (let [predicate-function
+                                           (backend-value backend (p/code-sym predicate))]
+                                       `(~predicate-function ~state)))]
+                             (p/code-list-push! clauses
+                               `(and (= ~form-id ~(p/code-nth entry 0)) ~predicate-code))
+                             (p/code-list-push! clauses
+                               `(store! ~value-id
+                                  (~parser-code ~state (load ~value-id))))
+                             (set! j (+ (load j) 1)))))
+                       (p/code-list-done clauses))
                    :else (break)))))
-           (load value))))))
+           (load ~value-id))))))
 
 (defn compile-statement-dispatch [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 22)
@@ -1519,14 +1585,23 @@
         (close (syntax/call-production-terminal 2))
         (element-precedence 0)
         (emit-op ir/OP-JS-CALL))
+      (postfix-type-arguments type-argument-instantiation
+        (function parse-type-arguments)
+        (type-parser parse-type-parameters)
+        (emit-op ir/OP-TS-INSTANTIATION))
+      (postfix-lookahead type-arguments-before-call
+        (function parse-type-arguments-before-call)
+        (open (syntax/terminal-byte syntax/less-than))
+        (close (syntax/terminal-byte syntax/greater-than))
+        (follow (syntax/call-production-terminal 0)))
       (postfix-chain postfix-expression
         (function parse-postfix)
         (primary parse-primary)
         (dispatch postfix-form)
-        (first-form syntax/form-call)
-        (first-parser parse-call)
-        (second-form syntax/form-member)
-        (second-parser parse-member))
+        (forms [[syntax/form-call parse-call always]
+                [syntax/form-member parse-member always]
+                 [syntax/form-type-arguments parse-type-arguments
+                 parse-type-arguments-before-call]]))
       (statement-dispatch statement
         (function parse-statement)
         (block-open (syntax/block-production-terminal 0))
@@ -1658,6 +1733,12 @@
             (generator-form? production "postfix-separated")
               (do (p/code-list-push! definitions
                     (compile-postfix-separated backend production)) 0)
+            (generator-form? production "postfix-type-arguments")
+              (do (p/code-list-push! definitions
+                    (compile-postfix-type-arguments backend production)) 0)
+            (generator-form? production "postfix-lookahead")
+              (do (p/code-list-push! definitions
+                    (compile-postfix-lookahead backend production)) 0)
             (generator-form? production "postfix-chain")
               (do (p/code-list-push! definitions
                     (compile-postfix-chain backend production)) 0)
