@@ -11,13 +11,17 @@ else
 fi
 
 count=0
-for fixture in "$benchmark_dir"/react-hir-syntax-fixtures/*.ts; do
+for fixture in "$benchmark_dir"/react-hir-syntax-fixtures/*.ts \
+               "$benchmark_dir"/react-hir-syntax-fixtures/*.tsx; do
+  [ -f "$fixture" ] || continue
   "$checker" "$fixture"
   count=$((count + 1))
 done
 
 rejected=0
-for fixture in "$benchmark_dir"/react-hir-invalid-syntax-fixtures/*.ts; do
+for fixture in "$benchmark_dir"/react-hir-invalid-syntax-fixtures/*.ts \
+               "$benchmark_dir"/react-hir-invalid-syntax-fixtures/*.tsx; do
+  [ -f "$fixture" ] || continue
   if "$checker" "$fixture" >/dev/null 2>&1; then
     printf 'invalid syntax fixture unexpectedly succeeded: %s\n' "$fixture" >&2
     exit 1
