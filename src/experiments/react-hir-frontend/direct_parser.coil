@@ -23,6 +23,9 @@
    (events (ptr u32)) (event-count i64) (event-index i64)
    (builder (ptr builder/IrBuilder))
    (scratch (ptr DirectParserScratch))
+   (lookup-valid (ptr u8)) (lookup-hashes (ptr u64))
+   (lookup-bindings (ptr u32)) (lookup-counts (ptr u32))
+   (lookup-starts (ptr u32)) (lookup-ends (ptr u32)) (lookup-capacity i64)
    (block u32) (scope u32) (function-scope u32)
    (error i64) (error-offset u32) (terminated bool)])
 
@@ -214,18 +217,42 @@
             (set! i (+ (load i) 1)))))
       (load same))))
 
+(defn span-hash [(state (ptr DirectParseState)) (start u32) (end u32)] (-> u64)
+  (let [(mut hash) (cast u64 1469598103934665603) (mut at) start]
+    (loop
+      (if (>= (load at) end) (break)
+        (do
+          (store! hash (p/ixor (load hash) (cast u64 (source-byte state (load at)))))
+          (store! hash (* (load hash) (cast u64 1099511628211)))
+          (set! at (+ (load at) (cast u32 1))))))
+    (load hash)))
+
+(defn spans-equal? [(state (ptr DirectParseState)) (left-start u32) (left-end u32)
+                    (right-start u32) (right-end u32)] (-> bool)
+  (if (!= (- left-end left-start) (- right-end right-start)) false
+    (let [(mut offset) (cast u32 0) (mut same) true]
+      (loop
+        (if (or (>= (load offset) (- left-end left-start)) (not (load same))) (break)
+          (do
+            (if (!= (source-byte state (+ left-start (load offset)))
+                    (source-byte state (+ right-start (load offset))))
+                (store! same false) 0)
+            (set! offset (+ (load offset) (cast u32 1))))))
+      (load same))))
+
 (defn consume-byte! [(state (ptr DirectParseState)) (expected u8)] (-> bool)
   (if (and (< (.event-index state) (.event-count state))
            (= (current-byte state) expected))
       (do (advance! state) true)
     (do (fail! state DIRECT-PARSE-EXPECTED) false)))
 
-(defn find-binding [(state (ptr DirectParseState)) (start u32) (end u32)] (-> u32)
+(defn find-binding-range [(state (ptr DirectParseState)) (start u32) (end u32)
+                          (lower-bound u32)] (-> u32)
   (let [arena (.arena (.builder state))
         (mut index) (.binding-count arena)
         (mut found) (cast u32 ir/INVALID-ID)]
     (loop
-      (if (or (= (load index) (cast u32 0))
+      (if (or (<= (load index) lower-bound)
               (!= (load found) (cast u32 ir/INVALID-ID))) (break)
         (do
           (set! index (- (load index) (cast u32 1)))
@@ -248,6 +275,34 @@
                        (load same)))
                 (store! found (load index)) 0)))))
     (load found)))
+
+(defn find-binding [(state (ptr DirectParseState)) (start u32) (end u32)] (-> u32)
+  (let [arena (.arena (.builder state)) hash (span-hash state start end)
+        slot (cast i64 (% hash (cast u64 (.lookup-capacity state))))
+        hit (and (!= (load (p/index (.lookup-valid state) slot)) (cast u8 0))
+                 (= (load (p/index (.lookup-hashes state) slot)) hash)
+                 (spans-equal? state start end
+                   (load (p/index (.lookup-starts state) slot))
+                   (load (p/index (.lookup-ends state) slot))))
+        cached (if hit (load (p/index (.lookup-bindings state) slot))
+                   (cast u32 ir/INVALID-ID))
+        reusable (and hit
+                   (or (= cached (cast u32 ir/INVALID-ID))
+                       (ir/scope-ancestor? arena
+                         (load (p/index (.binding-scopes arena) (cast i64 cached)))
+                         (.scope state))))
+        lower-bound (if reusable (load (p/index (.lookup-counts state) slot))
+                      (cast u32 0))
+        newer (find-binding-range state start end lower-bound)
+        found (if (!= newer (cast u32 ir/INVALID-ID)) newer
+                (if reusable cached (cast u32 ir/INVALID-ID)))]
+    (store! (p/index (.lookup-valid state) slot) (cast u8 1))
+    (store! (p/index (.lookup-hashes state) slot) hash)
+    (store! (p/index (.lookup-bindings state) slot) found)
+    (store! (p/index (.lookup-counts state) slot) (.binding-count arena))
+    (store! (p/index (.lookup-starts state) slot) start)
+    (store! (p/index (.lookup-ends state) slot) end)
+    found))
 
 (defn ensure-capture! [(state (ptr DirectParseState)) (binding u32)] (-> i64)
   (let [arena (.arena (.builder state)) scope (.function-scope state)

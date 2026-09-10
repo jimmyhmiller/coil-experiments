@@ -184,6 +184,22 @@ parse tape; it is retained honestly rather than benchmarked through the former
 narrow path. This remains a language subset and is not yet semantically
 comparable to Oxc's full JavaScript/TypeScript parser.
 
+`benchmarks/run-react-hir-direct-large.sh` measures the generated direct
+frontend on a 161,000-byte application-shaped JavaScript file covering
+functions, lexical bindings, arithmetic/comparison, loops, conditionals,
+calls, members, arrays, objects, returns, scopes, and captures. It reports
+prepared-tape-to-SSA separately from complete text-to-SSA. The matching
+`benchmarks/run-oxc-parser-comparison.sh` parses identical bytes with the local
+Oxc checkout (`OXC_DIR` overrides its location).
+
+On the local Apple M2 Max, release builds measured approximately 0.180 GB/s for
+Coil tape-to-SSA, 0.147 GB/s for Coil text-to-SSA, and 0.186–0.187 GB/s for Oxc
+text-to-AST. Oxc is about 27% faster than Coil end to end on this shared-subset
+fixture. Coil's result includes direct SSA values, CFG blocks and successors,
+block parameters, bindings/captures, scopes, and finalized membership; Oxc's
+measurement stops after AST parsing. These numbers are not full-language
+equivalence because the Coil frontend still accepts a narrower grammar.
+
 `benchmarks/run-jsir-differential.sh` requires `JSIR_RS_DIR` to point at a
 `jsir-rs` checkout containing the `coil_signature` example (local commit
 `5616a14` on the `coil-differential` worktree). It compares independent output,

@@ -1,0 +1,122 @@
+(module react-hir-direct-large-benchmark)
+
+(import "coil.primitive" :as p)
+(import "coil.slice" :use [slice-data slice-get])
+(import "experiments.react-hir-frontend.frontend" :as frontend)
+(import "experiments.react-hir-frontend.pipeline" :as pipeline)
+(import "experiments.react-hir-frontend.ir" :as ir)
+(import "experiments.react-hir-frontend.ir-builder" :as builder)
+(import "experiments.react-hir-frontend.ir-storage" :as storage)
+(import "experiments.react-hir-frontend.direct-parser" :as parser)
+
+(extern malloc :cc c [i64] (-> (ptr u8)))
+(extern free :cc c [(ptr u8)] (-> i64))
+(extern clock_gettime :cc c [i32 (ptr Timespec)] (-> i32))
+(extern printf :cc c [(ptr i8) ...] (-> i32))
+(extern coil_benchmark_consume :cc c [(ptr i8) i64] (-> void))
+
+(defstruct Timespec [(seconds i64) (nanos i64)])
+
+(defn monotonic-nanos [] (-> i64)
+  (let [time (p/alloc-stack Timespec)]
+    (clock_gettime 6 time)
+    (+ (* (.seconds time) 1000000000) (.nanos time))))
+
+(defn fill-source! [(output (ptr u8)) (pattern (slice u8)) (repetitions i64)] (-> i64)
+  (let [(mut repetition) 0 (mut offset) 0]
+    (loop
+      (if (>= (load repetition) repetitions) (break)
+        (do
+          (let [(mut index) 0]
+            (loop
+              (if (>= (load index) (len pattern)) (break)
+                (do
+                  (store! (p/index output (+ (load offset) (load index)))
+                          (slice-get pattern (load index)))
+                  (set! index (+ (load index) 1))))))
+          (set! offset (+ (load offset) (len pattern)))
+          (set! repetition (+ (load repetition) 1)))))
+    (load offset)))
+
+(defn run-large [(repetitions i64) (rounds i64)] (-> i64)
+  (let [pattern "function compute(input) { let x = input + 10; while (x > 0) { x = x - 1; } if (x === 0) { return foo.state({value: [x, input]}); } else { return bar(input); } }\n"
+        source-size (* (len pattern) repetitions)
+        source (malloc source-size)
+        events (p/cast (ptr u32) (malloc (* source-size 4)))
+        parser-values (p/cast (ptr u32) (malloc (* source-size 2)))
+        arena (p/alloc-stack ir/IrArena)
+        builder-scratch (p/alloc-stack builder/BuilderScratch)
+        ir-builder (p/alloc-stack builder/IrBuilder)
+        parser-scratch (p/alloc-stack parser/DirectParserScratch)
+        scale (cast u32 repetitions)
+        caps (builder/BuilderCapacities
+          :regions (+ scale (cast u32 1)) :region-block-refs (* scale (cast u32 8))
+          :blocks (+ (* scale (cast u32 8)) (cast u32 1))
+          :block-op-refs (* scale (cast u32 64))
+          :ops (* scale (cast u32 64)) :op-region-refs (* scale (cast u32 2))
+          :values (* scale (cast u32 48)) :operands (* scale (cast u32 96))
+          :successors (* scale (cast u32 16)) :successor-args (* scale (cast u32 4))
+          :scopes (+ (* scale (cast u32 5)) (cast u32 1))
+          :bindings (* scale (cast u32 8)) :references (* scale (cast u32 48))
+          :captures (* scale (cast u32 8)))
+        memory-size (storage/required-bytes caps)
+        memory (malloc memory-size)
+        _filled (fill-source! source pattern repetitions)
+        initialized (storage/initialize! arena builder-scratch ir-builder memory memory-size
+                      (cast u32 source-size) caps)
+        prepared (pipeline/scan-source-to-parse-tape64 source source-size (cast u32 0)
+                   events (frontend/frontend-initial-state))]
+    (if (!= (.error initialized) storage/STORAGE-OK)
+        (do (printf c"storage initialization failed\n") 1)
+      (do
+        (store! parser-scratch (parser/DirectParserScratch
+          :values parser-values :value-capacity (/ source-size 2) :value-count 0))
+        (let [start (monotonic-nanos) (mut round) 0 (mut checksum) (cast u64 0)]
+          (loop
+            (if (>= (load round) rounds) (break)
+              (do
+                (storage/reset! arena ir-builder (cast u32 source-size))
+                (set! (.value-count parser-scratch) 0)
+                (let [parsed (parser/parse-direct-program! source source-size events
+                               (.count prepared) ir-builder parser-scratch)]
+                  (if (!= (.error parsed) parser/DIRECT-PARSE-OK)
+                      (do
+                        (printf c"parse failed error=%lld offset=%u\n"
+                                (.error parsed) (.error-offset parsed))
+                        (set! round rounds))
+                    (do
+                      (coil_benchmark_consume (p/cast (ptr i8) (.opcodes arena))
+                                              (* (cast i64 (.op-count arena)) 2))
+                      (store! checksum (+ (load checksum) (cast u64 (.op-count arena))))
+                      (set! round (+ (load round) 1))))))))
+          (let [elapsed (- (monotonic-nanos) start)]
+            (printf c"coil tape-to-ssa %8.3f GB/s  size=%lld rounds=%lld ns=%lld checksum=%llu\n"
+                    (/ (cast f64 (* source-size rounds)) (cast f64 elapsed))
+                    source-size rounds elapsed (load checksum))))
+        (let [start (monotonic-nanos) (mut round) 0 (mut checksum) (cast u64 0)]
+          (loop
+            (if (>= (load round) rounds) (break)
+              (do
+                (let [scanned (pipeline/scan-source-to-parse-tape64 source source-size
+                                (cast u32 0) events (frontend/frontend-initial-state))]
+                  (storage/reset! arena ir-builder (cast u32 source-size))
+                  (set! (.value-count parser-scratch) 0)
+                  (let [parsed (parser/parse-direct-program! source source-size events
+                                 (.count scanned) ir-builder parser-scratch)]
+                    (if (!= (.error parsed) parser/DIRECT-PARSE-OK)
+                        (set! round rounds)
+                      (do
+                        (coil_benchmark_consume (p/cast (ptr i8) (.opcodes arena))
+                                                (* (cast i64 (.op-count arena)) 2))
+                        (store! checksum (+ (load checksum) (cast u64 (.op-count arena))))
+                        (set! round (+ (load round) 1)))))))))
+          (let [elapsed (- (monotonic-nanos) start)]
+            (printf c"coil text-to-ssa %8.3f GB/s  size=%lld rounds=%lld ns=%lld checksum=%llu\n"
+                    (/ (cast f64 (* source-size rounds)) (cast f64 elapsed))
+                    source-size rounds elapsed (load checksum))))
+        (free source) (free (p/cast (ptr u8) events)) (free (p/cast (ptr u8) parser-values))
+        (free memory)
+        0))))
+
+(defn main [] (-> i64)
+  (run-large 1000 100))
