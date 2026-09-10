@@ -66,19 +66,23 @@ The implemented pipeline is:
 13. `ir_storage.coil` maps one aligned caller-owned byte buffer into every IR
     and builder plane from explicit capacities. `direct_parser.coil` is the
     first real AST-free text-to-SSA path: it consumes the SIMD parse tape and
-    directly emits literal/identifier/binary/declaration/expression/return
-    operations, SSA operands/results, lexical bindings/references, and a final
-    terminator. `direct_parser_test.coil` runs that complete path, verifies the
-    result, and checks deterministic textual IR including packed operator
-    immediates and declaration-name metadata. Direct `if` statements now build
+    directly emits literal/identifier/unary/binary/call/assignment/declaration/
+    expression/return operations, SSA operands/results, lexical bindings/
+    references/captures, functions with nested regions, and final terminators.
+    Caller-owned scratch preserves variable-length call operands without an AST
+    and supports nested calls. `direct_parser_test.coil` runs that complete path,
+    verifies the result, and checks deterministic textual IR including packed
+    operator immediates and declaration/function-name metadata. Direct `if`
+    statements now build
     condition, branch, and merge blocks with explicit successors. Conditional
     expressions additionally merge their branch values through a join block
     parameter and successor arguments.
 14. `js_printer.coil` regenerates normalized JavaScript for the implemented
-    linear subset by following SSA definitions rather than retained syntax
-    nodes. The regression suite proves JavaScript text-to-IR-to-JavaScript-to-IR
-    stability for operation kinds, compact attributes, operands, SSA counts,
-    bindings, and references while allowing source locations to change under
+    subset by following SSA definitions and nested function regions rather than
+    retained syntax nodes. The regression suite proves JavaScript
+    text-to-IR-to-JavaScript-to-IR stability for operation kinds, compact
+    attributes, operands, SSA counts, regions, blocks, scopes, bindings,
+    references, and captures while allowing source locations to change under
     formatting.
 15. `ir_text_parser.coil` is the inverse of the native IR printer. It reads the
     canonical text directly into `IrBuilder`, predeclaring blocks per region so
@@ -115,14 +119,15 @@ schema.
 The SSA/CFG schema, direct builder, verifier, printer, and a working direct
 parser slice exist. The broader legacy `parser.coil` coverage has not yet been
 migrated, and the parser benchmark still measures its syntax arena rather than
-text-to-verified-SSA throughput. The next coverage work is direct calls,
-unary/assignment operations, loops, functions/captures, collections, and JSX.
-The JavaScript semantic round-trip gate has begun on the linear subset, and the
+text-to-verified-SSA throughput. The next coverage work is direct loops,
+collections, member access, JSX, and structured printing for multi-block CFGs.
+The JavaScript semantic round-trip gate now covers linear expressions and
+functions with lexical captures, and the
 canonical textual-IR round-trip gate now passes for CFG and nested semantic
 fixtures. `benchmarks/run-jsir-differential.sh` runs the first live structural
 differential against the local `jsir-rs` frontend: both independently parse a
-shared declaration/binary/use fixture and must emit the same backend-neutral
-semantic signature. Broader differential fixtures remain open.
+shared declaration/unary/nested-call/assignment fixture and must emit the same
+backend-neutral semantic signature. Broader differential fixtures remain open.
 
 The SIMD frontend requires the combined compiler at Coil branch
 `simd-foundation` commit `d51cfcc` or later. That revision includes both generic

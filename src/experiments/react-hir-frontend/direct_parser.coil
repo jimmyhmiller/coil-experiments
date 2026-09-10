@@ -12,12 +12,17 @@
 (const DIRECT-PARSE-EXPECTED i64 2)
 (const DIRECT-PARSE-BUILDER i64 3)
 (const DIRECT-PARSE-AFTER-TERMINATOR i64 4)
+(const DIRECT-PARSE-SCRATCH-CAPACITY i64 5)
+
+(defstruct DirectParserScratch
+  [(values (ptr u32)) (value-capacity i64) (value-count i64)])
 
 (defstruct DirectParseState
   [(source (ptr u8)) (source-size i64)
    (events (ptr u32)) (event-count i64) (event-index i64)
    (builder (ptr builder/IrBuilder))
-   (block u32) (scope u32)
+   (scratch (ptr DirectParserScratch))
+   (block u32) (scope u32) (function-scope u32)
    (error i64) (error-offset u32) (terminated bool)])
 
 (defstruct ExprResult [(value u32) (start u32) (end u32)])
@@ -76,6 +81,15 @@
 (defn check-build! [(state (ptr DirectParseState)) (result builder/BuildResult)] (-> u32)
   (if (= (.error result) builder/BUILD-OK) (.id result)
     (do (fail! state DIRECT-PARSE-BUILDER) (cast u32 ir/INVALID-ID))))
+
+(defn push-scratch-value! [(state (ptr DirectParseState)) (value u32)] (-> i64)
+  (let [scratch (.scratch state)]
+    (if (>= (.value-count scratch) (.value-capacity scratch))
+        (do (fail! state DIRECT-PARSE-SCRATCH-CAPACITY) 0)
+      (do
+        (store! (p/index (.values scratch) (.value-count scratch)) value)
+        (set! (.value-count scratch) (+ (.value-count scratch) 1)))))
+  0)
 
 (defn ascii-word? [(byte u8)] (-> bool)
   (or (and (>= byte (cast u8 48)) (<= byte (cast u8 57)))
@@ -139,6 +153,25 @@
                 (store! found (load index)) 0)))))
     (load found)))
 
+(defn ensure-capture! [(state (ptr DirectParseState)) (binding u32)] (-> i64)
+  (let [arena (.arena (.builder state)) scope (.function-scope state)
+        binding-scope (load (p/index (.binding-scopes arena) (cast i64 binding)))]
+    (if (ir/scope-ancestor? arena scope binding-scope) 0
+      (let [(mut capture) (cast u32 0) (mut found) false]
+        (loop
+          (if (or (>= (load capture) (.capture-count arena)) (load found)) (break)
+            (do
+              (if (and (= (load (p/index (.capture-scopes arena)
+                                         (cast i64 (load capture)))) scope)
+                       (= (load (p/index (.capture-bindings arena)
+                                         (cast i64 (load capture)))) binding))
+                  (store! found true) 0)
+              (set! capture (+ (load capture) (cast u32 1))))))
+        (if (not (load found))
+            (let [result (builder/add-capture! (.builder state) scope binding)]
+              (check-build! state result)) 0))))
+  0)
+
 (defn emit-value-op! [(state (ptr DirectParseState)) (opcode u16)
                       (start u32) (end u32)] (-> ExprResult)
   (let [arena (.arena (.builder state)) value (.value-count arena)
@@ -160,7 +193,8 @@
               binding (find-binding state start end)]
           (if (!= binding (cast u32 ir/INVALID-ID))
               (let [reference (builder/add-reference! (.builder state) binding start end)]
-                (check-build! state reference)) 0)
+                (check-build! state reference)
+                (ensure-capture! state binding)) 0)
           result)))))
 
 (defn parse-string! [(state (ptr DirectParseState))] (-> ExprResult)
@@ -195,10 +229,68 @@
             (let [value (parse-expression! state 0)]
               (if (consume-byte! state (spec/group-production-terminal 2)) value
                 (fail! state DIRECT-PARSE-EXPECTED))))
+        (or (= form spec/form-unary-bang)
+            (= form spec/form-unary-minus)
+            (= form spec/form-unary-plus))
+          (let [start (current-position state) operator (current-byte state)
+                _advance (advance! state) argument (parse-expression! state 70)
+                arena (.arena (.builder state)) value (.value-count arena)
+                operation-result (builder/add-op! (.builder state) (.block state)
+                                   ir/OP-JS-UNARY (cast u32 0) (cast u32 0)
+                                   start (.end argument) (cast u32 1))]
+            (let [op (check-build! state operation-result)
+                  operand (builder/add-operand! (.builder state) op (.value argument))
+                  immediate (builder/set-op-immediate! (.builder state) op
+                                                       (cast u64 operator))]
+              (check-build! state operand)
+              (check-build! state immediate)
+              (ExprResult :value value :start start :end (.end argument))))
         :else (fail! state DIRECT-PARSE-UNEXPECTED)))))
 
+(defn parse-call! [(state (ptr DirectParseState)) (callee ExprResult)] (-> ExprResult)
+  (let [scratch (.scratch state) mark (.value-count scratch) _open (advance! state)]
+    (if (= (current-byte state) (spec/call-production-terminal 2)) 0
+      (loop
+        (let [argument (parse-expression! state 0)]
+          (push-scratch-value! state (.value argument))
+          (if (!= (.error state) DIRECT-PARSE-OK) (break)
+            (if (= (current-byte state) (spec/call-production-terminal 1))
+                (advance! state) (break))))))
+    (let [end-position (current-position state)]
+      (if (not (consume-byte! state (spec/call-production-terminal 2)))
+          (fail! state DIRECT-PARSE-EXPECTED)
+        (let [arena (.arena (.builder state)) value (.value-count arena)
+              operation-result (builder/add-op! (.builder state) (.block state)
+                                 ir/OP-JS-CALL (cast u32 0) (cast u32 0)
+                                 (.start callee) (+ end-position (cast u32 1))
+                                 (cast u32 1))]
+          (let [op (check-build! state operation-result)
+                callee-operand (builder/add-operand! (.builder state) op (.value callee))]
+            (check-build! state callee-operand)
+            (let [(mut index) mark]
+              (loop
+                (if (>= (load index) (.value-count scratch)) (break)
+                  (let [operand (builder/add-operand! (.builder state) op
+                                  (load (p/index (.values scratch) (load index))))]
+                    (check-build! state operand)
+                    (set! index (+ (load index) 1))))))
+            (set! (.value-count scratch) mark)
+            (ExprResult :value value :start (.start callee)
+                        :end (+ end-position (cast u32 1)))))))))
+
+(defn parse-postfix! [(state (ptr DirectParseState))] (-> ExprResult)
+  (let [(mut value) (parse-primary! state)]
+    (loop
+      (let [form (spec/postfix-form
+                   (if (< (.event-index state) (.event-count state))
+                       (event-kind (current-event state)) (cast u8 0))
+                   (current-byte state))]
+        (if (and (= (.error state) DIRECT-PARSE-OK) (= form spec/form-call))
+            (store! value (parse-call! state (load value))) (break))))
+    (load value)))
+
 (defn parse-expression! [(state (ptr DirectParseState)) (minimum i64)] (-> ExprResult)
-  (let [(mut left) (parse-primary! state)]
+  (let [(mut left) (parse-postfix! state)]
     (loop
       (let [byte0 (current-byte state)
             lookahead (spec/binary-lookahead byte0)
@@ -227,43 +319,69 @@
                 (check-build! state rhs)
                 (check-build! state imm)
                 (store! left (ExprResult :value value :start (.start old-left) :end (.end right)))))))))
-    (if (and (<= minimum 10) (= (.error state) DIRECT-PARSE-OK)
-             (= (current-byte state) (spec/conditional-production-terminal 0)))
-        (let [condition (load left) origin (.block state)
-              arena (.arena (.builder state))
-              region (load (p/index (.block-regions arena) (cast i64 origin)))
-              _question (advance! state)
-              then-result (builder/add-block! (.builder state) region)
-              then-block (check-build! state then-result)
-              else-result (builder/add-block! (.builder state) region)
-              else-block (check-build! state else-result)
-              branch-result (builder/add-op! (.builder state) origin ir/OP-COND-BR
-                                             (cast u32 0) (cast u32 0)
-                                             (.start condition) (current-position state)
-                                             (cast u32 0))]
-          (let [branch (check-build! state branch-result)
-                operand (builder/add-operand! (.builder state) branch (.value condition))
-                then-successor (builder/add-successor! (.builder state) branch then-block)
-                else-successor (builder/add-successor! (.builder state) branch else-block)]
-            (check-build! state operand)
-            (check-build! state then-successor)
-            (check-build! state else-successor))
-          (set! (.block state) then-block)
-          (let [consequent (parse-expression! state 0) then-exit (.block state)]
-            (if (consume-byte! state (spec/conditional-production-terminal 2))
-                (do
-                  (set! (.block state) else-block)
-                  (let [alternate (parse-expression! state 10) else-exit (.block state)
-                        join-result (builder/add-block! (.builder state) region)
-                        join-block (check-build! state join-result)
-                        parameter-result (builder/add-block-param! (.builder state) join-block)
-                        parameter (check-build! state parameter-result)]
-                    (emit-branch-arg! state then-exit join-block (.value consequent))
-                    (emit-branch-arg! state else-exit join-block (.value alternate))
-                    (set! (.block state) join-block)
-                    (ExprResult :value parameter :start (.start condition) :end (.end alternate))))
-              (fail! state DIRECT-PARSE-EXPECTED))))
-      (load left))))
+    (let [completed
+            (if (and (<= minimum 10) (= (.error state) DIRECT-PARSE-OK)
+                     (= (current-byte state) (spec/conditional-production-terminal 0)))
+                (let [condition (load left) origin (.block state)
+                      arena (.arena (.builder state))
+                      region (load (p/index (.block-regions arena) (cast i64 origin)))
+                      _question (advance! state)
+                      then-result (builder/add-block! (.builder state) region)
+                      then-block (check-build! state then-result)
+                      else-result (builder/add-block! (.builder state) region)
+                      else-block (check-build! state else-result)
+                      branch-result (builder/add-op! (.builder state) origin ir/OP-COND-BR
+                                                     (cast u32 0) (cast u32 0)
+                                                     (.start condition) (current-position state)
+                                                     (cast u32 0))]
+                  (let [branch (check-build! state branch-result)
+                        operand (builder/add-operand! (.builder state) branch (.value condition))
+                        then-successor (builder/add-successor! (.builder state) branch then-block)
+                        else-successor (builder/add-successor! (.builder state) branch else-block)]
+                    (check-build! state operand)
+                    (check-build! state then-successor)
+                    (check-build! state else-successor))
+                  (set! (.block state) then-block)
+                  (let [consequent (parse-expression! state 0) then-exit (.block state)]
+                    (if (consume-byte! state (spec/conditional-production-terminal 2))
+                        (do
+                          (set! (.block state) else-block)
+                          (let [alternate (parse-expression! state 10)
+                                else-exit (.block state)
+                                join-result (builder/add-block! (.builder state) region)
+                                join-block (check-build! state join-result)
+                                parameter-result
+                                  (builder/add-block-param! (.builder state) join-block)
+                                parameter (check-build! state parameter-result)]
+                            (emit-branch-arg! state then-exit join-block (.value consequent))
+                            (emit-branch-arg! state else-exit join-block (.value alternate))
+                            (set! (.block state) join-block)
+                            (let [result (p/alloc-stack ExprResult)]
+                              (store! result
+                                (ExprResult :value parameter :start (.start condition)
+                                            :end (.end alternate)))
+                              (load result))))
+                      (fail! state DIRECT-PARSE-EXPECTED))))
+              (load left))]
+      (if (and (<= minimum 5) (= (.error state) DIRECT-PARSE-OK)
+               (= (current-byte state) (spec/assignment-production-terminal 1))
+               (!= (adjacent-event-byte state 1)
+                   (spec/assignment-production-terminal 1)))
+          (let [left-value (load completed) _equals (advance! state)
+                right (parse-expression! state 0)
+                arena (.arena (.builder state)) value (.value-count arena)
+                operation-result (builder/add-op! (.builder state) (.block state)
+                                   ir/OP-JS-ASSIGN (cast u32 0) (cast u32 0)
+                                   (.start left-value) (.end right) (cast u32 1))]
+            (let [op (check-build! state operation-result)
+                  lhs (builder/add-operand! (.builder state) op (.value left-value))
+                  rhs (builder/add-operand! (.builder state) op (.value right))
+                  immediate (builder/set-op-immediate! (.builder state) op (cast u64 61))]
+              (check-build! state lhs)
+              (check-build! state rhs)
+              (check-build! state immediate)
+              (ExprResult :value value :start (.start left-value) :end (.end right))))
+        (load completed)))))
 
 (defn emit-branch-arg! [(state (ptr DirectParseState)) (block u32)
                         (target u32) (value u32)] (-> i64)
@@ -410,6 +528,71 @@
                   (set! (.terminated state) true)))))))))
   0)
 
+(defn parse-function! [(state (ptr DirectParseState))] (-> i64)
+  (let [start (current-position state) parent-block (.block state)
+        parent-scope (.scope state) parent-function-scope (.function-scope state)
+        parent-terminated (.terminated state) _keyword (advance! state)
+        name-start (current-position state) name-end (word-end state name-start)]
+    (if (= name-start name-end) (do (fail! state DIRECT-PARSE-EXPECTED) 0)
+      (do
+        (advance! state)
+        (let [binding-result (builder/add-binding! (.builder state) parent-scope
+                                                    name-start name-end)]
+          (check-build! state binding-result))
+        (let [function-result (builder/add-op! (.builder state) parent-block
+                               ir/OP-JS-FUNCTION name-start name-end start start (cast u32 0))
+              function-op (check-build! state function-result)
+              region-result (builder/add-region! (.builder state) function-op)
+              region (check-build! state region-result)
+              attached (builder/add-op-region! (.builder state) function-op region)
+              entry-result (builder/add-block! (.builder state) region)
+              entry (check-build! state entry-result)
+              scope-result (builder/add-scope! (.builder state) parent-scope start
+                                               (cast u32 (.source-size state)))
+              function-scope (check-build! state scope-result)]
+          (check-build! state attached)
+          (if (consume-byte! state (spec/function-production-terminal 2))
+              (do
+                (if (= (current-byte state) (spec/function-production-terminal 4)) 0
+                  (loop
+                    (let [parameter-start (current-position state)
+                          parameter-end (word-end state parameter-start)]
+                      (if (= parameter-start parameter-end)
+                          (do (fail! state DIRECT-PARSE-EXPECTED) (break))
+                        (do
+                          (advance! state)
+                          (let [parameter (builder/add-binding! (.builder state) function-scope
+                                                               parameter-start parameter-end)]
+                            (check-build! state parameter))
+                          (if (= (current-byte state)
+                                 (spec/function-production-terminal 3))
+                              (advance! state) (break)))))))
+                (if (consume-byte! state (spec/function-production-terminal 4))
+                    (do
+                      (set! (.block state) entry)
+                      (set! (.scope state) function-scope)
+                      (set! (.function-scope state) function-scope)
+                      (set! (.terminated state) false)
+                      (parse-block! state)
+                      (let [end (current-position state)]
+                        (if (and (= (.error state) DIRECT-PARSE-OK)
+                                 (not (.terminated state)))
+                            (let [return-result (builder/add-op! (.builder state) (.block state)
+                                                  ir/OP-RETURN (cast u32 0) (cast u32 0)
+                                                  end end (cast u32 0))]
+                              (check-build! state return-result)) 0)
+                        (let [scope-end (builder/set-scope-end! (.builder state)
+                                                               function-scope end)
+                              op-end (builder/set-op-span! (.builder state) function-op
+                                                           start end)]
+                          (check-build! state scope-end)
+                          (check-build! state op-end)))
+                      (set! (.block state) parent-block)
+                      (set! (.scope state) parent-scope)
+                      (set! (.function-scope state) parent-function-scope)
+                      (set! (.terminated state) parent-terminated)) 0)) 0)))))
+  0)
+
 (defn parse-statement! [(state (ptr DirectParseState))] (-> i64)
   (cond
     (= (current-byte state) (spec/block-production-terminal 0)) (parse-block! state)
@@ -419,11 +602,13 @@
       (parse-declaration! state)
     (current-keyword? state (spec/return-production-keyword 0)) (parse-return! state)
     (current-keyword? state (spec/if-production-keyword 0)) (parse-if! state)
+    (current-keyword? state (spec/function-production-keyword 0)) (parse-function! state)
     :else (parse-expression-statement! state)))
 
 (defn parse-direct-program!
   [(source (ptr u8)) (source-size i64) (events (ptr u32)) (event-count i64)
-   (ir-builder (ptr builder/IrBuilder))] (-> DirectParseResult)
+   (ir-builder (ptr builder/IrBuilder)) (parser-scratch (ptr DirectParserScratch))]
+  (-> DirectParseResult)
   (let [root-region-result (builder/add-region! ir-builder (cast u32 ir/INVALID-ID))
         root-region (check-build-result-id root-region-result)
         root-block-result (builder/add-block! ir-builder root-region)
@@ -434,7 +619,8 @@
         state (p/alloc-stack DirectParseState)]
     (store! state (DirectParseState :source source :source-size source-size
                    :events events :event-count event-count :event-index 0
-                   :builder ir-builder :block root-block :scope root-scope
+                   :builder ir-builder :scratch parser-scratch
+                   :block root-block :scope root-scope :function-scope root-scope
                    :error (if (= (.error root-scope-result) builder/BUILD-OK)
                               DIRECT-PARSE-OK DIRECT-PARSE-BUILDER)
                    :error-offset (cast u32 0) :terminated false))
