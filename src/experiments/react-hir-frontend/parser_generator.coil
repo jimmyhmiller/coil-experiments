@@ -3509,7 +3509,7 @@
                 current-byte-code adjacent-byte-code)))))))
 
 (defn compile-precedence-expression [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 16)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 19)
                 (generator-form? production "precedence-expression")))
       (generator-fail production "invalid precedence-expression production")
     (let [state-type (backend-value backend "state-type")
@@ -3542,10 +3542,14 @@
           assignment-max (field-value production "assignment-max-precedence")
           assignment-operators (field-value production "assignment-operators")
           assignment-op (field-value production "assignment-op")
+          short-circuit-operators (field-value production "short-circuit-operators")
+          nullish-op (field-value production "nullish-op")
+          branch-op (field-value production "branch-op")
           state (p/fresh-identifier "state") minimum (p/fresh-identifier "minimum")
-          byte0-id (p/fresh-identifier "byte0")]
+          byte0-id (p/fresh-identifier "byte0")
+          immediate-id (p/fresh-identifier "immediate")]
       `(defn ~function-name [(~state (ptr ~state-type)) (~minimum i64)] (-> ~result-type)
-         (let [(mut left) (~postfix-parser ~state)]
+         (let [(mut left) (~postfix-parser ~state) (mut logical-family) 0]
            (loop
              (let [~byte0-id (~current-byte-code ~state)
                    lookahead (~lookahead-code ~byte0-id)
@@ -3577,9 +3581,23 @@
                  (let [meta (% info 256)
                        width (% meta 128)
                        right-associative (>= meta 128)
-                       immediate (p/ior (cast u64 ~byte0-id)
+                       ~immediate-id (p/ior (cast u64 ~byte0-id)
                                    (p/ior (p/ishl (cast u64 byte1) (cast u64 8))
-                                          (p/ishl (cast u64 byte2) (cast u64 16))))]
+                                          (p/ishl (cast u64 byte2) (cast u64 16))))
+                       short-mode
+                         (cond
+                           ~@(let [clauses (p/code-list-new) (mut k) 0]
+                               (loop
+                                 (if (>= (load k) (p/code-count short-circuit-operators))
+                                     (break)
+                                   (let [entry (p/code-nth short-circuit-operators (load k))]
+                                     (p/code-list-push! clauses
+                                       `(= ~immediate-id (cast u64 ~(p/code-nth entry 0))))
+                                     (p/code-list-push! clauses (p/code-nth entry 1))
+                                     (set! k (+ (load k) 1)))))
+                               (p/code-list-push! clauses `:else)
+                               (p/code-list-push! clauses `0)
+                               (p/code-list-done clauses)))]
                    (let [old-left (load left)
                          arena-before (.arena (.builder ~state))
                          definition-kind (load (p/index (.value-def-kinds arena-before)
@@ -3595,21 +3613,77 @@
                          (do (~fail-code ~state ~expected-error) (break))
                        0)
                      (~advance-count-code ~state width)
-                     (let [right (~function-name ~state
-                                   (if right-associative precedence (+ precedence 1)))
-                         arena (.arena (.builder ~state)) value (.value-count arena)
-                         operation (builder/add-op! (.builder ~state) (.block ~state) ~binary-op
-                                      (cast u32 0) (cast u32 0)
-                                      (.start old-left) (.end right) (cast u32 1))]
-                     (let [op (~check-build-code ~state operation)
-                           lhs (builder/add-operand! (.builder ~state) op (.value old-left))
-                           rhs (builder/add-operand! (.builder ~state) op (.value right))
-                           imm (builder/set-op-immediate! (.builder ~state) op immediate)]
-                       (~check-build-code ~state lhs)
-                       (~check-build-code ~state rhs)
-                       (~check-build-code ~state imm)
-                       (store! left (~result-type :value value :start (.start old-left)
-                                                  :end (.end right))))))))))
+                     (let [family (if (= short-mode 3) 1 (if (> short-mode 0) 2 0))]
+                       (if (and (> family 0) (> (load logical-family) 0)
+                                (!= family (load logical-family)))
+                           (do (~fail-code ~state ~expected-error) (break)) 0)
+                       (if (> family 0) (store! logical-family family) 0)
+                       (if (> short-mode 0)
+                           (let [arena (.arena (.builder ~state)) origin (.block ~state)
+                                 region (load (p/index (.block-regions arena)
+                                                       (cast i64 origin)))
+                                 rhs-result (builder/add-block! (.builder ~state) region)
+                                 rhs-block (~check-build-code ~state rhs-result)
+                                 join-result (builder/add-block! (.builder ~state) region)
+                                 join-block (~check-build-code ~state join-result)
+                                 parameter-result (builder/add-block-param! (.builder ~state)
+                                                    join-block)
+                                 parameter (~check-build-code ~state parameter-result)
+                                 condition-value
+                                   (if (= short-mode 3)
+                                       (let [value (.value-count arena)
+                                             test-result
+                                               (builder/add-op! (.builder ~state) origin ~nullish-op
+                                                 (cast u32 0) (cast u32 0) (.start old-left)
+                                                 (.end old-left) (cast u32 1))
+                                             test (~check-build-code ~state test-result)
+                                             operand (builder/add-operand! (.builder ~state) test
+                                                       (.value old-left))]
+                                         (~check-build-code ~state operand)
+                                         value)
+                                     (.value old-left))
+                                 rhs-on-true (or (= short-mode 1) (= short-mode 3))
+                                 branch-result
+                                   (builder/add-op! (.builder ~state) origin ~branch-op
+                                     (cast u32 0) (cast u32 0) (.start old-left)
+                                     (~current-position-code ~state) (cast u32 0))
+                                 branch (~check-build-code ~state branch-result)
+                                 condition-operand (builder/add-operand! (.builder ~state) branch
+                                                     condition-value)
+                                 true-successor (builder/add-successor! (.builder ~state) branch
+                                                   (if rhs-on-true rhs-block join-block))
+                                 true-edge (~check-build-code ~state true-successor)
+                                 false-successor (builder/add-successor! (.builder ~state) branch
+                                                    (if rhs-on-true join-block rhs-block))
+                                 false-edge (~check-build-code ~state false-successor)
+                                 short-edge (if rhs-on-true false-edge true-edge)
+                                 short-argument (builder/add-successor-arg! (.builder ~state)
+                                                  short-edge (.value old-left))]
+                             (~check-build-code ~state condition-operand)
+                             (~check-build-code ~state short-argument)
+                             (set! (.block ~state) rhs-block)
+                             (let [right (~function-name ~state
+                                           (if right-associative precedence (+ precedence 1)))
+                                   rhs-exit (.block ~state)]
+                               (~emit-branch-arg-code ~state rhs-exit join-block (.value right))
+                               (set! (.block ~state) join-block)
+                               (store! left (~result-type :value parameter :start (.start old-left)
+                                                  :end (.end right)))))
+                         (let [right (~function-name ~state
+                                       (if right-associative precedence (+ precedence 1)))
+                               arena (.arena (.builder ~state)) value (.value-count arena)
+                               operation (builder/add-op! (.builder ~state) (.block ~state)
+                                            ~binary-op (cast u32 0) (cast u32 0)
+                                            (.start old-left) (.end right) (cast u32 1))]
+                           (let [op (~check-build-code ~state operation)
+                                 lhs (builder/add-operand! (.builder ~state) op (.value old-left))
+                                 rhs (builder/add-operand! (.builder ~state) op (.value right))
+                                 imm (builder/set-op-immediate! (.builder ~state) op ~immediate-id)]
+                             (~check-build-code ~state lhs)
+                             (~check-build-code ~state rhs)
+                             (~check-build-code ~state imm)
+                             (store! left (~result-type :value value :start (.start old-left)
+                                                        :end (.end right))))))))))))
            (let [completed
                    (if (and (<= ~minimum ~conditional-max)
                             (= (.error ~state) ~ok-error)
@@ -4206,7 +4280,11 @@
                                "<<=" ">>=" ">>>=" "**=" "&&=" "||=" "??="])
         (update-first-bytes [(syntax/terminal-byte syntax/plus)
                              (syntax/terminal-byte syntax/minus)])
-        (assignment-op ir/OP-JS-ASSIGN))]
+        (assignment-op ir/OP-JS-ASSIGN)
+        ;; [packed-byte-immediate lowering-mode]: 1=&&, 2=||, 3=??.
+        (short-circuit-operators [[9766 1] [31868 2] [16191 3]])
+        (nullish-op ir/OP-JS-IS-NULLISH)
+        (branch-op ir/OP-COND-BR))]
         definitions (p/code-list-new) (mut i) 0]
     (loop
       (if (>= (load i) (p/code-count productions)) (break)
