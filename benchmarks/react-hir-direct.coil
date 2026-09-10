@@ -1,0 +1,99 @@
+(module react-hir-direct-benchmark)
+
+(import "coil.primitive" :as p)
+(import "coil.slice" :use [slice-data])
+(import "experiments.react-hir-frontend.frontend" :as frontend)
+(import "experiments.react-hir-frontend.pipeline" :as pipeline)
+(import "experiments.react-hir-frontend.ir" :as ir)
+(import "experiments.react-hir-frontend.ir-builder" :as builder)
+(import "experiments.react-hir-frontend.ir-storage" :as storage)
+(import "experiments.react-hir-frontend.direct-parser" :as parser)
+
+(extern clock_gettime :cc c [i32 (ptr Timespec)] (-> i32))
+(extern printf :cc c [(ptr i8) ...] (-> i32))
+(extern coil_benchmark_consume :cc c [(ptr i8) i64] (-> void))
+
+(defstruct Timespec [(seconds i64) (nanos i64)])
+
+(defn monotonic-nanos [] (-> i64)
+  (let [time (p/alloc-stack Timespec)]
+    (clock_gettime 6 time)
+    (+ (* (.seconds time) 1000000000) (.nanos time))))
+
+(defn run-direct-benchmark [(rounds i64)] (-> i64)
+  (let [text "let x = 3; while (x) { x = x - 1; } foo.state({value: [x]});"
+        events (p/alloc-stack (array u32 256))
+        memory (p/alloc-stack (array u64 8192))
+        arena (p/alloc-stack ir/IrArena)
+        builder-scratch (p/alloc-stack builder/BuilderScratch)
+        ir-builder (p/alloc-stack builder/IrBuilder)
+        parser-values (p/alloc-stack (array u32 256))
+        parser-scratch (p/alloc-stack parser/DirectParserScratch)
+        caps (builder/BuilderCapacities
+          :regions (cast u32 8) :region-block-refs (cast u32 16)
+          :blocks (cast u32 16) :block-op-refs (cast u32 64)
+          :ops (cast u32 64) :op-region-refs (cast u32 8)
+          :values (cast u32 64) :operands (cast u32 128)
+          :successors (cast u32 32) :successor-args (cast u32 32)
+          :scopes (cast u32 16) :bindings (cast u32 32)
+          :references (cast u32 64) :captures (cast u32 16))
+        prepared (pipeline/scan-source-to-parse-tape64
+          (slice-data text) (len text) (cast u32 0) (p/cast (ptr u32) events)
+          (frontend/frontend-initial-state))]
+    (let [start (monotonic-nanos) (mut round) 0 (mut checksum) (cast u64 0)]
+      (loop
+        (if (>= (load round) rounds) (break)
+          (let [initialized (storage/initialize! arena builder-scratch ir-builder
+                              (p/cast (ptr u8) memory) 65536
+                              (cast u32 (len text)) caps)]
+            (if (!= (.error initialized) storage/STORAGE-OK) (break)
+              (do
+                (store! parser-scratch (parser/DirectParserScratch
+                  :values (p/cast (ptr u32) parser-values)
+                  :value-capacity 256 :value-count 0))
+                (let [parsed (parser/parse-direct-program!
+                               (slice-data text) (len text) (p/cast (ptr u32) events)
+                               (.count prepared) ir-builder parser-scratch)]
+                  (if (!= (.error parsed) parser/DIRECT-PARSE-OK) (break)
+                    (do
+                      (coil_benchmark_consume (p/cast (ptr i8) (.opcodes arena))
+                                              (* (cast i64 (.op-count arena)) 2))
+                      (store! checksum (p/ixor (load checksum)
+                                        (cast u64 (.op-count arena))))
+                      (set! round (+ (load round) 1))))))))))
+      (let [elapsed (- (monotonic-nanos) start)]
+        (printf c"tape-to-ssa %8.3f GB/s  %10lld ns  checksum=%llu\n"
+                (/ (cast f64 (* (len text) rounds)) (cast f64 elapsed))
+                elapsed (load checksum))))
+    (let [start (monotonic-nanos) (mut round) 0 (mut checksum) (cast u64 0)]
+      (loop
+        (if (>= (load round) rounds) (break)
+          (let [scanned (pipeline/scan-source-to-parse-tape64
+                          (slice-data text) (len text) (cast u32 0)
+                          (p/cast (ptr u32) events) (frontend/frontend-initial-state))
+                initialized (storage/initialize! arena builder-scratch ir-builder
+                              (p/cast (ptr u8) memory) 65536
+                              (cast u32 (len text)) caps)]
+            (if (!= (.error initialized) storage/STORAGE-OK) (break)
+              (do
+                (store! parser-scratch (parser/DirectParserScratch
+                  :values (p/cast (ptr u32) parser-values)
+                  :value-capacity 256 :value-count 0))
+                (let [parsed (parser/parse-direct-program!
+                               (slice-data text) (len text) (p/cast (ptr u32) events)
+                               (.count scanned) ir-builder parser-scratch)]
+                  (if (!= (.error parsed) parser/DIRECT-PARSE-OK) (break)
+                    (do
+                      (coil_benchmark_consume (p/cast (ptr i8) (.opcodes arena))
+                                              (* (cast i64 (.op-count arena)) 2))
+                      (store! checksum (p/ixor (load checksum)
+                                        (cast u64 (.op-count arena))))
+                      (set! round (+ (load round) 1))))))))))
+      (let [elapsed (- (monotonic-nanos) start)]
+        (printf c"text-to-ssa %8.3f GB/s  %10lld ns  checksum=%llu\n"
+                (/ (cast f64 (* (len text) rounds)) (cast f64 elapsed))
+                elapsed (load checksum))))
+    0))
+
+(defn main [] (-> i64)
+  (run-direct-benchmark 100000))
