@@ -1,0 +1,3 @@
+class {
+  value = 1;
+}
