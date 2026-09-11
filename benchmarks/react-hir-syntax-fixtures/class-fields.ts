@@ -67,3 +67,19 @@ class ComputedMembers {
     return value;
   }
 }
+
+interface FirstContract {}
+interface SecondContract<T> {}
+
+class ImplementsContracts extends Base
+  implements FirstContract, SecondContract<string> {
+  "quoted"(): void;
+  42(): number;
+
+  "quoted"() {}
+  42() {
+    return 42;
+  }
+}
+
+const ImplementsExpression = class implements FirstContract {};
