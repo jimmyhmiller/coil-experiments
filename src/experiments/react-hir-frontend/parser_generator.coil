@@ -3227,24 +3227,33 @@
                          :root-region root-region :root-block root-block))))))
 
 (defn compile-class-field [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 11)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 18)
                 (generator-form? production "class-field")))
       (generator-fail production "invalid class-field production")
     (let [state-type (backend-value backend "state-type")
           function-name (backend-value backend (p/code-sym (field-value production "function")))
           current-position-code (backend-value backend "current-position")
           current-byte-code (backend-value backend "current-byte")
+          event-position-code (backend-value backend "event-position")
           word-end-code (backend-value backend "word-end")
           advance-code (backend-value backend "advance")
+          consume-code (backend-value backend "consume-byte")
           parse-expression-code (backend-value backend "parse-expression")
+          parse-block-code (backend-value backend "parse-block")
           type-parser (backend-value backend (p/code-sym (field-value production "type-parser")))
+          pattern-parser (backend-value backend
+                           (p/code-sym (field-value production "pattern-parser")))
           terminator-parser (backend-value backend
                               (p/code-sym (field-value production "terminator-parser")))
           check-build-code (backend-value backend "check-build")
+          ok-error (backend-value backend "ok-error")
           fail-code (backend-value backend "fail") expected-error (backend-value backend "expected-error")
           colon (field-value production "type-prefix") equals (field-value production "equals")
           question (field-value production "optional") bang (field-value production "definite")
           separator (field-value production "separator") field-op (field-value production "emit-op")
+          open (field-value production "open") close (field-value production "close")
+          comma (field-value production "comma") body-open (field-value production "body-open")
+          method-op (field-value production "method-op") return-op (field-value production "fallthrough-op")
           state (p/fresh-identifier "state")]
       `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
          (let [start (~current-position-code ~state) end (~word-end-code ~state start)]
@@ -3254,22 +3263,84 @@
                (if (or (= (~current-byte-code ~state) ~question)
                        (= (~current-byte-code ~state) ~bang))
                    (~advance-code ~state) 0)
-               (if (= (~current-byte-code ~state) ~colon)
-                   (do (~type-parser ~state ~equals ~separator) 0) 0)
-               (let [(mut initializer-value) (cast u32 ir/INVALID-ID)]
-                 (if (= (~current-byte-code ~state) ~equals)
-                     (do (~advance-code ~state)
-                         (let [initializer (~parse-expression-code ~state 0)]
-                           (store! initializer-value (.value initializer))) 0) 0)
-                 (let [operation-result (builder/add-op! (.builder ~state) (.block ~state)
-                                          ~field-op start end start
-                                          (~current-position-code ~state) (cast u32 0))
-                       operation (~check-build-code ~state operation-result)]
-                   (if (!= (load initializer-value) (cast u32 ir/INVALID-ID))
-                       (do (~check-build-code ~state
-                         (builder/add-operand! (.builder ~state) operation
-                           (load initializer-value))) 0) 0))
-                 (~terminator-parser ~state (~current-position-code ~state)))))
+               (if (= (~current-byte-code ~state) ~open)
+                   (let [parent-block (.block ~state) parent-scope (.scope ~state)
+                         parent-function-scope (.function-scope ~state)
+                         parent-break-target (.break-target ~state)
+                         parent-continue-target (.continue-target ~state)
+                         parent-terminated (.terminated ~state)
+                         method-result (builder/add-op! (.builder ~state) parent-block
+                                         ~method-op start end start start (cast u32 0))
+                         method (~check-build-code ~state method-result)
+                         region-result (builder/add-region! (.builder ~state) method)
+                         region (~check-build-code ~state region-result)
+                         _attached (~check-build-code ~state
+                           (builder/add-op-region! (.builder ~state) method region))
+                         entry-result (builder/add-block! (.builder ~state) region)
+                         entry (~check-build-code ~state entry-result)
+                         scope-result (builder/add-scope! (.builder ~state) parent-scope start
+                                        (cast u32 (.source-size ~state)))
+                         method-scope (~check-build-code ~state scope-result)]
+                     (set! (.scope ~state) method-scope)
+                     (~advance-code ~state)
+                     (if (= (~current-byte-code ~state) ~close) 0
+                       (loop
+                         (~pattern-parser ~state true ~comma ~close)
+                         (if (= (~current-byte-code ~state) ~comma)
+                             (do (~advance-code ~state) 0) (break))))
+                     (if (~consume-code ~state ~close)
+                         (do
+                           (if (= (~current-byte-code ~state) ~colon)
+                               (do (~type-parser ~state ~body-open ~body-open) 0) 0)
+                           (set! (.block ~state) entry)
+                           (set! (.function-scope ~state) method-scope)
+                           (set! (.break-target ~state) (cast u32 ir/INVALID-ID))
+                           (set! (.continue-target ~state) (cast u32 ir/INVALID-ID))
+                           (set! (.terminated ~state) false)
+                           (~parse-block-code ~state)
+                           (let [method-end
+                                  (if (> (.event-index ~state) 0)
+                                      (+ (~event-position-code
+                                           (load (p/index (.events ~state)
+                                                   (- (.event-index ~state) 1))))
+                                         (cast u32 1))
+                                    (~current-position-code ~state))]
+                             (if (and (= (.error ~state) ~ok-error)
+                                      (not (.terminated ~state)))
+                                 (do (~check-build-code ~state
+                                   (builder/add-op! (.builder ~state) (.block ~state)
+                                     ~return-op (cast u32 0) (cast u32 0)
+                                     method-end method-end (cast u32 0))) 0) 0)
+                             (~check-build-code ~state
+                               (builder/set-scope-end! (.builder ~state) method-scope method-end))
+                             (~check-build-code ~state
+                               (builder/set-op-span! (.builder ~state) method start method-end)))
+                           0) 0)
+                     (set! (.block ~state) parent-block)
+                     (set! (.scope ~state) parent-scope)
+                     (set! (.function-scope ~state) parent-function-scope)
+                     (set! (.break-target ~state) parent-break-target)
+                     (set! (.continue-target ~state) parent-continue-target)
+                     (set! (.terminated ~state) parent-terminated)
+                     0)
+                 (do
+                   (if (= (~current-byte-code ~state) ~colon)
+                       (do (~type-parser ~state ~equals ~separator) 0) 0)
+                   (let [(mut initializer-value) (cast u32 ir/INVALID-ID)]
+                     (if (= (~current-byte-code ~state) ~equals)
+                         (do (~advance-code ~state)
+                             (let [initializer (~parse-expression-code ~state 0)]
+                               (store! initializer-value (.value initializer))) 0) 0)
+                     (let [operation-result (builder/add-op! (.builder ~state) (.block ~state)
+                                              ~field-op start end start
+                                              (~current-position-code ~state) (cast u32 0))
+                           operation (~check-build-code ~state operation-result)]
+                       (if (!= (load initializer-value) (cast u32 ir/INVALID-ID))
+                           (do (~check-build-code ~state
+                             (builder/add-operand! (.builder ~state) operation
+                               (load initializer-value))) 0) 0))
+                     (~terminator-parser ~state (~current-position-code ~state)))
+                   0))))
          0)))))
 
 (defn compile-class-declaration [(backend Code) (production Code)] (-> Code)
@@ -5201,13 +5272,20 @@
       (class-field class-field-member
         (function parse-class-field)
         (type-parser parse-type-annotation)
+        (pattern-parser parse-binding-pattern)
         (terminator-parser parse-statement-end)
+        (open (syntax/function-production-terminal 2))
+        (comma (syntax/function-production-terminal 3))
+        (close (syntax/function-production-terminal 4))
+        (body-open (syntax/terminal-byte syntax/lbrace))
         (type-prefix (syntax/terminal-byte syntax/colon))
         (equals (syntax/terminal-byte syntax/equals))
         (optional (syntax/terminal-byte syntax/question))
         (definite (syntax/terminal-byte syntax/bang))
         (separator (syntax/terminal-byte syntax/semicolon))
-        (emit-op ir/OP-JS-CLASS-FIELD))
+        (emit-op ir/OP-JS-CLASS-FIELD)
+        (method-op ir/OP-JS-CLASS-METHOD)
+        (fallthrough-op ir/OP-RETURN))
       (function-expression function-value
         (function parse-function-expression)
         (open (syntax/function-production-terminal 2))
