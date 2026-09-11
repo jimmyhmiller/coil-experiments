@@ -13,5 +13,28 @@ class Fields extends Base {
     return this.value + amount * scale;
   }
 
+  public static readonly version: number = 1;
+  protected override reset(): void {}
+  accessor current: number = 0;
+
+  get doubled(): number {
+    return this.value * 2;
+  }
+
+  set doubled(next: number) {
+    this.value = next / 2;
+  }
+
+  static {
+    this.version;
+  }
+
   empty() {}
+}
+
+class ContextualMemberNames {
+  static() {}
+  readonly = 1;
+  get = 2;
+  set = 3;
 }

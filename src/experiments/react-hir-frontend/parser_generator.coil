@@ -3227,13 +3227,15 @@
                          :root-region root-region :root-block root-block))))))
 
 (defn compile-class-field [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 18)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 22)
                 (generator-form? production "class-field")))
       (generator-fail production "invalid class-field production")
     (let [state-type (backend-value backend "state-type")
           function-name (backend-value backend (p/code-sym (field-value production "function")))
           current-position-code (backend-value backend "current-position")
           current-byte-code (backend-value backend "current-byte")
+          current-keyword-code (backend-value backend "current-keyword")
+          next-event-byte-code (backend-value backend "next-event-byte")
           event-position-code (backend-value backend "event-position")
           word-end-code (backend-value backend "word-end")
           advance-code (backend-value backend "advance")
@@ -3254,31 +3256,101 @@
           open (field-value production "open") close (field-value production "close")
           comma (field-value production "comma") body-open (field-value production "body-open")
           method-op (field-value production "method-op") return-op (field-value production "fallthrough-op")
+          static-block-keyword (field-value production "static-block-keyword")
+          static-block-op (field-value production "static-block-op")
+          yield-op (field-value production "yield-op")
+          modifiers (field-value production "modifiers")
+          modifier-bits-id (p/fresh-identifier "modifier-bits")
           state (p/fresh-identifier "state")]
       `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
-         (let [start (~current-position-code ~state) end (~word-end-code ~state start)]
-           (if (= start end) (do (~fail-code ~state ~expected-error) 0)
+         (let [member-start (~current-position-code ~state)
+               (mut ~modifier-bits-id) (cast u64 0)]
+           (loop
+             (cond
+               ~@(let [clauses (p/code-list-new) (mut i) 0]
+                   (loop
+                     (if (>= (load i) (p/code-count modifiers)) (break)
+                       (let [entry (p/code-nth modifiers (load i))]
+                         (p/code-list-push! clauses
+                           `(and (~current-keyword-code ~state ~(p/code-nth entry 0))
+                                 (not (or (= (~next-event-byte-code ~state 1) ~open)
+                                          (= (~next-event-byte-code ~state 1) ~equals)
+                                          (= (~next-event-byte-code ~state 1) ~colon)
+                                          (= (~next-event-byte-code ~state 1) ~question)
+                                          (= (~next-event-byte-code ~state 1) ~bang)
+                                          (= (~next-event-byte-code ~state 1) ~body-open)
+                                          (= (~next-event-byte-code ~state 1) ~separator)))))
+                         (p/code-list-push! clauses
+                           `(do (store! ~modifier-bits-id
+                                  (p/ior (load ~modifier-bits-id) ~(p/code-nth entry 1)))
+                                (~advance-code ~state) 0))
+                         (set! i (+ (load i) 1)))))
+                   (p/code-list-done clauses))
+               :else (break)))
+           (let [start (~current-position-code ~state) end (~word-end-code ~state start)
+                 static-block (~current-keyword-code ~state ~static-block-keyword)]
+             (if (= start end) (do (~fail-code ~state ~expected-error) 0)
              (do
                (~advance-code ~state)
                (if (or (= (~current-byte-code ~state) ~question)
                        (= (~current-byte-code ~state) ~bang))
                    (~advance-code ~state) 0)
-               (if (= (~current-byte-code ~state) ~open)
+               (cond
+                 (and static-block (= (~current-byte-code ~state) ~body-open))
+                   (let [parent-block (.block ~state) parent-scope (.scope ~state)
+                         parent-terminated (.terminated ~state)
+                         block-result (builder/add-op! (.builder ~state) parent-block
+                                        ~static-block-op start end member-start start
+                                        (cast u32 0))
+                         block-op (~check-build-code ~state block-result)
+                         region-result (builder/add-region! (.builder ~state) block-op)
+                         region (~check-build-code ~state region-result)
+                         _attached (~check-build-code ~state
+                           (builder/add-op-region! (.builder ~state) block-op region))
+                         entry-result (builder/add-block! (.builder ~state) region)
+                         entry (~check-build-code ~state entry-result)]
+                     (set! (.block ~state) entry)
+                     (set! (.terminated ~state) false)
+                     (~parse-block-code ~state)
+                     (let [block-end
+                            (if (> (.event-index ~state) 0)
+                                (+ (~event-position-code
+                                     (load (p/index (.events ~state)
+                                             (- (.event-index ~state) 1))))
+                                   (cast u32 1))
+                              (~current-position-code ~state))]
+                       (if (and (= (.error ~state) ~ok-error)
+                                (not (.terminated ~state)))
+                           (do (~check-build-code ~state
+                             (builder/add-op! (.builder ~state) (.block ~state)
+                               ~yield-op (cast u32 0) (cast u32 0)
+                               block-end block-end (cast u32 0))) 0) 0)
+                       (~check-build-code ~state
+                         (builder/set-op-span! (.builder ~state) block-op
+                           member-start block-end)))
+                     (set! (.block ~state) parent-block)
+                     (set! (.scope ~state) parent-scope)
+                     (set! (.terminated ~state) parent-terminated)
+                     0)
+                 (= (~current-byte-code ~state) ~open)
                    (let [parent-block (.block ~state) parent-scope (.scope ~state)
                          parent-function-scope (.function-scope ~state)
                          parent-break-target (.break-target ~state)
                          parent-continue-target (.continue-target ~state)
                          parent-terminated (.terminated ~state)
                          method-result (builder/add-op! (.builder ~state) parent-block
-                                         ~method-op start end start start (cast u32 0))
+                                         ~method-op start end member-start start (cast u32 0))
                          method (~check-build-code ~state method-result)
+                         _modifiers (~check-build-code ~state
+                           (builder/set-op-immediate! (.builder ~state) method
+                             (load ~modifier-bits-id)))
                          region-result (builder/add-region! (.builder ~state) method)
                          region (~check-build-code ~state region-result)
                          _attached (~check-build-code ~state
                            (builder/add-op-region! (.builder ~state) method region))
                          entry-result (builder/add-block! (.builder ~state) region)
                          entry (~check-build-code ~state entry-result)
-                         scope-result (builder/add-scope! (.builder ~state) parent-scope start
+                         scope-result (builder/add-scope! (.builder ~state) parent-scope member-start
                                         (cast u32 (.source-size ~state)))
                          method-scope (~check-build-code ~state scope-result)]
                      (set! (.scope ~state) method-scope)
@@ -3314,7 +3386,7 @@
                              (~check-build-code ~state
                                (builder/set-scope-end! (.builder ~state) method-scope method-end))
                              (~check-build-code ~state
-                               (builder/set-op-span! (.builder ~state) method start method-end)))
+                               (builder/set-op-span! (.builder ~state) method member-start method-end)))
                            0) 0)
                      (set! (.block ~state) parent-block)
                      (set! (.scope ~state) parent-scope)
@@ -3323,7 +3395,8 @@
                      (set! (.continue-target ~state) parent-continue-target)
                      (set! (.terminated ~state) parent-terminated)
                      0)
-                 (do
+                 :else
+                   (do
                    (if (= (~current-byte-code ~state) ~colon)
                        (do (~type-parser ~state ~equals ~separator) 0) 0)
                    (let [(mut initializer-value) (cast u32 ir/INVALID-ID)]
@@ -3332,16 +3405,19 @@
                              (let [initializer (~parse-expression-code ~state 0)]
                                (store! initializer-value (.value initializer))) 0) 0)
                      (let [operation-result (builder/add-op! (.builder ~state) (.block ~state)
-                                              ~field-op start end start
+                                              ~field-op start end member-start
                                               (~current-position-code ~state) (cast u32 0))
                            operation (~check-build-code ~state operation-result)]
+                       (~check-build-code ~state
+                         (builder/set-op-immediate! (.builder ~state) operation
+                           (load ~modifier-bits-id)))
                        (if (!= (load initializer-value) (cast u32 ir/INVALID-ID))
                            (do (~check-build-code ~state
                              (builder/add-operand! (.builder ~state) operation
                                (load initializer-value))) 0) 0))
                      (~terminator-parser ~state (~current-position-code ~state)))
-                   0))))
-         0)))))
+                   0))))))
+         0))))
 
 (defn compile-class-declaration [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 9)
@@ -5285,6 +5361,21 @@
         (separator (syntax/terminal-byte syntax/semicolon))
         (emit-op ir/OP-JS-CLASS-FIELD)
         (method-op ir/OP-JS-CLASS-METHOD)
+        (static-block-keyword "static")
+        (static-block-op ir/OP-JS-CLASS-STATIC-BLOCK)
+        (yield-op ir/OP-YIELD)
+        (modifiers [["static" ir/CLASS-MEMBER-STATIC]
+                    ["public" ir/CLASS-MEMBER-PUBLIC]
+                    ["private" ir/CLASS-MEMBER-PRIVATE]
+                    ["protected" ir/CLASS-MEMBER-PROTECTED]
+                    ["readonly" ir/CLASS-MEMBER-READONLY]
+                    ["abstract" ir/CLASS-MEMBER-ABSTRACT]
+                    ["override" ir/CLASS-MEMBER-OVERRIDE]
+                    ["declare" ir/CLASS-MEMBER-DECLARE]
+                    ["accessor" ir/CLASS-MEMBER-ACCESSOR]
+                    ["get" ir/CLASS-MEMBER-GET]
+                    ["set" ir/CLASS-MEMBER-SET]
+                    ["async" ir/CLASS-MEMBER-ASYNC]])
         (fallthrough-op ir/OP-RETURN))
       (function-expression function-value
         (function parse-function-expression)
