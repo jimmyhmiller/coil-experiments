@@ -129,12 +129,15 @@ the active join/exit block.
 const result = condition ? foo(a + b) : <Component value={x} />;
 ```
 
-The remaining explicit frontier includes template `${...}` transitions, regexp
-literals, complete numeric and operator syntax, automatic semicolon insertion,
-declaration lists/destructuring, for/do/switch/try/class/import/export/arrow and
-async/generator forms, optional/computed access, spreads, TypeScript, Unicode
-identifiers, scope construction, recovery, and the final React compiler HIR
-schema.
+The remaining explicit frontier is tracked by the feature inventory in
+`pad://react-hir-frontend`, independently of corpus acceptance. The largest
+unimplemented structural families are classes/decorators, structured
+TypeScript type syntax and declarations, the remaining module forms, Unicode
+identifiers, labels/`with`, tagged templates and special import/meta
+expressions, recovery, and the final React compiler HIR schema. Generated
+paths now cover the principal CFG statements, structured try/catch/finally,
+async/generator function declarations, expression-bodied and async arrows,
+optional/computed access, spreads, regexps, numeric forms, and ASI.
 
 The SSA/CFG schema, direct builder, verifier, printer, and a working direct
 parser slice exist. The broader legacy `parser.coil` coverage has not yet been
