@@ -99,3 +99,24 @@ class DecoratedClass {
 abstract class AbstractClass implements FirstContract {
   abstract read(value: number): string;
 }
+
+class GeneratorMethods {
+  *values() {
+    yield 1;
+  }
+
+  async *asyncValues() {
+    yield 2;
+  }
+}
+
+class ParameterProperties {
+  constructor(
+    @inject public service: FirstContract,
+    private readonly count = 0,
+  ) {}
+
+  decoratedParameter(@inject value: number) {
+    return value;
+  }
+}

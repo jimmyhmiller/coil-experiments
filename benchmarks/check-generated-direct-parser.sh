@@ -22,7 +22,7 @@ for production in \
   return throw break continue expression-statement block if try class decorated-class class-expression class-field while do-while for-kind classic-for iterator-for for switch function function-expression statement direct-program \
   type-annotation type-alias-body implements-clause type-parameters type-alias statement-end import \
   type-arguments \
-  type-arguments-before-call arrow-lookahead binding-pattern arrow jsx named-export interface \
+  type-arguments-before-call arrow-lookahead binding-pattern class-parameter decorated-parameter arrow jsx named-export interface \
   type-assertion \
   prefix-keyword template debugger non-null postfix-update-lookahead postfix-update optional-postfix
 do
@@ -33,4 +33,4 @@ do
   fi
 done
 
-printf '%s\n' 'all 62 direct-parser productions are generated'
+printf '%s\n' 'all 64 direct-parser productions are generated'
