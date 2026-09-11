@@ -83,3 +83,19 @@ class ImplementsContracts extends Base
 }
 
 const ImplementsExpression = class implements FirstContract {};
+
+@sealed
+@registered("classes")
+class DecoratedClass {
+  @tracked
+  value = 1;
+
+  @memoized()
+  method() {
+    return this.value;
+  }
+}
+
+abstract class AbstractClass implements FirstContract {
+  abstract read(value: number): string;
+}
