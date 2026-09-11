@@ -38,3 +38,12 @@ class ContextualMemberNames {
   get = 2;
   set = 3;
 }
+
+class PrivateMembers {
+  static #count: number = 0;
+  #value = 1;
+
+  #read(): number {
+    return this.#value;
+  }
+}
