@@ -125,3 +125,23 @@ class IndexedClass {
   readonly [key: string]: number;
   [index: number]: string;
 }
+
+class SuperUsage extends Base {
+  constructor() {
+    super();
+  }
+
+  inherited() {
+    return super.value;
+  }
+}
+
+class GenericClass<T extends FirstContract = FirstContract>
+  implements SecondContract<T> {
+  value?: T;
+}
+
+const GenericClassExpression = class<T> extends Base
+  implements SecondContract<T> {
+  value?: T;
+};
