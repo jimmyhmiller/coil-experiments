@@ -47,3 +47,23 @@ class PrivateMembers {
     return this.#value;
   }
 }
+
+const AnonymousClass = class extends Base {
+  value = 1;
+};
+
+const NamedClass = class Inner {
+  self() {
+    return Inner;
+  }
+};
+
+const computedName = "computed";
+
+class ComputedMembers {
+  [computedName] = 1;
+
+  static ["factory"](value: number) {
+    return value;
+  }
+}
