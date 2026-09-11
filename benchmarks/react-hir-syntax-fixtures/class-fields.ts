@@ -120,3 +120,8 @@ class ParameterProperties {
     return value;
   }
 }
+
+class IndexedClass {
+  readonly [key: string]: number;
+  [index: number]: string;
+}
