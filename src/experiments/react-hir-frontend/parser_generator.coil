@@ -202,6 +202,16 @@
       -1
     (p/code-int (p/code-nth (p/code-nth steps index) 1))))
 
+;; Byte of a (terminator B) step, for a strategy that tolerates the terminator's
+;; absence rather than delegating to a statement-end parser.
+(defn terminator-step-byte [(steps Code) (index i64) (role (slice u8))] (-> Code)
+  (if (or (< index 0) (>= index (p/code-count steps))
+          (not (step-form? (p/code-nth steps index) "terminator")))
+      (do (p/report steps
+            (p/code-str "production needs a terminator step for: " role))
+          `(cast u8 0))
+    `(cast u8 ~(p/code-nth (p/code-nth steps index) 1))))
+
 ;; Byte of a (terminal B) step, for a strategy that must both stop a repetition
 ;; at a closing terminal and then consume it.
 (defn terminal-step-byte [(steps Code) (index i64) (role (slice u8))] (-> Code)
@@ -3143,56 +3153,57 @@
           current-position-code (backend-value backend "current-position")
           current-byte-code (backend-value backend "current-byte")
           current-line-break-code (backend-value backend "current-line-break")
-          current-keyword-code (backend-value backend "current-keyword")
-          advance-code (backend-value backend "advance")
           fail-code (backend-value backend "fail")
           check-build-code (backend-value backend "check-build")
           expected-error (backend-value backend "expected-error")
           ok-error (backend-value backend "ok-error")
-          prefix (field-value production "prefix")
-          prefix-kind (field-value production "prefix-kind")
+          ;; The introducing token comes from the production, not from an
+          ;; unrelated production that happens to spell the same byte.
+          steps (production-steps production)
+          type-index (rule-step-index steps (field-value production "type") "type")
           line-break-stop (field-value production "line-break-stop")
           terminators (field-value production "terminators")
           opcode (field-value production "emit-op")
           state (p/fresh-identifier "state") stop-a (p/fresh-identifier "stop-a")
-          stop-b (p/fresh-identifier "stop-b")]
-      `(defn ~function-name
-         [(~state (ptr ~state-type)) (~stop-a u8) (~stop-b u8)] (-> i64)
-         (let [annotation-start (~current-position-code ~state)
-               (mut annotation-value) (cast u32 ir/INVALID-ID)]
-           (if ~(if (generator-symbol? prefix-kind "keyword")
-                    `(not (~current-keyword-code ~state ~prefix))
-                  `(!= (~current-byte-code ~state) ~prefix))
-               (do (~fail-code ~state ~expected-error) 0)
-             (do
-               (~advance-code ~state)
-               (let [root (~type-parser ~state) end (.end root)
-                     stopped (or (>= (.event-index ~state) (.event-count ~state))
-                                 (= (~current-byte-code ~state) ~stop-a)
-                                 (= (~current-byte-code ~state) ~stop-b)
-                                 (or
-                                   ~@(let [checks (p/code-list-new) (mut i) 0]
-                                       (loop
-                                         (if (>= (load i) (p/code-count terminators)) (break)
-                                           (do
-                                             (p/code-list-push! checks
-                                               `(= (~current-byte-code ~state)
-                                                   ~(p/code-nth terminators (load i))))
-                                             (set! i (+ (load i) 1)))))
-                                       (p/code-list-done checks)))
-                                 ~(if (generator-symbol? line-break-stop "true")
-                                      `(~current-line-break-code ~state) `false))]
-                 (if (or (!= (.error ~state) ~ok-error) (not stopped))
-                     (do (~fail-code ~state ~expected-error) 0)
-                   (let [arena (.arena (.builder ~state)) value (.value-count arena)
-                         operation (builder/add-op! (.builder ~state) (.block ~state)
-                                      ~opcode (.start root) (.end root)
-                                      annotation-start end (cast u32 1))]
-                     (let [op (~check-build-code ~state operation)
-                           operand (builder/add-operand! (.builder ~state) op (.value root))]
-                       (~check-build-code ~state operand)
-                       (store! annotation-value value)))))))
-           (cast i64 (load annotation-value)))))))
+          stop-b (p/fresh-identifier "stop-b")
+          annotation-start-id (p/fresh-identifier "annotation-start")
+          annotation-value-id (p/fresh-identifier "annotation-value")]
+      (if (< type-index 0) `(do 0)
+        (if (!= type-index (- (p/code-count steps) 1))
+            (generator-fail production
+              "a type span's type rule must be the production's last step")
+          `(defn ~function-name
+             [(~state (ptr ~state-type)) (~stop-a u8) (~stop-b u8)] (-> i64)
+             (let [~annotation-start-id (~current-position-code ~state)
+                   (mut ~annotation-value-id) (cast u32 ir/INVALID-ID)]
+               ~(compile-step-range backend steps 0 type-index state false
+                 `(let [root (~type-parser ~state) end (.end root)
+                        stopped (or (>= (.event-index ~state) (.event-count ~state))
+                                    (= (~current-byte-code ~state) ~stop-a)
+                                    (= (~current-byte-code ~state) ~stop-b)
+                                    (or
+                                      ~@(let [checks (p/code-list-new) (mut i) 0]
+                                          (loop
+                                            (if (>= (load i) (p/code-count terminators)) (break)
+                                              (do
+                                                (p/code-list-push! checks
+                                                  `(= (~current-byte-code ~state)
+                                                      ~(p/code-nth terminators (load i))))
+                                                (set! i (+ (load i) 1)))))
+                                          (p/code-list-done checks)))
+                                    ~(if (generator-symbol? line-break-stop "true")
+                                         `(~current-line-break-code ~state) `false))]
+                    (if (or (!= (.error ~state) ~ok-error) (not stopped))
+                        (do (~fail-code ~state ~expected-error) 0)
+                      (let [arena (.arena (.builder ~state)) value (.value-count arena)
+                            operation (builder/add-op! (.builder ~state) (.block ~state)
+                                         ~opcode (.start root) (.end root)
+                                         ~annotation-start-id end (cast u32 1))]
+                        (let [op (~check-build-code ~state operation)
+                              operand (builder/add-operand! (.builder ~state) op (.value root))]
+                          (~check-build-code ~state operand)
+                          (store! ~annotation-value-id value))))))
+               (cast i64 (load ~annotation-value-id)))))))))
 
 (defn compile-structured-type-parameters [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 14)
@@ -3465,7 +3476,7 @@
          0)))))
 
 (defn compile-erased-declaration [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 9)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 10)
                 (generator-form? production "erased-declaration")))
       (generator-fail production "invalid erased-declaration production")
     (let [state-type (backend-value backend "state-type")
@@ -3483,49 +3494,78 @@
           type-parameters-parser (backend-value backend
               (p/code-sym (field-value production "type-parameters-parser")))
           expected-error (backend-value backend "expected-error")
-          prefix (field-value production "prefix")
+          ;; The declared name, the erased body, and the ASI-eligible statement
+          ;; end are all claimed from the production's own shape.
+          steps (production-steps production)
+          keyword-index (keyword-step-index steps "erased declaration")
+          name-index (rule-step-index steps (field-value production "name") "name")
+          body-index (rule-step-index steps (field-value production "body") "body")
+          terminator-index (terminator-step-index steps "erased declaration statement end")
+          terminator (terminator-step-byte steps terminator-index
+                       "erased declaration statement end")
           type-parameters-open (field-value production "type-parameters-open")
-          terminator (field-value production "terminator")
-          opcode (field-value production "emit-op") state (p/fresh-identifier "state")]
-      `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
-         (let [start (~current-position-code ~state) _keyword (~advance-code ~state)
-               name-start (~current-position-code ~state)
-               name-end (~word-end-code ~state name-start)]
-           (if (= name-start name-end)
-               (do (~fail-code ~state ~expected-error) 0)
-             (do
-               (~advance-code ~state)
-               (let [(mut type-parameters-value) (cast u32 ir/INVALID-ID)
-                     _type-parameters
-                       (if (= (~current-byte-code ~state) ~type-parameters-open)
-                           (store! type-parameters-value
-                             (cast u32 (~type-parameters-parser ~state))) 0)]
-               (let [body-value (cast u32 (~type-parser ~state ~terminator ~terminator))
-                     end (~current-position-code ~state)
-                     declaration-result
-                       (builder/add-op! (.builder ~state) (.block ~state)
-                         ~opcode name-start name-end start end (cast u32 0))
-                     declaration (~check-build-code ~state declaration-result)]
-                 (let [
-                       _parameters-operand
-                         (if (!= (load type-parameters-value) (cast u32 ir/INVALID-ID))
-                             (~check-build-code ~state
-                               (builder/add-operand! (.builder ~state) declaration
-                                 (load type-parameters-value))) 0)
-                       body-operand
-                         (builder/add-operand! (.builder ~state) declaration body-value)
-                       immediate
-                         (builder/set-op-immediate! (.builder ~state) declaration
-                           (if (!= (load type-parameters-value) (cast u32 ir/INVALID-ID))
-                               (cast u64 ir/TYPE-DECL-HAS-TYPE-PARAMETERS)
-                             (cast u64 0)))]
-                   (~check-build-code ~state body-operand)
-                   (~check-build-code ~state immediate)
-                   (if (~match-byte-code ~state ~terminator)
-                       (let [updated (builder/set-op-span! (.builder ~state) declaration
-                                       start (+ end (cast u32 1)))]
-                         (~check-build-code ~state updated)) 0))))))
-         0)))))
+          opcode (field-value production "emit-op")
+          state (p/fresh-identifier "state")
+          start-id (p/fresh-identifier "start")
+          name-start-id (p/fresh-identifier "name-start")
+          name-end-id (p/fresh-identifier "name-end")]
+      (if (or (< keyword-index 0)
+              (or (< name-index 0) (or (< body-index 0) (< terminator-index 0))))
+          `(do 0)
+        (if (not (and (< name-index body-index) (< body-index terminator-index)))
+            (generator-fail production
+              "an erased declaration must name, then erase a body, then terminate")
+          `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
+             (let [~start-id (~current-position-code ~state)]
+               ~(compile-step-range backend steps 0 name-index state true
+                 `(let [~name-start-id (~current-position-code ~state)
+                        ~name-end-id (~word-end-code ~state ~name-start-id)]
+                    (if (= ~name-start-id ~name-end-id)
+                        (do (~fail-code ~state ~expected-error) 0)
+                      (do
+                        (~advance-code ~state)
+                        ~(compile-step-range backend steps (+ name-index 1) body-index
+                                             state false
+                          `(let [(mut type-parameters-value) (cast u32 ir/INVALID-ID)
+                                 _type-parameters
+                                   (if (= (~current-byte-code ~state) ~type-parameters-open)
+                                       (store! type-parameters-value
+                                         (cast u32 (~type-parameters-parser ~state))) 0)]
+                             (let [body-value
+                                     (cast u32 (~type-parser ~state ~terminator ~terminator))
+                                   end (~current-position-code ~state)
+                                   declaration-result
+                                     (builder/add-op! (.builder ~state) (.block ~state)
+                                       ~opcode ~name-start-id ~name-end-id
+                                       ~start-id end (cast u32 0))
+                                   declaration (~check-build-code ~state declaration-result)]
+                               (let [
+                                     _parameters-operand
+                                       (if (!= (load type-parameters-value)
+                                               (cast u32 ir/INVALID-ID))
+                                           (~check-build-code ~state
+                                             (builder/add-operand! (.builder ~state) declaration
+                                               (load type-parameters-value))) 0)
+                                     body-operand
+                                       (builder/add-operand! (.builder ~state)
+                                         declaration body-value)
+                                     immediate
+                                       (builder/set-op-immediate! (.builder ~state) declaration
+                                         (if (!= (load type-parameters-value)
+                                                 (cast u32 ir/INVALID-ID))
+                                             (cast u64 ir/TYPE-DECL-HAS-TYPE-PARAMETERS)
+                                           (cast u64 0)))]
+                                 (~check-build-code ~state body-operand)
+                                 (~check-build-code ~state immediate)
+                                 ;; The statement end is ASI-eligible: an absent
+                                 ;; terminator is not an error, it just does not
+                                 ;; extend the declaration's span.
+                                 (if (~match-byte-code ~state ~terminator)
+                                     (let [updated
+                                             (builder/set-op-span! (.builder ~state) declaration
+                                               ~start-id (+ end (cast u32 1)))]
+                                       (~check-build-code ~state updated)) 0))))))))))
+             0))))))
 
 (defn compile-structured-interface [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 11)
@@ -3638,7 +3678,6 @@
           current-keyword-code (backend-value backend "current-keyword")
           word-end-code (backend-value backend "identifier-end")
           advance-code (backend-value backend "advance")
-          consume-code (backend-value backend "consume-byte")
           fail-code (backend-value backend "fail")
           check-build-code (backend-value backend "check-build")
           push-value-code (backend-value backend "push-scratch-value")
@@ -3648,8 +3687,13 @@
                                (p/code-sym (field-value production "quoted-name-parser")))
           ok-error (backend-value backend "ok-error")
           expected-error (backend-value backend "expected-error")
-          body-open (field-value production "body-open")
-          body-close (field-value production "body-close")
+          ;; A module body is its own braced statement sequence, so its braces
+          ;; and its element rule come from the module-body production rather
+          ;; than from a block statement's.
+          body-steps (named-steps production "body-steps")
+          element-index (repeat-step-index body-steps (field-value production "element")
+                                           "module body element")
+          body-close (terminal-step-byte body-steps (+ element-index 1) "module body end")
           semicolon (field-value production "semicolon")
           dot (field-value production "dot")
           module-keyword (field-value production "module-keyword")
@@ -3658,7 +3702,9 @@
           quoted-name-bytes (field-value production "quoted-name-bytes")
           opcode (field-value production "emit-op")
           yield-op (field-value production "yield-op")
-          state (p/fresh-identifier "state") declaration-start (p/fresh-identifier "declaration-start")]
+          state (p/fresh-identifier "state") declaration-start (p/fresh-identifier "declaration-start")
+          mark-id (p/fresh-identifier "mark")]
+      (if (< element-index 0) `(do 0)
       `(defn ~function-name [(~state (ptr ~state-type)) (~declaration-start u32)] (-> i64)
          (let [parent-block (.block ~state) parent-scope (.scope ~state)
                parent-terminated (.terminated ~state)
@@ -3668,7 +3714,7 @@
                         (cast u64 0)))
                global (= kind (cast u64 2))
                _keyword (if global 0 (~advance-code ~state))
-               mark (.value-count (.scratch ~state))
+               ~mark-id (.value-count (.scratch ~state))
                (mut first) true (mut done) false (mut bodyless) false]
            (set! (.ambient-context ~state) (or (.ambient ~state) global))
            (loop
@@ -3739,8 +3785,8 @@
                                (do (~advance-code ~state) (store! first false))
                              (store! done true))))))))))
            (if (and (= (.error ~state) ~ok-error) (not (load bodyless)))
-               (if (not (~consume-code ~state ~body-open)) 0
-                 (do
+               ~(compile-step-range backend body-steps 0 element-index state false
+                 `(do
                    (loop
                      (if (or (= (~current-byte-code ~state) ~body-close)
                              (>= (.event-index ~state) (.event-count ~state))
@@ -3756,7 +3802,7 @@
                                (cast u32 0) (cast u32 0) end end (cast u32 0))) 0) 0)
                        (let [(mut index) (- (.value-count (.scratch ~state)) 4)]
                          (loop
-                           (if (< (load index) mark) (break)
+                           (if (< (load index) ~mark-id) (break)
                              (let [saved-block (load (p/index (.values (.scratch ~state))
                                                       (load index)))
                                    saved-scope (load (p/index (.values (.scratch ~state))
@@ -3774,18 +3820,18 @@
                                (set! (.block ~state) saved-block)
                                (set! (.scope ~state) saved-scope)
                                (set! index (- (load index) 4))
-                               (if (>= (load index) mark)
+                               (if (>= (load index) ~mark-id)
                                    (do (~check-build-code ~state
                                      (builder/add-op! (.builder ~state) (.block ~state)
                                        ~yield-op (cast u32 0) (cast u32 0)
                                        end end (cast u32 0))) 0) 0))))
-                         (set! (.value-count (.scratch ~state)) mark))))))
+                         (set! (.value-count (.scratch ~state)) ~mark-id))))))
              0)
            (set! (.block ~state) parent-block)
            (set! (.scope ~state) parent-scope)
            (set! (.terminated ~state) parent-terminated)
            (set! (.ambient-context ~state) parent-ambient-context)
-           0)))))
+           0))))))
 
 (defn compile-statement-terminator [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 5)
@@ -4039,7 +4085,7 @@
                        attributes))))))))))))
 
 (defn compile-import-declaration [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 28)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 30)
                 (generator-form? production "import-declaration")))
       (generator-fail production "invalid import-declaration production")
     (let [state-type (backend-value backend "state-type")
@@ -4071,8 +4117,26 @@
           defer-keyword (field-value production "defer-keyword")
           with-keyword (field-value production "with-keyword")
           assert-keyword (field-value production "assert-keyword")
-          open (field-value production "open") close (field-value production "close")
-          comma (field-value production "separator") star (field-value production "star")
+          ;; The named-import clause's braces and separator are walked out of
+          ;; the named-imports production, and the comma that joins a default
+          ;; binding to the bindings after it out of the import clause. Neither
+          ;; is an object literal's punctuation.
+          clause-steps (named-steps production "clause-steps")
+          specifier-index (separated-step-index clause-steps
+                            (field-value production "specifier") "import specifier")
+          open (terminal-step-byte clause-steps (- specifier-index 1)
+                 "named imports start")
+          close (terminal-step-byte clause-steps (+ specifier-index 1)
+                  "named imports end")
+          comma (separated-step-byte clause-steps specifier-index "import specifier")
+          default-clause-steps (named-steps production "default-clause-steps")
+          default-index (rule-step-index default-clause-steps
+                          (field-value production "default-binding") "default binding")
+          bindings-index (rule-step-index default-clause-steps
+                           (field-value production "bindings") "import bindings")
+          default-comma (terminal-step-byte default-clause-steps (+ default-index 1)
+                          "default import clause separator")
+          star (field-value production "star")
           quote-a (field-value production "quote-a") quote-b (field-value production "quote-b")
           import-op (field-value production "emit-op")
           specifier-op (field-value production "specifier-op")
@@ -4084,6 +4148,11 @@
           count-shift (field-value production "specifier-count-shift")
           attributes-flag (field-value production "attributes-flag")
           state (p/fresh-identifier "state")]
+      (if (or (< specifier-index 0)
+              (or (< default-index 0) (< bindings-index 0))) `(do 0)
+        (if (!= bindings-index (+ default-index 2))
+            (generator-fail production
+              "an import clause must separate its default binding from the bindings that follow it with one terminal")
       `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
          (let [start (~current-position-code ~state) _import (~advance-code ~state)
                scratch (.scratch ~state) mark (.value-count scratch)
@@ -4129,7 +4198,7 @@
                              (store! saw-default true)
                              (set! specifier-count
                                (+ (load specifier-count) (cast u32 1))))
-                           (if (= (~current-byte-code ~state) ~comma)
+                           (if (= (~current-byte-code ~state) ~default-comma)
                                (~advance-code ~state) 0)))) 0)
                  ;; Namespace import: * as local.
                  (if (= (~current-byte-code ~state) ~star)
@@ -4264,7 +4333,7 @@
                              (p/ior (load import-flags)
                                (p/ishl (cast u64 (load specifier-count))
                                  (cast u64 ~count-shift))))))) 0))) 0))
-         0))))
+         0))))))
 
 (defn compile-terminated-expression [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 10)
@@ -6000,7 +6069,7 @@
            (~result-type :value value :start (.start ~input) :end (.end template)))))))
 
 (defn compile-named-export [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 20)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 19)
                 (generator-form? production "named-export")))
       (generator-fail production "invalid named-export production")
     (let [state-type (backend-value backend "state-type")
@@ -6024,8 +6093,18 @@
                               (p/code-sym (field-value production "terminator-parser")))
           ok-error (backend-value backend "ok-error")
           expected-error (backend-value backend "expected-error")
-          open (field-value production "open") close (field-value production "close")
-          comma (field-value production "separator") as-keyword (field-value production "as-keyword")
+          ;; The braces and separator belong to the export clause, so they are
+          ;; walked out of the export clause production rather than borrowed
+          ;; from an object literal.
+          clause-steps (named-steps production "clause-steps")
+          specifier-index (separated-step-index clause-steps
+                            (field-value production "specifier") "export specifier")
+          open (terminal-step-byte clause-steps (- specifier-index 1)
+                 "export clause start")
+          close (terminal-step-byte clause-steps (+ specifier-index 1)
+                  "export clause end")
+          comma (separated-step-byte clause-steps specifier-index "export specifier")
+          as-keyword (field-value production "as-keyword")
           from-keyword (field-value production "from-keyword")
           type-keyword (field-value production "type-keyword")
           with-keyword (field-value production "with-keyword")
@@ -6035,6 +6114,7 @@
           specifier-op (field-value production "specifier-op")
           attributes-flag (field-value production "attributes-flag")
           state (p/fresh-identifier "state")]
+      (if (< specifier-index 0) `(do 0)
       `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
          (let [start (~current-position-code ~state) _export (~advance-code ~state)
                scratch (.scratch ~state) mark (.value-count scratch)
@@ -6155,7 +6235,7 @@
                    (p/ishl (cast u64 (load specifier-count))
                      (cast u64 ir/EXPORT-SPECIFIER-COUNT-SHIFT))))))
            0)
-         0))))
+         0)))))
 
 (defn compile-keyword-statement [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 6)
@@ -9839,24 +9919,24 @@
       (structured-type-span type-annotation
         (function parse-type-annotation)
         (type-parser parse-type-conditional)
-        (prefix (syntax/property-production-terminal 1))
-        (prefix-kind byte)
+        (steps ~(syntax/type-annotation-production-steps))
+        (type type)
         (line-break-stop false)
         (terminators [(syntax/terminal-byte syntax/semicolon)])
         (emit-op ir/OP-TS-TYPE))
       (structured-type-span signature-type-annotation
         (function parse-signature-type-annotation)
         (type-parser parse-type-conditional)
-        (prefix (syntax/property-production-terminal 1))
-        (prefix-kind byte)
+        (steps ~(syntax/type-annotation-production-steps))
+        (type type)
         (line-break-stop true)
         (terminators [(syntax/terminal-byte syntax/semicolon)])
         (emit-op ir/OP-TS-TYPE))
       (structured-type-span type-alias-body
         (function parse-type-alias-body)
         (type-parser parse-type-conditional)
-        (prefix (syntax/assignment-production-terminal 1))
-        (prefix-kind byte)
+        (steps ~(syntax/type-alias-body-production-steps))
+        (type type)
         (line-break-stop true)
         (terminators [(syntax/terminal-byte syntax/semicolon)])
         (emit-op ir/OP-TS-TYPE))
@@ -9880,8 +9960,9 @@
         (group-op ir/OP-TS-TYPE-PARAMETERS))
       (erased-declaration type-alias-declaration
         (function parse-type-alias)
-        (prefix (syntax/assignment-production-terminal 1))
-        (terminator (syntax/expression-statement-production-terminal 1))
+        (steps ~(syntax/type-alias-production-steps))
+        (name identifier)
+        (body type-alias-body)
         (type-parser parse-type-alias-body)
         (type-parameters-open (syntax/terminal-byte syntax/less-than))
         (type-parameters-parser parse-type-parameters)
@@ -9900,8 +9981,8 @@
         (function parse-module)
         (element-parser parse-statement)
         (quoted-name-parser parse-property-name-string)
-        (body-open (syntax/block-production-terminal 0))
-        (body-close (syntax/block-production-terminal 2))
+        (body-steps ~(syntax/module-body-production-steps))
+        (element statement)
         (semicolon (syntax/terminal-byte syntax/semicolon))
         (dot (syntax/terminal-byte syntax/dot))
         (module-keyword "module")
@@ -9963,9 +10044,11 @@
         (quoted-name-parser parse-property-name-string)
         (quote-a (syntax/terminal-byte syntax/single-quote))
         (quote-b (syntax/terminal-byte syntax/double-quote))
-        (open (syntax/object-production-terminal 0))
-        (close (syntax/object-production-terminal 2))
-        (separator (syntax/object-production-terminal 1))
+        (clause-steps ~(syntax/named-imports-production-steps))
+        (specifier import-specifier)
+        (default-clause-steps ~(syntax/import-clause-production-steps))
+        (default-binding default-binding)
+        (bindings import-bindings)
         (star (syntax/terminal-byte syntax/star))
         (terminator-parser parse-statement-end)
         (emit-op ir/OP-JS-IMPORT)
@@ -10269,9 +10352,8 @@
                 [syntax/form-tagged-template parse-tagged-template always]]))
       (named-export named-export-statement
         (function parse-named-export)
-        (open (syntax/object-production-terminal 0))
-        (close (syntax/object-production-terminal 2))
-        (separator (syntax/object-production-terminal 1))
+        (clause-steps ~(syntax/export-clause-production-steps))
+        (specifier export-specifier)
         (as-keyword "as")
         (from-keyword "from")
         (type-keyword "type")
@@ -10371,7 +10453,7 @@
         (class-parser parse-class)
         (decorator-prefix (cast u8 64))
         (decorator-parser parse-decorated-class)
-        (type-keyword "type")
+        (type-keyword (syntax/type-alias-production-keyword 0))
         (type-parser parse-type-alias)
         (interface-keyword "interface")
         (module-keyword "module")
