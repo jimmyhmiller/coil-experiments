@@ -56,7 +56,9 @@ Coil function bodies. Generator algorithms currently include:
   TypeScript type trees. The precedence ladder currently emits primary,
   postfix, intersection, union, and conditional types, including mapped types,
   `infer`, `keyof`/`readonly`/`unique`, type-level `typeof`, and typed or
-  untyped property signatures with ordinary, quoted, numeric, or computed names;
+  untyped property signatures with ordinary, quoted, numeric, or computed names.
+  Call, construct, method, and getter signatures retain whether a return type
+  was written, while function and constructor type expressions require one;
 - `type-binding-pattern` for structured object, array, rest, assignment, and
   elision patterns in function, constructor, and method type parameters,
   including quoted, numeric, and computed object keys;
@@ -94,6 +96,9 @@ TypeScript slice: directives, every import-clause shape, type-only imports,
 generic type aliases, annotations, generic functions, bitwise and shift
 operators, compound assignments, unary `~`, and ASI. Passing means the emitted
 IR also passes the complete verifier.
+
+`direct_parser_test.coil` registers every structural check as a `deftest`, so
+the project suite executes its IR-shape and deliberate-corruption assertions.
 
 For now compiler and semantic specification share `parser_generator.coil`.
 Coil expands an imported `Code -> Code` helper as a nested macro before its
