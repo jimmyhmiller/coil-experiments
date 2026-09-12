@@ -2,7 +2,7 @@ use std::{env, fs, path::PathBuf, process::Command};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    TSClassImplements, TSEnumDeclaration, TSEnumMember, TSGlobalDeclaration,
+    Function, FunctionType, TSClassImplements, TSEnumDeclaration, TSEnumMember, TSGlobalDeclaration,
     TSExportAssignment, TSImportEqualsDeclaration, TSInterfaceBody, TSInterfaceHeritage,
     TSModuleDeclaration, TSModuleReference, TSNamespaceExportDeclaration, TSOptionalType,
     TSRestType, TSSignature, TSType, TSTypePredicateName, TSTypeQueryExprName,
@@ -10,6 +10,7 @@ use oxc_ast::ast::{
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
+use oxc_syntax::scope::ScopeFlags;
 
 struct Case {
     name: &'static str,
@@ -59,12 +60,15 @@ const CASES: &[Case] = &[
     Case { name: "enum-context", source: "enum Plain { A, B=2, 'quoted'='value', ['computed']=4, [`templ`] } const enum Fixed { X=1, Y } declare enum Ambient { A, B='b' }" },
     Case { name: "module-context", source: "namespace A.B { export type T=string; export const x:number=1; } module M { interface I { x:string } } declare module 'pkg' { export interface X { y:number } } declare global { interface Window { z:boolean } } declare module 'bodyless';" },
     Case { name: "module-statement-context", source: "import fs=require('fs'); import Alias=A.B.C; import type Types=require('types'); export=Alias; export as namespace Library;" },
+    Case { name: "function-overload-context", source: "declare function convert<T>(input:T):T\ndeclare function convert(input:string):number; function convert(input:unknown):unknown{return input;}" },
 ];
 
 struct Shape {
     nodes: Vec<&'static str>,
     spans: Vec<Option<(u32, u32)>>,
     module_spans: Vec<(u32, u32)>,
+    function_spans: Vec<(u32, u32)>,
+    function_flags: Vec<u64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -201,6 +205,10 @@ fn field_checks(name: &str) -> &'static [FieldCheck] {
             FieldCheck { opcode: 137, expected: &[(1, 0)] },
             FieldCheck { opcode: 138, expected: &[(0, 0)] },
         ],
+        "function-overload-context" => &[FieldCheck {
+            opcode: 41,
+            expected: &[(0, 1), (0, 1), (0, 0)],
+        }],
         _ => &[],
     }
 }
@@ -228,7 +236,10 @@ fn coil_metadata(output: &str, opcode: u16) -> Vec<Meta> {
 }
 
 impl Shape {
-    fn new() -> Self { Self { nodes: Vec::new(), spans: Vec::new(), module_spans: Vec::new() } }
+    fn new() -> Self { Self {
+        nodes: Vec::new(), spans: Vec::new(), module_spans: Vec::new(),
+        function_spans: Vec::new(), function_flags: Vec::new(),
+    } }
 
     fn push(&mut self, kind: &'static str, span: Option<(u32, u32)>) {
         self.nodes.push(kind);
@@ -237,6 +248,21 @@ impl Shape {
 }
 
 impl<'a> Visit<'a> for Shape {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if matches!(function.r#type,
+            FunctionType::FunctionDeclaration | FunctionType::TSDeclareFunction)
+        {
+            let span = function.span();
+            // Coil represents statement modifiers as preceding operations; its
+            // function operation therefore begins at `function`, while Oxc's
+            // TSDeclareFunction span includes the `declare ` modifier.
+            let start = if function.declare { span.start + 8 } else { span.start };
+            self.function_spans.push((start, span.end));
+            self.function_flags.push(u64::from(function.body.is_none()));
+        }
+        walk::walk_function(self, function, flags);
+    }
+
     fn visit_ts_type(&mut self, ty: &TSType<'a>) {
         // Oxc stores entity-name leaves as fields. Coil makes those leaves SSA
         // values when another operation (type arguments, a predicate, or an
@@ -512,6 +538,17 @@ fn main() {
             if actual != expected.module_spans {
                 eprintln!("MODULE_SPAN_MISMATCH {}\n  oxc:  {:?}\n  coil: {:?}",
                     case.name, expected.module_spans, actual);
+                failures += 1;
+            }
+        }
+        if !expected.function_spans.is_empty() {
+            let actual_spans = coil_opcode_spans(&dump, 41);
+            let actual_flags: Vec<_> = coil_metadata(&dump, 41)
+                .into_iter().map(|meta| meta.immediate).collect();
+            if actual_spans != expected.function_spans || actual_flags != expected.function_flags {
+                eprintln!("FUNCTION_MISMATCH {}\n  oxc spans={:?} flags={:?}\n  coil spans={:?} flags={:?}",
+                    case.name, expected.function_spans, expected.function_flags,
+                    actual_spans, actual_flags);
                 failures += 1;
             }
         }

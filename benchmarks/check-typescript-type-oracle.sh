@@ -28,6 +28,7 @@ oxc_ast = { path = "$oxc_dir/crates/oxc_ast" }
 oxc_ast_visit = { path = "$oxc_dir/crates/oxc_ast_visit" }
 oxc_parser = { path = "$oxc_dir/crates/oxc_parser" }
 oxc_span = { path = "$oxc_dir/crates/oxc_span" }
+oxc_syntax = { path = "$oxc_dir/crates/oxc_syntax" }
 EOF
 
 CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$project_dir/target/typescript-type-oracle} \
