@@ -2,7 +2,8 @@ use std::{env, fs, path::PathBuf, process::Command};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Function, FunctionType, TSClassImplements, TSEnumDeclaration, TSEnumMember, TSGlobalDeclaration,
+    ExportAllDeclaration, ExportNamedDeclaration, ExportSpecifier, Function, FunctionType,
+    TSClassImplements, TSEnumDeclaration, TSEnumMember, TSGlobalDeclaration,
     TSExportAssignment, TSImportEqualsDeclaration, TSInterfaceBody, TSInterfaceHeritage,
     TSModuleDeclaration, TSModuleReference, TSNamespaceExportDeclaration, TSOptionalType,
     TSRestType, TSSignature, TSType, TSTypePredicateName, TSTypeQueryExprName,
@@ -61,6 +62,7 @@ const CASES: &[Case] = &[
     Case { name: "module-context", source: "namespace A.B { export type T=string; export const x:number=1; } module M { interface I { x:string } } declare module 'pkg' { export interface X { y:number } } declare global { interface Window { z:boolean } } declare module 'bodyless';" },
     Case { name: "module-statement-context", source: "import fs=require('fs'); import Alias=A.B.C; import type Types=require('types'); export=Alias; export as namespace Library;" },
     Case { name: "function-overload-context", source: "declare function convert<T>(input:T):T\ndeclare function convert(input:string):number; function convert(input:unknown):unknown{return input;}" },
+    Case { name: "structured-export-context", source: "export type {Foo,Bar as Baz};export type {Qux} from 'pkg';export type * from 'types';export * as ns from 'runtime';export type * as types from 'types2';export {type Hidden,value as renamed,'strange-name' as strange} from 'mixed';" },
 ];
 
 struct Shape {
@@ -209,6 +211,15 @@ fn field_checks(name: &str) -> &'static [FieldCheck] {
             opcode: 41,
             expected: &[(0, 1), (0, 1), (0, 0)],
         }],
+        "structured-export-context" => &[
+            FieldCheck { opcode: 139, expected: &[
+                (2, 513), (2, 265), (1, 11), (2, 270), (2, 271), (4, 776),
+            ] },
+            FieldCheck { opcode: 140, expected: &[
+                (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
+                (0, 1), (0, 0), (0, 0),
+            ] },
+        ],
         _ => &[],
     }
 }
@@ -248,6 +259,30 @@ impl Shape {
 }
 
 impl<'a> Visit<'a> for Shape {
+    fn visit_export_named_declaration(&mut self, declaration: &ExportNamedDeclaration<'a>) {
+        walk::walk_export_named_declaration(self, declaration);
+        if declaration.declaration.is_none() {
+            let span = declaration.span();
+            self.push("js.export_declaration", Some((span.start, span.end)));
+        }
+    }
+
+    fn visit_export_all_declaration(&mut self, declaration: &ExportAllDeclaration<'a>) {
+        walk::walk_export_all_declaration(self, declaration);
+        if let Some(exported) = &declaration.exported {
+            let span = exported.span();
+            self.push("js.export_specifier", Some((span.start, span.end)));
+        }
+        let span = declaration.span();
+        self.push("js.export_declaration", Some((span.start, span.end)));
+    }
+
+    fn visit_export_specifier(&mut self, specifier: &ExportSpecifier<'a>) {
+        walk::walk_export_specifier(self, specifier);
+        let span = specifier.span();
+        self.push("js.export_specifier", Some((span.start, span.end)));
+    }
+
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
         if matches!(function.r#type,
             FunctionType::FunctionDeclaration | FunctionType::TSDeclareFunction)
@@ -438,6 +473,7 @@ fn coil_shape(output: &str) -> Vec<&str> {
         "ts.enum_member", "ts.enum",
         "ts.module_reference", "ts.import_equals", "ts.export_assignment",
         "ts.namespace_export",
+        "js.export_specifier", "js.export_declaration",
     ];
     output.lines().filter_map(|line| {
         let op = line.trim().split_once(" = ").map_or_else(

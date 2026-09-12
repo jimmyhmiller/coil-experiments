@@ -5196,7 +5196,7 @@
            (load ~value-id))))))
 
 (defn compile-named-export [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 11)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 16)
                 (generator-form? production "named-export")))
       (generator-fail production "invalid named-export production")
     (let [state-type (backend-value backend "state-type")
@@ -5211,45 +5211,133 @@
           fail-code (backend-value backend "fail")
           check-build-code (backend-value backend "check-build")
           parse-string-code (backend-value backend "parse-string")
+          quoted-parser (backend-value backend
+                          (p/code-sym (field-value production "quoted-name-parser")))
+          push-value-code (backend-value backend "push-scratch-value")
           terminator-parser (backend-value backend
                               (p/code-sym (field-value production "terminator-parser")))
+          ok-error (backend-value backend "ok-error")
           expected-error (backend-value backend "expected-error")
           open (field-value production "open") close (field-value production "close")
           comma (field-value production "separator") as-keyword (field-value production "as-keyword")
           from-keyword (field-value production "from-keyword")
-          type-keyword (field-value production "type-keyword") opcode (field-value production "emit-op")
+          type-keyword (field-value production "type-keyword")
+          star (field-value production "star") quote-a (field-value production "quote-a")
+          quote-b (field-value production "quote-b") opcode (field-value production "emit-op")
+          specifier-op (field-value production "specifier-op")
           state (p/fresh-identifier "state")]
       `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
-         (let [start (~current-position-code ~state) _export (~advance-code ~state)]
-           (~consume-code ~state ~open)
-           (loop
-             (if (= (~current-byte-code ~state) ~close) (break)
+         (let [start (~current-position-code ~state) _export (~advance-code ~state)
+               scratch (.scratch ~state) mark (.value-count scratch)
+               type-only (~current-keyword-code ~state ~type-keyword)
+               _type (if type-only (~advance-code ~state) 0)
+               (mut flags) (if type-only (cast u64 ir/EXPORT-TYPE-ONLY) (cast u64 0))
+               (mut specifier-count) (cast u32 0)]
+           (if (= (~current-byte-code ~state) ~open)
                (do
-                 (if (~current-keyword-code ~state ~type-keyword)
-                     (do (~advance-code ~state) 0) 0)
-                 (let [name-start (~current-position-code ~state)
-                     name-end (~word-end-code ~state name-start)]
-                 (if (= name-start name-end)
-                     (do (~fail-code ~state ~expected-error) (break) 0)
-                   (do
-                     (~advance-code ~state)
-                     (if (~current-keyword-code ~state ~as-keyword)
-                         (do
-                           (~advance-code ~state)
-                           (let [alias-start (~current-position-code ~state)]
-                             (if (= alias-start (~word-end-code ~state alias-start))
-                                 (do (~fail-code ~state ~expected-error) 0)
-                               (do (~advance-code ~state) 0)))
-                           0) 0)
-                     (if (= (~current-byte-code ~state) ~comma)
-                         (do (~advance-code ~state) 0) (break))))))))
-           (~consume-code ~state ~close)
+                 (~advance-code ~state)
+                 (loop
+                   (if (or (= (~current-byte-code ~state) ~close)
+                           (!= (.error ~state) ~ok-error)) (break)
+                     (let [specifier-start (~current-position-code ~state)
+                           specifier-type (~current-keyword-code ~state ~type-keyword)
+                           _specifier-type (if specifier-type (~advance-code ~state) 0)
+                           local-start (~current-position-code ~state)
+                           (mut local-end) (~word-end-code ~state local-start)]
+                       (if (or (= (~current-byte-code ~state) ~quote-a)
+                               (= (~current-byte-code ~state) ~quote-b))
+                           (let [span (~quoted-parser ~state)]
+                             (store! local-end
+                               (cast u32 (p/ishr span (cast u64 32)))))
+                         (if (= local-start (load local-end))
+                             (do (~fail-code ~state ~expected-error) 0)
+                           (do (~advance-code ~state) 0)))
+                       (let [(mut exported-start) local-start
+                             (mut exported-end) (load local-end)]
+                         (if (~current-keyword-code ~state ~as-keyword)
+                             (do
+                               (~advance-code ~state)
+                               (store! exported-start (~current-position-code ~state))
+                               (store! exported-end
+                                 (~word-end-code ~state (load exported-start)))
+                               (if (or (= (~current-byte-code ~state) ~quote-a)
+                                       (= (~current-byte-code ~state) ~quote-b))
+                                   (let [span (~quoted-parser ~state)]
+                                     (store! exported-end
+                                       (cast u32 (p/ishr span (cast u64 32)))))
+                                 (if (= (load exported-start) (load exported-end))
+                                     (do (~fail-code ~state ~expected-error) 0)
+                                   (do (~advance-code ~state) 0)))
+                               0) 0)
+                         (let [arena (.arena (.builder ~state)) value (.value-count arena)
+                               result (builder/add-op! (.builder ~state) (.block ~state)
+                                        ~specifier-op local-start (load local-end)
+                                        specifier-start (load exported-end) (cast u32 1))
+                               operation (~check-build-code ~state result)]
+                           (~check-build-code ~state
+                             (builder/set-op-immediate! (.builder ~state) operation
+                               (if specifier-type
+                                   (cast u64 ir/EXPORT-SPECIFIER-TYPE-ONLY)
+                                 (cast u64 0))))
+                           (~push-value-code ~state value)
+                           (set! specifier-count (+ (load specifier-count) (cast u32 1))))
+                         (if (= (~current-byte-code ~state) ~comma)
+                             (do (~advance-code ~state) 0) (break))))))
+                 (~consume-code ~state ~close)
+                 0)
+             (if (= (~current-byte-code ~state) ~star)
+                 (do
+                   (store! flags (p/ior (load flags) (cast u64 ir/EXPORT-ALL)))
+                   (~advance-code ~state)
+                   (if (~current-keyword-code ~state ~as-keyword)
+                       (do
+                         (~advance-code ~state)
+                         (let [name-start (~current-position-code ~state)
+                               name-end (~word-end-code ~state name-start)]
+                           (if (= name-start name-end)
+                               (do (~fail-code ~state ~expected-error) 0)
+                             (do
+                               (~advance-code ~state)
+                               (let [arena (.arena (.builder ~state)) value (.value-count arena)
+                                     result (builder/add-op! (.builder ~state) (.block ~state)
+                                              ~specifier-op name-start name-end name-start name-end
+                                              (cast u32 1))]
+                                 (~check-build-code ~state result)
+                                 (~push-value-code ~state value)
+                                 (set! specifier-count (cast u32 1))
+                                 (store! flags
+                                   (p/ior (load flags) (cast u64 ir/EXPORT-NAMESPACE)))))))
+                         0) 0)
+                   0)
+               (do (~fail-code ~state ~expected-error) 0)))
            (if (~current-keyword-code ~state ~from-keyword)
-               (do (~advance-code ~state) (~parse-string-code ~state) 0) 0)
+               (do
+                 (~advance-code ~state)
+                 (let [module-value (~parse-string-code ~state)]
+                   (~push-value-code ~state (.value module-value))
+                   (store! flags (p/ior (load flags) (cast u64 ir/EXPORT-HAS-SOURCE))))
+                 0)
+             (if (!= (p/iand (load flags) (cast u64 ir/EXPORT-ALL)) (cast u64 0))
+                 (do (~fail-code ~state ~expected-error) 0) 0))
            (let [end (~terminator-parser ~state (~current-position-code ~state))
-                 operation (builder/add-op! (.builder ~state) (.block ~state) ~opcode
-                              (cast u32 0) (cast u32 0) start end (cast u32 0))]
-             (~check-build-code ~state operation)))
+                 operation-result (builder/add-op! (.builder ~state) (.block ~state) ~opcode
+                                    (cast u32 0) (cast u32 0) start end (cast u32 0))
+                 operation (~check-build-code ~state operation-result)
+                 (mut index) mark]
+             (loop
+               (if (>= (load index) (.value-count scratch)) (break)
+                 (do
+                   (~check-build-code ~state
+                     (builder/add-operand! (.builder ~state) operation
+                       (load (p/index (.values scratch) (load index)))))
+                   (set! index (+ (load index) 1)))))
+             (set! (.value-count scratch) mark)
+             (~check-build-code ~state
+               (builder/set-op-immediate! (.builder ~state) operation
+                 (p/ior (load flags)
+                   (p/ishl (cast u64 (load specifier-count))
+                     (cast u64 ir/EXPORT-SPECIFIER-COUNT-SHIFT))))))
+           0)
          0))))
 
 (defn compile-keyword-statement [(backend Code) (production Code)] (-> Code)
@@ -5463,7 +5551,7 @@
          0))))
 
 (defn compile-statement-dispatch [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 60)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 61)
                 (generator-form? production "statement-dispatch")))
       (generator-fail production "invalid statement-dispatch production")
     (let [state-type (backend-value backend "state-type")
@@ -5538,6 +5626,7 @@
           export-keyword (field-value production "export-keyword")
           as-keyword (field-value production "as-keyword")
           equals (field-value production "equals")
+          star (field-value production "star")
           debugger-keyword (field-value production "debugger-keyword")
           modifier-keywords (field-value production "modifier-keywords")
           ambient-keyword (field-value production "ambient-keyword")
@@ -5551,7 +5640,11 @@
              (if (or (and (~current-keyword-code ~state ~export-keyword)
                           (or (= (~next-event-byte-code ~state 1) ~block-open)
                               (= (~next-event-byte-code ~state 1) ~equals)
-                              (~next-event-keyword-code ~state 1 ~as-keyword)))
+                              (= (~next-event-byte-code ~state 1) ~star)
+                              (~next-event-keyword-code ~state 1 ~as-keyword)
+                              (and (~next-event-keyword-code ~state 1 ~type-keyword)
+                                   (or (= (~next-event-byte-code ~state 2) ~block-open)
+                                       (= (~next-event-byte-code ~state 2) ~star)))))
                      (not (or ~@(let [checks (p/code-list-new) (mut j) 0]
                                (loop
                                  (if (>= (load j) (p/code-count modifier-keywords)) (break)
@@ -5586,7 +5679,11 @@
                           (~next-event-keyword-code ~state 1 ~as-keyword))))
                (~ts-module-parser ~state)
              (and (~current-keyword-code ~state ~export-keyword)
-                  (= (~next-event-byte-code ~state 1) ~block-open))
+                  (or (= (~next-event-byte-code ~state 1) ~block-open)
+                      (= (~next-event-byte-code ~state 1) ~star)
+                      (and (~next-event-keyword-code ~state 1 ~type-keyword)
+                           (or (= (~next-event-byte-code ~state 2) ~block-open)
+                               (= (~next-event-byte-code ~state 2) ~star)))))
                (~named-export-parser ~state)
              (= (~current-byte-code ~state) ~block-open) (~block-parser ~state)
              (or (~current-keyword-code ~state ~enum-keyword)
@@ -8692,8 +8789,13 @@
         (as-keyword "as")
         (from-keyword "from")
         (type-keyword "type")
+        (star (syntax/terminal-byte syntax/star))
+        (quote-a (syntax/terminal-byte syntax/single-quote))
+        (quote-b (syntax/terminal-byte syntax/double-quote))
+        (quoted-name-parser parse-property-name-string)
         (terminator-parser parse-statement-end)
-        (emit-op ir/OP-JS-EXPORT))
+        (emit-op ir/OP-JS-EXPORT-DECLARATION)
+        (specifier-op ir/OP-JS-EXPORT-SPECIFIER))
       (keyword-statement debugger-statement
         (function parse-debugger)
         (keyword "debugger")
@@ -8773,6 +8875,7 @@
         (export-keyword "export")
         (as-keyword "as")
         (equals (syntax/terminal-byte syntax/equals))
+        (star (syntax/terminal-byte syntax/star))
         (named-export-parser parse-named-export)
         (debugger-keyword "debugger")
         (debugger-parser parse-debugger)
