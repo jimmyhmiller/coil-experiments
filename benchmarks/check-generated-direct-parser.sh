@@ -21,7 +21,7 @@ for production in \
   word string property-name-string number spread regexp primary property object-shorthand object call member computed-member postfix expression declaration \
   return throw break continue expression-statement block if try class decorated-class class-expression class-field while do-while for-kind classic-for iterator-for for switch function function-expression statement direct-program \
   type-annotation type-alias-body implements-clause type-parameters type-alias statement-end import \
-  type-import type-prefix type-conditional type-arguments \
+  type-template type-import type-prefix type-conditional type-arguments \
   type-arguments-before-call arrow-lookahead binding-pattern class-parameter decorated-parameter arrow jsx named-export interface \
   type-assertion \
   prefix-keyword template debugger non-null postfix-update-lookahead postfix-update optional-postfix
@@ -33,4 +33,4 @@ do
   fi
 done
 
-printf '%s\n' 'all 67 direct-parser productions are generated'
+printf '%s\n' 'all 68 direct-parser productions are generated'
