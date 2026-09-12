@@ -167,6 +167,77 @@
           `(cast u8 0))
     `(cast u8 ~(p/code-nth (p/code-nth steps index) 1))))
 
+;; Raw byte of a (terminal B) step. A strategy that serves several productions
+;; at once uses this to check that they agree on a shared delimiter instead of
+;; picking one of them and silently ignoring the others.
+(defn terminal-step-value [(steps Code) (index i64) (role (slice u8))] (-> i64)
+  (if (or (or (< index 0) (>= index (p/code-count steps)))
+          (or (not (step-form? (p/code-nth steps index) "terminal"))
+              (not (p/code-int? (p/code-nth (p/code-nth steps index) 1)))))
+      (do (p/report steps
+            (p/code-str "production needs a terminal step for: " role)) -1)
+    (p/code-int (p/code-nth (p/code-nth steps index) 1))))
+
+;; First (keyword ...) step at or after `from`. A production with several
+;; keywords - `for (x of y)`, `for await (x of y)` - names each one by the role
+;; that precedes it rather than by a fixed position, so keyword-step-index's
+;; "exactly one keyword" rule does not apply.
+(defn keyword-step-index-from [(steps Code) (from i64) (role (slice u8))] (-> i64)
+  (let [(mut i) (if (< from 0) 0 from) (mut found) -1]
+    (loop
+      (if (or (>= (load i) (p/code-count steps)) (>= (load found) 0)) (break)
+        (do
+          (if (and (step-form? (p/code-nth steps (load i)) "keyword")
+                   (= (p/code-count (p/code-nth steps (load i))) 2))
+              (store! found (load i)) 0)
+          (set! i (+ (load i) 1)))))
+    (if (< (load found) 0)
+        (do (p/report steps
+              (p/code-str "production has no following (keyword ...) step for: " role)) -1)
+      (load found))))
+
+;; Outer delimiters of a bracketed production: its first and its last
+;; (terminal B) step. A strategy that only has to recognize a construct's
+;; brackets - a lookahead tracking nesting depth, say - reads them from here
+;; instead of naming step positions.
+(defn first-terminal-step-index [(steps Code) (role (slice u8))] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
+    (loop
+      (if (or (>= (load i) (p/code-count steps)) (>= (load found) 0)) (break)
+        (do
+          (if (step-form? (p/code-nth steps (load i)) "terminal")
+              (store! found (load i)) 0)
+          (set! i (+ (load i) 1)))))
+    (if (< (load found) 0)
+        (do (p/report steps
+              (p/code-str "production has no opening (terminal ...) step for: " role)) -1)
+      (load found))))
+
+(defn last-terminal-step-index [(steps Code) (role (slice u8))] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
+    (loop
+      (if (>= (load i) (p/code-count steps)) (break)
+        (do
+          (if (step-form? (p/code-nth steps (load i)) "terminal")
+              (store! found (load i)) 0)
+          (set! i (+ (load i) 1)))))
+    (if (< (load found) 0)
+        (do (p/report steps
+              (p/code-str "production has no closing (terminal ...) step for: " role)) -1)
+      (load found))))
+
+;; A [STEPS KIND] pair: the declaration production whose keyword introduces a
+;; binding, paired with the IR declaration kind it means. The keyword itself is
+;; read out of the production, which must lead with it.
+(defn declaration-kind-keyword [(entry Code)] (-> Code)
+  (if (not (and (p/code-vector? entry) (= (p/code-count entry) 2)
+                (p/code-vector? (p/code-nth entry 0))))
+      (generator-fail entry
+        "declaration kind expects [PRODUCTION-STEPS DECLARATION-KIND]")
+    (let [entry-steps (p/code-nth entry 0)
+          index (keyword-step-index entry-steps "declaration kind")]
+      (if (< index 0) `"" (keyword-step-text entry-steps index)))))
+
 (defn named-steps [(production Code) (name (slice u8))] (-> Code)
   (let [steps (field-value production name)]
     (if (not (p/code-vector? steps))
@@ -8068,8 +8139,14 @@
                                       (p/code-count steps) state false `0)))))))))
              0))))))
 
+;; Which `for` a `for` is. The four for productions between them spell every
+;; token this scanner has to recognize: the leading keyword and the header
+;; delimiters come from the classic production, the `in`/`of` operators from the
+;; productions that name them, and `await` from the await production's second
+;; keyword. Only the depth-tracking scan itself - which no grammar step can
+;; describe - is written out here.
 (defn compile-for-kind-lookahead [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 12)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 11)
                 (generator-form? production "for-kind-lookahead")))
       (generator-fail production "invalid for-kind-lookahead production")
     (let [state-type (backend-value backend "state-type")
@@ -8078,67 +8155,101 @@
           current-byte-code (backend-value backend "current-byte")
           current-keyword-code (backend-value backend "current-keyword")
           advance-code (backend-value backend "advance")
-          for-keyword (field-value production "for-keyword")
-          await-keyword (field-value production "await-keyword")
-          in-keyword (field-value production "in-keyword")
-          of-keyword (field-value production "of-keyword")
-          open (field-value production "open") close (field-value production "close")
-          nested-opens (field-value production "nested-opens")
-          nested-closes (field-value production "nested-closes")
-          separator (field-value production "separator")
+          steps (production-steps production)
+          in-steps (named-steps production "in-steps")
+          of-steps (named-steps production "of-steps")
+          await-steps (named-steps production "await-steps")
+          nested-delimiters (field-value production "nested-delimiters")
+          target (field-value production "target")
+          for-keyword-index (keyword-step-index steps "for statement")
+          initializer-index (rule-step-index steps
+                              (field-value production "initializer") "for initializer")
+          update-index (rule-step-index steps
+                         (field-value production "update") "for update")
+          in-target-index (rule-step-index in-steps target "for-in target")
+          of-target-index (rule-step-index of-steps target "for-of target")
+          await-target-index (rule-step-index await-steps target "for-await-of target")
+          in-keyword-index (keyword-step-index-from in-steps (+ in-target-index 1)
+                             "for-in operator")
+          of-keyword-index (keyword-step-index-from of-steps (+ of-target-index 1)
+                             "for-of operator")
+          await-keyword-index (keyword-step-index-from await-steps 1 "for-await prefix")
           state (p/fresh-identifier "state") byte-id (p/fresh-identifier "byte")]
-      `(defn ~function-name :inline (Always) [(~state (ptr ~state-type))] (-> i64)
-         (let [saved-index (.event-index ~state) (mut kind) 0 (mut depth) 0
-               (mut of-kind) 2]
-           (if (~current-keyword-code ~state ~for-keyword)
-               (do
-                 (~advance-code ~state)
-                 (if (~current-keyword-code ~state ~await-keyword)
-                     (do (store! of-kind 3) (~advance-code ~state) 0) 0)
-                 (if (= (~current-byte-code ~state) ~open)
+      (if (or (or (< for-keyword-index 0) (< initializer-index 0) (< update-index 0))
+              (or (or (< in-target-index 0) (< of-target-index 0) (< await-target-index 0))
+                  (or (< in-keyword-index 0) (< of-keyword-index 0)
+                      (< await-keyword-index 0)))) `(do 0)
+        (if (>= await-keyword-index await-target-index)
+            (generator-fail production
+              "for-kind-lookahead requires the await keyword to precede the target rule")
+          (let [for-keyword (keyword-step-text steps for-keyword-index)
+                in-keyword (keyword-step-text in-steps in-keyword-index)
+                of-keyword (keyword-step-text of-steps of-keyword-index)
+                await-keyword (keyword-step-text await-steps await-keyword-index)
+                open (terminal-step-byte steps (- initializer-index 1) "for header open")
+                separator (terminal-step-byte steps (+ initializer-index 1)
+                            "for header separator")
+                close (terminal-step-byte steps (+ update-index 1) "for header close")]
+            `(defn ~function-name :inline (Always) [(~state (ptr ~state-type))] (-> i64)
+               (let [saved-index (.event-index ~state) (mut kind) 0 (mut depth) 0
+                     (mut of-kind) 2]
+                 (if (~current-keyword-code ~state ~for-keyword)
                      (do
                        (~advance-code ~state)
-                       (loop
-                         (if (>= (.event-index ~state) (.event-count ~state)) (break)
-                           (let [~byte-id (~current-byte-code ~state)]
-                             (if (and (= (load depth) 0)
-                                      (= ~byte-id ~separator))
-                                 (break)
-                               (if (and (= (load depth) 0)
-                                        (~current-keyword-code ~state ~in-keyword))
-                                   (do (if (= (load of-kind) 2) (store! kind 1) 0) (break))
-                                 (if (and (= (load depth) 0)
-                                          (~current-keyword-code ~state ~of-keyword))
-                                     (do (store! kind (load of-kind)) (break))
-                                   (if (and (= (load depth) 0) (= ~byte-id ~close))
+                       (if (~current-keyword-code ~state ~await-keyword)
+                           (do (store! of-kind 3) (~advance-code ~state) 0) 0)
+                       (if (= (~current-byte-code ~state) ~open)
+                           (do
+                             (~advance-code ~state)
+                             (loop
+                               (if (>= (.event-index ~state) (.event-count ~state)) (break)
+                                 (let [~byte-id (~current-byte-code ~state)]
+                                   (if (and (= (load depth) 0)
+                                            (= ~byte-id ~separator))
                                        (break)
-                                     (do
-                                       (if (or ~@(let [checks (p/code-list-new) (mut j) 0]
-                                                    (loop
-                                                      (if (>= (load j)
-                                                              (p/code-count nested-opens)) (break)
-                                                        (do (p/code-list-push! checks
-                                                              `(= ~byte-id
-                                                                  ~(p/code-nth nested-opens
-                                                                     (load j))))
-                                                            (set! j (+ (load j) 1)))))
-                                                    (p/code-list-done checks)))
-                                           (set! depth (+ (load depth) 1))
-                                         (if (or ~@(let [checks (p/code-list-new) (mut j) 0]
-                                                      (loop
-                                                        (if (>= (load j)
-                                                                (p/code-count nested-closes)) (break)
-                                                          (do (p/code-list-push! checks
-                                                                `(= ~byte-id
-                                                                    ~(p/code-nth nested-closes
-                                                                       (load j))))
-                                                              (set! j (+ (load j) 1)))))
-                                                      (p/code-list-done checks)))
-                                             (if (> (load depth) 0)
-                                                 (set! depth (- (load depth) 1)) 0) 0))
-                                       (~advance-code ~state)))))))))) 0)) 0)
-           (set! (.event-index ~state) saved-index)
-           (load kind))))))
+                                     (if (and (= (load depth) 0)
+                                              (~current-keyword-code ~state ~in-keyword))
+                                         (do (if (= (load of-kind) 2) (store! kind 1) 0) (break))
+                                       (if (and (= (load depth) 0)
+                                                (~current-keyword-code ~state ~of-keyword))
+                                           (do (store! kind (load of-kind)) (break))
+                                         (if (and (= (load depth) 0) (= ~byte-id ~close))
+                                             (break)
+                                           (do
+                                             (if (or ~@(let [checks (p/code-list-new) (mut j) 0]
+                                                          (loop
+                                                            (if (>= (load j)
+                                                                    (p/code-count nested-delimiters)) (break)
+                                                              (let [nested (p/code-nth nested-delimiters
+                                                                             (load j))]
+                                                                (p/code-list-push! checks
+                                                                  `(= ~byte-id
+                                                                      ~(terminal-step-byte nested
+                                                                         (first-terminal-step-index nested
+                                                                           "nested opening delimiter")
+                                                                         "nested opening delimiter")))
+                                                                (set! j (+ (load j) 1)))))
+                                                          (p/code-list-done checks)))
+                                                 (set! depth (+ (load depth) 1))
+                                               (if (or ~@(let [checks (p/code-list-new) (mut j) 0]
+                                                            (loop
+                                                              (if (>= (load j)
+                                                                      (p/code-count nested-delimiters)) (break)
+                                                                (let [nested (p/code-nth nested-delimiters
+                                                                               (load j))]
+                                                                  (p/code-list-push! checks
+                                                                    `(= ~byte-id
+                                                                        ~(terminal-step-byte nested
+                                                                           (last-terminal-step-index nested
+                                                                             "nested closing delimiter")
+                                                                           "nested closing delimiter")))
+                                                                  (set! j (+ (load j) 1)))))
+                                                            (p/code-list-done checks)))
+                                                   (if (> (load depth) 0)
+                                                       (set! depth (- (load depth) 1)) 0) 0))
+                                             (~advance-code ~state)))))))))) 0)) 0)
+                 (set! (.event-index ~state) saved-index)
+                 (load kind)))))))))
 
 (defn compile-for-dispatch [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 6)
@@ -8185,11 +8296,46 @@
           publish-loop-labels-code (backend-value backend "publish-loop-labels")
           fail-code (backend-value backend "fail")
           expected-error (backend-value backend "expected-error")
-          open (field-value production "open") close (field-value production "close")
-          await-keyword (field-value production "await-keyword")
+          in-steps (named-steps production "in-steps")
+          of-steps (named-steps production "of-steps")
+          await-steps (named-steps production "await-steps")
+          target (field-value production "target")
+          iterable (field-value production "iterable")
+          in-target-index (rule-step-index in-steps target "for-in target")
+          of-target-index (rule-step-index of-steps target "for-of target")
+          await-target-index (rule-step-index await-steps target "for-await-of target")
+          in-iterable-index (rule-step-index in-steps iterable "for-in iterable")
+          of-iterable-index (rule-step-index of-steps iterable "for-of iterable")
+          await-iterable-index (rule-step-index await-steps iterable
+                                 "for-await-of iterable")
+          in-keyword-index (keyword-step-index-from in-steps (+ in-target-index 1)
+                             "for-in operator")
+          of-keyword-index (keyword-step-index-from of-steps (+ of-target-index 1)
+                             "for-of operator")
+          await-keyword-index (keyword-step-index-from await-steps 1 "for-await prefix")
+          ;; One parser serves all three productions, so they have to agree on
+          ;; the header delimiters. A disagreement is an expansion error rather
+          ;; than a parser that follows whichever production was read first.
+          open-value (terminal-step-value of-steps (- of-target-index 1)
+                       "for-of header open")
+          close-value (terminal-step-value of-steps (+ of-iterable-index 1)
+                        "for-of header close")
+          in-open-value (terminal-step-value in-steps (- in-target-index 1)
+                          "for-in header open")
+          in-close-value (terminal-step-value in-steps (+ in-iterable-index 1)
+                           "for-in header close")
+          await-open-value (terminal-step-value await-steps (- await-target-index 1)
+                             "for-await-of header open")
+          await-close-value (terminal-step-value await-steps (+ await-iterable-index 1)
+                              "for-await-of header close")
+          open `(cast u8 ~open-value) close `(cast u8 ~close-value)
+          in-keyword (if (< in-keyword-index 0) `""
+                       (keyword-step-text in-steps in-keyword-index))
+          of-keyword (if (< of-keyword-index 0) `""
+                       (keyword-step-text of-steps of-keyword-index))
+          await-keyword (if (< await-keyword-index 0) `""
+                          (keyword-step-text await-steps await-keyword-index))
           using-keyword (field-value production "using-keyword")
-          in-keyword (field-value production "in-keyword")
-          of-keyword (field-value production "of-keyword")
           declaration-kinds (field-value production "declaration-kinds")
           equals (field-value production "equals") comma (field-value production "comma")
           target-ops (field-value production "target-ops")
@@ -8201,185 +8347,205 @@
           branch-op (field-value production "branch-op")
           state (p/fresh-identifier "state") target-op-id (p/fresh-identifier "target-op")
           declaration-kind-id (p/fresh-identifier "declaration-kind")]
-      `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
-         (let [iterator-kind (~lookahead-code ~state)
-               start (~current-position-code ~state) _for (~advance-code ~state)]
-           (if (= iterator-kind 3) (do (~advance-code ~state) 0) 0)
-           (if (~consume-code ~state ~open)
-               (let [parent-scope (.scope ~state)
-                     scope-result (builder/add-scope! (.builder ~state) parent-scope start
-                                    (cast u32 (.source-size ~state)))
-                     loop-scope (~check-build-code ~state scope-result)
-                     arena (.arena (.builder ~state)) origin (.block ~state)
-                     region (load (p/index (.block-regions arena) (cast i64 origin)))
-                     header-result (builder/add-block! (.builder ~state) region)
-                     header (~check-build-code ~state header-result)
-                     body-result (builder/add-block! (.builder ~state) region)
-                     body (~check-build-code ~state body-result)
-                     exit-result (builder/add-block! (.builder ~state) region)
-                     exit-block (~check-build-code ~state exit-result)
-                     declaration-start (~current-position-code ~state)
-                     (mut target-start) declaration-start
-                     (mut target-name-end) (~word-end-code ~state declaration-start)
-                     await-using (and (~current-keyword-code ~state ~await-keyword)
-                                      (~next-event-keyword-code ~state 1 ~using-keyword))
-                     using-declaration
-                       (and (~current-keyword-code ~state ~using-keyword)
-                            (not (~next-event-keyword-code ~state 1 ~of-keyword)))
-                     resource-declaration (or await-using using-declaration)
-                     (mut ~declaration-kind-id) (cast u64 0)
-                     (mut target-value) (cast u32 ir/INVALID-ID)]
-                 (set! (.scope ~state) loop-scope)
-                 (set! (.block ~state) body)
-                 (if (or resource-declaration
-                         (or ~@(let [checks (p/code-list-new) (mut j) 0]
-                              (loop
-                                (if (>= (load j) (p/code-count declaration-kinds)) (break)
-                                  (let [entry (p/code-nth declaration-kinds (load j))]
-                                    (p/code-list-push! checks
-                                      `(~current-keyword-code ~state ~(p/code-nth entry 0)))
-                                    (set! j (+ (load j) 1)))))
-                              (p/code-list-done checks))))
-                     (do
-                       (if resource-declaration
-                           (do
-                             (store! ~declaration-kind-id
-                               (if await-using (cast u64 ir/DECL-AWAIT-USING)
-                                 (cast u64 ir/DECL-USING)))
-                             (if await-using (~advance-code ~state) 0)
-                             (~advance-code ~state)
-                             (store! target-start (~current-position-code ~state))
-                             (store! target-name-end
-                               (~word-end-code ~state (load target-start))) 0)
-                         (do
-                           ~(let [clauses (p/code-list-new) (mut j) 0]
-                               (loop
-                                 (if (>= (load j) (p/code-count declaration-kinds)) (break)
-                                   (let [entry (p/code-nth declaration-kinds (load j))]
-                                     (p/code-list-push! clauses
-                                       `(~current-keyword-code ~state ~(p/code-nth entry 0)))
-                                     (p/code-list-push! clauses
-                                       `(store! ~declaration-kind-id ~(p/code-nth entry 1)))
-                                     (set! j (+ (load j) 1)))))
-                               `(cond ~@(p/code-list-done clauses) :else 0))
-                           (~advance-code ~state)
-                           (store! target-start (~current-position-code ~state))
-                           (store! target-name-end
-                             (~word-end-code ~state (load target-start))) 0))
-                       (~pattern-parser ~state false ~equals ~comma))
-                   (let [target (~parse-expression-code ~state ~target-precedence)
-                         definition-kind
-                           (load (p/index (.value-def-kinds arena)
-                                          (cast i64 (.value target))))
-                         definition-index
-                           (load (p/index (.value-def-indices arena)
-                                          (cast i64 (.value target))))
-                         ~target-op-id
-                           (if (= definition-kind (cast u8 ir/DEF-OP-RESULT))
-                               (load (p/index (.opcodes arena) (cast i64 definition-index)))
-                             ir/OP-INVALID)]
-                     (if (or ~@(let [checks (p/code-list-new) (mut j) 0]
+      (if (or (or (or (< in-target-index 0) (< of-target-index 0))
+                  (or (< await-target-index 0) (< in-iterable-index 0)))
+              (or (or (< of-iterable-index 0) (< await-iterable-index 0))
+                  (or (or (< in-keyword-index 0) (< of-keyword-index 0))
+                      (or (< await-keyword-index 0) (< open-value 0))))) `(do 0)
+        (if (or (or (!= open-value in-open-value) (!= open-value await-open-value))
+                (or (!= close-value in-close-value) (!= close-value await-close-value)))
+            (generator-fail production
+              "the for-in, for-of, and for-await-of productions must share header delimiters")
+          (if (or (>= await-keyword-index await-target-index)
+                  (or (>= in-target-index in-keyword-index)
+                      (>= of-target-index of-keyword-index)))
+              (generator-fail production
+                "iterator-for-statement requires the target rule before the iteration keyword")
+            `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
+               (let [iterator-kind (~lookahead-code ~state)
+                     start (~current-position-code ~state) _for (~advance-code ~state)]
+                 (if (= iterator-kind 3) (do (~advance-code ~state) 0) 0)
+                 (if (~consume-code ~state ~open)
+                     (let [parent-scope (.scope ~state)
+                           scope-result (builder/add-scope! (.builder ~state) parent-scope start
+                                          (cast u32 (.source-size ~state)))
+                           loop-scope (~check-build-code ~state scope-result)
+                           arena (.arena (.builder ~state)) origin (.block ~state)
+                           region (load (p/index (.block-regions arena) (cast i64 origin)))
+                           header-result (builder/add-block! (.builder ~state) region)
+                           header (~check-build-code ~state header-result)
+                           body-result (builder/add-block! (.builder ~state) region)
+                           body (~check-build-code ~state body-result)
+                           exit-result (builder/add-block! (.builder ~state) region)
+                           exit-block (~check-build-code ~state exit-result)
+                           declaration-start (~current-position-code ~state)
+                           (mut target-start) declaration-start
+                           (mut target-name-end) (~word-end-code ~state declaration-start)
+                           await-using (and (~current-keyword-code ~state ~await-keyword)
+                                            (~next-event-keyword-code ~state 1 ~using-keyword))
+                           using-declaration
+                             (and (~current-keyword-code ~state ~using-keyword)
+                                  (not (~next-event-keyword-code ~state 1 ~of-keyword)))
+                           resource-declaration (or await-using using-declaration)
+                           (mut ~declaration-kind-id) (cast u64 0)
+                           (mut target-value) (cast u32 ir/INVALID-ID)]
+                       (set! (.scope ~state) loop-scope)
+                       (set! (.block ~state) body)
+                       (if (or resource-declaration
+                               (or ~@(let [checks (p/code-list-new) (mut j) 0]
                                     (loop
-                                      (if (>= (load j) (p/code-count target-ops)) (break)
-                                        (do (p/code-list-push! checks
-                                              `(= ~target-op-id
-                                                  ~(p/code-nth target-ops (load j))))
-                                            (set! j (+ (load j) 1)))))
-                                    (p/code-list-done checks)))
-                         (store! target-value (.value target))
-                       (do (~fail-code ~state ~expected-error) 0))))
-                 (if (if (= iterator-kind 1)
-                         (~current-keyword-code ~state ~in-keyword)
-                       (~current-keyword-code ~state ~of-keyword))
-                     (~advance-code ~state)
-                   (do (~fail-code ~state ~expected-error) 0))
-                 (if (and resource-declaration
-                          (and (!= iterator-kind 2) (!= iterator-kind 3)))
-                     (do (~fail-code ~state ~expected-error) 0) 0)
-                 (set! (.block ~state) origin)
-                 (let [iterable (~parse-expression-code ~state 0)]
-                   (if (~consume-code ~state ~close)
-                       (let [iterator-value (.value-count arena)
-                             init-result (builder/add-op! (.builder ~state) origin
-                                           ~iterator-init-op (cast u32 0) (cast u32 0)
-                                           (.start iterable) (.end iterable) (cast u32 1))
-                             init-op (~check-build-code ~state init-result)
-                             init-operand (builder/add-operand! (.builder ~state) init-op
-                                            (.value iterable))
-                             init-kind (builder/set-op-immediate! (.builder ~state) init-op
-                                         (cast u64 iterator-kind))]
-                         (~check-build-code ~state init-operand)
-                         (~check-build-code ~state init-kind)
-                         (~emit-branch-code ~state origin header)
-                         (set! (.block ~state) header)
-                         (set! (.terminated ~state) false)
-                         (let [next-value (.value-count arena)
-                               next-result (builder/add-op! (.builder ~state) header
-                                             ~iterator-next-op (cast u32 0) (cast u32 0)
-                                             start (~current-position-code ~state) (cast u32 2))
-                               next-op (~check-build-code ~state next-result)
-                               next-operand (builder/add-operand! (.builder ~state) next-op
-                                              iterator-value)
-                               branch-result (builder/add-op! (.builder ~state) header ~branch-op
-                                               (cast u32 0) (cast u32 0) start
-                                               (~current-position-code ~state) (cast u32 0))
-                               branch (~check-build-code ~state branch-result)
-                               condition-operand (builder/add-operand! (.builder ~state) branch
-                                                   next-value)
-                               body-successor (builder/add-successor! (.builder ~state) branch body)
-                               exit-successor (builder/add-successor! (.builder ~state) branch
-                                                exit-block)]
-                           (~check-build-code ~state next-operand)
-                           (~check-build-code ~state condition-operand)
-                           (~check-build-code ~state body-successor)
-                           (~check-build-code ~state exit-successor)
-                           (set! (.block ~state) body)
-                           (if (!= (load ~declaration-kind-id) (cast u64 0))
-                               (let [declaration-result
-                                      (builder/add-op! (.builder ~state) body ~declare-op
-                                        (load target-start) (load target-name-end)
-                                        declaration-start (load target-name-end) (cast u32 0))
-                                     declaration (~check-build-code ~state declaration-result)
-                                     operand (builder/add-operand! (.builder ~state) declaration
-                                               (+ next-value (cast u32 1)))
-                                     kind-result (builder/set-op-immediate! (.builder ~state)
-                                                   declaration (load ~declaration-kind-id))]
-                                 (~check-build-code ~state operand)
-                                 (~check-build-code ~state kind-result))
-                             (let [assignment-result
-                                    (builder/add-op! (.builder ~state) body ~assign-op
-                                      (cast u32 0) (cast u32 0) (load target-start)
-                                      (~current-position-code ~state) (cast u32 1))
-                                   assignment (~check-build-code ~state assignment-result)
-                                   target-operand (builder/add-operand! (.builder ~state)
-                                                    assignment (load target-value))
-                                   value-operand (builder/add-operand! (.builder ~state)
-                                                   assignment (+ next-value (cast u32 1)))]
-                               (~check-build-code ~state target-operand)
-                               (~check-build-code ~state value-operand)))
-                           (let [parent-break-target (.break-target ~state)
-                                 parent-continue-target (.continue-target ~state)]
-                             (set! (.break-target ~state) exit-block)
-                             (set! (.continue-target ~state) header)
-                             (~publish-loop-labels-code ~state header)
-                             (set! (.terminated ~state) false)
-                             (~parse-statement-code ~state)
-                             (if (not (.terminated ~state))
-                                 (~emit-branch-code ~state (.block ~state) header) 0)
-                             (set! (.break-target ~state) parent-break-target)
-                             (set! (.continue-target ~state) parent-continue-target))
-                           (let [end (~current-position-code ~state)
-                                 scope-end (builder/set-scope-end! (.builder ~state)
-                                             loop-scope end)]
-                             (~check-build-code ~state scope-end))
-                           (set! (.scope ~state) parent-scope)
-                           (set! (.block ~state) exit-block)
-                           (set! (.terminated ~state) false))) 0) 0))
-               (do (~fail-code ~state ~expected-error) 0)))
-         0))))
+                                      (if (>= (load j) (p/code-count declaration-kinds)) (break)
+                                        (let [entry (p/code-nth declaration-kinds (load j))]
+                                          (p/code-list-push! checks
+                                            `(~current-keyword-code ~state ~(declaration-kind-keyword entry)))
+                                          (set! j (+ (load j) 1)))))
+                                    (p/code-list-done checks))))
+                           (do
+                             (if resource-declaration
+                                 (do
+                                   (store! ~declaration-kind-id
+                                     (if await-using (cast u64 ir/DECL-AWAIT-USING)
+                                       (cast u64 ir/DECL-USING)))
+                                   (if await-using (~advance-code ~state) 0)
+                                   (~advance-code ~state)
+                                   (store! target-start (~current-position-code ~state))
+                                   (store! target-name-end
+                                     (~word-end-code ~state (load target-start))) 0)
+                               (do
+                                 ~(let [clauses (p/code-list-new) (mut j) 0]
+                                     (loop
+                                       (if (>= (load j) (p/code-count declaration-kinds)) (break)
+                                         (let [entry (p/code-nth declaration-kinds (load j))]
+                                           (p/code-list-push! clauses
+                                             `(~current-keyword-code ~state ~(declaration-kind-keyword entry)))
+                                           (p/code-list-push! clauses
+                                             `(store! ~declaration-kind-id ~(p/code-nth entry 1)))
+                                           (set! j (+ (load j) 1)))))
+                                     `(cond ~@(p/code-list-done clauses) :else 0))
+                                 (~advance-code ~state)
+                                 (store! target-start (~current-position-code ~state))
+                                 (store! target-name-end
+                                   (~word-end-code ~state (load target-start))) 0))
+                             (~pattern-parser ~state false ~equals ~comma))
+                         (let [target (~parse-expression-code ~state ~target-precedence)
+                               definition-kind
+                                 (load (p/index (.value-def-kinds arena)
+                                                (cast i64 (.value target))))
+                               definition-index
+                                 (load (p/index (.value-def-indices arena)
+                                                (cast i64 (.value target))))
+                               ~target-op-id
+                                 (if (= definition-kind (cast u8 ir/DEF-OP-RESULT))
+                                     (load (p/index (.opcodes arena) (cast i64 definition-index)))
+                                   ir/OP-INVALID)]
+                           (if (or ~@(let [checks (p/code-list-new) (mut j) 0]
+                                          (loop
+                                            (if (>= (load j) (p/code-count target-ops)) (break)
+                                              (do (p/code-list-push! checks
+                                                    `(= ~target-op-id
+                                                        ~(p/code-nth target-ops (load j))))
+                                                  (set! j (+ (load j) 1)))))
+                                          (p/code-list-done checks)))
+                               (store! target-value (.value target))
+                             (do (~fail-code ~state ~expected-error) 0))))
+                       (if (if (= iterator-kind 1)
+                               (~current-keyword-code ~state ~in-keyword)
+                             (~current-keyword-code ~state ~of-keyword))
+                           (~advance-code ~state)
+                         (do (~fail-code ~state ~expected-error) 0))
+                       (if (and resource-declaration
+                                (and (!= iterator-kind 2) (!= iterator-kind 3)))
+                           (do (~fail-code ~state ~expected-error) 0) 0)
+                       (set! (.block ~state) origin)
+                       (let [iterable (~parse-expression-code ~state 0)]
+                         (if (~consume-code ~state ~close)
+                             (let [iterator-value (.value-count arena)
+                                   init-result (builder/add-op! (.builder ~state) origin
+                                                 ~iterator-init-op (cast u32 0) (cast u32 0)
+                                                 (.start iterable) (.end iterable) (cast u32 1))
+                                   init-op (~check-build-code ~state init-result)
+                                   init-operand (builder/add-operand! (.builder ~state) init-op
+                                                  (.value iterable))
+                                   init-kind (builder/set-op-immediate! (.builder ~state) init-op
+                                               (cast u64 iterator-kind))]
+                               (~check-build-code ~state init-operand)
+                               (~check-build-code ~state init-kind)
+                               (~emit-branch-code ~state origin header)
+                               (set! (.block ~state) header)
+                               (set! (.terminated ~state) false)
+                               (let [next-value (.value-count arena)
+                                     next-result (builder/add-op! (.builder ~state) header
+                                                   ~iterator-next-op (cast u32 0) (cast u32 0)
+                                                   start (~current-position-code ~state) (cast u32 2))
+                                     next-op (~check-build-code ~state next-result)
+                                     next-operand (builder/add-operand! (.builder ~state) next-op
+                                                    iterator-value)
+                                     branch-result (builder/add-op! (.builder ~state) header ~branch-op
+                                                     (cast u32 0) (cast u32 0) start
+                                                     (~current-position-code ~state) (cast u32 0))
+                                     branch (~check-build-code ~state branch-result)
+                                     condition-operand (builder/add-operand! (.builder ~state) branch
+                                                         next-value)
+                                     body-successor (builder/add-successor! (.builder ~state) branch body)
+                                     exit-successor (builder/add-successor! (.builder ~state) branch
+                                                      exit-block)]
+                                 (~check-build-code ~state next-operand)
+                                 (~check-build-code ~state condition-operand)
+                                 (~check-build-code ~state body-successor)
+                                 (~check-build-code ~state exit-successor)
+                                 (set! (.block ~state) body)
+                                 (if (!= (load ~declaration-kind-id) (cast u64 0))
+                                     (let [declaration-result
+                                            (builder/add-op! (.builder ~state) body ~declare-op
+                                              (load target-start) (load target-name-end)
+                                              declaration-start (load target-name-end) (cast u32 0))
+                                           declaration (~check-build-code ~state declaration-result)
+                                           operand (builder/add-operand! (.builder ~state) declaration
+                                                     (+ next-value (cast u32 1)))
+                                           kind-result (builder/set-op-immediate! (.builder ~state)
+                                                         declaration (load ~declaration-kind-id))]
+                                       (~check-build-code ~state operand)
+                                       (~check-build-code ~state kind-result))
+                                   (let [assignment-result
+                                          (builder/add-op! (.builder ~state) body ~assign-op
+                                            (cast u32 0) (cast u32 0) (load target-start)
+                                            (~current-position-code ~state) (cast u32 1))
+                                         assignment (~check-build-code ~state assignment-result)
+                                         target-operand (builder/add-operand! (.builder ~state)
+                                                          assignment (load target-value))
+                                         value-operand (builder/add-operand! (.builder ~state)
+                                                         assignment (+ next-value (cast u32 1)))]
+                                     (~check-build-code ~state target-operand)
+                                     (~check-build-code ~state value-operand)))
+                                 (let [parent-break-target (.break-target ~state)
+                                       parent-continue-target (.continue-target ~state)]
+                                   (set! (.break-target ~state) exit-block)
+                                   (set! (.continue-target ~state) header)
+                                   (~publish-loop-labels-code ~state header)
+                                   (set! (.terminated ~state) false)
+                                   (~parse-statement-code ~state)
+                                   (if (not (.terminated ~state))
+                                       (~emit-branch-code ~state (.block ~state) header) 0)
+                                   (set! (.break-target ~state) parent-break-target)
+                                   (set! (.continue-target ~state) parent-continue-target))
+                                 (let [end (~current-position-code ~state)
+                                       scope-end (builder/set-scope-end! (.builder ~state)
+                                                   loop-scope end)]
+                                   (~check-build-code ~state scope-end))
+                                 (set! (.scope ~state) parent-scope)
+                                 (set! (.block ~state) exit-block)
+                                 (set! (.terminated ~state) false))) 0) 0))
+                     (do (~fail-code ~state ~expected-error) 0)))
+               0)))))))
 
+;; Classic three-clause `for`. The grammar owns the keyword, the header
+;; delimiters, and the two clause separators; each separator is read from the
+;; step that follows its own clause, so the two are independent. Everything left
+;; here is CFG shape - a header, an update block, a body, an exit - plus the
+;; rule that any of the three clauses may be empty, neither of which a
+;; production can state.
 (defn compile-for-statement [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 9)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 11)
                 (generator-form? production "for-statement")))
       (generator-fail production "invalid for-statement production")
     (let [state-type (backend-value backend "state-type")
@@ -8397,100 +8563,118 @@
           emit-branch-code (backend-value backend "emit-branch")
           check-build-code (backend-value backend "check-build")
           publish-loop-labels-code (backend-value backend "publish-loop-labels")
-          fail-code (backend-value backend "fail")
-          expected-error (backend-value backend "expected-error")
-          open (field-value production "open") close (field-value production "close")
-          separator (field-value production "separator")
-          declaration-keywords (field-value production "declaration-keywords")
+          steps (production-steps production)
+          declaration-kinds (field-value production "declaration-kinds")
           branch-op (field-value production "branch-op")
-          state (p/fresh-identifier "state")]
-      `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
-         (let [start (~current-position-code ~state) _for (~advance-code ~state)
-               parent-scope (.scope ~state)]
-           (if (~consume-code ~state ~open)
-               (let [scope-result (builder/add-scope! (.builder ~state) parent-scope start
-                                    (cast u32 (.source-size ~state)))
-                     loop-scope (~check-build-code ~state scope-result)]
-                 (set! (.scope ~state) loop-scope)
-                 (if (= (~current-byte-code ~state) ~separator)
-                     (do (~advance-code ~state) 0)
-                   (if (or ~@(let [checks (p/code-list-new) (mut j) 0]
-                               (loop
-                                 (if (>= (load j) (p/code-count declaration-keywords)) (break)
-                                   (do
-                                     (p/code-list-push! checks
-                                       `(~current-keyword-code ~state
-                                          ~(p/code-nth declaration-keywords (load j))))
-                                     (set! j (+ (load j) 1)))))
-                               (p/code-list-done checks)))
-                       (~declaration-parser ~state)
-                     (do
-                       (~parse-expression-code ~state 0)
-                       (~consume-code ~state ~separator)
-                       0)))
-                 (let [arena (.arena (.builder ~state)) origin (.block ~state)
-                       region (load (p/index (.block-regions arena) (cast i64 origin)))
-                       header-result (builder/add-block! (.builder ~state) region)
-                       header (~check-build-code ~state header-result)
-                       update-result (builder/add-block! (.builder ~state) region)
-                       update-block (~check-build-code ~state update-result)
-                       body-result (builder/add-block! (.builder ~state) region)
-                       body (~check-build-code ~state body-result)
-                       exit-result (builder/add-block! (.builder ~state) region)
-                       exit-block (~check-build-code ~state exit-result)]
-                   (~emit-branch-code ~state origin header)
-                   (set! (.block ~state) header)
-                   (set! (.terminated ~state) false)
-                   (if (= (~current-byte-code ~state) ~separator)
-                       (do
-                         (~advance-code ~state)
-                         (~emit-branch-code ~state header body))
-                     (let [condition (~parse-expression-code ~state 0)]
-                       (if (~consume-code ~state ~separator)
-                           (let [branch-result
-                                  (builder/add-op! (.builder ~state) header ~branch-op
-                                    (cast u32 0) (cast u32 0) start
-                                    (~current-position-code ~state) (cast u32 0))]
-                             (let [branch (~check-build-code ~state branch-result)
-                                   operand (builder/add-operand! (.builder ~state) branch
-                                                                 (.value condition))
-                                   body-successor (builder/add-successor! (.builder ~state)
-                                                    branch body)
-                                   exit-successor (builder/add-successor! (.builder ~state)
-                                                    branch exit-block)]
-                               (~check-build-code ~state operand)
-                               (~check-build-code ~state body-successor)
-                               (~check-build-code ~state exit-successor)
-                               0)) 0)))
-                   (set! (.block ~state) update-block)
-                   (set! (.terminated ~state) false)
-                   (if (= (~current-byte-code ~state) ~close) 0
-                     (do (~parse-expression-code ~state 0) 0))
-                   (if (~consume-code ~state ~close)
-                       (do
-                         (~emit-branch-code ~state update-block header)
-                         (let [parent-break-target (.break-target ~state)
-                               parent-continue-target (.continue-target ~state)]
-                           (set! (.break-target ~state) exit-block)
-                           (set! (.continue-target ~state) update-block)
-                           (~publish-loop-labels-code ~state update-block)
-                           (set! (.block ~state) body)
-                           (set! (.terminated ~state) false)
-                           (~parse-statement-code ~state)
-                           (if (not (.terminated ~state))
-                               (~emit-branch-code ~state (.block ~state) update-block) 0)
-                           (set! (.break-target ~state) parent-break-target)
-                           (set! (.continue-target ~state) parent-continue-target)
-                           (let [end (~current-position-code ~state)
-                                 scope-end (builder/set-scope-end! (.builder ~state)
-                                             loop-scope end)]
-                             (~check-build-code ~state scope-end))
-                           (set! (.scope ~state) parent-scope)
-                           (set! (.block ~state) exit-block)
-                           (set! (.terminated ~state) false))
-                         0) 0)))
-             (do (~fail-code ~state ~expected-error) 0)))
-         0))))
+          initializer-index (rule-step-index steps
+                              (field-value production "initializer") "for initializer")
+          condition-index (rule-step-index steps
+                            (field-value production "condition") "for condition")
+          update-index (rule-step-index steps
+                         (field-value production "update") "for update")
+          body-index (rule-step-index steps (field-value production "body") "body")
+          state (p/fresh-identifier "state")
+          start-id (p/fresh-identifier "start")
+          parent-scope-id (p/fresh-identifier "parent-scope")]
+      (if (or (or (< initializer-index 0) (< condition-index 0))
+              (or (< update-index 0) (< body-index 0))) `(do 0)
+        (if (not (and (< initializer-index condition-index)
+                      (and (< condition-index update-index)
+                           (< update-index body-index))))
+            (generator-fail production
+              "for-statement requires the initializer, condition, update, and body rules in order")
+          (let [initializer-end (terminal-step-byte steps (+ initializer-index 1)
+                                  "for initializer separator")
+                condition-end (terminal-step-byte steps (+ condition-index 1)
+                                "for condition separator")
+                close (terminal-step-byte steps (+ update-index 1) "for header close")]
+            `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
+               (let [~start-id (~current-position-code ~state)
+                     ~parent-scope-id (.scope ~state)]
+                 ~(compile-step-range backend steps 0 initializer-index state true
+                    `(let [scope-result (builder/add-scope! (.builder ~state) ~parent-scope-id
+                                          ~start-id (cast u32 (.source-size ~state)))
+                           loop-scope (~check-build-code ~state scope-result)]
+                       (set! (.scope ~state) loop-scope)
+                       (if (= (~current-byte-code ~state) ~initializer-end)
+                           (do (~advance-code ~state) 0)
+                         (if (or ~@(let [checks (p/code-list-new) (mut j) 0]
+                                     (loop
+                                       (if (>= (load j) (p/code-count declaration-kinds)) (break)
+                                         (let [entry (p/code-nth declaration-kinds (load j))]
+                                           (p/code-list-push! checks
+                                             `(~current-keyword-code ~state
+                                                ~(declaration-kind-keyword entry)))
+                                           (set! j (+ (load j) 1)))))
+                                     (p/code-list-done checks)))
+                             (~declaration-parser ~state)
+                           (do
+                             (~parse-expression-code ~state 0)
+                             (~consume-code ~state ~initializer-end)
+                             0)))
+                       (let [arena (.arena (.builder ~state)) origin (.block ~state)
+                             region (load (p/index (.block-regions arena) (cast i64 origin)))
+                             header-result (builder/add-block! (.builder ~state) region)
+                             header (~check-build-code ~state header-result)
+                             update-result (builder/add-block! (.builder ~state) region)
+                             update-block (~check-build-code ~state update-result)
+                             body-result (builder/add-block! (.builder ~state) region)
+                             body (~check-build-code ~state body-result)
+                             exit-result (builder/add-block! (.builder ~state) region)
+                             exit-block (~check-build-code ~state exit-result)]
+                         (~emit-branch-code ~state origin header)
+                         (set! (.block ~state) header)
+                         (set! (.terminated ~state) false)
+                         (if (= (~current-byte-code ~state) ~condition-end)
+                             (do
+                               (~advance-code ~state)
+                               (~emit-branch-code ~state header body))
+                           (let [condition (~parse-expression-code ~state 0)]
+                             (if (~consume-code ~state ~condition-end)
+                                 (let [branch-result
+                                        (builder/add-op! (.builder ~state) header ~branch-op
+                                          (cast u32 0) (cast u32 0) ~start-id
+                                          (~current-position-code ~state) (cast u32 0))]
+                                   (let [branch (~check-build-code ~state branch-result)
+                                         operand (builder/add-operand! (.builder ~state) branch
+                                                                       (.value condition))
+                                         body-successor (builder/add-successor! (.builder ~state)
+                                                          branch body)
+                                         exit-successor (builder/add-successor! (.builder ~state)
+                                                          branch exit-block)]
+                                     (~check-build-code ~state operand)
+                                     (~check-build-code ~state body-successor)
+                                     (~check-build-code ~state exit-successor)
+                                     0)) 0)))
+                         (set! (.block ~state) update-block)
+                         (set! (.terminated ~state) false)
+                         (if (= (~current-byte-code ~state) ~close) 0
+                           (do (~parse-expression-code ~state 0) 0))
+                         (if (~consume-code ~state ~close)
+                             (do
+                               (~emit-branch-code ~state update-block header)
+                               (let [parent-break-target (.break-target ~state)
+                                     parent-continue-target (.continue-target ~state)]
+                                 (set! (.break-target ~state) exit-block)
+                                 (set! (.continue-target ~state) update-block)
+                                 (~publish-loop-labels-code ~state update-block)
+                                 (set! (.block ~state) body)
+                                 (set! (.terminated ~state) false)
+                                 (~parse-statement-code ~state)
+                                 (if (not (.terminated ~state))
+                                     (~emit-branch-code ~state (.block ~state) update-block) 0)
+                                 (set! (.break-target ~state) parent-break-target)
+                                 (set! (.continue-target ~state) parent-continue-target)
+                                 (let [end (~current-position-code ~state)
+                                       scope-end (builder/set-scope-end! (.builder ~state)
+                                                   loop-scope end)]
+                                   (~check-build-code ~state scope-end))
+                                 (set! (.scope ~state) ~parent-scope-id)
+                                 (set! (.block ~state) exit-block)
+                                 (set! (.terminated ~state) false))
+                               ~(compile-step-range backend steps (+ body-index 1)
+                                  (p/code-count steps) state false `0)) 0)))))
+               0)))))))
 
 (defn compile-function-expression [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 13)
@@ -9927,19 +10111,16 @@
         (branch-op ir/OP-COND-BR))
       (for-kind-lookahead javascript-for-kind
         (function parse-for-kind)
-        (for-keyword (syntax/for-production-keyword 0))
-        (await-keyword (syntax/for-await-of-production-keyword 1))
-        (in-keyword (syntax/for-in-production-keyword 3))
-        (of-keyword (syntax/for-of-production-keyword 3))
-        (open (syntax/for-production-terminal 1))
-        (close (syntax/for-production-terminal 7))
-        (nested-opens [(syntax/group-production-terminal 0)
-                       (syntax/array-production-terminal 0)
-                       (syntax/object-production-terminal 0)])
-        (nested-closes [(syntax/group-production-terminal 2)
-                        (syntax/array-production-terminal 2)
-                        (syntax/object-production-terminal 2)])
-        (separator (syntax/for-production-terminal 3)))
+        (steps ~(syntax/for-production-steps))
+        (in-steps ~(syntax/for-in-production-steps))
+        (of-steps ~(syntax/for-of-production-steps))
+        (await-steps ~(syntax/for-await-of-production-steps))
+        (initializer initializer)
+        (update update)
+        (target assignment-target)
+        (nested-delimiters [~(syntax/group-production-steps)
+                            ~(syntax/array-production-steps)
+                            ~(syntax/object-production-steps)]))
       (for-dispatch javascript-for
         (function parse-for)
         (lookahead parse-for-kind)
@@ -9948,15 +10129,15 @@
       (iterator-for-statement iterator-for-statement
         (function parse-iterator-for)
         (lookahead parse-for-kind)
-        (open (syntax/for-production-terminal 1))
-        (close (syntax/for-production-terminal 7))
-        (await-keyword (syntax/for-await-of-production-keyword 1))
+        (in-steps ~(syntax/for-in-production-steps))
+        (of-steps ~(syntax/for-of-production-steps))
+        (await-steps ~(syntax/for-await-of-production-steps))
+        (target assignment-target)
+        (iterable expression)
         (using-keyword "using")
-        (in-keyword (syntax/for-in-production-keyword 3))
-        (of-keyword (syntax/for-of-production-keyword 3))
-        (declaration-kinds [[(syntax/variable-production-keyword 0) ir/DECL-CONST]
-                            [(syntax/let-production-keyword 0) ir/DECL-LET]
-                            [(syntax/var-production-keyword 0) ir/DECL-VAR]])
+        (declaration-kinds [[~(syntax/variable-production-steps) ir/DECL-CONST]
+                            [~(syntax/let-production-steps) ir/DECL-LET]
+                            [~(syntax/var-production-steps) ir/DECL-VAR]])
         (equals (syntax/variable-production-terminal 2))
         (comma (syntax/call-production-terminal 1))
         (target-ops [ir/OP-JS-IDENTIFIER ir/OP-JS-MEMBER
@@ -9970,13 +10151,14 @@
         (branch-op ir/OP-COND-BR))
       (for-statement classic-for-statement
         (function parse-classic-for)
-        (open (syntax/for-production-terminal 1))
-        (close (syntax/for-production-terminal 7))
-        (separator (syntax/for-production-terminal 3))
-        (declaration-keywords
-          [(syntax/variable-production-keyword 0)
-           (syntax/let-production-keyword 0)
-           (syntax/var-production-keyword 0)])
+        (steps ~(syntax/for-production-steps))
+        (initializer initializer)
+        (condition condition)
+        (update update)
+        (body statement)
+        (declaration-kinds [[~(syntax/variable-production-steps) ir/DECL-CONST]
+                            [~(syntax/let-production-steps) ir/DECL-LET]
+                            [~(syntax/var-production-steps) ir/DECL-VAR]])
         (declaration-parser parse-declaration)
         (branch-op ir/OP-COND-BR))
       (function-declaration function-statement
