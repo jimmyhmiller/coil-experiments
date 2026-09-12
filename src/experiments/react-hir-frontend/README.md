@@ -103,36 +103,54 @@ The implemented pipeline is:
     defines no `parse-` function of its own, only the cursor, UTF-8, span,
     binding, and scratch primitives a generated parser calls.
 
-    Two things are genuinely determined by `frontend_spec.coil` rather than by
-    the generator. Operator precedence and longest-match width come from the
-    `operators` table, so adding an operator is a one-line grammar edit. And for
-    the productions listed below, the *shape* is authoritative:
-    `def-frontend-grammar` emits a `NAME-production-steps` accessor holding the
-    normalized step vector (terminal and separator names already resolved to
-    bytes), the generator splices it in at expansion time, and the strategy
-    walks it in order. Deleting the parentheses from `while-production` yields a
-    working parser for `while cond { ... }`; renaming a clause keyword moves the
-    parser with it. A production that no longer supplies a role its strategy
-    needs is a hard expansion error, never a silently broken parser.
-    `benchmarks/check-grammar-authority.sh` proves all of this by perturbing the
-    grammar, rebuilding, and asserting the parser followed.
+    The grammar in `frontend_spec.coil` determines the parser, not just its
+    byte constants. `def-frontend-grammar` emits a `NAME-production-steps`
+    accessor per production holding the normalized step vector, with terminal
+    and separator names already resolved to bytes; the generator splices it in
+    at expansion time and walks it in order. 26 of the 33 strategies that once
+    indexed a fixed step position now do this, across 51 declared productions.
+    Deleting the parentheses from `while-production` yields a working parser for
+    `while cond { ... }`; renaming a clause keyword, re-spelling a list
+    separator, or re-bracketing a destructuring pattern all move the parser with
+    the grammar. Roles claim `(rule X)`, `(repeat X)`, `(separated X B)` and
+    `(terminator B)` steps by name, and a production that no longer supplies a
+    role its strategy needs is a hard expansion error, never a silently broken
+    parser.
 
-    Shape-authoritative so far: `while`, `if`/`else`, `do`/`while`, blocks, and
-    the terminated statements (`return`, `throw`, expression statements). A
-    `(terminator BYTE)` step marks an ASI-eligible statement end, which the
-    strategy routes through the statement-end parser instead of a plain byte
-    consume.
+    `(terminator BYTE)` marks an ASI-eligible statement end, routed through the
+    statement-end parser rather than consumed as a plain byte. `javascript-asi`
+    itself stays a primitive - ASI is a rule *about* productions, not a step
+    sequence - but both spellings it tests are now derived from the productions
+    it must agree with, so the block parser and ASI cannot disagree about where
+    a block ends.
 
-    The remaining strategies still reach into a production by fixed step index
-    (`(syntax/for-production-terminal 1)`), which makes their productions a bag
-    of byte constants rather than a grammar: the sequencing is re-encoded by
-    hand inside the `compile-` function, so reshaping one of those productions
-    does not reshape its parser. They also remain one `compile-` function per
-    construct — 69 strategy kinds across 74 production instances, of which only
+    `benchmarks/check-grammar-authority.sh` proves this by perturbing the
+    grammar, rebuilding, and asserting the parser followed: six cases covering
+    undelimited `while`, a renamed `else`, renamed `do`/`while` keywords, a
+    re-spelled type annotation, try/catch keywords and catch delimiters, and a
+    production missing a required role, which must fail to compile.
+    `benchmarks/compare-against-baseline.sh REF` is the behavioural gate: it
+    builds the checker at `REF` in a scratch worktree and requires byte-identical
+    textual IR on all 70 valid fixtures and identical diagnostics on all 131
+    invalid ones. The whole migration is byte-identical to the pre-migration
+    commit, at unchanged throughput.
+
+    Nine indexed uses remain, and each is a site borrowing a byte from a
+    production that describes a different construct - the `=` of `=>` and of a
+    destructuring default taken from `assignment-production`; a declarator-list
+    comma taken from `call-production`; an interface body's `{` taken from
+    `block-production`; a FOLLOW-set member for type-argument lookahead. These
+    are deliberately not migrated: walking an unrelated production's shape is
+    what produced the original coupling. Each needs its own declaration - an
+    arrow production, a binding-initializer production, an object-type
+    production - or, for the FOLLOW set, a notion of first/follow sets the
+    grammar does not yet have.
+
+    The generator is still one `compile-` function per construct. Only
     `terminated-expression`, `structured-type-span`, `separated-value`,
-    `control-transfer`, and `class-parameter` are reused at all. Migrating the
-    rest, and collapsing the one-off strategies into general forms, is the open
-    work.
+    `control-transfer` and `class-parameter` are shared across more than one
+    production. Collapsing those one-off strategies into general forms is the
+    remaining half of the work; making the shapes authoritative was the first.
 
 All bitmap-producing entry points accept an explicit valid byte count. SIMD
 tail fill bytes therefore cannot appear as source events. Tape writes report
