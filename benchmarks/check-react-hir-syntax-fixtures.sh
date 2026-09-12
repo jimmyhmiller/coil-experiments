@@ -22,8 +22,17 @@ rejected=0
 for fixture in "$benchmark_dir"/react-hir-invalid-syntax-fixtures/*.ts \
                "$benchmark_dir"/react-hir-invalid-syntax-fixtures/*.tsx; do
   [ -f "$fixture" ] || continue
-  if "$checker" "$fixture" >/dev/null 2>&1; then
+  set +e
+  "$checker" "$fixture" >/dev/null 2>&1
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
     printf 'invalid syntax fixture unexpectedly succeeded: %s\n' "$fixture" >&2
+    exit 1
+  fi
+  if [ "$status" -ne 1 ]; then
+    printf 'invalid syntax fixture failed unsafely (status %d): %s\n' \
+      "$status" "$fixture" >&2
     exit 1
   fi
   rejected=$((rejected + 1))
