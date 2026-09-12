@@ -4,7 +4,8 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     ExportAllDeclaration, ExportNamedDeclaration, ExportSpecifier, Function, FunctionType,
     ImportDeclaration, ImportDefaultSpecifier, ImportNamespaceSpecifier, ImportSpecifier,
-    ImportAttribute, VariableDeclaration, VariableDeclarationKind, WithClause,
+    ImportAttribute, TaggedTemplateExpression, VariableDeclaration, VariableDeclarationKind,
+    WithClause,
     TSClassImplements, TSEnumDeclaration, TSEnumMember, TSGlobalDeclaration,
     TSExportAssignment, TSImportEqualsDeclaration, TSInterfaceBody, TSInterfaceHeritage,
     TSModuleDeclaration, TSModuleReference, TSNamespaceExportDeclaration, TSOptionalType,
@@ -69,6 +70,7 @@ const CASES: &[Case] = &[
     Case { name: "module-attributes-context", source: "import data from 'data' with {type:'json','resolution-mode':'import'};import legacy from 'legacy' assert {type:'json'};export {value} from 'data' with {type:'json'};export * from 'legacy' assert {type:'json'};" },
     Case { name: "resource-declaration-context", source: "using resource:Disposable=acquire();using first=openA(),second:Disposable=openB();await using asyncResource:AsyncDisposable=acquireAsync();" },
     Case { name: "resource-loop-context", source: "for(using item of resources){}for(await using asyncItem of asyncResources){}for(using of resources){}" },
+    Case { name: "tagged-template-context", source: "const a=tag`a${x}b`;const b=ns.tag<A,B>`c${y}d`;" },
 ];
 
 struct Shape {
@@ -79,6 +81,7 @@ struct Shape {
     function_flags: Vec<u64>,
     resource_spans: Vec<(u32, u32)>,
     resource_kinds: Vec<u64>,
+    tagged_template_spans: Vec<(u32, u32)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -252,6 +255,12 @@ fn field_checks(name: &str) -> &'static [FieldCheck] {
             opcode: 38,
             expected: &[(1, 4), (1, 5)],
         }],
+        "tagged-template-context" => &[
+            FieldCheck { opcode: 56, expected: &[(1, 0), (1, 0)] },
+            FieldCheck { opcode: 97, expected: &[(2, 0)] },
+            FieldCheck { opcode: 52, expected: &[(2, 0)] },
+            FieldCheck { opcode: 143, expected: &[(2, 0), (2, 0)] },
+        ],
         _ => &[],
     }
 }
@@ -283,6 +292,7 @@ impl Shape {
         nodes: Vec::new(), spans: Vec::new(), module_spans: Vec::new(),
         function_spans: Vec::new(), function_flags: Vec::new(),
         resource_spans: Vec::new(), resource_kinds: Vec::new(),
+        tagged_template_spans: Vec::new(),
     } }
 
     fn push(&mut self, kind: &'static str, span: Option<(u32, u32)>) {
@@ -292,6 +302,12 @@ impl Shape {
 }
 
 impl<'a> Visit<'a> for Shape {
+    fn visit_tagged_template_expression(&mut self, expression: &TaggedTemplateExpression<'a>) {
+        walk::walk_tagged_template_expression(self, expression);
+        let span = expression.span();
+        self.tagged_template_spans.push((span.start, span.end));
+    }
+
     fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
         walk::walk_variable_declaration(self, declaration);
         let kind = match declaration.kind {
@@ -688,6 +704,14 @@ fn main() {
                 eprintln!("RESOURCE_MISMATCH {}\n  oxc spans={:?} kinds={:?}\n  coil spans={:?} kinds={:?}",
                     case.name, expected.resource_spans, expected.resource_kinds,
                     actual_spans, actual_kinds);
+                failures += 1;
+            }
+        }
+        if !expected.tagged_template_spans.is_empty() {
+            let actual = coil_opcode_spans(&dump, 143);
+            if actual != expected.tagged_template_spans {
+                eprintln!("TAGGED_TEMPLATE_SPAN_MISMATCH {}\n  oxc:  {:?}\n  coil: {:?}",
+                    case.name, expected.tagged_template_spans, actual);
                 failures += 1;
             }
         }
