@@ -2,8 +2,9 @@ use std::{env, fs, path::PathBuf, process::Command};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    TSClassImplements, TSInterfaceBody, TSInterfaceHeritage, TSOptionalType, TSRestType,
-    TSSignature, TSType, TSTypePredicateName, TSTypeQueryExprName,
+    TSClassImplements, TSEnumDeclaration, TSEnumMember, TSInterfaceBody,
+    TSInterfaceHeritage, TSOptionalType, TSRestType, TSSignature, TSType,
+    TSTypePredicateName, TSTypeQueryExprName,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
@@ -54,6 +55,7 @@ const CASES: &[Case] = &[
     Case { name: "assertion-type-context", source: "const a = value as A<B>; const b = value satisfies C | D; const c = value!;" },
     Case { name: "call-new-type-context", source: "const a = fn<A, B>(x); const b = new C<D>(x); const c = fn<E>;" },
     Case { name: "angle-assertion-context", source: "const plain=<A>input; const nested=<A<B>>input;" },
+    Case { name: "enum-context", source: "enum Plain { A, B=2, 'quoted'='value', ['computed']=4, [`templ`] } const enum Fixed { X=1, Y } declare enum Ambient { A, B='b' }" },
 ];
 
 struct Shape {
@@ -178,6 +180,13 @@ fn field_checks(name: &str) -> &'static [FieldCheck] {
             opcode: 122,
             expected: &[(2, 3), (2, 3)],
         }],
+        "enum-context" => &[
+            FieldCheck { opcode: 133, expected: &[(5, 0), (2, 1), (2, 2)] },
+            FieldCheck { opcode: 134, expected: &[
+                (0, 0), (1, 4), (1, 5), (1, 6), (0, 3),
+                (1, 4), (0, 0), (0, 0), (1, 4),
+            ] },
+        ],
         _ => &[],
     }
 }
@@ -326,6 +335,18 @@ impl<'a> Visit<'a> for Shape {
         let span = body.span();
         self.push("ts.type_literal", Some((span.start, span.end)));
     }
+
+    fn visit_ts_enum_member(&mut self, member: &TSEnumMember<'a>) {
+        walk::walk_ts_enum_member(self, member);
+        let span = member.span();
+        self.push("ts.enum_member", Some((span.start, span.end)));
+    }
+
+    fn visit_ts_enum_declaration(&mut self, declaration: &TSEnumDeclaration<'a>) {
+        walk::walk_ts_enum_declaration(self, declaration);
+        let span = declaration.span();
+        self.push("ts.enum", Some((span.start, span.end)));
+    }
 }
 
 fn coil_shape(output: &str) -> Vec<&str> {
@@ -338,6 +359,7 @@ fn coil_shape(output: &str) -> Vec<&str> {
         "ts.property_signature", "ts.method_signature", "ts.call_signature",
         "ts.construct_signature", "ts.index_signature", "ts.named_tuple_member",
         "ts.optional_type", "ts.rest_type",
+        "ts.enum_member", "ts.enum",
     ];
     output.lines().filter_map(|line| {
         let op = line.trim().split_once(" = ").map_or_else(

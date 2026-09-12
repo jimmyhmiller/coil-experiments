@@ -1,0 +1,1 @@
+enum MissingComma { A B }

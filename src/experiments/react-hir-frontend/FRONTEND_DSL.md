@@ -82,7 +82,8 @@ runtime interpreter or production tables.
 No handwritten `parse-*` definition remains in `direct_parser.coil`.
 `benchmarks/check-generated-direct-parser.sh` enforces both halves of that
 contract: the runtime source must contain none, while macro expansion must
-contain all 71 expected generated definitions.
+contain all 74 expected generated definitions, including prefix type
+assertions, their JSX-disambiguating lookahead, and structured enums.
 
 Language-coverage changes additionally run through `react-hir-check`, which
 executes the generated parser and the complete IR verifier for one source file.

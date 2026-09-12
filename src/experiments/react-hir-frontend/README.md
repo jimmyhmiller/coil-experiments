@@ -132,7 +132,7 @@ const result = condition ? foo(a + b) : <Component value={x} />;
 The remaining explicit frontier is tracked by the feature inventory in
 `pad://react-hir-frontend`, independently of corpus acceptance. The largest
 unimplemented structural families are classes/decorators, structured
-TypeScript type syntax and declarations, the remaining module forms, Unicode
+the remaining TypeScript declaration and module forms, Unicode
 identifiers, labels/`with`, tagged templates and special import/meta
 expressions, recovery, and the final React compiler HIR schema. Generated
 paths now cover the principal CFG statements, structured try/catch/finally,
