@@ -75,6 +75,168 @@
 ;;
 ;; This compiler owns the repetition, separator, closing-token, scratch-lifetime,
 ;; and error-control algorithm. The backend supplies only primitive operations.
+;; ---------------------------------------------------------------------------
+;; Authoritative production-shape walking.
+;;
+;; A generated production carries the grammar's normalized step vector, spliced
+;; in at expansion time from the `-steps` accessor that def-frontend-grammar
+;; emits. Strategies below walk that vector in order and emit one parse action
+;; per step. They never index a fixed step position, so editing a production in
+;; frontend_spec.coil changes the parser that is generated from it.
+;;
+;; Rule steps are claimed by name through role fields (for example a loop's
+;; `condition` and `body`). Any step a strategy reaches but cannot emit is a
+;; hard expansion error rather than a silently dropped action.
+
+(defn step-form? [(step Code) (name (slice u8))] (-> bool)
+  (and (p/code-list? step) (> (p/code-count step) 0)
+       (generator-symbol? (p/code-nth step 0) name)))
+
+;; Index of the single (keyword "TEXT") step, and its text. A clause whose
+;; keyword the parser must test before committing has to begin with it.
+(defn keyword-step-index [(steps Code) (role (slice u8))] (-> i64)
+  (let [(mut i) 0 (mut found) -1 (mut count) 0]
+    (loop
+      (if (>= (load i) (p/code-count steps)) (break)
+        (do
+          (if (and (step-form? (p/code-nth steps (load i)) "keyword")
+                   (= (p/code-count (p/code-nth steps (load i))) 2))
+              (do (if (< (load found) 0) (store! found (load i)) 0)
+                  (set! count (+ (load count) 1))) 0)
+          (set! i (+ (load i) 1)))))
+    (cond
+      (= (load count) 0)
+        (do (p/report steps
+              (p/code-str "production has no (keyword ...) step for: " role)) -1)
+      (> (load count) 1)
+        (do (p/report steps
+              (p/code-str "production has more than one (keyword ...) step for: " role)) -1)
+      (> (load found) 0)
+        (do (p/report steps
+              (p/code-str "production must begin with its keyword: " role)) -1)
+      :else (load found))))
+
+(defn terminator-step-index [(steps Code) (role (slice u8))] (-> i64)
+  (let [(mut i) 0 (mut found) -1 (mut count) 0]
+    (loop
+      (if (>= (load i) (p/code-count steps)) (break)
+        (do
+          (if (step-form? (p/code-nth steps (load i)) "terminator")
+              (do (if (< (load found) 0) (store! found (load i)) 0)
+                  (set! count (+ (load count) 1))) 0)
+          (set! i (+ (load i) 1)))))
+    (cond
+      (= (load count) 0)
+        (do (p/report steps
+              (p/code-str "production has no (terminator ...) step for: " role)) -1)
+      (> (load count) 1)
+        (do (p/report steps
+              (p/code-str "production has more than one (terminator ...) step for: " role)) -1)
+      :else (load found))))
+
+(defn keyword-step-text [(steps Code) (index i64)] (-> Code)
+  (p/code-nth (p/code-nth steps index) 1))
+
+(defn repeat-step-index [(steps Code) (rule Code) (role (slice u8))] (-> i64)
+  (let [(mut i) 0 (mut found) -1 (mut count) 0]
+    (loop
+      (if (>= (load i) (p/code-count steps)) (break)
+        (let [step (p/code-nth steps (load i))]
+          (if (and (step-form? step "repeat") (= (p/code-count step) 2)
+                   (p/code-sym? (p/code-nth step 1)) (p/code-sym? rule)
+                   (= (p/code-sym (p/code-nth step 1)) (p/code-sym rule)))
+              (do (if (< (load found) 0) (store! found (load i)) 0)
+                  (set! count (+ (load count) 1))) 0)
+          (set! i (+ (load i) 1)))))
+    (cond
+      (= (load count) 0)
+        (do (p/report steps
+              (p/code-str "production has no (repeat ...) step for role: " role)) -1)
+      (> (load count) 1)
+        (do (p/report steps
+              (p/code-str "production has more than one (repeat ...) step for role: " role)) -1)
+      :else (load found))))
+
+;; Byte of a (terminal B) step, for a strategy that must both stop a repetition
+;; at a closing terminal and then consume it.
+(defn terminal-step-byte [(steps Code) (index i64) (role (slice u8))] (-> Code)
+  (if (or (< index 0) (>= index (p/code-count steps))
+          (not (step-form? (p/code-nth steps index) "terminal")))
+      (do (p/report steps
+            (p/code-str "production needs a closing terminal step for: " role))
+          `(cast u8 0))
+    `(cast u8 ~(p/code-nth (p/code-nth steps index) 1))))
+
+(defn named-steps [(production Code) (name (slice u8))] (-> Code)
+  (let [steps (field-value production name)]
+    (if (not (p/code-vector? steps))
+        (generator-fail production
+          (p/code-str "field must be a normalized grammar step vector: " name))
+      steps)))
+
+(defn production-steps [(production Code)] (-> Code)
+  (let [steps (field-value production "steps")]
+    (if (not (p/code-vector? steps))
+        (generator-fail production
+          "production `steps` must be the grammar's normalized step vector")
+      steps)))
+
+;; Index of the single (rule NAME) step matching `rule`. Missing or ambiguous
+;; roles fail expansion: the grammar and the strategy must agree.
+(defn rule-step-index [(steps Code) (rule Code) (role (slice u8))] (-> i64)
+  (let [(mut i) 0 (mut found) -1 (mut count) 0]
+    (loop
+      (if (>= (load i) (p/code-count steps)) (break)
+        (let [step (p/code-nth steps (load i))]
+          ;; The role names a grammar rule by spelling. The step symbols come
+          ;; from the grammar module, so they are compared by name rather than
+          ;; by hygienic identity.
+          (if (and (step-form? step "rule") (= (p/code-count step) 2)
+                   (p/code-sym? (p/code-nth step 1)) (p/code-sym? rule)
+                   (= (p/code-sym (p/code-nth step 1)) (p/code-sym rule)))
+              (do (if (< (load found) 0) (store! found (load i)) 0)
+                  (set! count (+ (load count) 1))) 0)
+          (set! i (+ (load i) 1)))))
+    (cond
+      (= (load count) 0)
+        (do (p/report steps
+              (p/code-str "production has no (rule ...) step for role: " role)) -1)
+      (> (load count) 1)
+        (do (p/report steps
+              (p/code-str "production has more than one (rule ...) step for role: " role)) -1)
+      :else (load found))))
+
+;; Emit the terminal and keyword steps in [from, to) around the rule steps a
+;; strategy handles itself, wrapping `rest`. `dispatched-prefix` marks a leading
+;; keyword the statement dispatcher already matched, which is advanced past
+;; rather than re-checked.
+(defn compile-step-range
+  [(backend Code) (steps Code) (from i64) (to i64) (state Code)
+   (dispatched-prefix bool) (rest Code)] (-> Code)
+  (if (>= from to) rest
+    (let [step (p/code-nth steps from)
+          tail (compile-step-range backend steps (+ from 1) to state
+                                   dispatched-prefix rest)
+          consume-code (backend-value backend "consume-byte")
+          advance-code (backend-value backend "advance")
+          current-keyword-code (backend-value backend "current-keyword")]
+      (cond
+        (and (step-form? step "terminal") (= (p/code-count step) 2))
+          `(if (not (~consume-code ~state (cast u8 ~(p/code-nth step 1)))) 0 ~tail)
+        ;; A keyword the dispatcher already matched is only advanced past. Any
+        ;; later keyword is a real requirement of the production, so a mismatch
+        ;; records the expected-token error rather than returning quietly.
+        (and (step-form? step "keyword") (= (p/code-count step) 2))
+          (if (and dispatched-prefix (= from 0))
+              `(let [_dispatched-keyword (~advance-code ~state)] ~tail)
+            `(if (not (~current-keyword-code ~state ~(p/code-nth step 1)))
+                 (do (~(backend-value backend "fail") ~state
+                       ~(backend-value backend "expected-error")) 0)
+               (let [_keyword (~advance-code ~state)] ~tail)))
+        :else
+          (generator-fail step
+            "this production step has no generated action in this strategy")))))
+
 (defn compile-spread-value [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 5)
                 (generator-form? production "spread-value")))
@@ -3915,8 +4077,16 @@
                               (p/code-sym (field-value production "terminator-parser")))
           check-build-code (backend-value backend "check-build")
           ok-error (backend-value backend "ok-error")
-          prefix (field-value production "prefix")
-          terminator (field-value production "terminator")
+          steps (production-steps production)
+          value-index (rule-step-index steps (field-value production "value") "value")
+          terminator-index (terminator-step-index steps "statement end")
+          ;; A production whose value rule is not first carries a leading
+          ;; keyword the dispatcher matched; the operation then spans from that
+          ;; keyword rather than from the expression.
+          prefixed (> value-index 0)
+          terminator (if (>= terminator-index 0)
+                         `(cast u8 ~(p/code-nth (p/code-nth steps terminator-index) 1))
+                       `(cast u8 0))
           opcode (field-value production "emit-op")
           terminate (field-value production "terminate")
           optional (field-value production "optional")
@@ -3926,16 +4096,17 @@
           value-id (p/fresh-identifier "value")
           end-id (p/fresh-identifier "end-position")
           line-break-id (p/fresh-identifier "has-line-break")
-          prefix-action (if (generator-symbol? prefix "true")
-                            `(~advance-code ~state) `0)
-          operation-start (if (generator-symbol? prefix "true")
-                              start-id `(.start ~value-id))
+          operation-start (if prefixed start-id `(.start ~value-id))
           terminate-action (if (generator-symbol? terminate "true")
                                `(set! (.terminated ~state) true) `0)]
+      (if (or (< value-index 0) (< terminator-index 0)) `(do 0)
+       (if (<= terminator-index value-index)
+           (generator-fail production
+             "terminated-expression requires the value rule to precede the terminator")
       `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
-         (let [~start-id (~current-position-code ~state)
-               _prefix ~prefix-action]
-           (let [~line-break-id
+         (let [~start-id (~current-position-code ~state)]
+           ~(compile-step-range backend steps 0 value-index state true
+           `(let [~line-break-id
                    ~(if (generator-symbol? line-break "ignore") `false
                       `(~current-line-break-code ~state))]
              (if (and ~(if (generator-symbol? line-break "forbid") `true `false)
@@ -3964,8 +4135,8 @@
                            operand (builder/add-operand! (.builder ~state) op (.value ~value-id))]
                        (~check-build-code ~state operand)
                        ~terminate-action)) 0)))))
-             ))
-         0))))
+             )))
+         0))))))
 
 (defn compile-named-property-emission
   [(state Code) (result-type Code) (check-build-code Code) (opcode Code)
@@ -6188,41 +6359,50 @@
           current-position-code (backend-value backend "current-position")
           current-byte-code (backend-value backend "current-byte")
           consume-code (backend-value backend "consume-byte")
-          fail-code (backend-value backend "fail")
           check-build-code (backend-value backend "check-build")
           element-parser (backend-value backend
                            (p/code-sym (field-value production "element-parser")))
           ok-error (backend-value backend "ok-error")
-          open (field-value production "open") close (field-value production "close")
-          state (p/fresh-identifier "state")]
-      `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
-         (let [start (~current-position-code ~state) parent-scope (.scope ~state)]
-           (if (~consume-code ~state ~open)
-               (let [scope-result (builder/add-scope! (.builder ~state) parent-scope start
-                                      (cast u32 (.source-size ~state)))
-                     scope (~check-build-code ~state scope-result)]
-                 (set! (.scope ~state) scope)
-                 (loop
-                   (if (or (!= (.error ~state) ~ok-error)
-                           (>= (.event-index ~state) (.event-count ~state))
-                           (= (~current-byte-code ~state) ~close)) (break)
-                     (do
-                       (if (.terminated ~state)
-                           (let [arena (.arena (.builder ~state))
-                                 region (load (p/index (.block-regions arena)
-                                                       (cast i64 (.block ~state))))
-                                 block-result (builder/add-block! (.builder ~state) region)
-                                 block (~check-build-code ~state block-result)]
-                             (set! (.block ~state) block)
-                             (set! (.terminated ~state) false)) 0)
-                       (~element-parser ~state))))
-                 (let [end-position (~current-position-code ~state)]
-                   (if (~consume-code ~state ~close)
-                       (let [ended (builder/set-scope-end! (.builder ~state) scope
-                                      (+ end-position (cast u32 1)))]
-                         (~check-build-code ~state ended)) 0))
-                 (set! (.scope ~state) parent-scope)) 0))
-         0))))
+          steps (production-steps production)
+          repeat-index (repeat-step-index steps (field-value production "element")
+                                          "element")
+          close (terminal-step-byte steps (+ repeat-index 1) "repetition end")
+          state (p/fresh-identifier "state")
+          start-id (p/fresh-identifier "start")
+          scope-id (p/fresh-identifier "scope")
+          parent-scope-id (p/fresh-identifier "parent-scope")]
+      (if (< repeat-index 0) `(do 0)
+        `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
+           (let [~start-id (~current-position-code ~state)
+                 ~parent-scope-id (.scope ~state)]
+             ~(compile-step-range backend steps 0 repeat-index state false
+                `(let [scope-result (builder/add-scope! (.builder ~state) ~parent-scope-id
+                                       ~start-id (cast u32 (.source-size ~state)))
+                       ~scope-id (~check-build-code ~state scope-result)]
+                   (set! (.scope ~state) ~scope-id)
+                   (loop
+                     (if (or (!= (.error ~state) ~ok-error)
+                             (>= (.event-index ~state) (.event-count ~state))
+                             (= (~current-byte-code ~state) ~close)) (break)
+                       (do
+                         (if (.terminated ~state)
+                             (let [arena (.arena (.builder ~state))
+                                   region (load (p/index (.block-regions arena)
+                                                         (cast i64 (.block ~state))))
+                                   block-result (builder/add-block! (.builder ~state) region)
+                                   block (~check-build-code ~state block-result)]
+                               (set! (.block ~state) block)
+                               (set! (.terminated ~state) false)) 0)
+                         (~element-parser ~state))))
+                   (let [end-position (~current-position-code ~state)]
+                     (if (~consume-code ~state ~close)
+                         (let [ended (builder/set-scope-end! (.builder ~state) ~scope-id
+                                        (+ end-position (cast u32 1)))]
+                           (~check-build-code ~state ended)) 0))
+                   (set! (.scope ~state) ~parent-scope-id)
+                   ~(compile-step-range backend steps (+ repeat-index 2)
+                      (p/code-count steps) state false `0))))
+           0)))))
 
 (defn compile-class-parameter [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 8)
@@ -7553,8 +7733,11 @@
            (set! (.terminated ~state) parent-terminated)
            0)))))
 
+;; if/else. The grammar decides both clauses' keywords, the delimiters around
+;; the condition, and where each branch's statement sits. This strategy supplies
+;; only the diamond CFG and the join-block fallthrough rule.
 (defn compile-conditional-statement [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 7)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 9)
                 (generator-form? production "conditional-statement")))
       (generator-fail production "invalid conditional-statement production")
     (let [state-type (backend-value backend "state-type")
@@ -7562,125 +7745,171 @@
                           (p/code-sym (field-value production "function")))
           current-position-code (backend-value backend "current-position")
           advance-code (backend-value backend "advance")
-          consume-code (backend-value backend "consume-byte")
           parse-expression-code (backend-value backend "parse-expression")
           parse-statement-code (backend-value backend "parse-statement")
           current-keyword-code (backend-value backend "current-keyword")
           emit-branch-code (backend-value backend "emit-branch")
           check-build-code (backend-value backend "check-build")
-          open (field-value production "open") close (field-value production "close")
-          else-keyword (field-value production "else-keyword")
           branch-op (field-value production "branch-op")
-          state (p/fresh-identifier "state")]
-      `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
-         (let [start (~current-position-code ~state) _keyword (~advance-code ~state)]
-           (if (not (~consume-code ~state ~open)) 0
-             (let [condition (~parse-expression-code ~state 0)]
-               (if (not (~consume-code ~state ~close)) 0
-                 (let [arena (.arena (.builder ~state)) origin (.block ~state)
-                       region (load (p/index (.block-regions arena) (cast i64 origin)))
-                       then-result (builder/add-block! (.builder ~state) region)
-                       then-block (~check-build-code ~state then-result)
-                       else-result (builder/add-block! (.builder ~state) region)
-                       else-block (~check-build-code ~state else-result)
-                       branch-result (builder/add-op! (.builder ~state) origin ~branch-op
-                                      (cast u32 0) (cast u32 0) start
-                                      (~current-position-code ~state) (cast u32 0))]
-                   (let [branch (~check-build-code ~state branch-result)
-                         operand (builder/add-operand! (.builder ~state) branch
-                                                       (.value condition))
-                         then-successor (builder/add-successor! (.builder ~state) branch
-                                                                then-block)
-                         else-successor (builder/add-successor! (.builder ~state) branch
-                                                                else-block)]
-                     (~check-build-code ~state operand)
-                     (~check-build-code ~state then-successor)
-                     (~check-build-code ~state else-successor))
-                   (set! (.block ~state) then-block)
-                   (set! (.terminated ~state) false)
-                   (~parse-statement-code ~state)
-                   (let [then-exit (.block ~state)
-                         then-falls (not (.terminated ~state))]
-                     (set! (.block ~state) else-block)
-                     (set! (.terminated ~state) false)
-                     (if (~current-keyword-code ~state ~else-keyword)
-                         (do (~advance-code ~state) (~parse-statement-code ~state)) 0)
-                     (let [else-exit (.block ~state)
-                           else-falls (not (.terminated ~state))]
-                       (if (or then-falls else-falls)
-                           (let [join-result (builder/add-block! (.builder ~state) region)
-                                 join-block (~check-build-code ~state join-result)]
-                             (if then-falls
-                                 (~emit-branch-code ~state then-exit join-block) 0)
-                             (if else-falls
-                                 (~emit-branch-code ~state else-exit join-block) 0)
-                             (set! (.block ~state) join-block)
-                             (set! (.terminated ~state) false))
-                         (set! (.terminated ~state) true)))))))))
-         0))))
+          steps (production-steps production)
+          else-steps (named-steps production "else-steps")
+          condition-index (rule-step-index steps (field-value production "condition")
+                                           "condition")
+          consequent-index (rule-step-index steps (field-value production "consequent")
+                                            "consequent")
+          else-keyword-index (keyword-step-index else-steps "else clause")
+          alternate-index (rule-step-index else-steps (field-value production "alternate")
+                                           "alternate")
+          state (p/fresh-identifier "state")
+          start-id (p/fresh-identifier "start")
+          condition-id (p/fresh-identifier "condition")
+          then-block-id (p/fresh-identifier "then-block")
+          else-block-id (p/fresh-identifier "else-block")
+          region-id (p/fresh-identifier "region")]
+      (if (or (< condition-index 0) (< consequent-index 0)
+              (< else-keyword-index 0) (< alternate-index 0)) `(do 0)
+        (if (>= condition-index consequent-index)
+            (generator-fail production
+              "conditional-statement requires the condition rule to precede the consequent rule")
+          `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
+             (let [~start-id (~current-position-code ~state)]
+               ~(compile-step-range backend steps 0 condition-index state true
+                  `(let [~condition-id (~parse-expression-code ~state 0)]
+                     ~(compile-step-range backend steps (+ condition-index 1)
+                        consequent-index state false
+                        `(let [arena (.arena (.builder ~state)) origin (.block ~state)
+                               ~region-id (load (p/index (.block-regions arena) (cast i64 origin)))
+                               then-result (builder/add-block! (.builder ~state) ~region-id)
+                               ~then-block-id (~check-build-code ~state then-result)
+                               else-result (builder/add-block! (.builder ~state) ~region-id)
+                               ~else-block-id (~check-build-code ~state else-result)
+                               branch-result (builder/add-op! (.builder ~state) origin ~branch-op
+                                              (cast u32 0) (cast u32 0) ~start-id
+                                              (~current-position-code ~state) (cast u32 0))]
+                           (let [branch (~check-build-code ~state branch-result)
+                                 operand (builder/add-operand! (.builder ~state) branch
+                                                               (.value ~condition-id))
+                                 then-successor (builder/add-successor! (.builder ~state) branch
+                                                                        ~then-block-id)
+                                 else-successor (builder/add-successor! (.builder ~state) branch
+                                                                        ~else-block-id)]
+                             (~check-build-code ~state operand)
+                             (~check-build-code ~state then-successor)
+                             (~check-build-code ~state else-successor))
+                           (set! (.block ~state) ~then-block-id)
+                           (set! (.terminated ~state) false)
+                           (~parse-statement-code ~state)
+                           ~(compile-step-range backend steps (+ consequent-index 1)
+                              (p/code-count steps) state false
+                              `(let [then-exit (.block ~state)
+                                     then-falls (not (.terminated ~state))]
+                                 (set! (.block ~state) ~else-block-id)
+                                 (set! (.terminated ~state) false)
+                                 (if (~current-keyword-code ~state
+                                       ~(keyword-step-text else-steps else-keyword-index))
+                                     (do (~advance-code ~state)
+                                         ~(compile-step-range backend else-steps
+                                            (+ else-keyword-index 1) alternate-index state false
+                                            `(do (~parse-statement-code ~state)
+                                                 ~(compile-step-range backend else-steps
+                                                    (+ alternate-index 1)
+                                                    (p/code-count else-steps) state false `0))))
+                                   0)
+                                 (let [else-exit (.block ~state)
+                                       else-falls (not (.terminated ~state))]
+                                   (if (or then-falls else-falls)
+                                       (let [join-result (builder/add-block! (.builder ~state) ~region-id)
+                                             join-block (~check-build-code ~state join-result)]
+                                         (if then-falls
+                                             (~emit-branch-code ~state then-exit join-block) 0)
+                                         (if else-falls
+                                             (~emit-branch-code ~state else-exit join-block) 0)
+                                         (set! (.block ~state) join-block)
+                                         (set! (.terminated ~state) false))
+                                     (set! (.terminated ~state) true))))))))))
+             0))))))
 
+;; while-shaped loop. The grammar decides the keyword, the delimiters around the
+;; condition, and where the body sits; this strategy only supplies the CFG
+;; shape (header/body/exit with a backedge), which no grammar can express.
 (defn compile-loop-statement [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 6)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 7)
                 (generator-form? production "loop-statement")))
       (generator-fail production "invalid loop-statement production")
     (let [state-type (backend-value backend "state-type")
           function-name (backend-value backend
                           (p/code-sym (field-value production "function")))
           current-position-code (backend-value backend "current-position")
-          advance-code (backend-value backend "advance")
-          consume-code (backend-value backend "consume-byte")
           parse-expression-code (backend-value backend "parse-expression")
           parse-statement-code (backend-value backend "parse-statement")
           emit-branch-code (backend-value backend "emit-branch")
           check-build-code (backend-value backend "check-build")
           publish-loop-labels-code (backend-value backend "publish-loop-labels")
-          open (field-value production "open") close (field-value production "close")
           branch-op (field-value production "branch-op")
-          state (p/fresh-identifier "state")]
-      `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
-         (let [start (~current-position-code ~state) _keyword (~advance-code ~state)]
-           (if (not (~consume-code ~state ~open)) 0
-             (let [arena (.arena (.builder ~state)) origin (.block ~state)
-                   region (load (p/index (.block-regions arena) (cast i64 origin)))
-                   header-result (builder/add-block! (.builder ~state) region)
-                   header (~check-build-code ~state header-result)
-                   body-result (builder/add-block! (.builder ~state) region)
-                   body (~check-build-code ~state body-result)
-                   exit-result (builder/add-block! (.builder ~state) region)
-                   exit-block (~check-build-code ~state exit-result)]
-               (~emit-branch-code ~state origin header)
-               (set! (.block ~state) header)
-               (set! (.terminated ~state) false)
-               (let [condition (~parse-expression-code ~state 0)]
-                 (if (not (~consume-code ~state ~close)) 0
-                   (let [branch-result (builder/add-op! (.builder ~state) header ~branch-op
-                                          (cast u32 0) (cast u32 0) start
-                                          (~current-position-code ~state) (cast u32 0))]
-                     (let [branch (~check-build-code ~state branch-result)
-                           operand (builder/add-operand! (.builder ~state) branch
-                                                         (.value condition))
-                           body-successor (builder/add-successor! (.builder ~state) branch body)
-                           exit-successor (builder/add-successor! (.builder ~state) branch
-                                                                  exit-block)]
-                       (~check-build-code ~state operand)
-                       (~check-build-code ~state body-successor)
-                       (~check-build-code ~state exit-successor))
-                     (let [parent-break-target (.break-target ~state)
-                           parent-continue-target (.continue-target ~state)]
-                       (set! (.break-target ~state) exit-block)
-                       (set! (.continue-target ~state) header)
-                       (~publish-loop-labels-code ~state header)
-                       (set! (.block ~state) body)
-                       (set! (.terminated ~state) false)
-                       (~parse-statement-code ~state)
-                       (if (not (.terminated ~state))
-                           (~emit-branch-code ~state (.block ~state) header) 0)
-                       (set! (.break-target ~state) parent-break-target)
-                       (set! (.continue-target ~state) parent-continue-target)
-                       (set! (.block ~state) exit-block)
-                       (set! (.terminated ~state) false))))))))
-         0))))
+          steps (production-steps production)
+          condition-index (rule-step-index steps (field-value production "condition")
+                                           "condition")
+          body-index (rule-step-index steps (field-value production "body") "body")
+          state (p/fresh-identifier "state")
+          start-id (p/fresh-identifier "start")
+          header-id (p/fresh-identifier "header")
+          body-id (p/fresh-identifier "body")
+          exit-id (p/fresh-identifier "exit-block")
+          condition-id (p/fresh-identifier "condition")]
+      (if (or (< condition-index 0) (< body-index 0)) `(do 0)
+        (if (>= condition-index body-index)
+            (generator-fail production
+              "loop-statement requires the condition rule to precede the body rule")
+          `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
+             (let [~start-id (~current-position-code ~state)]
+               ~(compile-step-range backend steps 0 condition-index state true
+                  `(let [arena (.arena (.builder ~state)) origin (.block ~state)
+                         region (load (p/index (.block-regions arena) (cast i64 origin)))
+                         header-result (builder/add-block! (.builder ~state) region)
+                         ~header-id (~check-build-code ~state header-result)
+                         body-result (builder/add-block! (.builder ~state) region)
+                         ~body-id (~check-build-code ~state body-result)
+                         exit-result (builder/add-block! (.builder ~state) region)
+                         ~exit-id (~check-build-code ~state exit-result)]
+                     (~emit-branch-code ~state origin ~header-id)
+                     (set! (.block ~state) ~header-id)
+                     (set! (.terminated ~state) false)
+                     (let [~condition-id (~parse-expression-code ~state 0)]
+                       ~(compile-step-range backend steps (+ condition-index 1) body-index
+                          state false
+                          `(let [branch-result (builder/add-op! (.builder ~state) ~header-id ~branch-op
+                                                  (cast u32 0) (cast u32 0) ~start-id
+                                                  (~current-position-code ~state) (cast u32 0))]
+                             (let [branch (~check-build-code ~state branch-result)
+                                   operand (builder/add-operand! (.builder ~state) branch
+                                                                 (.value ~condition-id))
+                                   body-successor (builder/add-successor! (.builder ~state) branch ~body-id)
+                                   exit-successor (builder/add-successor! (.builder ~state) branch
+                                                                          ~exit-id)]
+                               (~check-build-code ~state operand)
+                               (~check-build-code ~state body-successor)
+                               (~check-build-code ~state exit-successor))
+                             (let [parent-break-target (.break-target ~state)
+                                   parent-continue-target (.continue-target ~state)]
+                               (set! (.break-target ~state) ~exit-id)
+                               (set! (.continue-target ~state) ~header-id)
+                               (~publish-loop-labels-code ~state ~header-id)
+                               (set! (.block ~state) ~body-id)
+                               (set! (.terminated ~state) false)
+                               (~parse-statement-code ~state)
+                               (if (not (.terminated ~state))
+                                   (~emit-branch-code ~state (.block ~state) ~header-id) 0)
+                               (set! (.break-target ~state) parent-break-target)
+                               (set! (.continue-target ~state) parent-continue-target)
+                               (set! (.block ~state) ~exit-id)
+                               (set! (.terminated ~state) false)
+                               ~(compile-step-range backend steps (+ body-index 1)
+                                  (p/code-count steps) state false `0))))))))
+             0))))))
 
+;; do/while. The grammar decides both keywords, the delimiters around the trailing
+;; condition, and the statement terminator's position; this strategy supplies the
+;; post-test CFG (body runs before the condition block is entered).
 (defn compile-post-test-loop-statement [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 8)
                 (generator-form? production "post-test-loop-statement")))
@@ -7689,9 +7918,6 @@
           function-name (backend-value backend
                           (p/code-sym (field-value production "function")))
           current-position-code (backend-value backend "current-position")
-          current-keyword-code (backend-value backend "current-keyword-fast")
-          advance-code (backend-value backend "advance")
-          consume-code (backend-value backend "consume-byte")
           parse-expression-code (backend-value backend "parse-expression")
           parse-statement-code (backend-value backend "parse-statement")
           terminator-parser (backend-value backend
@@ -7699,63 +7925,74 @@
           emit-branch-code (backend-value backend "emit-branch")
           check-build-code (backend-value backend "check-build")
           publish-loop-labels-code (backend-value backend "publish-loop-labels")
-          fail-code (backend-value backend "fail")
-          expected-error (backend-value backend "expected-error")
-          while-keyword (field-value production "while-keyword")
-          open (field-value production "open") close (field-value production "close")
           branch-op (field-value production "branch-op")
-          state (p/fresh-identifier "state")]
-      `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
-         (let [start (~current-position-code ~state) _do (~advance-code ~state)
-               arena (.arena (.builder ~state)) origin (.block ~state)
-               region (load (p/index (.block-regions arena) (cast i64 origin)))
-               body-result (builder/add-block! (.builder ~state) region)
-               body (~check-build-code ~state body-result)
-               condition-result (builder/add-block! (.builder ~state) region)
-               condition-block (~check-build-code ~state condition-result)
-               exit-result (builder/add-block! (.builder ~state) region)
-               exit-block (~check-build-code ~state exit-result)
-               parent-break-target (.break-target ~state)
-               parent-continue-target (.continue-target ~state)]
-           (~emit-branch-code ~state origin body)
-           (set! (.break-target ~state) exit-block)
-           (set! (.continue-target ~state) condition-block)
-           (~publish-loop-labels-code ~state condition-block)
-           (set! (.block ~state) body)
-           (set! (.terminated ~state) false)
-           (~parse-statement-code ~state)
-           (if (not (.terminated ~state))
-               (~emit-branch-code ~state (.block ~state) condition-block) 0)
-           (set! (.break-target ~state) parent-break-target)
-           (set! (.continue-target ~state) parent-continue-target)
-           (if (not (~current-keyword-code ~state ~while-keyword))
-               (do (~fail-code ~state ~expected-error) 0)
-             (do
-               (~advance-code ~state)
-               (if (~consume-code ~state ~open)
-                   (do
-                     (set! (.block ~state) condition-block)
+          steps (production-steps production)
+          body-index (rule-step-index steps (field-value production "body") "body")
+          condition-index (rule-step-index steps (field-value production "condition")
+                                           "condition")
+          terminator-index (terminator-step-index steps "do/while statement end")
+          state (p/fresh-identifier "state")
+          start-id (p/fresh-identifier "start")
+          body-id (p/fresh-identifier "body")
+          condition-block-id (p/fresh-identifier "condition-block")
+          exit-id (p/fresh-identifier "exit-block")
+          condition-id (p/fresh-identifier "condition")]
+      (if (or (< body-index 0) (< condition-index 0) (< terminator-index 0)) `(do 0)
+        (if (>= body-index condition-index)
+            (generator-fail production
+              "post-test-loop-statement requires the body rule to precede the condition rule")
+          `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
+             (let [~start-id (~current-position-code ~state)]
+               ~(compile-step-range backend steps 0 body-index state true
+                  `(let [arena (.arena (.builder ~state)) origin (.block ~state)
+                         region (load (p/index (.block-regions arena) (cast i64 origin)))
+                         body-result (builder/add-block! (.builder ~state) region)
+                         ~body-id (~check-build-code ~state body-result)
+                         condition-result (builder/add-block! (.builder ~state) region)
+                         ~condition-block-id (~check-build-code ~state condition-result)
+                         exit-result (builder/add-block! (.builder ~state) region)
+                         ~exit-id (~check-build-code ~state exit-result)
+                         parent-break-target (.break-target ~state)
+                         parent-continue-target (.continue-target ~state)]
+                     (~emit-branch-code ~state origin ~body-id)
+                     (set! (.break-target ~state) ~exit-id)
+                     (set! (.continue-target ~state) ~condition-block-id)
+                     (~publish-loop-labels-code ~state ~condition-block-id)
+                     (set! (.block ~state) ~body-id)
                      (set! (.terminated ~state) false)
-                     (let [condition (~parse-expression-code ~state 0)]
-                       (if (~consume-code ~state ~close)
-                           (let [branch-result
-                                  (builder/add-op! (.builder ~state) condition-block ~branch-op
-                                    (cast u32 0) (cast u32 0) start
-                                    (~current-position-code ~state) (cast u32 0))]
-                             (let [branch (~check-build-code ~state branch-result)
-                                   operand (builder/add-operand! (.builder ~state) branch
-                                                                 (.value condition))
-                                   body-successor (builder/add-successor! (.builder ~state)
-                                                    branch body)
-                                   exit-successor (builder/add-successor! (.builder ~state)
-                                                    branch exit-block)]
-                               (~check-build-code ~state operand)
-                               (~check-build-code ~state body-successor)
-                               (~check-build-code ~state exit-successor))
-                             (~terminator-parser ~state (~current-position-code ~state))
-                             (set! (.block ~state) exit-block)
-                             (set! (.terminated ~state) false)) 0)) 0) 0))))
-         0))))
+                     (~parse-statement-code ~state)
+                     (if (not (.terminated ~state))
+                         (~emit-branch-code ~state (.block ~state) ~condition-block-id) 0)
+                     (set! (.break-target ~state) parent-break-target)
+                     (set! (.continue-target ~state) parent-continue-target)
+                     ~(compile-step-range backend steps (+ body-index 1) condition-index
+                        state false
+                        `(do
+                           (set! (.block ~state) ~condition-block-id)
+                           (set! (.terminated ~state) false)
+                           (let [~condition-id (~parse-expression-code ~state 0)]
+                             ~(compile-step-range backend steps (+ condition-index 1)
+                                terminator-index state false
+                                `(let [branch-result
+                                        (builder/add-op! (.builder ~state) ~condition-block-id
+                                          ~branch-op (cast u32 0) (cast u32 0) ~start-id
+                                          (~current-position-code ~state) (cast u32 0))]
+                                   (let [branch (~check-build-code ~state branch-result)
+                                         operand (builder/add-operand! (.builder ~state) branch
+                                                                       (.value ~condition-id))
+                                         body-successor (builder/add-successor! (.builder ~state)
+                                                          branch ~body-id)
+                                         exit-successor (builder/add-successor! (.builder ~state)
+                                                          branch ~exit-id)]
+                                     (~check-build-code ~state operand)
+                                     (~check-build-code ~state body-successor)
+                                     (~check-build-code ~state exit-successor))
+                                   (~terminator-parser ~state (~current-position-code ~state))
+                                   (set! (.block ~state) ~exit-id)
+                                   (set! (.terminated ~state) false)
+                                   ~(compile-step-range backend steps (+ terminator-index 1)
+                                      (p/code-count steps) state false `0)))))))))
+             0))))))
 
 (defn compile-for-kind-lookahead [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 12)
@@ -9152,8 +9389,8 @@
         (emit-op ir/OP-JS-OBJECT))
       (terminated-expression return-statement
         (function parse-return)
-        (prefix true)
-        (terminator (syntax/return-production-terminal 2))
+        (steps ~(syntax/return-production-steps))
+        (value expression)
         (emit-op ir/OP-RETURN)
         (terminator-parser parse-statement-end)
         (optional true)
@@ -9161,8 +9398,8 @@
         (line-break asi))
       (terminated-expression throw-statement
         (function parse-throw)
-        (prefix true)
-        (terminator (syntax/throw-production-terminal 2))
+        (steps ~(syntax/throw-production-steps))
+        (value expression)
         (emit-op ir/OP-THROW)
         (terminator-parser parse-statement-end)
         (optional false)
@@ -9170,8 +9407,8 @@
         (line-break forbid))
       (terminated-expression expression-statement
         (function parse-expression-statement)
-        (prefix false)
-        (terminator (syntax/expression-statement-production-terminal 1))
+        (steps ~(syntax/expression-statement-production-steps))
+        (value expression)
         (emit-op ir/OP-JS-EXPRESSION)
         (terminator-parser parse-statement-end)
         (optional false)
@@ -9509,8 +9746,8 @@
         (fallback-parser parse-expression-statement))
       (scoped-repeat block-statement
         (function parse-block)
-        (open (syntax/block-production-terminal 0))
-        (close (syntax/block-production-terminal 2))
+        (steps ~(syntax/block-production-steps))
+        (element statement)
         (element-parser parse-statement)
         (scope true))
       (binding-declaration variable-declaration
@@ -9582,9 +9819,11 @@
         (fallthrough-op ir/OP-UNREACHABLE))
       (conditional-statement if-statement
         (function parse-if)
-        (open (syntax/if-production-terminal 1))
-        (close (syntax/if-production-terminal 3))
-        (else-keyword (syntax/else-clause-production-keyword 0))
+        (steps ~(syntax/if-production-steps))
+        (condition expression)
+        (consequent statement)
+        (else-steps ~(syntax/else-clause-production-steps))
+        (alternate statement)
         (branch-op ir/OP-COND-BR))
       (try-statement try-catch-finally-statement
         (function parse-try)
@@ -9598,14 +9837,15 @@
         (yield-op ir/OP-YIELD))
       (loop-statement while-statement
         (function parse-while)
-        (open (syntax/while-production-terminal 1))
-        (close (syntax/while-production-terminal 3))
+        (steps ~(syntax/while-production-steps))
+        (condition expression)
+        (body statement)
         (branch-op ir/OP-COND-BR))
       (post-test-loop-statement do-while-statement
         (function parse-do-while)
-        (while-keyword (syntax/do-while-production-keyword 2))
-        (open (syntax/do-while-production-terminal 3))
-        (close (syntax/do-while-production-terminal 5))
+        (steps ~(syntax/do-while-production-steps))
+        (body statement)
+        (condition expression)
         (terminator-parser parse-statement-end)
         (branch-op ir/OP-COND-BR))
       (for-kind-lookahead javascript-for-kind

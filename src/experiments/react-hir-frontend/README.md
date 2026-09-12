@@ -98,14 +98,41 @@ The implemented pipeline is:
     scopes, bindings, references, and captures. Byte-identical print/parse/print
     tests cover a CFG with a join block parameter, a parsed multi-block
     statement CFG, and nested regions with lexical capture metadata.
-16. `parser_generator.coil` begins the actual semantic parser-generator layer.
-    A declarative `separated-value` production now generates the full direct
-    array parser at Coil compile time: repetition, separators, caller-owned
-    scratch lifetime, diagnostics, spans, and IR emission. The handwritten
-    array parser was deleted, nested aggregate regressions pass through the
-    generated function, and macro expansion exposes the generated Coil for
-    inspection. Other productions remain handwritten until migrated through
-    general generator forms rather than construct-specific parser additions.
+16. `parser_generator.coil` is the semantic parser-generator layer. Every
+    construct parser is emitted at Coil compile time; `direct_parser.coil`
+    defines no `parse-` function of its own, only the cursor, UTF-8, span,
+    binding, and scratch primitives a generated parser calls.
+
+    Two things are genuinely determined by `frontend_spec.coil` rather than by
+    the generator. Operator precedence and longest-match width come from the
+    `operators` table, so adding an operator is a one-line grammar edit. And for
+    the productions listed below, the *shape* is authoritative:
+    `def-frontend-grammar` emits a `NAME-production-steps` accessor holding the
+    normalized step vector (terminal and separator names already resolved to
+    bytes), the generator splices it in at expansion time, and the strategy
+    walks it in order. Deleting the parentheses from `while-production` yields a
+    working parser for `while cond { ... }`; renaming a clause keyword moves the
+    parser with it. A production that no longer supplies a role its strategy
+    needs is a hard expansion error, never a silently broken parser.
+    `benchmarks/check-grammar-authority.sh` proves all of this by perturbing the
+    grammar, rebuilding, and asserting the parser followed.
+
+    Shape-authoritative so far: `while`, `if`/`else`, `do`/`while`, blocks, and
+    the terminated statements (`return`, `throw`, expression statements). A
+    `(terminator BYTE)` step marks an ASI-eligible statement end, which the
+    strategy routes through the statement-end parser instead of a plain byte
+    consume.
+
+    The remaining strategies still reach into a production by fixed step index
+    (`(syntax/for-production-terminal 1)`), which makes their productions a bag
+    of byte constants rather than a grammar: the sequencing is re-encoded by
+    hand inside the `compile-` function, so reshaping one of those productions
+    does not reshape its parser. They also remain one `compile-` function per
+    construct — 69 strategy kinds across 74 production instances, of which only
+    `terminated-expression`, `structured-type-span`, `separated-value`,
+    `control-transfer`, and `class-parameter` are reused at all. Migrating the
+    rest, and collapsing the one-off strategies into general forms, is the open
+    work.
 
 All bitmap-producing entry points accept an explicit valid byte count. SIMD
 tail fill bytes therefore cannot appear as source events. Tape writes report
