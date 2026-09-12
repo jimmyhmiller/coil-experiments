@@ -6679,11 +6679,64 @@
                                 (p/code-count steps) state false `0)))))))
              0))))))
 
+;; Every keyword a dispatcher can match is a string literal in its own generator
+;; entry, and each of those came from the grammar. Collecting them at expansion
+;; time yields the set of first bytes and the length range a word must fall in
+;; to be worth testing, so a word matching neither skips the whole chain.
+;; The walk is deliberately over-broad - it takes every string in the entry,
+;; including ones that are not statement-leading - because a superset only makes
+;; the guard more permissive, while missing one would change the language.
+(defn note-keyword-shape! [(value Code) (cells (ptr i64))] (-> i64)
+  (if (not (p/code-string? value)) 0
+    (let [text (p/code-str value) width (len text)]
+      (if (= width 0) 0
+        (let [byte (cast i64 (slice-get text 0))
+              word (p/idiv byte 64)
+              slot (p/index cells (+ 2 word))]
+          (if (< width (load (p/index cells 0)))
+              (store! (p/index cells 0) width) 0)
+          (if (> width (load (p/index cells 1)))
+              (store! (p/index cells 1) width) 0)
+          (store! slot (p/ior (load slot) (p/ishl 1 (% byte 64))))
+          0)))))
+
+(defn walk-keyword-shapes! [(value Code) (cells (ptr i64)) (depth i64)] (-> i64)
+  (do
+    (note-keyword-shape! value cells)
+    (if (and (< depth 4) (or (p/code-vector? value) (p/code-list? value)))
+        (let [(mut i) 0]
+          (loop
+            (if (>= (load i) (p/code-count value)) (break)
+              (do (walk-keyword-shapes! (p/code-nth value (load i)) cells (+ depth 1))
+                  (set! i (+ (load i) 1)))))
+          0)
+      0)))
+
+(defn keyword-shape-guard [(production Code) (byte-code Code) (length-code Code)] (-> Code)
+  (let [cells (p/alloc-stack (array i64 6))
+        base (p/cast (ptr i64) cells)]
+    (store! (p/index base 0) 1000) (store! (p/index base 1) 0)
+    (store! (p/index base 2) 0) (store! (p/index base 3) 0)
+    (store! (p/index base 4) 0) (store! (p/index base 5) 0)
+    (walk-keyword-shapes! production base 0)
+    (if (= (load (p/index base 1)) 0) `false
+      `(let [shape-byte (cast i64 ~byte-code) shape-length ~length-code]
+         (and (>= shape-length ~(load (p/index base 0)))
+              (<= shape-length ~(load (p/index base 1)))
+              (!= (p/iand
+                    (cond (< shape-byte 64) ~(load (p/index base 2))
+                          (< shape-byte 128) ~(load (p/index base 3))
+                          (< shape-byte 192) ~(load (p/index base 4))
+                          :else ~(load (p/index base 5)))
+                    (p/ishl 1 (% shape-byte 64)))
+                  0))))))
+
 (defn compile-statement-dispatch [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 68)
                 (generator-form? production "statement-dispatch")))
       (generator-fail production "invalid statement-dispatch production")
-    (let [state-type (backend-value backend "state-type")
+    (let [current-word-end-code (backend-value backend "current-word-end")
+          state-type (backend-value backend "state-type")
           function-role (field-value production "function")
           function-name (backend-value backend (p/code-sym function-role))
           current-byte-code (backend-value backend "current-byte")
@@ -6822,6 +6875,17 @@
              labeled (~label-parser ~state)
              (= (~current-byte-code ~state) ~decorator-prefix) (~decorator-parser ~state)
              (= (~current-byte-code ~state) ~empty-terminal) (~advance-code ~state)
+             ;; A word whose first byte and length match no keyword the grammar
+             ;; declares cannot begin any statement form below, so it goes
+             ;; straight to the expression statement instead of falling through
+             ;; every keyword test. The label and delimiter cases above are
+             ;; already settled, so bypassing here changes none of them.
+             (and (= (~event-kind-code (~current-event-code ~state)) (cast u8 ~word-event))
+                  (not ~(keyword-shape-guard production
+                          `(~current-byte-code ~state)
+                          `(- (cast i64 (~current-word-end-code ~state))
+                              (cast i64 (~current-position-code ~state))))))
+               (~fallback-parser ~state)
              (or (and (~current-keyword-code ~state ~import-keyword)
                       (or (= (~next-event-byte-code ~state 2) ~equals)
                           (and (~next-event-keyword-code ~state 1 ~type-keyword)
