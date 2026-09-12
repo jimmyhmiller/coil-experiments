@@ -20,3 +20,7 @@ for (const {name} of records) {
 for (state.current of records) {
   consume(state.current);
 }
+
+for await (const value of asyncValues) {
+  consume(value);
+}

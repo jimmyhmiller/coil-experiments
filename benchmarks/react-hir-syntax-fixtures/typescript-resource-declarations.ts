@@ -13,6 +13,10 @@ for (await using item of asyncResources) {
   consume(item);
 }
 
+for await (await using item of asyncResources) {
+  consume(item);
+}
+
 for (using of resources) {
   consume(using);
 }
