@@ -1,0 +1,102 @@
+(module experiments.image.jit-host)
+
+; The JIT-backed image host, packaged as a prebuilt static library.
+;
+; Embedding the live controller means embedding Coil's in-process compiler
+; (`coil.jit`), which is a large program in its own right — recompiling it from
+; source on every application build costs tens of seconds. It does not change
+; between application builds, so it should be compiled once:
+;
+;   coil build src/experiments/image/jit_host.coil --lib -o build/libcoilimage.a
+;
+; An application then links that archive and reaches the live world through the
+; narrow C ABI below, instead of importing the controller. Because the library
+; owns the live runtime's `alloc-static` registries, an application must NOT
+; also import `experiments.heap-inspector.live` — there would be two disjoint
+; sets of registry cells. Everything an application needs is exported here.
+;
+; Link it with the archive force-loaded and symbols exported dynamically: the
+; `coil_live_*` entry points are resolved by JIT-compiled candidate code through
+; dlsym(RTLD_DEFAULT) at runtime, so they must survive linking and appear in the
+; dynamic symbol table.
+;
+;   coil build app.coil -o app \
+;     --link-flag -Wl,-force_load,build/libcoilimage.a \
+;     --link-flag -Wl,-export_dynamic
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :use *)
+(import "experiments.image.format" :use *)
+(import "experiments.image.image" :as image)
+(import "experiments.image.image-boot" :as iboot)
+(import "experiments.image.bake" :as bake)
+(import "experiments.image.ledger" :as ledger)
+(import "experiments.heap-inspector.live" :as live)
+
+(defn host-slice [(p (ptr u8)) (n i64)] (-> (slice u8)) (slice-new p n))
+
+;;; Submit one source edit through the live controller, recording it in the
+;;; ledger on success. `kind` is IMAGE-LEDGER-BASE / EDIT / RECOVERY.
+(defn host-edit [(src (ptr u8)) (n i64) (kind i64)] (-> i64)
+  (iboot/image-controller-edit! (host-slice src n) kind))
+
+;;; Save the live world to a path.
+(defn host-save [(path (ptr u8)) (n i64) (mode i64)] (-> i64)
+  (image/image-save! (host-slice path n) mode))
+
+;;; Full boot: replay the ledger through the controller, then overlay heap state.
+(defn host-boot [(path (ptr u8)) (n i64)] (-> i64)
+  (iboot/image-boot! (host-slice path n)))
+
+;;; Data reload only: schemas + graph, no code replay.
+(defn host-load-data [(path (ptr u8)) (n i64)] (-> i64)
+  (image/image-load-data! (host-slice path n)))
+
+;;; Full boot from a baked executable.
+(defn host-boot-baked [(path (ptr u8)) (n i64)] (-> i64)
+  (iboot/image-boot-baked! (host-slice path n)))
+
+;;; Data-reload boot from a baked executable.
+(defn host-boot-baked-data [(path (ptr u8)) (n i64)] (-> i64)
+  (bake/image-boot-baked-data! (host-slice path n)))
+
+(defn host-bake [(src (ptr u8)) (sn i64) (img (ptr u8)) (in i64)
+                 (out (ptr u8)) (on i64)] (-> i64)
+  (bake/image-bake! (alloc/malloc-allocator)
+    (host-slice src sn) (host-slice img in) (host-slice out on)))
+
+(defn host-is-baked [(path (ptr u8)) (n i64)] (-> i64)
+  (if (bake/image-baked? (alloc/malloc-allocator) (host-slice path n)) 1 0))
+
+(defn host-ledger-count [] (-> i64) (ledger/ledger-count))
+
+;;; The payload of the live root named `name`, or null. This is how a linked
+;;; application reads restored state without importing the live runtime.
+(defn host-root-payload [(name (ptr u8)) (n i64)] (-> (ptr i8))
+  (let [want (host-slice name n)
+        roots (live/live-roots)
+        (mut found) (primitive/cast (ptr i8) 0)]
+    (for [i 0 (load (live/live-root-count))]
+      (let [r (primitive/index roots i)]
+        (if (and (.live r) (live/live-text=? (.name r) want))
+            (let [h (.handle r)]
+              (set! found (live/live-handle-payload h (.runtime-id h) (.schema-id h))))
+            0)))
+    (load found)))
+
+(defn host-root-count [] (-> i64) (load (live/live-root-count)))
+(defn host-handle-count [] (-> i64) (load (live/live-handle-count)))
+
+(export-c [host-edit :as "coil_img_edit"]
+          [host-save :as "coil_img_save"]
+          [host-boot :as "coil_img_boot"]
+          [host-load-data :as "coil_img_load_data"]
+          [host-boot-baked :as "coil_img_boot_baked"]
+          [host-boot-baked-data :as "coil_img_boot_baked_data"]
+          [host-bake :as "coil_img_bake"]
+          [host-is-baked :as "coil_img_is_baked"]
+          [host-ledger-count :as "coil_img_ledger_count"]
+          [host-root-payload :as "coil_img_root_payload"]
+          [host-root-count :as "coil_img_root_count"]
+          [host-handle-count :as "coil_img_handle_count"])

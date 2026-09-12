@@ -1,0 +1,587 @@
+(module experiments.live.enable-transform)
+
+;;; The whole-program transform behind experiments.live.enable (see there for
+;;; what a live build is). It stays apart from the host so the metaprogram
+;;; engine compiles only this module: the host, the live runtime and the
+;;; in-process compiler are the program's, never the build's.
+;;;
+;;; It checks an unstarted initial generation of the entry module and replaces
+;;; its public `main` with the live host entry. It reports what a running
+;;; program did with the file as it is now at the forms concerned.
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.fs" :as fs)
+(import "coil.os" :as os)
+(import "coil.result" :use *)
+(import "coil.slice" :use [slice-len slice-get subslice])
+(import "coil.str" :as str)
+(import "coil.time" :as time)
+(import "experiments.live.digest" :use [digest digest-hex])
+(import "experiments.heap-inspector.live-reader" :as reader)
+(import "experiments.heap-inspector.live-project" :as project)
+
+(export coil-live-enable)
+
+; How long a build waits for a running program to finish applying the file
+; it is about to report on, in 100 ms steps.
+(const LE-WAIT-STEPS 100)
+
+; ---- text ----------------------------------------------------------------------
+(defn le--cat [(a (dyn alloc/Allocator)) (x (slice u8)) (y (slice u8))] (-> (slice u8))
+  (let [(mut sb) (str/sb-new a)]
+    (str/sb-push-str! (mut sb) x)
+    (str/sb-push-str! (mut sb) y)
+    (str/sb-finish! (mut sb))))
+
+(defn le--push-decimal! [(sb (mut str/StrBuf)) (n i64)] (-> i64)
+  (when (>= n 10) (le--push-decimal! (mut sb) (/ n 10)) 0)
+  (str/sb-push-byte! (mut sb) (primitive/cast u8 (+ 48 (% n 10))))
+  0)
+
+(defn le--decimal [(a (dyn alloc/Allocator)) (n i64)] (-> (slice u8))
+  (let [(mut sb) (str/sb-new a)]
+    (le--push-decimal! (mut sb) n)
+    (str/sb-finish! (mut sb))))
+
+(defn le--slash? [(p (slice u8)) (i i64)] (-> bool)
+  (= (primitive/cast i64 (slice-get p i)) 47))
+
+; P against the build's working directory ROOT.
+(defn le--absolute [(a (dyn alloc/Allocator)) (root (slice u8)) (p (slice u8))] (-> (slice u8))
+  (cond (= (slice-len p) 0) root
+        (le--slash? p 0) p
+        (= p ".") root
+        (and (> (slice-len p) 2) (= (subslice p 0 2) "./"))
+          (le--cat a root (subslice p 1 (slice-len p)))
+        :else (le--cat a (le--cat a root "/") p)))
+
+(defn le--under? [(root (slice u8)) (path (slice u8))] (-> bool)
+  (let [n (slice-len root)]
+    (and (> (slice-len path) (+ n 1))
+         (and (= (subslice path 0 n) root) (le--slash? path n)))))
+
+; ---- forms ---------------------------------------------------------------------
+(defn le--head? [(f Code) (head (slice u8))] (-> bool)
+  (and (primitive/code-list? f)
+       (and (> (primitive/code-count f) 0)
+            (and (primitive/code-sym? (primitive/code-nth f 0))
+                 (= (primitive/code-str (primitive/code-nth f 0)) head)))))
+
+(defn le--user-main? [(f Code)] (-> bool)
+  (and (le--head? f "defn")
+       (and (> (primitive/code-count f) 2)
+            (and (primitive/code-sym? (primitive/code-nth f 1))
+                 (and (= (primitive/code-str (primitive/code-nth f 1)) "main")
+                      (primitive/code-from-user? f))))))
+
+(defn le--imports? [(f Code) (namespace (slice u8))] (-> bool)
+  (and (le--head? f "import")
+       (and (> (primitive/code-count f) 1)
+            (and (primitive/code-string? (primitive/code-nth f 1))
+                 (= (primitive/code-str (primitive/code-nth f 1)) namespace)))))
+
+; Is M the build's entry module? The manifest's `use` puts the import of
+; experiments.live.enable in the entry file only; a file may also import it
+; itself. (Dependency modules count as user code, and may define a `main` of
+; their own, so "the module with a main" is not the entry.)
+(defn le--entry? [(m Code)] (-> bool)
+  (let [(mut found) false]
+    (for [k 1 (primitive/code-count m)]
+      (when (le--imports? (primitive/code-nth m k) "experiments.live.enable")
+        (set! found true)
+        0))
+    (load found)))
+
+; The index in module record M of its user-written `main`, or -1.
+(defn le--main-index [(m Code)] (-> i64)
+  (let [(mut found) -1]
+    (for [k 1 (primitive/code-count m)]
+      (when (and (< (load found) 0) (le--user-main? (primitive/code-nth m k)))
+        (set! found k)
+        0))
+    (load found)))
+
+; The file module record M was read from ("" for one with no user-written form).
+(defn le--record-file [(m Code)] (-> (slice u8))
+  (let [(mut file) ""]
+    (for [k 1 (primitive/code-count m)]
+      (let [f (primitive/code-nth m k)]
+        (when (and (= (slice-len (load file)) 0) (primitive/code-from-user? f))
+          (set! file (primitive/code-file f))
+          0)))
+    (load file)))
+
+; Where a diagnostic about M as a whole goes: its first user-written form. (A
+; module record holds the module's forms under its name; its `(module ...)`
+; declaration is not one of them.)
+(defn le--anchor-index [(m Code)] (-> i64)
+  (let [(mut found) 0]
+    (for [k 1 (primitive/code-count m)]
+      (when (and (= (load found) 0)
+                 (primitive/code-from-user? (primitive/code-nth m k)))
+        (set! found k)
+        0))
+    (load found)))
+
+; PATH as the project names it: relative to ROOT when it is under it.
+(defn le--shown [(root (slice u8)) (path (slice u8))] (-> (slice u8))
+  (if (le--under? root path)
+      (subslice path (+ (slice-len root) 1) (slice-len path))
+      path))
+
+; The index in M of the user-written top-level form starting on LINE, or -1.
+(defn le--line-index [(m Code) (line i64)] (-> i64)
+  (let [(mut found) -1]
+    (when (> line 0)
+      (for [k 1 (primitive/code-count m)]
+        (let [f (primitive/code-nth m k)]
+          (when (and (< (load found) 0)
+                     (and (primitive/code-from-user? f)
+                          (= (primitive/code-line f) line)))
+            (set! found k)
+            0)))
+      0)
+    (load found)))
+
+; The index in PROG of the module record read from absolute PATH, or -1.
+(defn le--record-index [(a (dyn alloc/Allocator))
+                        (prog Code)
+                        (root (slice u8))
+                        (path (slice u8))] (-> i64)
+  (let [(mut found) -1]
+    (for [i 0 (primitive/code-count prog)]
+      (let [file (le--record-file (primitive/code-nth prog i))]
+        (when (and (< (load found) 0)
+                   (and (> (slice-len file) 0)
+                        (= (le--absolute a root file) path)))
+          (set! found i)
+          0)))
+    (load found)))
+
+; ---- the build's view of the project -------------------------------------------
+(defn le--root [(a (dyn alloc/Allocator))] (-> (slice u8))
+  (match (os/current-dir a)
+    (Ok [dir] (os/owned-string-slice dir))
+    (Err [_]
+         (do
+           (primitive/error "coil live: cannot read the build's working directory")
+           ""))))
+
+; The build's namespace roots, absolute and colon-separated, for the host's
+; in-process compiler: it resolves the program's imports exactly as this build.
+(defn le--roots [(a (dyn alloc/Allocator)) (root (slice u8))] (-> (slice u8))
+  (let [raw
+          (match (os/env-get a "COIL_NAMESPACE_ROOTS")
+            (Ok [found]
+                (match found
+                  (Some [s] (os/owned-string-slice s))
+                  (None [] "")))
+            (Err [_] ""))
+        n (slice-len raw)
+        (mut sb) (str/sb-new a)
+        (mut start) 0
+        (mut first) true]
+    (for [i 0 (+ n 1)]
+      (when (if (= i n) true (= (primitive/cast i64 (slice-get raw i)) 58))
+        (when (> i (load start))
+          (unless (load first)
+            (str/sb-push-byte! (mut sb) (primitive/cast u8 58))
+            0)
+          (set! first false)
+          (str/sb-push-str! (mut sb)
+                            (le--absolute a root (subslice raw (load start) i)))
+          0)
+        (set! start (+ i 1))
+        0))
+    (if (load first) root (str/sb-finish! (mut sb)))))
+
+; ---- what the running program did with the file ---------------------------------
+(defn le--pause [] (-> i64)
+  (match (time/duration-millis 100)
+    (Ok [d] (match (time/sleep d) (_ 0)))
+    (Err [_] 0)))
+
+(defn le--alive? [(pid i64)] (-> bool)
+  (and (> pid 0)
+       (= (os/kill (primitive/cast i32 pid) (primitive/cast i32 0))
+          (primitive/cast i32 0))))
+
+; `(live-verdict PID ENTRY DIGEST STATE EPOCH SUMMARY PROBLEMS REMOVED STALE)`, as
+; experiments.live.host writes it.
+(defn le--verdict? [(v Code)] (-> bool)
+  (and (le--head? v "live-verdict")
+       (and (= (primitive/code-count v) 10)
+            (and (primitive/code-int? (primitive/code-nth v 1))
+                 (and (primitive/code-string? (primitive/code-nth v 2))
+                      (primitive/code-string? (primitive/code-nth v 3)))))))
+
+(defn le--read-verdict [(text (slice u8))] (-> Code)
+  (let [parsed
+          (primitive/code-read text `(reader-config :unquote #\~ :splice #\@))]
+    (if (and (le--head? parsed "do") (> (primitive/code-count parsed) 1))
+        (primitive/code-nth parsed 1)
+        parsed)))
+
+(defn le--current? [(a (dyn alloc/Allocator))
+                    (files Code)] (-> bool)
+  (let [(mut current) (> (primitive/code-count files) 0)]
+    (for [i 0 (primitive/code-count files)]
+      (let [f (primitive/code-nth files i)]
+        (match (fs/read-file a (primitive/code-str (primitive/code-nth f 1)))
+          (Ok [text] (unless (= (digest-hex a (digest text))
+                                (primitive/code-str (primitive/code-nth f 2)))
+                       (set! current false) 0))
+          (Err [_] (unless (= (primitive/code-str (primitive/code-nth f 2)) "0000000000000000")
+                       (set! current false) 0)))))
+    (load current)))
+
+(defn le--problem-message [(a (dyn alloc/Allocator))
+                           (who (slice u8))
+                           (state Code)
+                           (p Code)] (-> (slice u8))
+  (let [head (primitive/code-str (primitive/code-nth p 1))
+        name (primitive/code-str (primitive/code-nth p 2))
+        (mut sb) (str/sb-new a)]
+    (str/sb-push-str! (mut sb) who)
+    (str/sb-push-str! (mut sb)
+                      (cond (primitive/code-eq state `:rejected)
+                              " rejected this edit and keeps running its previous version"
+                            (primitive/code-eq state `:needs-migration)
+                              " cannot carry the values it holds into this edit"
+                            (primitive/code-eq state `:needs-restart)
+                              " cannot apply this edit while it runs"
+                            :else " cannot read this file"))
+    (when (> (slice-len name) 0)
+      (str/sb-push-str! (mut sb) " (`")
+      (str/sb-push-str! (mut sb) head)
+      (str/sb-push-str! (mut sb) " ")
+      (str/sb-push-str! (mut sb) name)
+      (str/sb-push-str! (mut sb) "`)")
+      0)
+    (str/sb-push-str! (mut sb) ":\n")
+    (str/sb-push-str! (mut sb) (primitive/code-str (primitive/code-nth p 4)))
+    (str/sb-finish! (mut sb))))
+
+(defn le--report-state! [(a (dyn alloc/Allocator))
+                         (prog Code)
+                         (m Code)
+                         (root (slice u8))
+                         (v Code)] (-> i64)
+  (let [anchor (primitive/code-nth m (le--anchor-index m))
+        who
+          (le--cat a
+                   (le--cat a
+                            "live: the running program (pid "
+                            (le--decimal a
+                                         (primitive/code-int (primitive/code-nth v
+                                                                                 1))))
+                   ")")
+        state (primitive/code-nth v 4)
+        problems (primitive/code-nth v 7)
+        removed (primitive/code-nth v 8)
+        stale (primitive/code-nth v 9)]
+    (unless (primitive/code-eq state `:live)
+      (if (= (primitive/code-count problems) 0)
+          (do
+            (primitive/report anchor
+                              (le--cat a
+                                       (le--cat a who ": ")
+                                       (primitive/code-str (primitive/code-nth v
+                                                                               6))))
+            0)
+          (do
+            (for [i 0 (primitive/code-count problems)]
+              (let [p (primitive/code-nth problems i)
+                    r (if (> (primitive/code-count p) 5)
+                          (le--record-index a prog root (primitive/code-str (primitive/code-nth p 5))) -1)
+                    record (if (< r 0) m (primitive/code-nth prog r))
+                    k
+                      (le--line-index record
+                                      (primitive/code-int (primitive/code-nth p
+                                                                              3)))]
+                (primitive/report (if (< k 0) (primitive/code-nth record (le--anchor-index record)) (primitive/code-nth record k))
+                                  (le--problem-message a who state p))
+                0))
+            0))
+      0)
+    (when (> (primitive/code-count removed) 0)
+      (let [(mut sb) (str/sb-new a)]
+        (str/sb-push-str! (mut sb) who)
+        (str/sb-push-str! (mut sb)
+                          " still runs definitions this file no longer has: ")
+        (for [i 0 (primitive/code-count removed)]
+          (when (> i 0) (str/sb-push-str! (mut sb) ", ") 0)
+          (str/sb-push-str! (mut sb)
+                            (primitive/code-str (primitive/code-nth removed i)))
+          0)
+        (str/sb-push-str! (mut sb)
+                          ". It keeps a definition's last accepted version until it restarts.")
+        (primitive/warn anchor (str/sb-finish! (mut sb)))
+        0)
+      0)
+    0))
+
+; Report, at the forms concerned, what a program running from ENTRY did with
+; the file as it is now. There is nothing to report when no program is
+; running from it. A program still applying an earlier save is given a few
+; seconds to finish, so a build right after a save reports on that save.
+(defn le--report-verdict! [(a (dyn alloc/Allocator))
+                           (prog Code)
+                           (m Code)
+                           (entry (slice u8))
+                           (root (slice u8))] (-> i64)
+  (let [path (le--cat a root "/.coil-live/verdict.coil")
+        (mut tries) 0
+        (mut done) false]
+    (loop (when (load done) (break))
+      (match (fs/read-file a path)
+        (Err [_] (do (set! done true) 0))
+        (Ok [text]
+            (let [v (le--read-verdict text)]
+              (cond (not (le--verdict? v)) (do (set! done true) 0)
+                    (not (le--alive? (primitive/code-int (primitive/code-nth v
+                                                                             1))))
+                      (do (set! done true) 0)
+                    (not (= (primitive/code-str (primitive/code-nth v 2)) entry))
+                      (do (set! done true) 0)
+                    (le--current? a (primitive/code-nth v 9))
+                      (do
+                        (le--report-state! a prog m root v)
+                        (set! done true)
+                        0)
+                    (>= (load tries) LE-WAIT-STEPS)
+                      (do
+                        (primitive/report (primitive/code-nth m
+                                                              (le--anchor-index m))
+                                          (le--cat a
+                                                   (le--cat a
+                                                            "live: the running program (pid "
+                                                            (le--decimal a
+                                                                         (primitive/code-int (primitive/code-nth v
+                                                                                                                 1))))
+                                                   ") has not finished applying this version of the file; check again once it has"))
+                        (set! done true)
+                        0)
+                    :else (do (le--pause) (set! tries (+ (load tries) 1)) 0)))))
+      0)
+    0))
+
+; ---- the transform -------------------------------------------------------------
+; The JIT imports its host callbacks through C symbols. The offline checked
+; copy lives in the host program itself: bind those same declarations to the
+; exported Coil functions instead of declaring an extern against our own export.
+(defn le--host-binding [(prog Code) (f Code) (site Code)] (-> Code)
+  (let [(mut result) f]
+    (when (le--head? f "extern")
+      (let [name (primitive/code-nth f 1)]
+        (for [i 0 (primitive/code-count prog)]
+          (let [m (primitive/code-nth prog i)]
+            (for [j 1 (primitive/code-count m)]
+              (let [decl (primitive/code-nth m j)]
+                (when (le--head? decl "export-c")
+                  (for [k 1 (primitive/code-count decl)]
+                    (let [binding (primitive/code-nth decl k)]
+                      (when (and (= (primitive/code-count binding) 3)
+                                 (= (primitive/code-str (primitive/code-nth binding
+                                                                            2))
+                                    (primitive/code-str name)))
+                        (let [target
+                                (primitive/datum->syntax site
+                                                         (primitive/syntax->datum (primitive/code-nth binding
+                                                                                                      0)))
+                              local
+                                (primitive/datum->syntax site
+                                                         (primitive/syntax->datum name))]
+                          (set! result
+                                `(import ~(primitive/code-str (primitive/code-nth m
+                                                                                  0))
+                                         :use
+                                         [~target]
+                                         :rename
+                                         [[~target ~local]])))
+                        0)))
+                  0))))))
+      0)
+    (load result)))
+
+(defn le--host-owner-module [(prog Code) (m Code)] (-> Code)
+  (if (= (primitive/code-str (primitive/code-nth m 0))
+         "experiments.heap-inspector.live-types")
+      (let [out (primitive/code-list-new)]
+        (primitive/code-list-push! out (primitive/code-nth m 0))
+        (for [i 1 (primitive/code-count m)]
+          (primitive/code-list-push! out
+                                     (le--host-binding prog
+                                                       (primitive/code-nth m i)
+                                                       (primitive/code-nth m 0))))
+        (primitive/code-list-done out))
+      m))
+
+
+; The live implementation and its dependencies are the host. Everything else
+; loaded from the consumer project participates, including transitive imports.
+(defn le--host-modules [(prog Code)] (-> Code)
+  (let [(mut names) `(experiments.live.enable)]
+    (loop
+      (let [before (primitive/code-count (load names))]
+        (for [i 0 (primitive/code-count prog)]
+          (let [m (primitive/code-nth prog i)]
+            (when (project/lp-named-in? (load names) (primitive/code-nth m 0))
+              (for [j 1 (primitive/code-count m)]
+                (let [f (primitive/code-nth m j)]
+                  (when (le--head? f "import")
+                    (let [dep (primitive/code-nth f 1)]
+                      (unless (project/lp-named-in? (load names) dep)
+                        (set! names `(~@(load names) ~dep)) 0)) 0))) 0)))
+        (when (= before (primitive/code-count (load names))) (break)) 0))
+    (load names)))
+
+(defn le--lower-project [(a (dyn alloc/Allocator)) (prog Code) (root (slice u8))] (-> Code)
+  (let [host-modules (le--host-modules prog)
+        raw (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count prog)]
+      (let [m (primitive/code-nth prog i) name (primitive/code-nth m 0)
+            path (le--record-file m)]
+        (when (and (> (slice-len path) 0)
+                   (and (le--under? root (le--absolute a root path))
+                        (not (project/lp-named-in? host-modules name))))
+          (let [forms (primitive/code-list-new)]
+            (for [j 1 (primitive/code-count m)]
+              (let [f (primitive/code-nth m j)]
+                (unless (or (le--head? f "module") (le--head? f "migrate"))
+                  (primitive/code-list-push! forms (reader/lr-normal-form f)) 0)))
+            (let [source (primitive/code-list-done forms)]
+              (primitive/code-list-push! raw
+                `(~name ~source))) 0)) 0))
+    (let [sources (primitive/code-list-done raw)
+          masked (primitive/code-list-new)]
+      (for [i 0 (primitive/code-count sources)]
+        (let [m (primitive/code-nth sources i) name (primitive/code-nth m 0)
+              source (project/lp-mask-native-project m sources)]
+          (primitive/code-list-push! masked
+            `(~name ~source ~(reader/lr-build-registry name source) ~source ()))))
+    (let [raw-modules (primitive/code-list-done masked)
+          tokens (project/lp-project-tokens raw-modules `())
+          built (primitive/code-list-new)
+          out (primitive/code-list-new)]
+      (for [i 0 (primitive/code-count raw-modules)]
+        (let [m (primitive/code-nth raw-modules i)]
+          (primitive/code-list-push! built
+            `(~(primitive/code-nth m 0) ~(primitive/code-nth m 1)
+               ~(project/lp-tokenize (primitive/code-nth m 2) tokens)
+               ~(primitive/code-nth m 3) ()))))
+      (let [modules (primitive/code-list-done built)]
+        (for [i 0 (primitive/code-count modules)]
+          (primitive/code-list-push! out
+            (project/lp-lower-module (primitive/code-nth modules i) modules `()))))
+      (primitive/code-list-done out)))))
+
+; The entry record keeps its module declaration and imports and gains a `main`
+; that starts the live host on its file.
+(defn le--live-entry [(a (dyn alloc/Allocator))
+                      (prog Code)
+                      (entry-index i64)
+                      (main-index i64)
+                      (lowered-project Code)] (-> Code)
+  (let [m (primitive/code-nth prog entry-index)
+        head (primitive/code-nth m 0)
+        main-form (primitive/code-nth m main-index)
+        root (le--root a)
+        entry (le--absolute a root (primitive/code-file main-form))
+        roots (le--roots a root)
+        out (primitive/code-list-new)]
+    (when (or (> (primitive/code-count (primitive/code-nth main-form 2)) 0)
+              (not (primitive/code-eq (primitive/code-nth main-form 3)
+                                      `(-> i64))))
+      (primitive/report main-form
+                        "live: use (defn main [] (-> i64) ...); the live host enters it once on the native main thread")
+      0)
+    (le--report-verdict! a prog m entry root)
+    (primitive/code-list-push! out head)
+    (let [lowered (project/lp-find-module lowered-project head 0)]
+      (for [k 1 (primitive/code-count lowered)]
+        (primitive/code-list-push! out
+          (le--host-binding prog (primitive/code-nth lowered k) head))))
+    (primitive/code-list-push! out
+                               `(import "experiments.heap-inspector.live-types"
+                                        :use
+                                        [LiveHandleOwner live-handle-owner-new]))
+    ; hygiene: the host import and the generated `main` belong to the entry
+    ; module, as its own `main` did.
+    (primitive/code-list-push! out
+                               `(import "experiments.live.host"
+                                        :as
+                                        ~(primitive/datum->syntax head
+                                                                  "__live_host")))
+    (primitive/code-list-push! out
+                               `(defn ~(primitive/datum->syntax head "main") [] (-> i64)
+                                  (~(primitive/datum->syntax head
+                                                             "__live_host/live-host-main!") ~entry
+                                     ~root
+                                     ~roots)))
+    (primitive/code-list-done out)))
+
+;;; The whole-program transform. A build whose entry file defines no `main` (a
+;;; library, a test file) is left as it is, and so is one already rewritten: its
+;;; entry's own `main` is gone.
+(defn coil-live-enable [(prog Code)] (-> Code)
+  (let [a (alloc/malloc-allocator)
+        n (primitive/code-count prog)
+        (mut entry-index) -1
+        (mut main-index) -1]
+    (for [i 0 n]
+      (let [m (primitive/code-nth prog i)]
+        (when (and (< (load entry-index) 0) (le--entry? m))
+          (let [k (le--main-index m)]
+            (when (>= k 0) (set! entry-index i) (set! main-index k) 0)
+            0))
+        0))
+    (let [out (primitive/code-list-new)
+          lowered (if (>= (load entry-index) 0) (le--lower-project a prog (le--root a)) `())]
+      (for [i 0 n]
+        (primitive/code-list-push! out
+                                   (if (= i (load entry-index))
+                                       (le--live-entry a
+                                                       prog
+                                                       i
+                                                       (load main-index)
+                                                       lowered)
+                                       (let [m (primitive/code-nth prog i)
+                                             selected (project/lp-find-module lowered (primitive/code-nth m 0) 0)]
+                                         (if (primitive/code-list? selected)
+                                             (let [record (primitive/code-list-new)]
+                                               (primitive/code-list-push! record (primitive/code-nth selected 0))
+                                               (for [j 1 (primitive/code-count selected)]
+                                                 (primitive/code-list-push! record
+                                                   (le--host-binding prog (primitive/code-nth selected j)
+                                                                      (primitive/code-nth selected 0))))
+                                               (primitive/code-list-done record))
+                                             (le--host-owner-module prog m)))))
+        0)
+      `(do ~@(primitive/code-list-done out)))))
+
+(transform coil-live-enable :phase before-expand)
+
+; Project lint deliberately inspects raw source with registered checkers instead
+; of executing application transforms. Register the runtime-verdict check on that
+; path too. Its entry identity comes from the verdict, so other project modules
+; (including test files with a main) cannot be mistaken for the running entry.
+(defn coil-live-verdict-check [(prog Code)] (-> Code)
+  (let [a (alloc/malloc-allocator)
+        root (le--root a)]
+    (for [i 0 (primitive/code-count prog)]
+      (let [m (primitive/code-nth prog i)
+            main-index (le--main-index m)]
+        (when (>= main-index 0)
+          (le--report-verdict! a
+                               prog
+                               m
+                               (le--absolute a
+                                             root
+                                             (primitive/code-file (primitive/code-nth m
+                                                                                      main-index)))
+                               root)
+          0)))
+    `(do ~@prog)))
+
+(checker coil-live-verdict-check)

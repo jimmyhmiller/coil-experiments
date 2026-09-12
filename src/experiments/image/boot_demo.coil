@@ -4,134 +4,131 @@
 ; controller (real JIT), mutated at runtime, saved, and then reconstructed in a
 ; SEPARATE process by replaying the ledger and overlaying the saved heap state.
 ;
-;   coil run src/experiments/image/boot_demo.coil -- save FILE
-;   coil run src/experiments/image/boot_demo.coil -- boot FILE
+; This program links the prebuilt JIT host archive (`jit_host.coil`, built once)
+; and reaches the live world through its C ABI. It imports neither the
+; controller nor the live runtime, so it does not recompile Coil's in-process
+; compiler on every build — which takes this from ~37 s to about a second.
 ;
-; scripts/image-boot.sh runs both halves and checks the output. This proves
-; both halves of an image: the accepted program (replayed) and the live heap
-; state (overlaid), across a process boundary, through the real compiler.
+;   coil build src/experiments/image/jit_host.coil --lib -o build/libcoilimage.a -O1
+;   coil build src/experiments/image/boot_demo.coil -o build/image-boot-demo \
+;     --link-flag -Wl,-force_load,build/libcoilimage.a
+;
+; scripts/image-boot.sh does both and runs the three processes.
 
 (import "coil.primitive" :as primitive)
-(import "coil.alloc" :as alloc)
 (import "coil.slice" :use *)
-(import "experiments.image.format" :use *)
-(import "experiments.image.image" :as image)
-(import "experiments.image.ledger" :as ledger)
-(import "experiments.image.bake" :as bake)
-(import "experiments.image.image-boot" :as iboot)
-(import "experiments.heap-inspector.controller" :as controller)
-(import "experiments.heap-inspector.live" :as live)
 
 (extern printf :cc c [(ptr i8) ...] (-> i32))
 
-; The base program: a live struct with a persistent root and a mutator. Kept
-; small so replay through the JIT is quick.
+; The JIT host's C ABI (see jit_host.coil).
+(extern coil_img_edit :cc c [(ptr u8) i64 i64] (-> i64))
+(extern coil_img_save :cc c [(ptr u8) i64 i64] (-> i64))
+(extern coil_img_boot :cc c [(ptr u8) i64] (-> i64))
+(extern coil_img_boot_baked :cc c [(ptr u8) i64] (-> i64))
+(extern coil_img_bake :cc c [(ptr u8) i64 (ptr u8) i64 (ptr u8) i64] (-> i64))
+(extern coil_img_is_baked :cc c [(ptr u8) i64] (-> i64))
+(extern coil_img_ledger_count :cc c [] (-> i64))
+(extern coil_img_root_payload :cc c [(ptr u8) i64] (-> (ptr i8)))
+
+; Ledger kinds and save modes, mirroring experiments.image.format.
+(const LEDGER-BASE 1)
+(const LEDGER-EDIT 2)
+(const MODE-QUIT 2)
+
+; The base program: a live struct with a persistent root and a mutator.
 (const BASE-PROGRAM
   "(defstruct Cell [(a i64) (b i64)])\n(letonce cell (Cell :a 1 :b 2))\n(defn bump [] (-> i64) (set! (.a cell) (+ (.a cell) 100)) 0)")
 
-; The live payload layout of Cell: a versioned struct with the source fields in
-; order. Scalars only, so the image serializes it as opaque bytes.
+; The upgrade program adds a defaulted field; the live machinery auto-derives
+; the v1->v2 migration, so the overlaid runtime state (a=99) survives.
+(const UPGRADE-PROGRAM "(defstruct Cell [(a i64) (b i64) (c i64 42)])")
+
+; The live payload layout of Cell: the source fields in order, scalars only.
 (defstruct CellPayload [(a i64) (b i64)])
+(defstruct CellPayloadV2 [(a i64) (b i64) (c i64)])
 
-(defn find-root [(name (slice u8))] (-> (ptr live/LiveRoot))
-  (let [roots (live/live-roots) (mut found) (primitive/cast (ptr live/LiveRoot) 0)]
-    (for [i 0 (load (live/live-root-count))]
-      (let [r (primitive/index roots i)]
-        (if (and (.live r) (live/live-text=? (.name r) name)) (set! found r) 0)))
-    (load found)))
+(defn edit! [(src (slice u8)) (kind i64)] (-> i64)
+  (coil_img_edit (slice-data src) (slice-len src) kind))
+(defn save! [(path (slice u8)) (mode i64)] (-> i64)
+  (coil_img_save (slice-data path) (slice-len path) mode))
+(defn boot! [(path (slice u8))] (-> i64)
+  (coil_img_boot (slice-data path) (slice-len path)))
 
-(defn cell-payload [] (-> (ptr CellPayload))
-  (let [root (find-root "cell")]
-    (if (= (primitive/cast i64 root) 0) (primitive/cast (ptr CellPayload) 0)
-        (let [h (.handle root)]
-          (primitive/cast (ptr CellPayload)
-            (live/live-handle-payload h (.runtime-id h) (.schema-id h)))))))
+(defn cell [] (-> (ptr CellPayload))
+  (primitive/cast (ptr CellPayload) (coil_img_root_payload (slice-data "cell") 4)))
+(defn cell-v2 [] (-> (ptr CellPayloadV2))
+  (primitive/cast (ptr CellPayloadV2) (coil_img_root_payload (slice-data "cell") 4)))
 
 (defn build-and-save! [(path (slice u8))] (-> i64)
-  (let [status (iboot/image-controller-edit! BASE-PROGRAM IMAGE-LEDGER-BASE)]
+  (let [status (edit! BASE-PROGRAM LEDGER-BASE)]
     (if (!= status 0)
         (do (printf c"SAVE-FAIL edit=%ld\n" status) 1)
-        (let [p (cell-payload)]
+        (let [p (cell)]
           (if (= (primitive/cast i64 p) 0)
               (do (printf c"SAVE-FAIL no-cell\n") 1)
               (do
-                ; Simulate runtime evolution: the saved state must differ from
-                ; the base program's initial value (a=1).
                 (set! (.a p) 99)
-                (let [rc (image/image-save! path IMAGE-MODE-QUIT)]
+                (let [rc (save! path MODE-QUIT)]
                   (if (!= rc 0)
-                      (do (printf c"SAVE-FAIL save=%ld %.*s\n" rc
-                            (primitive/cast i32 (slice-len (image/image-error-name rc)))
-                            (slice-data (image/image-error-name rc))) 1)
+                      (do (printf c"SAVE-FAIL save=%ld\n" rc) 1)
                       (do (printf c"SAVE-OK a=%ld b=%ld ledger=%ld\n"
-                            (.a p) (.b p) (ledger/ledger-count)) 0)))))))))
+                            (.a p) (.b p) (coil_img_ledger_count)) 0)))))))))
 
 (defn boot-and-verify! [(path (slice u8))] (-> i64)
-  (let [status (iboot/image-boot! path)]
+  (let [status (boot! path)]
     (if (!= status 0)
-        (do (printf c"BOOT-FAIL %ld %.*s\n" status
-              (primitive/cast i32 (slice-len (image/image-error-name status)))
-              (slice-data (image/image-error-name status))) 1)
-        (let [p (cell-payload)]
+        (do (printf c"BOOT-FAIL %ld\n" status) 1)
+        (let [p (cell)]
           (if (= (primitive/cast i64 p) 0)
               (do (printf c"BOOT-FAIL no-cell\n") 1)
               (cond
                 (!= (.a p) 99) (do (printf c"BOOT-FAIL a=%ld want 99\n" (.a p)) 1)
                 (!= (.b p) 2) (do (printf c"BOOT-FAIL b=%ld want 2\n" (.b p)) 1)
-                (!= (ledger/ledger-count) 1) (do (printf c"BOOT-FAIL ledger=%ld\n" (ledger/ledger-count)) 1)
+                (!= (coil_img_ledger_count) 1)
+                  (do (printf c"BOOT-FAIL ledger=%ld\n" (coil_img_ledger_count)) 1)
                 :else (do (printf c"BOOT-OK a=%ld b=%ld ledger=%ld\n"
-                            (.a p) (.b p) (ledger/ledger-count)) 0)))))))
-
-; The upgrade program adds a defaulted field. The live machinery auto-derives
-; the v1->v2 migration (copy a,b; default c=42), so the overlaid runtime state
-; (a=99) is preserved forward.
-(const UPGRADE-PROGRAM
-  "(defstruct Cell [(a i64) (b i64) (c i64 42)])")
-
-(defstruct CellPayloadV2 [(a i64) (b i64) (c i64)])
-
-(defn cell-payload-v2 [] (-> (ptr CellPayloadV2))
-  (let [root (find-root "cell")]
-    (if (= (primitive/cast i64 root) 0) (primitive/cast (ptr CellPayloadV2) 0)
-        (let [h (.handle root)]
-          (primitive/cast (ptr CellPayloadV2)
-            (live/live-handle-payload h (.runtime-id h) (.schema-id h)))))))
+                            (.a p) (.b p) (coil_img_ledger_count)) 0)))))))
 
 (defn boot-and-upgrade! [(path (slice u8))] (-> i64)
-  (let [status (iboot/image-boot! path)]
+  (let [status (boot! path)]
     (if (!= status 0)
         (do (printf c"UPGRADE-FAIL boot=%ld\n" status) 1)
-        ; Overlay restored a=99. Now upgrade the schema; migration preserves it.
-        (let [rc (iboot/image-controller-edit! UPGRADE-PROGRAM IMAGE-LEDGER-EDIT)]
+        (let [rc (edit! UPGRADE-PROGRAM LEDGER-EDIT)]
           (if (!= rc 0)
               (do (printf c"UPGRADE-FAIL edit=%ld\n" rc) 1)
-              (let [p (cell-payload-v2)]
+              (let [p (cell-v2)]
                 (if (= (primitive/cast i64 p) 0)
                     (do (printf c"UPGRADE-FAIL no-cell\n") 1)
                     (cond
                       (!= (.a p) 99) (do (printf c"UPGRADE-FAIL a=%ld want 99\n" (.a p)) 1)
                       (!= (.b p) 2) (do (printf c"UPGRADE-FAIL b=%ld want 2\n" (.b p)) 1)
                       (!= (.c p) 42) (do (printf c"UPGRADE-FAIL c=%ld want 42\n" (.c p)) 1)
-                      :else (do (printf c"UPGRADE-OK a=%ld b=%ld c=%ld\n" (.a p) (.b p) (.c p)) 0)))))))))
+                      :else (do (printf c"UPGRADE-OK a=%ld b=%ld c=%ld\n"
+                                  (.a p) (.b p) (.c p)) 0)))))))))
 
-; Bake the current binary plus an image into a self-booting executable.
 (defn bake! [(self-bin (slice u8)) (img (slice u8)) (out (slice u8))] (-> i64)
-  (let [rc (bake/image-bake! (alloc/malloc-allocator) self-bin img out)]
-    (if (!= rc 0)
-        (do (printf c"BAKE-FAIL %ld\n" rc) 1)
-        (do (printf c"BAKE-OK\n") 0))))
+  (let [rc (coil_img_bake (slice-data self-bin) (slice-len self-bin)
+                          (slice-data img) (slice-len img)
+                          (slice-data out) (slice-len out))]
+    (if (!= rc 0) (do (printf c"BAKE-FAIL %ld\n" rc) 1) (do (printf c"BAKE-OK\n") 0))))
 
-; Boot from a baked executable (run with no arguments) and verify the state.
 (defn self-boot! [(self-path (slice u8))] (-> i64)
-  (let [status (iboot/image-boot-baked! self-path)]
+  (let [status (coil_img_boot_baked (slice-data self-path) (slice-len self-path))]
     (if (!= status 0)
         (do (printf c"BAKED-FAIL boot=%ld\n" status) 1)
-        (let [p (cell-payload)]
+        (let [p (cell)]
           (if (= (primitive/cast i64 p) 0)
               (do (printf c"BAKED-FAIL no-cell\n") 1)
               (if (!= (.a p) 99)
                   (do (printf c"BAKED-FAIL a=%ld want 99\n" (.a p)) 1)
                   (do (printf c"BAKED-OK a=%ld b=%ld\n" (.a p) (.b p)) 0)))))))
+
+(defn text=? [(a (slice u8)) (b (slice u8))] (-> bool)
+  (if (!= (slice-len a) (slice-len b)) false
+      (let [(mut ok) true]
+        (for [i 0 (slice-len a)]
+          (if (!= (slice-get a i) (slice-get b i)) (set! ok false) 0))
+        (load ok))))
 
 (defn cstr [(p (ptr i8))] (-> (slice u8))
   (let [(mut n) 0]
@@ -142,15 +139,14 @@
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
   (let [argv0 (cstr (load (primitive/index argv 0)))]
     (cond
-      ; No verb: if this executable is baked, boot from itself.
       (< (primitive/cast i64 argc) 2)
-        (if (bake/image-baked? (alloc/malloc-allocator) argv0)
+        (if (!= (coil_img_is_baked (slice-data argv0) (slice-len argv0)) 0)
             (self-boot! argv0)
             (do (printf c"usage: boot_demo <save|boot|upgrade|bake> ...\n") 2))
       :else
         (let [mode (cstr (load (primitive/index argv 1)))]
           (cond
-            (live/live-text=? mode "bake")
+            (text=? mode "bake")
               (if (< (primitive/cast i64 argc) 5)
                   (do (printf c"usage: boot_demo bake SELFBIN IMG OUT\n") 2)
                   (bake! (cstr (load (primitive/index argv 2)))
@@ -161,7 +157,7 @@
             :else
               (let [path (cstr (load (primitive/index argv 2)))]
                 (cond
-                  (live/live-text=? mode "save") (build-and-save! path)
-                  (live/live-text=? mode "boot") (boot-and-verify! path)
-                  (live/live-text=? mode "upgrade") (boot-and-upgrade! path)
+                  (text=? mode "save") (build-and-save! path)
+                  (text=? mode "boot") (boot-and-verify! path)
+                  (text=? mode "upgrade") (boot-and-upgrade! path)
                   :else (do (printf c"unknown mode\n") 2))))))))

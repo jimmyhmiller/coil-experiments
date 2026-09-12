@@ -1,26 +1,37 @@
 (module experiments.live-repl.protocol)
-
 (import "coil.alloc" :as alloc)
 (import "coil.primitive" :as primitive)
 (import "coil.slice" :use [slice-len slice-get])
+(import "coil.str" :as str)
 (import "experiments.live-repl.bencode" :use *)
 (import "experiments.heap-inspector.controller" :as controller)
 
-(export dispatch-request)
+(export dispatch-request
+        set-file-handler!
+        set-file-project!
+        FILE-OP-STATUS
+        FILE-OP-CHECK
+        FILE-OP-APPLY
+        FILE-FORMAT-MARKDOWN
+        FILE-FORMAT-JSON)
 
 (defn text=? [(a (slice u8)) (b (slice u8))] (-> bool)
-  (if (!= (slice-len a) (slice-len b)) false
+  (if (!= (slice-len a) (slice-len b))
+      false
       (block :same
-        (for [i 0 (slice-len a)]
-          (if (!= (slice-get a i) (slice-get b i))
-              (return-from :same false) 0))
-        true)))
+             (for [i 0 (slice-len a)]
+               (if (!= (slice-get a i) (slice-get b i))
+                   (return-from :same false)
+                   0))
+             true)))
 
 (defn response-base! [(response (ptr Response)) (request (ptr Request))] (-> i64)
   (if (> (slice-len (.id request)) 0)
-      (response-string! response "id" (.id request)) 0)
+      (response-string! response "id" (.id request))
+      0)
   (if (> (slice-len (.session request)) 0)
-      (response-string! response "session" (.session request)) 0)
+      (response-string! response "session" (.session request))
+      0)
   0)
 
 (defn done [(a (dyn alloc/Allocator)) (request (ptr Request))] (-> (slice u8))
@@ -50,25 +61,143 @@
     (response-status-pair! response "eval-error" "done")
     (response-finish! response)))
 
-(defn submit [(a (dyn alloc/Allocator)) (request (ptr Request)) (source (slice u8))] (-> (slice u8))
-  (let [status (controller/live-controller-edit-source! source)]
-    (if (= status 0)
-        (value a request (controller/live-controller-snapshot))
-        (failure a request))))
+(defn submit [(a (dyn alloc/Allocator))
+              (request (ptr Request))
+              (source (slice u8))] (-> (slice u8))
+  (if (.installed (file-handler))
+      (let [response (primitive/alloc-stack Response)]
+        (store! response (response-new a))
+        (response-base! response request)
+        (response-string! response
+                          "err"
+                          "this session is owned by a live source file: edit that file and use coil/file-apply; eval/load-file would bypass its transactional ledger")
+        (response-status-pair! response "error" "done")
+        (response-finish! response))
+      (let [status (controller/live-controller-edit-source! source)]
+        (if (= status 0)
+            (value a request (controller/live-controller-snapshot))
+            (failure a request)))))
+
+; ---- live files -----------------------------------------------------------------
+;;; A program that runs a source file live (experiments.live.host) serves it
+;;; here. `coil/file-status` reports what the program did with the file's latest
+;;; version; `coil/file-check` checks the file as it is on disk without changing
+;;; the program; `coil/file-apply` applies it now instead of at the next save.
+;;; Optional request keys: `policy` ("strict", the default, or "deferred") and
+;;; `format` ("markdown", the default, or "json"). The report is the `value`;
+;;; the status carries `coil/not-live` when the program does not run the file
+;;; as it is (or, for a check, would not).
+(const FILE-OP-STATUS 0)
+
+(const FILE-OP-CHECK 1)
+
+(const FILE-OP-APPLY 2)
+
+(const FILE-FORMAT-MARKDOWN 0)
+
+(const FILE-FORMAT-JSON 1)
+
+;;; The handler takes OP, a controller policy and FORMAT, appends its report
+;;; to OUT, and returns 0 when the program runs the file as it is, 1 otherwise.
+(defstruct FileHandler
+  [(installed bool)
+   (project (slice u8))
+   (handler (fnptr c [i64 i64 i64 (ptr str/StrBuf)] i64))])
+
+(defn file-handler [] (-> (ptr FileHandler))
+  (primitive/alloc-static FileHandler))
+
+(defn set-file-project! [(project (slice u8))] (-> i64)
+  (set! (.project (file-handler)) project)
+  0)
+
+;;; Install the file handler. Call once, before the server starts.
+(defn set-file-handler! [(handler (fnptr c [i64 i64 i64 (ptr str/StrBuf)] i64))] (-> i64)
+  (let [h (file-handler)]
+    (set! (.handler h) handler)
+    (set! (.installed h) true)
+    0))
+
+(defn file-op [(a (dyn alloc/Allocator)) (request (ptr Request)) (op i64)] (-> (slice u8))
+  (let [h (file-handler)
+        response (primitive/alloc-stack Response)]
+    (store! response (response-new a))
+    (response-base! response request)
+    (cond (and (> (slice-len (.project request)) 0)
+               (not (text=? (.project request) (.project h))))
+            (do
+              (response-string! response
+                                "err"
+                                "the discovery port belongs to a different project; restart the intended program to refresh its .nrepl-port")
+              (response-status-pair! response "error" "done")
+              0)
+          (or (not (or (text=? (.policy request) "")
+                       (or (text=? (.policy request) "strict")
+                           (text=? (.policy request) "deferred"))))
+              (not (or (text=? (.format request) "")
+                       (or (text=? (.format request) "markdown")
+                           (text=? (.format request) "json")))))
+            (do
+              (response-string! response
+                                "err"
+                                "invalid file operation options: policy must be strict or deferred; format must be markdown or json")
+              (response-status-pair! response "error" "done")
+              0)
+          (not (.installed h))
+            (do
+              (response-string! response
+                                "err"
+                                "this program does not run a file live")
+              (response-status-pair! response "error" "done")
+              0)
+          :else
+            (let [out (primitive/alloc-stack str/StrBuf)
+                  policy
+                    (if (text=? (.policy request) "deferred")
+                        controller/LIVE-POLICY-DEFERRED
+                        controller/LIVE-POLICY-STRICT)
+                  format
+                    (if (text=? (.format request) "json")
+                        FILE-FORMAT-JSON
+                        FILE-FORMAT-MARKDOWN)]
+              (store! out (str/sb-new a))
+              (let [status
+                      (primitive/call-ptr (.handler h) op policy format out)
+                    (mut sb) (load out)]
+                (response-string! response "value" (str/sb-finish! (mut sb)))
+                (if (= status 0)
+                    (response-status! response "done")
+                    (response-status-pair! response "coil/not-live" "done"))
+                0)))
+    (response-finish! response)))
 
 (defn describe [(a (dyn alloc/Allocator)) (request (ptr Request))] (-> (slice u8))
   (let [response (primitive/alloc-stack Response)]
     (store! response (response-new a))
     (response-base! response request)
     (response-dict-start! response "ops")
-    (response-dict-entry-start! response "clone") (response-container-end! response)
-    (response-dict-entry-start! response "describe") (response-container-end! response)
-    (response-dict-entry-start! response "eval") (response-container-end! response)
-    (response-dict-entry-start! response "load-file") (response-container-end! response)
-    (response-dict-entry-start! response "ls-sessions") (response-container-end! response)
-    (response-dict-entry-start! response "coil/state") (response-container-end! response)
-    (response-dict-entry-start! response "coil/source") (response-container-end! response)
-    (response-dict-entry-start! response "coil/pending") (response-container-end! response)
+    (response-dict-entry-start! response "clone")
+    (response-container-end! response)
+    (response-dict-entry-start! response "describe")
+    (response-container-end! response)
+    (response-dict-entry-start! response "eval")
+    (response-container-end! response)
+    (response-dict-entry-start! response "load-file")
+    (response-container-end! response)
+    (response-dict-entry-start! response "ls-sessions")
+    (response-container-end! response)
+    (response-dict-entry-start! response "coil/state")
+    (response-container-end! response)
+    (response-dict-entry-start! response "coil/source")
+    (response-container-end! response)
+    (response-dict-entry-start! response "coil/pending")
+    (response-container-end! response)
+    (response-dict-entry-start! response "coil/file-status")
+    (response-container-end! response)
+    (response-dict-entry-start! response "coil/file-check")
+    (response-container-end! response)
+    (response-dict-entry-start! response "coil/file-apply")
+    (response-container-end! response)
     (response-container-end! response)
     (response-dict-start! response "versions")
     (response-dict-entry-start! response "nrepl")
@@ -89,32 +218,37 @@
 ;;; state. This is intentional and is reported by `describe`.
 (defn dispatch-request [(a (dyn alloc/Allocator)) (request (ptr Request))] (-> (slice u8))
   (let [op (.op request)]
-    (cond
-      (text=? op "describe") (describe a request)
-      (text=? op "clone")
-        (let [response (primitive/alloc-stack Response)]
-          (store! response (response-new a))
-          (response-base! response request)
-          (response-string! response "new-session" "coil-live")
-          (response-status! response "done")
-          (response-finish! response))
-      (text=? op "ls-sessions")
-        (let [response (primitive/alloc-stack Response)]
-          (store! response (response-new a))
-          (response-base! response request)
-          (response-list-string! response "sessions" "coil-live")
-          (response-status! response "done")
-          (response-finish! response))
-      (text=? op "eval") (submit a request (.code request))
-      (text=? op "load-file") (submit a request (.file request))
-      (text=? op "coil/state") (value a request (controller/live-controller-snapshot))
-      (text=? op "coil/source") (value a request (controller/live-controller-source))
-      (text=? op "coil/pending") (value a request (controller/live-controller-pending))
-      (text=? op "close") (done a request)
-      :else
-        (let [response (primitive/alloc-stack Response)]
-          (store! response (response-new a))
-          (response-base! response request)
-          (response-string! response "err" "unknown nREPL operation")
-          (response-status! response "unknown-op")
-          (response-finish! response)))))
+    (cond (text=? op "describe") (describe a request)
+          (text=? op "clone")
+            (let [response (primitive/alloc-stack Response)]
+              (store! response (response-new a))
+              (response-base! response request)
+              (response-string! response "new-session" "coil-live")
+              (response-status! response "done")
+              (response-finish! response))
+          (text=? op "ls-sessions")
+            (let [response (primitive/alloc-stack Response)]
+              (store! response (response-new a))
+              (response-base! response request)
+              (response-list-string! response "sessions" "coil-live")
+              (response-status! response "done")
+              (response-finish! response))
+          (text=? op "eval") (submit a request (.code request))
+          (text=? op "load-file") (submit a request (.file request))
+          (text=? op "coil/state")
+            (value a request (controller/live-controller-snapshot))
+          (text=? op "coil/source")
+            (value a request (controller/live-controller-source))
+          (text=? op "coil/pending")
+            (value a request (controller/live-controller-pending-copy a))
+          (text=? op "coil/file-status") (file-op a request FILE-OP-STATUS)
+          (text=? op "coil/file-check") (file-op a request FILE-OP-CHECK)
+          (text=? op "coil/file-apply") (file-op a request FILE-OP-APPLY)
+          (text=? op "close") (done a request)
+          :else
+            (let [response (primitive/alloc-stack Response)]
+              (store! response (response-new a))
+              (response-base! response request)
+              (response-string! response "err" "unknown nREPL operation")
+              (response-status! response "unknown-op")
+              (response-finish! response)))))

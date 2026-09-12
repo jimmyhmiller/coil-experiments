@@ -1,0 +1,1130 @@
+(module experiments.heap-inspector.live-project)
+
+;;; The project compiler keeps ordinary module records throughout lowering.
+;;; Imports, exports, macro hygiene and lexical lookup remain the compiler's
+;;; responsibility. One retained state and one publication cover every module.
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use [slice-len slice-get subslice])
+(import "experiments.heap-inspector.live-reader" :as reader)
+(import "experiments.heap-inspector.live-registry" :as registry)
+(import "experiments.heap-inspector.live-meta" :as meta)
+
+(defn lp-head? [(form Code) (head Code)] (-> bool)
+  (reader/lr-head? form head))
+
+(defn lp-name=? [(a Code) (b Code)] (-> bool)
+  (registry/registry-name=? a b))
+
+(defn lp-find-module [(modules Code) (name Code) (start i64)] (-> Code)
+  (let [(mut found) `:missing]
+    (for [i start (primitive/code-count modules)]
+      (let [m (primitive/code-nth modules i)]
+        (when (lp-name=? (primitive/code-nth m 0) name)
+          (set! found m)
+          0)))
+    (load found)))
+
+(defn lp-qualified [(module Code) (name Code) (site Code)] (-> Code)
+  (primitive/datum->syntax site
+                           (primitive/syntax->datum (primitive/code-symbol module
+                                                                           "."
+                                                                           name))))
+
+(defn lp-request [(modules Code)] (-> Code)
+  (let [(mut found) `:missing]
+    (for [i 0 (primitive/code-count modules)]
+      (let [m (primitive/code-nth modules i)]
+        (for [j 1 (primitive/code-count m)]
+          (let [f (primitive/code-nth m j)]
+            (when (lp-head? f `live-project-request)
+              (set! found (primitive/code-nth f 1))
+              0)))))
+    (load found)))
+
+; Tokens are allocated once by exact (module, kind, source-name) identity.
+; Appending a module never renumbers a gate already held by running code.
+(defn lp-token [(tokens Code) (id Code)] (-> i64)
+  (let [(mut found) 0]
+    (for [i 0 (primitive/code-count tokens)]
+      (when (lp-name=? (primitive/code-nth tokens i) id)
+        (set! found (+ i 1))
+        0))
+    (load found)))
+
+(defn lp-tokenize [(reg Code) (tokens Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (primitive/code-list-push! out `live-registry)
+    (primitive/code-list-push! out (primitive/code-nth reg 1))
+    (for [i 0 (registry/registry-record-count reg)]
+      (let [record (registry/registry-record-at reg i)
+            token (lp-token tokens (registry/registry-record-id record))
+            artifacts (registry/registry-record-artifacts record)
+            next (primitive/code-list-new)]
+        (when (= token 0)
+          (primitive/error "live project: missing source gate identity")
+          0)
+        (primitive/code-list-push! next `generated-artifacts)
+        (for [j 1 (primitive/code-count artifacts)]
+          (let [artifact (primitive/code-nth artifacts j)]
+            (unless (or (registry/registry-artifact-role? artifact
+                                                          `:runtime-source-token)
+                        (or (registry/registry-artifact-role? artifact
+                                                              `:runtime-name)
+                            (registry/registry-artifact-role? artifact
+                                                              `:schema-owner-token)))
+              (primitive/code-list-push! next artifact)
+              0)))
+        (primitive/code-list-push! next
+                                   `(artifact :runtime-source-token ~token))
+        (primitive/code-list-push! next
+                                   `(artifact :runtime-name
+                                                ~(primitive/code-symbol (primitive/code-nth reg
+                                                                                            1)
+                                                                        "/"
+                                                                        (reader/lr-source-runtime-name (registry/registry-record-name record)))))
+        (let [schema-token
+                (lp-token tokens
+                          `(live-schema-owner ~(registry/registry-record-id record)))]
+          (when (> schema-token 0)
+            (primitive/code-list-push! next
+                                       `(artifact :schema-owner-token
+                                                    ~schema-token))
+            0))
+        (primitive/code-list-push! out
+                                   (registry/registry-record-with-artifacts record
+                                                                            (primitive/code-list-done next)))))
+    (primitive/code-list-done out)))
+
+(defn lp-normal-forms [(snapshot Code) (loaded Code) (prior Code)] (-> Code)
+  (let [site
+          (if (and (primitive/code-list? prior)
+                   (> (primitive/code-count (primitive/code-nth prior 1)) 0))
+              (primitive/code-nth (primitive/code-nth (primitive/code-nth prior
+                                                                          1)
+                                                      0)
+                                  0)
+              (primitive/code-nth loaded 0))
+        forms (reader/lr-normal-forms-at (primitive/code-nth snapshot 3) site)]
+    forms))
+
+(defn lp-without-migrations [(forms Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count forms)]
+      (let [f (primitive/code-nth forms i)]
+        ; Migration declarations belong to transitions, not fresh starts.
+        (unless (reader/lr-marker? f)
+          (primitive/code-list-push! out f)
+          0)))
+    (primitive/code-list-done out)))
+
+(defn lp-form-present? [(forms Code) (form Code)] (-> bool)
+  (let [(mut found) false]
+    (for [i 0 (primitive/code-count forms)]
+      (when (lp-name=? (primitive/code-nth forms i) form)
+        (set! found true)
+        0))
+    (load found)))
+
+(defn lp-incoming [(forms Code) (prior Code)] (-> Code)
+  (let [old (if (primitive/code-list? prior) (primitive/code-nth prior 1) `())
+        old-markers
+          (if (and (primitive/code-list? prior)
+                   (> (primitive/code-count prior) 4))
+              (primitive/code-nth prior 4)
+              `())
+        out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count forms)]
+      (let [f (primitive/code-nth forms i)]
+        (if (reader/lr-marker? f)
+            (when (and (primitive/code-list? prior)
+                       (not (lp-form-present? old-markers f)))
+              (primitive/code-list-push! out f)
+              0)
+            (unless (lp-form-present? old f)
+              (primitive/code-list-push! out f)
+              0))))
+    (primitive/code-list-done out)))
+
+(defn lp-migrations [(forms Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count forms)]
+      (let [f (primitive/code-nth forms i)]
+        (when (reader/lr-marker? f) (primitive/code-list-push! out f) 0)))
+    (primitive/code-list-done out)))
+
+; Explicit native allocations keep Coil's native layout. Managed structs are
+; still lowered to handles. The distinction follows allocation semantics, so
+; rendering/FFI modules need no opt-out and their functions remain live.
+(defn lp-native-use? [(form Code) (name Code)] (-> bool)
+  (let [(mut found) false]
+    (when (or (primitive/code-list? form) (primitive/code-vector? form))
+      (when (and (> (primitive/code-count form) 1)
+                 (or (lp-head? form `primitive/alloc-stack)
+                     (or (lp-head? form `primitive/alloc-static)
+                         (lp-head? form `ptr))))
+        (when (lp-native-type? (primitive/code-nth form 1) name)
+          (set! found true)
+          0)
+        0)
+      (for [i 0 (primitive/code-count form)]
+        (when (lp-native-use? (primitive/code-nth form i) name)
+          (set! found true)
+          0))
+      0)
+    (load found)))
+
+(defn lp-native-type? [(T Code) (name Code)] (-> bool)
+  (or (lp-name=? T name)
+      (and (lp-head? T `array) (lp-native-type? (primitive/code-nth T 1) name))))
+
+(defn lp-project-native-use? [(owner Code) (modules Code) (name Code)] (-> bool)
+  (let [(mut found) (lp-native-use? (primitive/code-nth owner 1) name)]
+    (for [i 0 (primitive/code-count modules)]
+      (let [m (primitive/code-nth modules i)
+            names (lp-visible-names m owner name)]
+        (when (lp-native-use? (primitive/code-nth m 1)
+                              (lp-qualified (primitive/code-nth owner 0)
+                                            name
+                                            name))
+          (set! found true)
+          0)
+        (for [j 0 (primitive/code-count names)]
+          (when (lp-native-use? (primitive/code-nth m 1)
+                                (primitive/code-nth names j))
+            (set! found true)
+            0))))
+    (load found)))
+
+(defn lp-compile-function? [(f Code)] (-> bool)
+  (let [(mut found) false]
+    (when (lp-head? f `defn)
+      (for [i 2 (primitive/code-count f)]
+        (when (lp-name=? (primitive/code-nth f i) `(-> Code))
+          (set! found true)
+          0))
+      0)
+    (load found)))
+
+(defn lp-mask-native-project [(owner Code) (modules Code)] (-> Code)
+  (let [forms (primitive/code-nth owner 1)
+        out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count forms)]
+      (let [f (primitive/code-nth forms i)]
+        (primitive/code-list-push! out
+                                   (cond (lp-compile-function? f)
+                                           `(live-compile-defn ~@(primitive/code-rest f))
+                                         (and (lp-head? f `defstruct)
+                                              (lp-project-native-use? owner
+                                                                      modules
+                                                                      (primitive/code-nth f
+                                                                                          1)))
+                                           `(live-native-struct ~@(primitive/code-rest f))
+                                         :else f))))
+    (primitive/code-list-done out)))
+
+(defn lp-mask-native [(forms Code)] (-> Code)
+  (lp-mask-native-project `(:local ~forms) `()))
+
+(defn lp-unmask-native [(form Code)] (-> Code)
+  (cond (lp-head? form `live-native-struct)
+          `(defstruct ~@(primitive/code-rest form))
+        (lp-head? form `live-compile-defn) `(defn ~@(primitive/code-rest form))
+        :else form))
+
+(defn lp-validate-native [(forms Code) (prior Code)] (-> i64)
+  (when (primitive/code-list? prior)
+    (let [old (primitive/code-nth prior 1)]
+      (for [i 0 (primitive/code-count old)]
+        (let [f (primitive/code-nth old i)]
+          (when (lp-head? f `live-native-struct)
+            (unless (lp-form-present? forms f)
+              (primitive/error (primitive/code-str "live project: native layout '"
+                                                   (primitive/code-nth f 1)
+                                                   "' changed; raw pointers/FFI storage cannot migrate. Restore the layout or restart."))
+              0)
+            0))))
+    0)
+  0)
+
+(defn lp-build-modules [(request Code) (loaded Code) (prior Code)] (-> Code)
+  (let [out (primitive/code-list-new)
+        sources (primitive/code-list-new)]
+    (for [i 2 (primitive/code-count request)]
+      (let [snapshot (primitive/code-nth request i)
+            name (primitive/code-nth snapshot 1)
+            m (lp-find-module loaded name 0)
+            old (lp-find-module prior name 0)]
+        (unless (primitive/code-list? m)
+          (primitive/error (primitive/code-str "live project: module was not loaded: "
+                                               name))
+          0)
+        (primitive/code-list-push! sources
+                                   `(~(primitive/code-nth m 0) ~(lp-normal-forms snapshot
+                                                                                 m
+                                                                                 old)))))
+    (let [source-modules (primitive/code-list-done sources)]
+      (for [i 2 (primitive/code-count request)]
+        (let [snapshot (primitive/code-nth request i)
+              requested-name (primitive/code-nth snapshot 1)
+              source-module (lp-find-module loaded requested-name 0)
+              old (lp-find-module prior requested-name 0)]
+          (unless (primitive/code-list? source-module)
+            (primitive/error (primitive/code-str "live project: module was not loaded: "
+                                                 requested-name))
+            0)
+          (let [name (primitive/code-nth source-module 0)
+                raw
+                  (lp-mask-native-project (lp-find-module source-modules
+                                                          requested-name
+                                                          0)
+                                          source-modules)
+                forms (lp-without-migrations raw)
+                _valid (lp-validate-native forms old)
+                incoming (lp-incoming raw old)
+                reg
+                  (if (primitive/code-list? old)
+                      (reader/lr-apply-candidate-forms (primitive/code-nth old
+                                                                           2)
+                                                       incoming
+                                                       0)
+                      (reader/lr-build-registry name forms))]
+            (primitive/code-list-push! out
+                                       `(~name ~forms
+                                           ~reg
+                                           ~incoming
+                                           ~(lp-migrations raw))))))
+      (primitive/code-list-done out))))
+
+(defn lp-project-tokens [(modules Code) (old-tokens Code)] (-> Code)
+  (let [(mut tokens) old-tokens]
+    (for [i 0 (primitive/code-count modules)]
+      (let [reg (primitive/code-nth (primitive/code-nth modules i) 2)]
+        (for [j 0 (registry/registry-record-count reg)]
+          (let [id
+                  (registry/registry-record-id (registry/registry-record-at reg
+                                                                            j))]
+            (when (= (lp-token (load tokens) id) 0)
+              (set! tokens `(~@(load tokens) ~id))
+              0)
+            (let [kind
+                    (registry/registry-record-kind (registry/registry-record-at reg
+                                                                                j))
+                  schema-id `(live-schema-owner ~id)]
+              (when (and (or (primitive/code-eq kind `:struct)
+                             (primitive/code-eq kind `:sum)
+                             (primitive/code-eq kind `:closure))
+                         (= (lp-token (load tokens) schema-id) 0))
+                (set! tokens `(~@(load tokens) ~schema-id))
+                0))))))
+    (load tokens)))
+
+(defn lp-option [(form Code) (key Code)] (-> Code)
+  (let [(mut found) `:missing]
+    (for [i 2 (- (primitive/code-count form) 1)]
+      (when (primitive/code-eq (primitive/code-nth form i) key)
+        (set! found (primitive/code-nth form (+ i 1)))
+        0))
+    (load found)))
+
+(defn lp-named-in? [(names Code) (name Code)] (-> bool)
+  (let [(mut found) false]
+    (when (primitive/code-list? names)
+      (for [i 0 (primitive/code-count names)]
+        (when (lp-name=? (primitive/code-nth names i) name)
+          (set! found true)
+          0))
+      0)
+    (load found)))
+
+(defn lp-exported? [(m Code) (name Code)] (-> bool)
+  (let [forms (primitive/code-nth m 1)
+        (mut explicit) false
+        (mut exported) false]
+    (for [i 0 (primitive/code-count forms)]
+      (let [f (primitive/code-nth forms i)]
+        (when (lp-head? f `export)
+          (set! explicit true)
+          (when (lp-named-in? (primitive/code-rest f) name)
+            (set! exported true)
+            0)
+          0)))
+    (or (not (load explicit)) (load exported))))
+
+(defn lp-referred-name [(import-form Code) (name Code)] (-> Code)
+  (let [use (lp-option import-form `:use)
+        exclude (lp-option import-form `:exclude)
+        renames (lp-option import-form `:rename)
+        (mut result) `:missing]
+    (when (and (or (lp-name=? use `*) (lp-named-in? use name))
+               (not (lp-named-in? exclude name)))
+      (set! result name)
+      (when (primitive/code-list? renames)
+        (for [i 0 (primitive/code-count renames)]
+          (let [pair (primitive/code-nth renames i)]
+            (when (and (= (primitive/code-count pair) 2)
+                       (lp-name=? (primitive/code-nth pair 0) name))
+              (set! result (primitive/code-nth pair 1))
+              0)))
+        0)
+      0)
+    (load result)))
+
+; This environment is type/ownership metadata for the live lowering pass.
+; Source import declarations remain intact and normal compiler resolution still
+; validates each source call. Generated helpers carry their owning module.
+(defn lp-visible-name [(from Code) (owner Code) (name Code) (alias-only bool)] (-> Code)
+  (let [forms (primitive/code-nth from 1)
+        owner-name (primitive/code-nth owner 0)
+        (mut result) `:missing]
+    (when (lp-exported? owner name)
+      (for [i 0 (primitive/code-count forms)]
+        (let [f (primitive/code-nth forms i)]
+          (when (and (lp-head? f `import)
+                     (lp-name=? (primitive/code-nth f 1) owner-name))
+            (let [alias (lp-option f `:as)
+                  referred (lp-referred-name f name)]
+              (if alias-only
+                  (when (primitive/code-sym? alias)
+                    (set! result (primitive/code-symbol alias "/" name))
+                    0)
+                  (when (primitive/code-sym? referred)
+                    (set! result referred)
+                    0)))
+            0)))
+      0)
+    (load result)))
+
+; Keep every spelling when a consumer imports one module more than once.
+(defn lp-visible-names [(from Code) (owner Code) (name Code)] (-> Code)
+  (let [out (primitive/code-list-new)
+        forms (primitive/code-nth from 1)]
+    (when (lp-exported? owner name)
+      (for [i 0 (primitive/code-count forms)]
+        (let [f (primitive/code-nth forms i)]
+          (when (and (lp-head? f `import)
+                     (lp-name=? (primitive/code-nth f 1)
+                                (primitive/code-nth owner 0)))
+            (let [alias (lp-option f `:as)
+                  bare (lp-referred-name f name)]
+              (when (primitive/code-sym? alias)
+                (primitive/code-list-push! out
+                                           (primitive/code-symbol alias
+                                                                  "/"
+                                                                  name))
+                0)
+              (when (primitive/code-sym? bare)
+                (primitive/code-list-push! out bare)
+                0))
+            0)))
+      0)
+    (primitive/code-list-done out)))
+
+(defn lp-resolved-type-name [(from Code) (modules Code) (name Code)] (-> Code)
+  (let [(mut result) name
+        (mut own) false]
+    (for [i 0 (primitive/code-count modules)]
+      (let [owner (primitive/code-nth modules i)
+            reg (primitive/code-nth owner 2)]
+        (for [j 0 (registry/registry-record-count reg)]
+          (let [r (registry/registry-record-at reg j)
+                kind (registry/registry-record-kind r)
+                n (registry/registry-record-name r)]
+            (when (or (primitive/code-eq kind `:struct)
+                      (primitive/code-eq kind `:sum)
+                      (primitive/code-eq kind `:closure)
+                      (primitive/code-eq kind `:trait))
+              (if (lp-name=? (primitive/code-nth from 0)
+                             (primitive/code-nth owner 0))
+                  (when (lp-name=? name n)
+                    (set! own true)
+                    (set! result
+                          (lp-qualified (primitive/code-nth owner 0) n name))
+                    0)
+                  (when (and (not (load own))
+                             (lp-named-in? (lp-visible-names from owner n) name))
+                    (set! result
+                          (lp-qualified (primitive/code-nth owner 0) n name))
+                    0))
+              0)))))
+    (load result)))
+
+(defn lp-type [(T Code) (from Code) (modules Code) (parameters Code)] (-> Code)
+  (cond (primitive/code-sym? T)
+          (if (lp-named-in? parameters T)
+              T
+              (lp-resolved-type-name from modules T))
+        (primitive/code-list? T)
+          (let [out (primitive/code-list-new)]
+            (for [i 0 (primitive/code-count T)]
+              (primitive/code-list-push! out
+                                         (lp-type (primitive/code-nth T i)
+                                                  from
+                                                  modules
+                                                  parameters)))
+            (let [done (primitive/code-list-done out)]
+              (if (primitive/code-vector? T) `[~@done] done)))
+        :else T))
+
+(defn lp-proxy-form [(record Code)
+                     (name Code)
+                     (owner Code)
+                     (modules Code)
+                     (consumer Code)] (-> Code)
+  (let [f (registry/registry-record-form record)
+        kind (registry/registry-record-kind record)
+        out (primitive/code-list-new)]
+    (primitive/code-list-push! out (primitive/code-nth f 0))
+    (primitive/code-list-push! out name)
+    (cond (primitive/code-eq kind `:function)
+            (let [generic? (primitive/code-vector? (primitive/code-nth f 3))
+                  parameters (if generic? (primitive/code-nth f 2) `())
+                  ps (primitive/code-nth f (if generic? 3 2))
+                  params (primitive/code-list-new)]
+              (when generic? (primitive/code-list-push! out parameters) 0)
+              (for [i 0 (primitive/code-count ps)]
+                (let [p (primitive/code-nth ps i)]
+                  (primitive/code-list-push! params
+                                             `(~(primitive/code-nth p 0) ~(lp-type (primitive/code-nth p
+                                                                                                       1)
+                                                                                   owner
+                                                                                   modules
+                                                                                   parameters)))))
+              (primitive/code-list-push! out
+                                         `[~@(primitive/code-list-done params)])
+              (primitive/code-list-push! out
+                                         (lp-type (primitive/code-nth f
+                                                                      (if generic?
+                                                                          4
+                                                                          3))
+                                                  owner
+                                                  modules
+                                                  parameters))
+              (primitive/code-list-push! out `0)
+              0)
+          (primitive/code-eq kind `:struct)
+            (let [generic? (= (primitive/code-count f) 4)
+                  parameters (if generic? (primitive/code-nth f 2) `())
+                  fields (meta/live-struct-fields f)
+                  next-fields (primitive/code-list-new)]
+              (when generic? (primitive/code-list-push! out parameters) 0)
+              (for [i 0 (primitive/code-count fields)]
+                (let [field (primitive/code-nth fields i)
+                      next (primitive/code-list-new)]
+                  (primitive/code-list-push! next (primitive/code-nth field 0))
+                  (primitive/code-list-push! next
+                                             (lp-type (primitive/code-nth field
+                                                                          1)
+                                                      owner
+                                                      modules
+                                                      parameters))
+                  (for [j 2 (primitive/code-count field)]
+                    (primitive/code-list-push! next
+                                               (primitive/code-nth field j)))
+                  (primitive/code-list-push! next-fields
+                                             (primitive/code-list-done next))))
+              (primitive/code-list-push! out
+                                         `[~@(primitive/code-list-done next-fields)])
+              0)
+          (primitive/code-eq kind `:sum)
+            (let [generic? (primitive/code-vector? (primitive/code-nth f 2))
+                  parameters (if generic? (primitive/code-nth f 2) `())
+                  canonical
+                    (lp-qualified (primitive/code-nth owner 0)
+                                  (registry/registry-record-name record)
+                                  name)
+                  spelling (primitive/code-str name)
+                  (mut slash) -1]
+              (when generic? (primitive/code-list-push! out parameters) 0)
+              (for [i 0 (slice-len spelling)]
+                (when (= (slice-get spelling i) (primitive/cast u8 47))
+                  (set! slash i)
+                  0))
+              (for [i (if generic? 3 2) (primitive/code-count f)]
+                (let [variant (primitive/code-nth f i)
+                      original (primitive/code-nth variant 0)
+                      referred (lp-visible-name consumer owner original false)
+                      visible
+                        (cond (lp-name=? name canonical)
+                                (lp-qualified (primitive/code-nth owner 0)
+                                              original
+                                              name)
+                              (>= (load slash) 0)
+                                (primitive/datum->syntax name
+                                                         (primitive/syntax->datum (primitive/code-symbol (subslice spelling
+                                                                                                                   0
+                                                                                                                   (+ (load slash)
+                                                                                                                      1))
+                                                                                                         original)))
+                              (primitive/code-sym? referred) referred
+                              :else
+                                (lp-qualified (primitive/code-nth owner 0)
+                                              original
+                                              name))
+                      fields (primitive/code-list-new)]
+                  (when (> (primitive/code-count variant) 1)
+                    (let [raw-fields (primitive/code-nth variant 1)]
+                      (for [j 0 (primitive/code-count raw-fields)]
+                        (let [field (primitive/code-nth raw-fields j)]
+                          (primitive/code-list-push! fields
+                                                     `(~(primitive/code-nth field
+                                                                            0) ~(lp-type (primitive/code-nth field
+                                                                                                             1)
+                                                                                         owner
+                                                                                         modules
+                                                                                         parameters))))))
+                    0)
+                  (primitive/code-list-push! out
+                                             (if (> (primitive/code-count variant)
+                                                    1)
+                                                 `(~visible [~@(primitive/code-list-done fields)])
+                                                 `(~visible)))))
+              0)
+          (primitive/code-eq kind `:root)
+            (let [value (primitive/code-nth f 2)
+                  constructor (primitive/code-nth value 0)]
+              (primitive/code-list-push! out
+                                         `(~(lp-resolved-type-name owner
+                                                                   modules
+                                                                   constructor) ~@(primitive/code-rest value)))
+              0)
+          :else
+            (for [i 2 (primitive/code-count f)]
+              (primitive/code-list-push! out (primitive/code-nth f i))))
+    (primitive/code-list-done out)))
+
+(defn lp-proxy [(record Code)
+                (name Code)
+                (owner Code)
+                (modules Code)
+                (consumer Code)] (-> Code)
+  (let [artifacts (registry/registry-record-artifacts record)
+        proxy-form (lp-proxy-form record name owner modules consumer)
+        next (primitive/code-list-new)]
+    (primitive/code-list-push! next `generated-artifacts)
+    (for [i 1 (primitive/code-count artifacts)]
+      (let [a (primitive/code-nth artifacts i)
+            role (primitive/code-nth a 1)
+            n (primitive/code-count a)]
+        (primitive/code-list-push! next
+                                   (cond (or (primitive/code-eq role
+                                                                `:payload-variant)
+                                             (primitive/code-eq role
+                                                                `:variant-constructor))
+                                           (let [index
+                                                   (meta/live-sum-variant-index (registry/registry-record-form record)
+                                                                                (primitive/code-nth a
+                                                                                                    2))
+                                                 variants
+                                                   (meta/live-sum-variants proxy-form)]
+                                             `(artifact ~role
+                                                        ~(primitive/code-nth (primitive/code-nth variants
+                                                                                                 index)
+                                                                             0)
+                                                        ~(lp-qualified (primitive/code-nth owner
+                                                                                           0)
+                                                                       (primitive/code-nth a
+                                                                                           3)
+                                                                       name)))
+                                         (or (primitive/code-eq role
+                                                                `:runtime-name)
+                                             (primitive/code-eq role
+                                                                `:runtime-source-token)
+                                             (primitive/code-eq role
+                                                                `:abi-lineage)
+                                             (primitive/code-eq role
+                                                                `:generic-source-template))
+                                           a
+                                         (and (= n 3)
+                                              (primitive/code-sym? (primitive/code-nth a
+                                                                                       2)))
+                                           `(artifact ~role
+                                                      ~(lp-qualified (primitive/code-nth owner
+                                                                                         0)
+                                                                     (primitive/code-nth a
+                                                                                         2)
+                                                                     name))
+                                         (and (= n 4)
+                                              (primitive/code-sym? (primitive/code-nth a
+                                                                                       3)))
+                                           `(artifact ~role
+                                                      ~(primitive/code-nth a 2)
+                                                      ~(lp-qualified (primitive/code-nth owner
+                                                                                         0)
+                                                                     (primitive/code-nth a
+                                                                                         3)
+                                                                     name))
+                                         :else a))))
+    (primitive/code-list-push! next `(artifact :project-reference true))
+    `(live-definition ~(registry/registry-record-id record)
+                      ~(registry/registry-record-kind record)
+                      ~name
+                      ~(primitive/code-nth record 4)
+                      ~proxy-form
+                      ~(registry/registry-record-value-dependencies record)
+                      ~(registry/registry-record-type-dependencies record)
+                      ~(primitive/code-list-done next))))
+
+(defn lp-module-view [(m Code) (modules Code)] (-> Code)
+  (let [own (primitive/code-nth m 2)
+        records (primitive/code-list-new)
+        forms (primitive/code-list-new)]
+    (reader/lr-push-list! forms (primitive/code-nth m 1))
+    (for [i 0 (registry/registry-record-count own)]
+      (primitive/code-list-push! records (registry/registry-record-at own i)))
+    (for [i 0 (primitive/code-count modules)]
+      (let [owner (primitive/code-nth modules i)
+            reg (primitive/code-nth owner 2)]
+        (for [j 0 (registry/registry-record-count reg)]
+          (let [record (registry/registry-record-at reg j)
+                name (registry/registry-record-name record)
+                kind (registry/registry-record-kind record)]
+            (when (and (primitive/code-sym? name)
+                       (or (primitive/code-eq kind `:function)
+                           (primitive/code-eq kind `:struct)
+                           (primitive/code-eq kind `:sum)
+                           (primitive/code-eq kind `:root)))
+              (let [names (primitive/code-list-new)]
+                (primitive/code-list-push! names
+                                           (lp-qualified (primitive/code-nth owner
+                                                                             0)
+                                                         name
+                                                         name))
+                (unless (lp-name=? (primitive/code-nth owner 0)
+                                   (primitive/code-nth m 0))
+                  (let [visible (lp-visible-names m owner name)]
+                    (for [k 0 (primitive/code-count visible)]
+                      (let [spelling (primitive/code-nth visible k)]
+                        (unless (lp-head? (registry/registry-find own
+                                                                  kind
+                                                                  spelling)
+                                          `live-definition)
+                          (primitive/code-list-push! names spelling)
+                          0))))
+                  0)
+                (let [visible (primitive/code-list-done names)]
+                  (for [k 0 (primitive/code-count visible)]
+                    (let [proxy
+                            (lp-proxy record
+                                      (primitive/code-nth visible k)
+                                      owner
+                                      modules
+                                      m)]
+                      (primitive/code-list-push! records proxy)
+                      (primitive/code-list-push! forms
+                                                 (registry/registry-record-form proxy))))))
+              0)))))
+    `(~(primitive/code-nth m 0) ~(primitive/code-list-done forms)
+        (live-registry ~(primitive/code-nth m 0)
+                       ~@(primitive/code-list-done records)))))
+
+(defn lp-bind-module [(reg Code)] (-> Code)
+  (reader/lr-bind-live-functions reg 0))
+
+(defn lp-schema-owners [(reg Code) (prior Code) (i i64)] (-> Code)
+  (if (>= i (registry/registry-record-count reg))
+      `0
+      (let [record (registry/registry-record-at reg i)
+            old
+              (registry/registry-find-by-id prior
+                                            (registry/registry-record-id record))
+            token (registry/registry-find-artifact record `:schema-owner-token)]
+        (if (and (lp-head? token `artifact)
+                 (or (not (lp-head? old `live-definition))
+                     (not (lp-name=? (registry/registry-find-artifact record
+                                                                      `:versioned-payload)
+                                     (registry/registry-find-artifact old
+                                                                      `:versioned-payload)))))
+            (let [status (primitive/fresh-identifier "schema_owner_status")]
+              `(let [~status
+                       (~(primitive/syntax->datum `coil_live_stage_code_owner) ~(primitive/code-nth token
+                                                                                                    2))]
+                 (if (!= ~status 0)
+                     ~status
+                     ~(lp-schema-owners reg prior (+ i 1)))))
+            (lp-schema-owners reg prior (+ i 1))))))
+
+(defn lp-type-changes [(incoming Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count incoming)]
+      (let [f (primitive/code-nth incoming i)]
+        (when (or (lp-head? f `defstruct)
+                  (lp-head? f `defsum)
+                  (reader/lr-marker? f))
+          (primitive/code-list-push! out f)
+          0)))
+    (primitive/code-list-done out)))
+
+(defn lp-transition-definitions [(m Code) (view Code) (old-view Code)] (-> Code)
+  (let [incoming (lp-type-changes (primitive/code-nth m 3))
+        out (primitive/code-list-new)
+        old-reg (primitive/code-nth old-view 2)
+        new-reg (primitive/code-nth view 2)]
+    (for [i 0 (primitive/code-count incoming)]
+      (let [f (primitive/code-nth incoming i)]
+        (when (or (lp-head? f `defstruct) (lp-head? f `defsum))
+          (let [kind (registry/registry-definition-kind f)
+                old
+                  (registry/registry-find old-reg kind (primitive/code-nth f 1))]
+            (when (lp-head? old `live-definition)
+              (primitive/code-list-push! out
+                                         (if (lp-head? f `defstruct)
+                                             (reader/lr-rename-struct (reader/lr-normalize-struct (registry/registry-record-form old))
+                                                                      (reader/lr-artifact-symbol old
+                                                                                                 `:versioned-payload))
+                                             (reader/lr-versioned-sum-decl (registry/registry-record-form old)
+                                                                           old)))
+              0))
+          0)))
+    (when (> (primitive/code-count incoming) 0)
+      (let [generated
+              (reader/lr-incremental-lower (primitive/code-nth old-view 1)
+                                           (primitive/code-nth view 1)
+                                           incoming
+                                           old-reg
+                                           new-reg)]
+        (for [i 1 (primitive/code-count generated)]
+          (let [f (primitive/code-nth generated i)]
+            (unless (and (reader/lr-defn? f)
+                         (lp-name=? (primitive/code-nth f 1)
+                                    `__live_candidate_commit))
+              (primitive/code-list-push! out f)
+              0))))
+      0)
+    (primitive/code-list-done out)))
+
+(defn lp-generated-same? [(a Code) (b Code)] (-> bool)
+  (or (lp-name=? a b)
+      (reader/lr-same-identity? a b)
+      (and (lp-head? a `extern)
+           (lp-head? b `extern)
+           (lp-name=? (primitive/code-nth a 1) (primitive/code-nth b 1)))))
+
+(defn lp-overlay [(base Code) (overlay Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count base)]
+      (let [f (primitive/code-nth base i)
+            (mut replaced) false]
+        (for [j 0 (primitive/code-count overlay)]
+          (when (lp-generated-same? f (primitive/code-nth overlay j))
+            (set! replaced true)
+            0))
+        (unless (load replaced) (primitive/code-list-push! out f) 0)))
+    (reader/lr-push-list! out overlay)
+    (primitive/code-list-done out)))
+
+; Storage belongs to the source function, not its versioned implementation.
+; Extract allocation sites into stable helpers before emitting a generation.
+(defn lp-static-sites! [(form Code) (out CodeBuilder)] (-> i64)
+  (if (lp-head? form `primitive/alloc-static)
+      (do (primitive/code-list-push! out form) 0)
+      (when (primitive/code-list? form)
+        (for [i 0 (primitive/code-count form)]
+          (lp-static-sites! (primitive/code-nth form i) out))
+        0))
+  0)
+
+(defn lp-statics [(form Code)
+                  (name Code)
+                  (helpers CodeBuilder)
+                  (index (ptr i64))
+                  (generics Code)] (-> Code)
+  (cond (lp-head? form `primitive/alloc-static)
+          (let [helper
+                  (reader/lr-lineage-name name
+                                          (primitive/code-str "--live-static-"
+                                                              (load index)))
+                T (primitive/code-nth form 1)]
+            (set! index (+ (load index) 1))
+            (primitive/code-list-push! helpers
+                                       (if (> (primitive/code-count generics) 0)
+                                           `(defn ~helper
+                                              ~generics
+                                              []
+                                              (-> (ptr ~T))
+                                              ~form)
+                                           `(defn ~helper [] (-> (ptr ~T))
+                                              ~form)))
+            (if (> (primitive/code-count generics) 0)
+                `(~helper ~generics)
+                `(~helper)))
+        (primitive/code-list? form)
+          (let [out (primitive/code-list-new)]
+            (for [i 0 (primitive/code-count form)]
+              (primitive/code-list-push! out
+                                         (lp-statics (primitive/code-nth form i)
+                                                     name
+                                                     helpers
+                                                     index
+                                                     generics)))
+            (let [done (primitive/code-list-done out)]
+              (if (primitive/code-vector? form) `[~@done] done)))
+        :else form))
+
+(defn lp-stable-function-storage [(f Code)
+                                  (reg Code)
+                                  (old-reg Code)
+                                  (helpers CodeBuilder)] (-> Code)
+  (let [(mut result) f]
+    (when (reader/lr-defn? f)
+      (for [i 0 (registry/registry-record-count reg)]
+        (let [r (registry/registry-record-at reg i)]
+          (when (and (primitive/code-eq (registry/registry-record-kind r)
+                                        `:function)
+                     (lp-name=? (primitive/code-nth f 1)
+                                (reader/lr-artifact-symbol r
+                                                           `:private-implementation)))
+            (let [old
+                    (registry/registry-find-by-id old-reg
+                                                  (registry/registry-record-id r))
+                  sites (primitive/code-list-new)
+                  before (primitive/code-list-new)
+                  index (primitive/alloc-stack i64)]
+              (store! index 0)
+              (lp-static-sites! (registry/registry-record-form r) sites)
+              (when (lp-head? old `live-definition)
+                (lp-static-sites! (registry/registry-record-form old) before)
+                (unless (lp-name=? (primitive/code-list-done sites)
+                                   (primitive/code-list-done before))
+                  (primitive/error (primitive/code-str "live project: native static allocation sites in '"
+                                                       (registry/registry-record-name r)
+                                                       "' changed; restore their types, initializers and order or restart."))
+                  0)
+                0)
+              (set! result
+                    (lp-statics f
+                                (registry/registry-record-name r)
+                                helpers
+                                index
+                                (if (primitive/code-vector? (primitive/code-nth f
+                                                                                3))
+                                    (primitive/code-nth f 2)
+                                    `[]))))
+            0)))
+      0)
+    (load result)))
+
+(defn lp-lower-module [(m Code) (modules Code) (prior Code)] (-> Code)
+  (let [name (primitive/code-nth m 0)
+        forms (primitive/code-nth m 1)
+        reg (primitive/code-nth m 2)
+        view (lp-module-view m modules)
+        environment (primitive/code-nth view 1)
+        view-reg (primitive/code-nth view 2)
+        old (lp-find-module prior name 0)
+        old-view
+          (if (primitive/code-list? old)
+              (lp-module-view old prior)
+              `(~name () (live-registry ~name)))
+        lowered (reader/lr-lower-module forms environment view-reg false)
+        generated
+          (if (primitive/code-list? old)
+              (lp-overlay (primitive/code-rest lowered)
+                          (lp-transition-definitions m view old-view))
+              (primitive/code-rest lowered))
+        helpers (primitive/code-list-new)
+        out (primitive/code-list-new)]
+    (primitive/code-list-push! out name)
+    (primitive/code-list-push! out
+                               `(import "experiments.heap-inspector.live-types"
+                                        :use
+                                        [LiveHandleOwner live-handle-owner-new]))
+    (for [i 0 (primitive/code-count generated)]
+      (let [f (primitive/code-nth generated i)]
+        (unless (and (reader/lr-defn? f)
+                     (lp-name=? (primitive/code-nth f 1) `main))
+          (primitive/code-list-push! out
+                                     (lp-stable-function-storage (lp-unmask-native f)
+                                                                 reg
+                                                                 (primitive/code-nth old-view
+                                                                                     2)
+                                                                 helpers))
+          0)))
+    (reader/lr-push-list! out (primitive/code-list-done helpers))
+    (primitive/code-list-push! out
+                               `(defn ~(primitive/syntax->datum `__live_project_bind) [] (-> i64)
+                                  ~(lp-bind-module reg)))
+    (primitive/code-list-push! out
+                               `(defn ~(primitive/syntax->datum `__live_project_owners) [] (-> i64)
+                                  ~(lp-schema-owners reg
+                                                     (primitive/code-nth old-view
+                                                                         2)
+                                                     0)))
+    (primitive/code-list-push! out
+                               `(defn ~(primitive/syntax->datum `__live_project_schemas) [] (-> i64)
+                                  ~(reader/lr-register-schemas-then forms
+                                                                    view-reg
+                                                                    0
+                                                                    `0)))
+    (primitive/code-list-push! out
+                               `(defn ~(primitive/syntax->datum `__live_project_migrate) [] (-> i64)
+                                  ~(reader/lr-incremental-stage (primitive/code-nth m
+                                                                                    3)
+                                                                (primitive/code-nth old-view
+                                                                                    2)
+                                                                view-reg
+                                                                (- (primitive/code-count (primitive/code-nth m
+                                                                                                             3))
+                                                                   1)
+                                                                `0)))
+    (primitive/code-list-done out)))
+
+(defn lp-phase [(modules Code) (helper Code) (i i64) (next Code)] (-> Code)
+  (if (>= i (primitive/code-count modules))
+      next
+      (let [m (primitive/code-nth modules i)
+            status (primitive/fresh-identifier "project_phase_status")]
+        `(let [~status
+                 (~(lp-qualified (primitive/code-nth m 0)
+                                 helper
+                                 (primitive/syntax->datum `replsession)))]
+           (if (!= ~status 0)
+               (do
+                 (~(primitive/syntax->datum `coil_live_cancel_staged_locked))
+                 (~(primitive/syntax->datum `coil_live_set_status) ~status))
+               ~(lp-phase modules helper (+ i 1) next))))))
+
+(defn lp-coordinator [(request Code) (modules Code) (initial bool)] (-> Code)
+  (let [entry (lp-find-module modules (primitive/code-nth request 1) 0)
+        reg (primitive/code-nth entry 2)
+        main-record (registry/registry-find reg `:function `main)
+        redraw-record (registry/registry-find reg `:function `redraw)
+        site (primitive/syntax->datum `replsession)
+        start
+          (lp-qualified (primitive/code-nth entry 0)
+                        (reader/lr-artifact-symbol main-record
+                                                   `:private-implementation)
+                        site)
+        redraw
+          (if (lp-head? redraw-record `live-definition)
+              (lp-qualified (primitive/code-nth entry 0)
+                            (reader/lr-artifact-symbol redraw-record
+                                                       `:public-entry)
+                            site)
+              (primitive/syntax->datum `__live_project_no_redraw))
+        status (primitive/fresh-identifier "project_status")
+        binders (primitive/code-list-new)
+        all-records (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count modules)]
+      (let [m (primitive/code-nth modules i)
+            module-reg (primitive/code-nth m 2)]
+        (primitive/code-list-push! binders
+                                   `(~(lp-qualified (primitive/code-nth m 0)
+                                                    `__live_project_bind
+                                                    site)))
+        (for [j 0 (registry/registry-record-count module-reg)]
+          (primitive/code-list-push! all-records
+                                     (registry/registry-record-at module-reg j)))))
+    `(replsession (import "coil.primitive" :as primitive)
+                  (extern ~(primitive/syntax->datum `coil_live_begin_staging_locked)
+                          :cc
+                          c
+                          []
+                          (-> i64))
+                  (extern ~(primitive/syntax->datum `coil_live_stage_affected)
+                          :cc
+                          c
+                          [i64 i64 (ptr u8) i64]
+                          (-> i64))
+                  (extern ~(primitive/syntax->datum `coil_live_begin_affected_publication)
+                          :cc
+                          c
+                          []
+                          (-> i64))
+                  (extern ~(primitive/syntax->datum `coil_live_cancel_staged_locked)
+                          :cc
+                          c
+                          []
+                          (-> i64))
+                  (extern ~(primitive/syntax->datum `coil_live_set_status)
+                          :cc
+                          c
+                          [i64]
+                          (-> i64))
+                  (extern ~(primitive/syntax->datum `coil_live_publish_staged_locked)
+                          :cc
+                          c
+                          []
+                          (-> i64))
+                  (extern ~(primitive/syntax->datum `coil_live_validate_staged)
+                          :cc
+                          c
+                          []
+                          (-> i64))
+                  (extern ~(primitive/syntax->datum `coil_live_app_stage_callbacks)
+                          :cc
+                          c
+                          [(fnptr c [] i64) (fnptr c [] i64)]
+                          (-> i64))
+                  (defn ~(primitive/syntax->datum `__live_project_no_redraw) [] (-> i64)
+                    0)
+                  (defn ~(primitive/syntax->datum `__live_candidate_commit) [] (-> i64)
+                    (~(primitive/syntax->datum `coil_live_begin_staging_locked))
+                    ~(reader/lr-stage-changed-source-ids `(live-registry project)
+                                                         `(live-registry project
+                                                                         ~@(primitive/code-list-done all-records))
+                                                         0
+                                                         (reader/lr-begin-affected-publication (lp-phase modules
+                                                                                                         `__live_project_schemas
+                                                                                                         0
+                                                                                                         (lp-phase modules
+                                                                                                                   `__live_project_migrate
+                                                                                                                   0
+                                                                                                                   (reader/lr-validate-before-bind (lp-phase modules
+                                                                                                                                                             `__live_project_owners
+                                                                                                                                                             0
+                                                                                                                                                             `(do
+                                                                                                                                                                ~@(primitive/code-list-done binders)
+                                                                                                                                                                (~(primitive/syntax->datum `coil_live_publish_staged_locked))))))))))
+                  (defn ~(primitive/syntax->datum `__live_project_entry) [] (-> i64)
+                    (let [~status
+                            (~(primitive/syntax->datum `__live_candidate_commit))]
+                      ~(if initial
+                           `(if (= ~status 0)
+                                (~(primitive/syntax->datum `coil_live_app_stage_callbacks) (primitive/fnptr-of ~start)
+                                   (primitive/fnptr-of ~redraw))
+                                ~status)
+                           `~status)))
+                  (export-c [~(primitive/syntax->datum `__live_project_entry)
+                             :as
+                             "coil_repl_entry"]))))
+
+(defn live-project-transform [(prog Code)] (-> Code)
+  (let [request (lp-request prog)]
+    (if (not (lp-head? request `live-project))
+        `(do ~@prog)
+        (let [accepted (primitive/code-session-state `:empty)
+              initial (not (lp-head? accepted `live-project-state))
+              prior (if initial `() (primitive/code-nth accepted 1))
+              old-tokens (if initial `() (primitive/code-nth accepted 2))
+              raw-modules (lp-build-modules request prog prior)
+              tokens (lp-project-tokens raw-modules old-tokens)
+              module-builder (primitive/code-list-new)
+              out (primitive/code-list-new)]
+          (for [i 0 (primitive/code-count raw-modules)]
+            (let [m (primitive/code-nth raw-modules i)]
+              (primitive/code-list-push! module-builder
+                                         `(~(primitive/code-nth m 0) ~(primitive/code-nth m
+                                                                                          1)
+                                             ~(lp-tokenize (primitive/code-nth m
+                                                                               2)
+                                                           tokens)
+                                             ~(primitive/code-nth m 3)
+                                             ~(primitive/code-nth m 4)))))
+          (let [modules (primitive/code-list-done module-builder)]
+            (primitive/code-session-stage! `(live-project-state ~modules
+                                                                ~tokens))
+            (for [i 0 (primitive/code-count prog)]
+              (let [m (primitive/code-nth prog i)
+                    selected (lp-find-module modules (primitive/code-nth m 0) 0)]
+                (cond (lp-name=? (primitive/code-nth m 0) `replsession)
+                        (primitive/code-list-push! out
+                                                   (lp-coordinator request
+                                                                   modules
+                                                                   initial))
+                      (primitive/code-list? selected)
+                        (primitive/code-list-push! out
+                                                   (lp-lower-module selected
+                                                                    modules
+                                                                    prior))
+                      :else (primitive/code-list-push! out m))))
+            `(do ~@(primitive/code-list-done out)))))))

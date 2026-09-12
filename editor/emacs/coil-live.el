@@ -14,6 +14,8 @@
   :type 'string)
 
 (defvar-local coil-live-connection nil)
+(defvar coil-live-connections (make-hash-table :test #'equal)
+  "Live nREPL connection buffers keyed by project, host, and port.")
 (defvar coil-live-last-state nil)
 
 (define-derived-mode coil-mode lisp-mode "Coil"
@@ -37,14 +39,22 @@
                           (with-temp-buffer
                             (insert-file-contents port-file)
                             (buffer-string)))))
-                   (read-number "Coil nREPL port: "))))
-    (setq coil-live-connection
-          (process-buffer
-           (nrepl-start-client-process
-            (or host "127.0.0.1") port nil
-            (lambda (_endpoint)
-              (generate-new-buffer " *coil-live-connection*")))))
-    (message "Connected to Coil live runtime on %s:%d" (or host "127.0.0.1") port)))
+                   (read-number "Coil nREPL port: ")))
+         (host (or host "127.0.0.1"))
+         (key (list (file-truename root) host port))
+         (shared (gethash key coil-live-connections)))
+    (unless (and (buffer-live-p shared)
+                 (process-live-p (get-buffer-process shared)))
+      (setq shared
+            (process-buffer
+             (nrepl-start-client-process
+              host port nil
+              (lambda (_endpoint)
+                (generate-new-buffer
+                 (format " *coil-live %s:%d*" host port))))))
+      (puthash key shared coil-live-connections))
+    (setq coil-live-connection shared)
+    (message "Connected to Coil live runtime on %s:%d" host port)))
 
 (defun coil-live--connection ()
   (or (and coil-live-connection

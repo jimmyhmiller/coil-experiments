@@ -1,0 +1,1042 @@
+(module experiments.live.host)
+
+;;; The live host: what `experiments.live.enable` turns a program's `main` into.
+;;;
+;;; It compiles the project source graph through the retained live JIT, runs the
+;;; program's own `main` on the native main thread, and watches every participating
+;;; source file. Each candidate is compared with the accepted project ledger and
+;;; submitted as one strict live transaction: all of it checks, loads and
+;;; migrates, or none of it runs and the program keeps its accepted generation.
+;;;
+;;; It also serves nREPL for editors and `coil-live`, and writes the verdict that
+;;; the `coil check` checker turns into compile errors, so an agent that only
+;;; edits files and runs the compiler still learns what the live program did.
+;;;
+;;;   <root>/.nrepl-port             the nREPL port
+;;;   <root>/.coil-live/verdict.coil the last verdict, as data (read by the checker)
+;;;   <root>/.coil-live/STATUS.md    the same verdict for people and agents
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.atomic" :as atomic)
+(import "coil.arraylist" :use [ArrayList al-new len get push! al-elem])
+(import "coil.fs" :as fs)
+(import "coil.io" :as io)
+(import "coil.os" :as os)
+(import "coil.result" :use *)
+(import "coil.scratch" :as scratch)
+(import "coil.slice" :use [slice-len slice-get subslice])
+(import "coil.str" :as str)
+(import "coil.thread" :as thread)
+(import "coil.socket" :as socket)
+(import "experiments.heap-inspector.controller" :as controller)
+(import "experiments.heap-inspector.live-app-api" :as live-app)
+(import "experiments.live-repl.server" :as nrepl)
+(import "experiments.live-repl.protocol" :as protocol)
+(import "experiments.live.digest" :use [digest digest-hex])
+(import "experiments.live.ledger" :use *)
+(import "experiments.live.project" :as project :use [ProjectFile])
+
+(extern usleep :cc c [i32] (-> i32))
+
+(extern mkdir :cc c [(ptr i8) i32] (-> i32))
+
+(extern rename :cc c [(ptr i8) (ptr i8)] (-> i32))
+
+(extern setenv :cc c [(ptr i8) (ptr i8) i32] (-> i32))
+
+(extern pthread_detach :cc c [(ptr i8)] (-> i32))
+
+(extern fopen :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+(extern fclose :cc c [(ptr i8)] (-> i32))
+
+(extern fileno :cc c [(ptr i8)] (-> i32))
+
+(extern flock :cc c [i32 i32] (-> i32))
+
+; ---- regions -----------------------------------------------------------------
+; Everything one processed version of the entry file produces -- its ledger and
+; its verdict -- lives in one arena, released as soon as neither the accepted
+; ledger nor a current verdict points into it. A long editing session holds a
+; bounded amount of memory however often the file is saved.
+(defstruct Region [(arena (ptr scratch/ScratchArena))])
+
+(defn region-new [] (-> Region)
+  (let [arena
+          (alloc/unwrap-ptr [scratch/ScratchArena]
+                            (alloc/create [scratch/ScratchArena]
+                                          (alloc/malloc-allocator)))]
+    (scratch/scratch-init-with-cap arena (alloc/malloc-allocator) 65536)
+    (Region :arena arena)))
+
+(defn region-allocator [(r Region)] (-> (dyn alloc/Allocator))
+  (scratch/scratch-allocator (.arena r)))
+
+(defn region-free! [(r Region)] (-> i64)
+  (let [arena (.arena r)]
+    (when (!= (primitive/cast i64 arena) 0)
+      (scratch/scratch-close! arena)
+      (alloc/destroy [scratch/ScratchArena] (alloc/malloc-allocator) arena)
+      0)
+    0))
+
+(defn same-region? [(x Region) (y Region)] (-> bool)
+  (= (primitive/cast i64 (.arena x)) (primitive/cast i64 (.arena y))))
+
+; ---- state -------------------------------------------------------------------
+(defstruct LiveProblem
+  [(file (slice u8))
+   (module (slice u8))
+   (head (slice u8))  ; the offending form's head ("defn", "defstruct"); "" for the file
+   (name (slice u8))  ; its name; "" for the file
+   (line i64)  ; its first line; 0 for the file
+   (message (slice u8))])
+
+(defstruct LiveVerdict
+  [(files (ArrayList ProjectFile))
+   (state (slice u8))  ; live would-apply rejected needs-migration needs-restart unreadable
+   (digest i64)  ; the entry text this verdict describes
+   (epoch i64)  ; the live program's generation after it
+   (summary (slice u8))
+   (problems (ArrayList LiveProblem))
+   (removed (ArrayList (slice u8)))])  ; definitions gone from the file, still live
+
+(defstruct LiveHost
+  [(entry (slice u8))
+   (root (slice u8))
+   (accepted Ledger)
+   (accepted-region Region)
+   (seen i64)  ; digest of the entry text last processed
+   (verdict LiveVerdict)
+   (verdict-region Region)
+   (check LiveVerdict)  ; the last dry run's verdict (never the program's)
+   (check-region Region)
+   (listener socket/TcpListener)
+   (owner (ptr i8))
+   (retry-polls i64)
+   (checking-files (ArrayList ProjectFile))])
+
+(defn live-host [] (-> (ptr LiveHost))
+  (primitive/alloc-static LiveHost))
+
+; File processing is serialized between the watcher and nREPL clients. The
+; controller serializes the live transactions themselves.
+(defn live-host-lock-cell [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defn host-lock! [] (-> i64)
+  (loop (if (= (atomic/atomic-cas (live-host-lock-cell) 0 1) 0)
+            (break)
+            (do (usleep 1000) 0)))
+  0)
+
+(defn host-unlock! [] (-> i64)
+  (atomic/atomic-store (live-host-lock-cell) 0)
+  0)
+
+; ---- text helpers ------------------------------------------------------------
+(defn say [(s (slice u8))] (-> i64)
+  (match (io/print-str (io/stderr) s) (_ 0)))
+
+(defn cat [(a (dyn alloc/Allocator)) (x (slice u8)) (y (slice u8))] (-> (slice u8))
+  (let [(mut sb) (str/sb-new a)]
+    (str/sb-push-str! (mut sb) x)
+    (str/sb-push-str! (mut sb) y)
+    (str/sb-finish! (mut sb))))
+
+; N in decimal.
+(defn decimal [(a (dyn alloc/Allocator)) (n i64)] (-> (slice u8))
+  (let [digits (primitive/alloc-stack (array u8 24))
+        (mut count) 0
+        (mut rest) (if (< n 0) (- 0 n) n)
+        (mut sb) (str/sb-new a)]
+    (loop (set! (primitive/index digits (load count))
+                (primitive/cast u8 (+ 48 (% (load rest) 10))))
+      (set! count (+ (load count) 1))
+      (set! rest (/ (load rest) 10))
+      (when (= (load rest) 0) (break))
+      0)
+    (when (< n 0) (str/sb-push-byte! (mut sb) (primitive/cast u8 45)) 0)
+    (for [i 0 (load count)]
+      (str/sb-push-byte! (mut sb)
+                         (load (primitive/index digits (- (- (load count) 1) i))))
+      0)
+    (str/sb-finish! (mut sb))))
+
+(defn form-label [(a (dyn alloc/Allocator)) (head (slice u8)) (name (slice u8))] (-> (slice u8))
+  (if (= (slice-len name) 0) head (cat a (cat a head " ") name)))
+
+; The text between the first pair of single quotes in S ("" when there is none):
+; the field a live-migration diagnostic names.
+(defn quoted-field [(s (slice u8))] (-> (slice u8))
+  (match (str/str-find s "'")
+    (None [] "")
+    (Some [open]
+          (match (str/str-find-from s "'" (+ open 1))
+            (None [] "")
+            (Some [close] (subslice s (+ open 1) close))))))
+
+(defn unsupported-message [(a (dyn alloc/Allocator))
+                           (head (slice u8))
+                           (name (slice u8))] (-> (slice u8))
+  (let [(mut sb) (str/sb-new a)]
+    (str/sb-push-str! (mut sb) "`(")
+    (str/sb-push-str! (mut sb) (form-label a head name))
+    (str/sb-push-str! (mut sb)
+                      (if (and (= head "defn") (= name "main"))
+                          " ...)` changed. The application's main is entered once on the native main thread. Restart to run this main, or keep the event loop unchanged and edit the functions it calls."
+                          " ...)` changed or was removed. This declaration is compiled into its callers. Restart the program to apply this edit, or restore it."))
+    (str/sb-finish! (mut sb))))
+
+(defn migration-message [(a (dyn alloc/Allocator))
+                         (diagnostic (slice u8))
+                         (type-name (slice u8))] (-> (slice u8))
+  (let [fld (quoted-field diagnostic)
+        field-name (if (= (slice-len fld) 0) "FIELD" fld)
+        (mut sb) (str/sb-new a)]
+    (str/sb-push-str! (mut sb) diagnostic)
+    (str/sb-push-str! (mut sb) "\nThe running program holds live values of ")
+    (str/sb-push-str! (mut sb) type-name)
+    (str/sb-push-str! (mut sb)
+                      ". To keep them, say how each old value becomes the new field, next to the struct:\n    (migrate ")
+    (str/sb-push-str! (mut sb) type-name)
+    (str/sb-push-str! (mut sb) " ")
+    (str/sb-push-str! (mut sb) field-name)
+    (str/sb-push-str! (mut sb)
+                      " old <the new value, computed from old>)\nor give a new field a default in the struct: (")
+    (str/sb-push-str! (mut sb) field-name)
+    (str/sb-push-str! (mut sb)
+                      " TYPE DEFAULT). A migration may stay in the file: once applied it is never sent again.")
+    (str/sb-finish! (mut sb))))
+
+(defn applied-summary [(a (dyn alloc/Allocator))
+                       (plan (ptr LedgerPlan))
+                       (check-only bool)] (-> (slice u8))
+  (let [(mut sb) (str/sb-new a)
+        (mut first) true
+        submit (field plan submit)]
+    (str/sb-push-str! (mut sb) (if check-only "would apply: " "applied: "))
+    (for [i 0 (len (load submit))]
+      (let [f (al-elem [LedgerForm] submit i)]
+        (when (= (.kind f) KIND-DEFINITION)
+          (unless (load first) (str/sb-push-str! (mut sb) ", ") 0)
+          (set! first false)
+          (str/sb-push-str! (mut sb) (form-label a (.head f) (.name f)))
+          0))
+      0)
+    (let [migs (field plan migrations)]
+      (for [i 0 (len (load migs))]
+        (str/sb-push-str! (mut sb) ", migrate ")
+        (str/sb-push-str! (mut sb) (.name (al-elem [LedgerForm] migs i)))
+        0))
+    (str/sb-finish! (mut sb))))
+
+; The live reader compiles each definition under a generated identity:
+; `replsession.value--live-impl--next`, `replsession.Kind--live-payload--next`,
+; and for a variant `replsession.Kind--live-payload-variant-Bar--next`. In a
+; message meant for whoever edits the file, name each as the file does: `value`,
+; `Kind`, `Bar`.
+(defn generated-name-end? [(c i64)] (-> bool)
+  (or (= c 39) (or (= c 32) (or (= c 10) (or (= c 34) (= c 96))))))
+
+; The first index of NEEDLE in TEXT within [FROM, TO), or -1.
+(defn find-within [(text (slice u8)) (needle (slice u8)) (from i64) (to i64)] (-> i64)
+  (let [n (slice-len needle)
+        (mut found) -1]
+    (for [k from (+ (- to n) 1)]
+      (when (and (< (load found) 0) (= (subslice text k (+ k n)) needle))
+        (set! found k)
+        0)
+      0)
+    (load found)))
+
+; The source name of the generated identity TEXT[START, END), which follows the
+; session qualifier.
+(defn source-name [(text (slice u8)) (start i64) (end i64)] (-> (slice u8))
+  (let [generated (find-within text "--live" start end)]
+    (if (< generated 0)
+        (subslice text start end)
+        (let [variant (find-within text "-variant-" generated end)]
+          (if (< variant 0)
+              (subslice text start generated)
+              (let [vstart (+ variant 9)
+                    vend (find-within text "--" vstart end)]
+                (subslice text vstart (if (< vend 0) end vend))))))))
+
+(defn clean-diagnostic [(a (dyn alloc/Allocator)) (text (slice u8))] (-> (slice u8))
+  (let [prefix "replsession."
+        n (slice-len text)
+        np (slice-len prefix)
+        (mut sb) (str/sb-new a)
+        (mut i) 0]
+    (loop (when (>= (load i) n) (break))
+      (if (and (<= (+ (load i) np) n)
+               (= (subslice text (load i) (+ (load i) np)) prefix))
+          (let [start (+ (load i) np)
+                (mut j) start]
+            (loop (when (or (>= (load j) n)
+                            (generated-name-end? (primitive/cast i64
+                                                                 (slice-get text
+                                                                            (load j)))))
+                    (break))
+              (set! j (+ (load j) 1))
+              0)
+            (str/sb-push-str! (mut sb) (source-name text start (load j)))
+            (set! i (load j))
+            0)
+          (do
+            (str/sb-push-byte! (mut sb) (slice-get text (load i)))
+            (set! i (+ (load i) 1))
+            0)))
+    (str/sb-finish! (mut sb))))
+
+; ---- attributing a rejection to forms ---------------------------------------
+; A function the checker rejected names itself (the controller's repairs); a
+; missing transition is attributed to each struct the edit changed; anything
+; else belongs to the file as a whole.
+
+(defn repair-module [(owner (slice u8))] (-> (slice u8))
+  (let [(mut end) 0]
+    (for [i 0 (slice-len owner)]
+      (when (= (slice-get owner i) (primitive/cast u8 46)) (set! end i) 0))
+    (subslice owner 0 (load end))))
+
+(defn publication-guidance [(phase i64)] (-> (slice u8))
+  (cond (= phase 10) "Release outstanding root aliases, then submit the migration again."
+        (= phase 11) "A value is pinned or its allocator cannot relocate it. Release the pin or supply a transactional relocation policy, then retry."
+        (= phase 12) "A value is borrowed. End the borrow before submitting its migration again."
+        (= phase 13) "Native code retains a value's address. Release that FFI retention before retrying the migration."
+        (= phase 14) "An interior reference cannot be relocated. Repair the reference policy before retrying the migration."
+        :else ""))
+
+(defn collect-problems! [(a (dyn alloc/Allocator))
+                         (problems (mut (ArrayList LiveProblem)))
+                         (plan (ptr LedgerPlan))
+                         (next (ptr Ledger))
+                         (check-only bool)
+                         (transition bool)] (-> i64)
+  ; Copy under the controller lock: another client's edit cannot free these
+  ; strings while they are read. (If one ran between this edit and here, its
+  ; diagnostics would be attributed to this file: two clients editing at once.)
+  (controller/live-controller-lock!)
+  (let [diagnostic
+          (cat a (clean-diagnostic a
+                            (if check-only
+                                (controller/live-controller-check-diagnostic)
+                                (controller/live-controller-diagnostic)))
+                 (if check-only ""
+                     (cat a "\n" (publication-guidance (controller/live-controller-phase)))))
+        repairs (.repairs (controller/live-controller))
+        nrepairs (if check-only 0 (len repairs))]
+    (cond (> nrepairs 0)
+            (for [i 0 nrepairs]
+              (let [r (get repairs i)
+                    name
+                      (copy-bytes a
+                                  (controller/live-controller-repair-source-name (.function r)))
+                    module (copy-bytes a (repair-module (.function r)))
+                    j (ledger-find-in next module KIND-DEFINITION "defn" name)
+                    line
+                      (if (< j 0)
+                          0
+                          (.line (al-elem [LedgerForm] (field next forms) j)))]
+                (push! (mut problems)
+                       (LiveProblem
+                         :file (if (< j 0) (.entry (live-host)) (.file (al-elem [LedgerForm] (field next forms) j)))
+                         :module module
+                         :head "defn"
+                         :name name
+                         :line line
+                         :message (clean-diagnostic a (.diagnostic r))))
+                0))
+          transition
+            (let [changed (field plan changed)
+                  (mut any) false]
+              (for [i 0 (len (load changed))]
+                (let [f (al-elem [LedgerForm] changed i)]
+                  (when (or (= (.head f) "defstruct")
+                            (= (.head f) "defsum") (= (.head f) "defclosure"))
+                    (push! (mut problems)
+                           (LiveProblem
+                         :file (.file f)
+                                 :module (.module f)
+                                 :head (.head f)
+                             :name (.name f)
+                             :line (.line f)
+                             :message (migration-message a diagnostic (.name f))))
+                    (set! any true)
+                    0))
+                0)
+              (unless (load any)
+                (push! (mut problems)
+                       (LiveProblem
+                         :file (.entry (live-host))
+                         :module ""
+                         :head ""
+                         :name ""
+                         :line 0
+                         :message diagnostic))
+                0)
+              0)
+          :else
+            (do
+              (push! (mut problems)
+                     (LiveProblem
+                         :file (.entry (live-host))
+                         :module ""
+                       :head ""
+                       :name ""
+                       :line 0
+                       :message diagnostic))
+              0)))
+  (controller/live-controller-unlock!)
+  0)
+
+; ---- processing one immutable project generation ----------------------------
+;;; Discover and diff the project against the accepted ledger, then submit the
+;;; complete source graph as one live transaction under POLICY. CHECK-ONLY
+;;; does everything but publish: its verdict is recorded as the last check, and
+;;; nothing else about the host or the running program changes. Returns 0 when
+;;; the edit applied (or would), 1 otherwise. The caller holds the host lock.
+(defn process-project! [(policy i64) (check-only bool)] (-> i64)
+  (let [host (live-host)
+        region (region-new)
+        a (region-allocator region)
+        _lock (controller/live-controller-lock!)
+        (mut snapshot) (project/project-read a (.entry host) (.root host))
+        _unlock (controller/live-controller-unlock!)
+        _watch (project/project-watch-failures! a (mut snapshot) (.files (.verdict host)))
+        files (.files snapshot)
+        h (project/files-digest a files false)
+        (mut next) (.ledger snapshot)
+        (mut problems) (al-new [LiveProblem] a)
+        (mut removed) (al-new [(slice u8)] a)
+        (mut state) "live"
+        (mut summary) ""
+        (mut accept) false
+        (mut status) 1]
+    (if (not (.ok next))
+        (do
+          (set! state "unreadable")
+          (set! summary
+                (cat a "the project does not load; the accepted program keeps running. " (.message snapshot)))
+          (push! (mut problems)
+            (LiveProblem :file (if (= (slice-len (.error-file snapshot)) 0)
+                                  (.entry host) (.error-file snapshot))
+              :module "" :head "" :name "" :line (.error-line snapshot)
+              :message (load summary)))
+          0)
+        (let [(mut plan) (ledger-project-diff a (.entry-module snapshot) (field host accepted) (mut next))
+              duplicates (ledger-duplicates a (mut next))]
+          (for [i 0 (len (.removed plan))]
+            (let [f (get (.removed plan) i)]
+              (push! (mut removed) (form-label a (.head f) (.name f)))
+              0))
+          (cond (> (len duplicates) 0)
+                  (do
+                    (set! state "rejected")
+                    (set! summary
+                          "the source file defines the same live identity more than once; remove the duplicate definition. No part of this edit was applied")
+                    (for [i 0 (len duplicates)]
+                      (let [f (get duplicates i)]
+                        (push! (mut problems)
+                               (LiveProblem
+                         :file (.file f)
+                                 :module (.module f)
+                                 :head (.head f)
+                                 :name (.name f)
+                                 :line (.line f)
+                                 :message
+                                   "duplicate definition in the live source file"))))
+                    0)
+                (> (len (.removed plan)) 0)
+                  (do
+                    (set! state "needs-restart")
+                    (set! summary
+                          "definitions were removed but still belong to the running generation; restore them or restart the program. No part of this edit was applied")
+                    0)
+                (> (len (.unsupported plan)) 0)
+                  (do
+                    (for [i 0 (len (.unsupported plan))]
+                      (let [f (get (.unsupported plan) i)]
+                        (push! (mut problems)
+                               (LiveProblem
+                         :file (.file f)
+                                 :module (.module f)
+                                 :head (.head f)
+                                 :name (.name f)
+                                 :line (.line f)
+                                 :message
+                                   (unsupported-message a (.head f) (.name f))))
+                        0))
+                    (set! state "needs-restart")
+                    (set! summary
+                          "this edit changes forms a running program cannot recompile; restart the program to apply it, or revert those forms")
+                    0)
+                (= (len (.submit plan)) 0)
+                  (do
+                    (set! summary "nothing to apply: no definition changed")
+                    (set! accept true)
+                    (set! status 0)
+                    0)
+                :else
+                  (let [source (.source next)
+                        _files (set! (.checking-files host) files)
+                        submitted
+                          (controller/live-controller-submit! source
+                                                              policy
+                                                              true
+                                                              check-only)]
+                    (if (= (controller/live-controller-phase) 16)
+                        (do (set! state "pending")
+                            (set! summary "a project file changed during compilation; retrying the new snapshot") 0)
+                    (if (= submitted 0)
+                        (do
+                          (set! summary
+                                (applied-summary a (mut plan) check-only))
+                          (set! state (if check-only "would-apply" "live"))
+                          (set! accept true)
+                          (set! status 0)
+                          0)
+                        (let [transition
+                                (if check-only
+                                    (controller/live-controller-check-needs-transition?)
+                                    (= (controller/live-controller-phase) 9))]
+                          (collect-problems! a
+                                             (mut problems)
+                                             (mut plan)
+                                             (mut next)
+                                             check-only
+                                             transition)
+                          (set! state
+                                (if transition "needs-migration" "rejected"))
+                          (set! summary
+                                (if transition
+                                    "a struct's layout changed while the running program holds values of it; add a migration (or a default) for each changed field"
+                                    (let [guidance (publication-guidance (controller/live-controller-phase))]
+                                      (if (> (slice-len guidance) 0)
+                                          (cat a "the migration was rolled back; the running program is unchanged. " guidance)
+                                          "the edit does not check; the running program is unchanged"))))
+                          0)))))))
+    (let [verdict
+            (LiveVerdict
+              :files files
+              :state (load state)
+              :digest h
+              :epoch (controller/live-controller-epoch)
+              :summary (load summary)
+              :problems (load problems)
+              :removed (load removed))]
+      (if check-only
+          (do
+            (region-free! (.check-region host))
+            (set! (.check-region host) region)
+            (set! (.check host) verdict)
+            0)
+          (do
+            (set! (.seen host) h)
+            (if (load accept)
+                (let [old-accepted (.accepted-region host)
+                      old-verdict (.verdict-region host)]
+                  (set! (.accepted host) (load next))
+                  (set! (.accepted-region host) region)
+                  (set! (.verdict host) verdict)
+                  (set! (.verdict-region host) region)
+                  (region-free! old-accepted)
+                  (unless (same-region? old-verdict old-accepted)
+                    (region-free! old-verdict)
+                    0)
+                  0)
+                (let [old-verdict (.verdict-region host)]
+                  (set! (.verdict host) verdict)
+                  (set! (.verdict-region host) region)
+                  (unless (same-region? old-verdict (.accepted-region host))
+                    (region-free! old-verdict)
+                    0)
+                  0))
+            (write-status!)
+            (report-verdict!)
+            0)))
+    (load status)))
+
+; ---- the verdict on disk -----------------------------------------------------
+(defn push-sexp-string! [(sb (mut str/StrBuf)) (s (slice u8))] (-> i64)
+  (str/sb-push-byte! (mut sb) (primitive/cast u8 34))
+  (for [i 0 (slice-len s)]
+    (let [c (primitive/cast i64 (slice-get s i))]
+      (cond (= c 34) (str/sb-push-str! (mut sb) "\\\"")
+            (= c 92) (str/sb-push-str! (mut sb) "\\\\")
+            (= c 10) (str/sb-push-str! (mut sb) "\\n")
+            (= c 9) (str/sb-push-str! (mut sb) "\\t")
+            (= c 13) (str/sb-push-str! (mut sb) "\\r")
+            :else (str/sb-push-byte! (mut sb) (slice-get s i)))
+      0))
+  (str/sb-push-byte! (mut sb) (primitive/cast u8 34))
+  0)
+
+;;; The verdict as data, for the `coil check` checker:
+;;;   (live-verdict PID ENTRY DIGEST STATE EPOCH SUMMARY
+;;;     ((problem HEAD NAME LINE MESSAGE) ...)
+;;;     (REMOVED ...)
+;;;     (STALE-FILE ...))
+(defn verdict-sexp [(a (dyn alloc/Allocator))] (-> (slice u8))
+  (let [host (live-host)
+        v (field host verdict)
+        (mut sb) (str/sb-new a)]
+    (str/sb-push-str! (mut sb) "(live-verdict ")
+    (str/sb-push-str! (mut sb) (decimal a (primitive/cast i64 (os/getpid))))
+    (str/sb-push-str! (mut sb) " ")
+    (push-sexp-string! (mut sb) (.entry host))
+    (str/sb-push-str! (mut sb) " ")
+    (push-sexp-string! (mut sb) (digest-hex a (.digest v)))
+    (str/sb-push-str! (mut sb) " :")
+    (str/sb-push-str! (mut sb) (.state v))
+    (str/sb-push-str! (mut sb) " ")
+    (str/sb-push-str! (mut sb) (decimal a (.epoch v)))
+    (str/sb-push-str! (mut sb) " ")
+    (push-sexp-string! (mut sb) (.summary v))
+    (str/sb-push-str! (mut sb) "\n  (")
+    (let [ps (field v problems)]
+      (for [i 0 (len (load ps))]
+        (let [p (al-elem [LiveProblem] ps i)]
+          (str/sb-push-str! (mut sb) "\n   (problem ")
+          (push-sexp-string! (mut sb) (.head p))
+          (str/sb-push-str! (mut sb) " ")
+          (push-sexp-string! (mut sb) (.name p))
+          (str/sb-push-str! (mut sb) " ")
+          (str/sb-push-str! (mut sb) (decimal a (.line p)))
+          (str/sb-push-str! (mut sb) " ")
+          (push-sexp-string! (mut sb) (.message p))
+          (str/sb-push-str! (mut sb) " ") (push-sexp-string! (mut sb) (.file p))
+          (str/sb-push-str! (mut sb) " ") (push-sexp-string! (mut sb) (.module p))
+          (str/sb-push-str! (mut sb) ")")
+          0))
+      0)
+    (str/sb-push-str! (mut sb) ")\n  (")
+    (let [rs (field v removed)]
+      (for [i 0 (len (load rs))]
+        (when (> i 0) (str/sb-push-str! (mut sb) " ") 0)
+        (push-sexp-string! (mut sb) (get (load rs) i))
+        0))
+    (str/sb-push-str! (mut sb) ")\n  (")
+    (let [files (.files v)]
+      (for [i 0 (len files)]
+        (let [f (get files i)]
+          (str/sb-push-str! (mut sb) "(file ")
+          (push-sexp-string! (mut sb) (.path f))
+          (str/sb-push-str! (mut sb) " ")
+          (push-sexp-string! (mut sb) (digest-hex a (.digest f)))
+          (str/sb-push-str! (mut sb) ")"))))
+    (str/sb-push-str! (mut sb) "))\n")
+    (str/sb-finish! (mut sb))))
+
+;;; A verdict as Markdown, for people and agents (STATUS.md, `coil-live status`).
+(defn verdict-markdown [(a (dyn alloc/Allocator)) (v (ptr LiveVerdict))] (-> (slice u8))
+  (let [host (live-host)
+        (mut sb) (str/sb-new a)]
+    (str/sb-push-str! (mut sb) "# coil live: ")
+    (str/sb-push-str! (mut sb) (.state v))
+    (str/sb-push-str! (mut sb) "\n\n")
+    (str/sb-push-str! (mut sb) (.summary v))
+    (str/sb-push-str! (mut sb) "\n\n- entry: `")
+    (str/sb-push-str! (mut sb) (.entry host))
+    (str/sb-push-str! (mut sb) "`\n- live generation: ")
+    (str/sb-push-str! (mut sb) (decimal a (.epoch v)))
+    (str/sb-push-str! (mut sb) "\n- file version: ")
+    (str/sb-push-str! (mut sb) (digest-hex a (.digest v)))
+    (str/sb-push-str! (mut sb) "\n")
+    (let [ps (field v problems)]
+      (when (> (len (load ps)) 0)
+        (str/sb-push-str! (mut sb) "\n## Problems\n")
+        (for [i 0 (len (load ps))]
+          (let [p (al-elem [LiveProblem] ps i)]
+            (str/sb-push-str! (mut sb) "\n### ")
+            (if (= (slice-len (.name p)) 0)
+                (str/sb-push-str! (mut sb) "the file")
+                (do
+                  (str/sb-push-str! (mut sb) "`")
+                  (str/sb-push-str! (mut sb) (form-label a (.head p) (.name p)))
+                  (str/sb-push-str! (mut sb) "` in ")
+                  (str/sb-push-str! (mut sb) (.file p))
+                  (str/sb-push-str! (mut sb) " (line ")
+                  (str/sb-push-str! (mut sb) (decimal a (.line p)))
+                  (str/sb-push-str! (mut sb) ")")
+                  0))
+            (str/sb-push-str! (mut sb) "\n\n```\n")
+            (str/sb-push-str! (mut sb) (.message p))
+            (str/sb-push-str! (mut sb) "\n```\n")
+            0))
+        0))
+    (let [rs (field v removed)]
+      (when (> (len (load rs)) 0)
+        (str/sb-push-str! (mut sb)
+                          "\n## Removed from the file, still in the running program\n\nThe program keeps a definition's last accepted version until it restarts.\n\n")
+        (for [i 0 (len (load rs))]
+          (str/sb-push-str! (mut sb) "- `")
+          (str/sb-push-str! (mut sb) (get (load rs) i))
+          (str/sb-push-str! (mut sb) "`\n")
+          0)
+        0))
+    (str/sb-finish! (mut sb))))
+
+; Write PATH atomically: a reader sees the old file or the new one, never half.
+(defn write-atomically! [(a (dyn alloc/Allocator))
+                         (path (slice u8))
+                         (text (slice u8))] (-> i64)
+  (let [tmp (cat a path ".tmp")]
+    (match (fs/write-file a tmp text)
+      (Err [_] 1)
+      (Ok [_]
+          (if (= (rename (str/str->cstr a tmp) (str/str->cstr a path))
+                 (primitive/cast i32 0))
+              0
+              1)))))
+
+(defn write-status! [] (-> i64)
+  (let [host (live-host)
+        region (region-new)
+        a (region-allocator region)
+        dir (cat a (.root host) "/.coil-live")]
+    (mkdir (str/str->cstr a dir) (primitive/cast i32 493))
+    (let [data-status
+            (write-atomically! a (cat a dir "/verdict.coil") (verdict-sexp a))
+          report-status
+            (write-atomically! a
+                               (cat a dir "/STATUS.md")
+                               (verdict-markdown a (field host verdict)))]
+      (when (or (!= data-status 0) (!= report-status 0))
+        (say "coil live: cannot publish .coil-live status files; check project directory permissions\n")
+        0)
+      (region-free! region)
+      (if (and (= data-status 0) (= report-status 0)) 0 1))))
+
+; One line per verdict on stderr, plus a line per problem.
+(defn report-verdict! [] (-> i64)
+  (let [host (live-host)
+        v (field host verdict)
+        region (region-new)
+        a (region-allocator region)]
+    (say "[coil live] ")
+    (say (.state v))
+    (say ": ")
+    (say (.summary v))
+    (say "\n")
+    (let [ps (field v problems)]
+      (for [i 0 (len (load ps))]
+        (let [p (al-elem [LiveProblem] ps i)
+              msg (.message p)
+              first-line
+                (match (str/str-find msg "\n")
+                  (None [] msg)
+                  (Some [k] (subslice msg 0 k)))]
+          (say "  ")
+          (say (if (= (slice-len (.name p)) 0)
+                   "file"
+                   (form-label a (.head p) (.name p))))
+          (say ": ")
+          (say first-line)
+          (say "\n")
+          0))
+      0)
+    (region-free! region)
+    0))
+
+; ---- watching ----------------------------------------------------------------
+(defn read-digest [(path (slice u8))] (-> i64)
+  (let [region (region-new)
+        h
+          (match (fs/read-file (region-allocator region) path)
+            (Err [_] 0)
+            (Ok [text] (digest text)))]
+    (region-free! region)
+    h))
+
+(defn project-files-readable? [] (-> bool)
+  (let [region (region-new) a (region-allocator region)
+        files (.files (.verdict (live-host))) (mut readable) true]
+    (for [i 0 (len files)]
+      (let [f (get files i)]
+        (match (fs/read-file a (.path f))
+          (Ok [_] 0) (Err [_] (do (set! readable false) 0)))))
+    (region-free! region) (load readable)))
+
+(defn project-current-digest [] (-> i64)
+  (let [region (region-new)
+        h (project/files-digest (region-allocator region) (.files (.verdict (live-host))) true)]
+    (region-free! region) h))
+
+; Checked immediately before publication; an edit made during compilation is
+; retried as a new project snapshot, never labelled as the compiled version.
+(defn project-precommit [] (-> i64)
+  (let [region (region-new) a (region-allocator region)
+        files (.checking-files (live-host))
+        same (= (project/files-digest a files false) (project/files-digest a files true))]
+    (region-free! region) (if same 0 1)))
+
+(defn host-poll! [] (-> i64)
+  (host-lock!)
+  (let [host (live-host) h (project-current-digest)]
+    (set! (.retry-polls host) (+ (.retry-polls host) 1))
+    (when (or (!= h (.seen host))
+              (and (= (.state (.verdict host)) "unreadable") (>= (.retry-polls host) 8)))
+      (set! (.retry-polls host) 0)
+      (usleep 120000)
+      (when (= h (project-current-digest))
+        (process-project! controller/LIVE-POLICY-STRICT false) 0) 0))
+  (host-unlock!) 0)
+
+(defn watcher-thread [(arg (ptr i8))] (-> (ptr i8))
+  (primitive/cast i64 arg)
+  (loop (usleep 150000)
+    (host-poll!))
+  (primitive/cast (ptr i8) 0))
+
+(defn nrepl-thread [(arg (ptr i8))] (-> (ptr i8))
+  (primitive/cast i64 arg)
+  (nrepl/serve-listener! (field (live-host) listener))
+  (primitive/cast (ptr i8) 0))
+
+(defn spawn-detached! [(body (fnptr c [(ptr i8)] (ptr i8))) (arg (ptr i8))] (-> i64)
+  (let [worker (primitive/alloc-stack thread/Thread)
+        ; File processing compiles through the in-process compiler: give it
+        ; the same deep stack the nREPL client threads get.
+        status
+          (thread/thread-spawn-configured worker
+                                          body
+                                          arg
+                                          (thread/thread-config 33554432 16384))]
+    (if (!= (primitive/cast i64 status) 0)
+        (primitive/cast i64 status)
+        (do (pthread_detach (load (field worker handle))) 0))))
+
+; ---- operations for nREPL clients (`coil-live`) -------------------------------
+(defn hex-digit [(n i64)] (-> u8)
+  (primitive/cast u8 (if (< n 10) (+ n 48) (+ n 87))))
+
+(defn push-json-string! [(sb (mut str/StrBuf)) (s (slice u8))] (-> i64)
+  (str/sb-push-byte! (mut sb) (primitive/cast u8 34))
+  (for [i 0 (slice-len s)]
+    (let [c (primitive/cast i64 (slice-get s i))]
+      (cond (= c 34) (str/sb-push-str! (mut sb) "\\\"")
+            (= c 92) (str/sb-push-str! (mut sb) "\\\\")
+            (= c 10) (str/sb-push-str! (mut sb) "\\n")
+            (= c 13) (str/sb-push-str! (mut sb) "\\r")
+            (= c 9) (str/sb-push-str! (mut sb) "\\t")
+            (< c 32)
+              (do
+                (str/sb-push-str! (mut sb) "\\u00")
+                (str/sb-push-byte! (mut sb) (hex-digit (/ c 16)))
+                (str/sb-push-byte! (mut sb) (hex-digit (% c 16)))
+                0)
+            :else (str/sb-push-byte! (mut sb) (slice-get s i)))
+      0))
+  (str/sb-push-byte! (mut sb) (primitive/cast u8 34))
+  0)
+
+;;; A verdict as JSON, for tools (`coil-live --json`, the MCP server):
+;;;   {"state": "rejected", "summary": "...", "entry": "/abs/app.coil",
+;;;    "epoch": 4, "version": "40c50cf7e8684b0b",
+;;;    "problems": [{"form": "defn value", "line": 9, "message": "..."}],
+;;;    "removed": ["defn bonus"], "stale": ["/abs/util.coil"]}
+;;; A problem about the file as a whole has form "" and line 0.
+(defn verdict-json [(a (dyn alloc/Allocator)) (v (ptr LiveVerdict))] (-> (slice u8))
+  (let [host (live-host)
+        (mut sb) (str/sb-new a)]
+    (str/sb-push-str! (mut sb) "{\"state\":")
+    (push-json-string! (mut sb) (.state v))
+    (str/sb-push-str! (mut sb) ",\"summary\":")
+    (push-json-string! (mut sb) (.summary v))
+    (str/sb-push-str! (mut sb) ",\"entry\":")
+    (push-json-string! (mut sb) (.entry host))
+    (str/sb-push-str! (mut sb) ",\"epoch\":")
+    (str/sb-push-str! (mut sb) (decimal a (.epoch v)))
+    (str/sb-push-str! (mut sb) ",\"version\":")
+    (push-json-string! (mut sb) (digest-hex a (.digest v)))
+    (str/sb-push-str! (mut sb) ",\"problems\":[")
+    (let [ps (field v problems)]
+      (for [i 0 (len (load ps))]
+        (let [p (al-elem [LiveProblem] ps i)]
+          (when (> i 0) (str/sb-push-str! (mut sb) ",") 0)
+          (str/sb-push-str! (mut sb) "{\"form\":")
+          (push-json-string! (mut sb) (form-label a (.head p) (.name p)))
+          (str/sb-push-str! (mut sb) ",\"line\":")
+          (str/sb-push-str! (mut sb) (decimal a (.line p)))
+          (str/sb-push-str! (mut sb) ",\"message\":")
+          (push-json-string! (mut sb) (.message p))
+          (str/sb-push-str! (mut sb) ",\"file\":") (push-json-string! (mut sb) (.file p))
+          (str/sb-push-str! (mut sb) ",\"module\":") (push-json-string! (mut sb) (.module p))
+          (str/sb-push-str! (mut sb) "}")
+          0))
+      0)
+    (str/sb-push-str! (mut sb) "],\"removed\":[")
+    (let [rs (field v removed)]
+      (for [i 0 (len (load rs))]
+        (when (> i 0) (str/sb-push-str! (mut sb) ",") 0)
+        (push-json-string! (mut sb) (get (load rs) i))
+        0))
+    (str/sb-push-str! (mut sb) "],\"files\":[")
+    (let [files (.files v)]
+      (for [i 0 (len files)]
+        (let [f (get files i)]
+          (when (> i 0) (str/sb-push-str! (mut sb) ",") 0)
+          (str/sb-push-str! (mut sb) "{\"path\":")
+          (push-json-string! (mut sb) (.path f))
+          (str/sb-push-str! (mut sb) ",\"module\":")
+          (push-json-string! (mut sb) (.module f))
+          (str/sb-push-str! (mut sb) ",\"version\":")
+          (push-json-string! (mut sb) (digest-hex a (.digest f)))
+          (str/sb-push-str! (mut sb) "}"))))
+    (str/sb-push-str! (mut sb) "]}")
+    (str/sb-finish! (mut sb))))
+
+; Good: the program runs the file as it is (or, for a dry run, would), and every
+; other project file is still the version it started with.
+(defn verdict-good? [(v (ptr LiveVerdict))] (-> bool)
+  (or (= (.state v) "live") (= (.state v) "would-apply")))
+
+;;; The live-repl protocol's `coil/file-*` operations, in the C convention of its
+;;; handler slot. FILE-OP-STATUS reports the current verdict; FILE-OP-CHECK and
+;;; FILE-OP-APPLY first process the entry file as it is on disk now -- a dry run,
+;;; or applied under POLICY exactly as a save would be. Appends the verdict to
+;;; OUT as Markdown or JSON (FORMAT) and returns 0 when it is good, 1 otherwise.
+(defn host-file-op [(op i64) (policy i64) (format i64) (out (ptr str/StrBuf))] (-> i64)
+  (let [host (live-host)
+        region (region-new)
+        a (region-allocator region)
+        (mut good) false
+        (mut report) ""]
+    (host-lock!)
+    (if (= op protocol/FILE-OP-STATUS)
+        (when (!= (project-current-digest) (.digest (.verdict host)))
+          (let [(mut pending) (load (LiveVerdict
+                    :files (.files (.verdict host))
+                    :state (if (project-files-readable?) "pending" "unreadable") :digest (project-current-digest)
+                    :epoch (controller/live-controller-epoch)
+                    :summary (if (project-files-readable?)
+                      "saved project changes are pending; use coil-live apply to submit them now"
+                      "cannot read a project source file; the accepted program keeps running")
+                    :problems (al-new [LiveProblem] a) :removed (al-new [(slice u8)] a)))]
+            (set! report (if (= format protocol/FILE-FORMAT-JSON)
+                              (verdict-json a (mut pending)) (verdict-markdown a (mut pending))))) 0)
+        (do (process-project! policy (= op protocol/FILE-OP-CHECK)) 0))
+    (when (= (slice-len (load report)) 0)
+      (let [v
+              (if (= op protocol/FILE-OP-CHECK)
+                  (field host check)
+                  (field host verdict))]
+        (set! good (verdict-good? v))
+        (set! report
+              (if (= format protocol/FILE-FORMAT-JSON)
+                  (verdict-json a v)
+                  (verdict-markdown a v)))
+        0))
+    (host-unlock!)
+    (let [(mut sb) (load out)]
+      (str/sb-push-str! (mut sb) (load report))
+      (store! out (load sb)))
+    (region-free! region)
+    (if (load good) 0 1)))
+
+; ---- main ----------------------------------------------------------------------
+; An advisory lock is owned by the process, not a PID file. A crash releases it
+; automatically; a second launch cannot overwrite a running project's discovery.
+(defn claim-project! [(a (dyn alloc/Allocator)) (root (slice u8))] (-> bool)
+  (let [dir (cat a root "/.coil-live")]
+    (mkdir (str/str->cstr a dir) (primitive/cast i32 493))
+    (let [owner (fopen (str/str->cstr a (cat a dir "/owner.lock")) c"a+")]
+      (if (= (primitive/cast i64 owner) 0)
+          (do
+            (say "coil live: cannot create .coil-live/owner.lock in the project\n")
+            false)
+          (if (!= (flock (fileno owner) 6) (primitive/cast i32 0))
+              (do
+                (fclose owner)
+                (say "coil live: this project already has an active program; connect with coil-live status --dir PROJECT\n")
+                false)
+              (do (set! (.owner (live-host)) owner) true))))))
+
+;;; The `main` of a program built with `experiments.live.enable`.
+;;;   ENTRY   absolute path used to discover the project source graph
+;;;   ROOT    the project root: `.nrepl-port` and `.coil-live/` go here
+;;;   ROOTS   the build's namespace roots, for the in-process compiler
+;;; Returns what the program's own `main` returns.
+(defn live-host-main! [(entry (slice u8))
+                       (root (slice u8))
+                       (roots (slice u8))] (-> i64)
+  (let [host (live-host)
+        a (alloc/malloc-allocator)
+        boot (region-new)]
+    (block :startup
+           (unless (claim-project! a root) (return-from :startup 1))
+           (protocol/set-file-handler! (primitive/fnptr-of host-file-op))
+           (protocol/set-file-project! root)
+           ; The in-process compiler resolves the program's imports against the very
+           ; roots the program was built with.
+           (setenv c"COIL_NAMESPACE_ROOTS"
+                   (str/str->cstr a roots)
+                   (primitive/cast i32 1))
+           (set! (.entry host) (copy-bytes a entry))
+           (set! (.root host) (copy-bytes a root))
+           (set! (.accepted host) (ledger-empty (region-allocator boot)))
+           (set! (.accepted-region host) boot)
+           (set! (.verdict-region host) boot)
+           (set! (.seen host) 0)
+           (set! (.files (.verdict host)) (al-new [ProjectFile] a))
+           (controller/live-controller-set-precommit! (primitive/fnptr-of project-precommit))
+           (if (!= (controller/live-controller-enable-app!) 0)
+               (do
+                 (say "coil live: could not start the in-process compiler session\n")
+                 1)
+               (match (fs/read-file a entry)
+                 (Err [_]
+                      (do
+                        (say "coil live: cannot read ")
+                        (say entry)
+                        (say "\n")
+                        1))
+                 (Ok [text]
+                     (do
+                       ; A function named redraw is application code. Neither
+                       ; startup nor the publisher may run it on a worker.
+                       (controller/live-controller-set-auto-redraw! false)
+                       (host-lock!)
+                       (let [status
+                               (process-project! controller/LIVE-POLICY-STRICT
+                                               false)]
+                         (host-unlock!)
+                         (if (!= status 0)
+                             (do
+                               (say "coil live: the program does not start; see ")
+                               (say root)
+                               (say "/.coil-live/STATUS.md\n")
+                               status)
+                             (do
+                               (when (!= (write-status!) 0)
+                                 (return-from :startup 1))
+                               (when (!= (nrepl/prepare-listener! (field host
+                                                                         listener)
+                                                                  (str/str->cstr a
+                                                                                 (cat a
+                                                                                      root
+                                                                                      "/.nrepl-port")))
+                                         0)
+                                 (say "coil live: cannot start or publish the editor server\n")
+                                 (return-from :startup 1))
+                               (when (!= (spawn-detached! (primitive/fnptr-of nrepl-thread)
+                                                          (primitive/cast (ptr i8)
+                                                                          0))
+                                         0)
+                                 (say "coil live: cannot start the editor server thread\n")
+                                 (return-from :startup 1))
+                               (when (!= (spawn-detached! (primitive/fnptr-of watcher-thread)
+                                                          (primitive/cast (ptr i8)
+                                                                          0))
+                                         0)
+                                 (say "coil live: cannot start the file watcher thread\n")
+                                 (return-from :startup 1))
+                               (say "coil live: ")
+                               (say entry)
+                               (say " is live. Saves apply as they check; status in ")
+                               (say root)
+                               (say "/.coil-live/STATUS.md\n")
+                               (live-app/live-app-run!)))))))))))

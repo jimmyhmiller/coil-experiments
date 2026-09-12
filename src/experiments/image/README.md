@@ -84,7 +84,9 @@ build/adventure bake build/adventure game.img game   # one self-booting file
   tests. The live path reuses `format.coil` and the blocker vocabulary.
 - **`image_boot.coil`** — the controller-backed half: `image-boot!`,
   `image-controller-edit!`, and the full baked boot. Only programs that restore
-  code import this, so only they compile the JIT.
+  code use this.
+- **`jit_host.coil`** — that half packaged as a prebuilt static library behind a
+  C ABI, so an app links the compiler instead of recompiling it.
 - **`roundtrip.coil`, `boot_demo.coil`, `coop_demo.coil`, `workspace_demo.coil`,
   `adventure.coil`** — the demo programs driven by the shell harnesses.
 
@@ -110,21 +112,49 @@ build/adventure bake build/adventure game.img game   # one self-booting file
 
 ## Build time
 
-Apps that only **save and data-reload** an image (`adventure`, `workspace_demo`,
-`coop_demo`, `roundtrip`, and every `_test`) build in about 1.5 s and the whole
-`coil test --suite image` suite runs in ~2.5 s. Only programs that use **full
-boot** — replaying the ledger through the live JIT controller (`boot_demo`, and
-`image-boot!`/`image-controller-edit!` in `image_boot.coil`) — embed the
-in-process compiler (`coil.jit`) and pay ~35 s to build it.
+Nothing here should take tens of seconds to build. Two things made it slow, and
+both are fixed.
 
-This is deliberate. `image.coil` (save, `image-load-data!`, diagnostics) and
-`bake.coil` (`image-bake!`, `image-boot-baked-data!`) are controller-free; the
-controller-backed half lives in `image_boot.coil`. Importing the controller
-pulls the entire compiler-as-a-library into the binary and, at the default
-`-O3`, LLVM then optimizes all of it — which is what made these builds slow
-(~28 s for the adventure before the split, ~1.5 s after). Keep `image_boot`
-out of an app unless it genuinely needs to restore code, not just data. For a
-program that must embed the JIT, `-O2` roughly halves its build.
+**1. Don't compile the compiler into apps that don't JIT.** `image.coil` (save,
+`image-load-data!`, diagnostics) and `bake.coil` are controller-free; the
+controller-backed half lives in `image_boot.coil`. Importing the live controller
+drags Coil's whole in-process compiler (`coil.jit`) into the binary, and at the
+default `-O3` LLVM then optimizes all of it.
+
+**2. When you do need the JIT, link it, don't recompile it.** `jit_host.coil`
+wraps the controller-backed half behind a small C ABI and builds once into a
+static archive. `boot_demo` links that archive and imports neither the
+controller nor the live runtime.
+
+```sh
+coil build src/experiments/image/jit_host.coil --lib -o build/libcoilimage.a -O1
+coil build src/experiments/image/boot_demo.coil -o build/image-boot-demo \
+  --link-flag "$PWD/build/libcoilimage.a"
+```
+
+| build | before | after |
+|---|---|---|
+| `adventure` / `workspace_demo` / `coop_demo` / `roundtrip` | ~28 s | ~1.5 s |
+| `coil test --suite image` (26 tests) | > 60 s | ~2.5 s |
+| `boot_demo` (needs the JIT) | 37 s | **0.45 s** |
+| the JIT host archive | — | 16.7 s, once |
+
+`scripts/image-boot.sh` rebuilds the archive only when the image or
+heap-inspector sources are newer than it.
+
+Two caveats, both filed in the `coil-bugs` pad. `-O1` is the floor for anything
+importing `coil.jit`: at `-O0` LLVM aborts on Coil's guaranteed `musttail`.
+And linking a Coil archive into a Coil program warns about duplicate stdlib
+`alloc-static` symbols (the linker picks one, which is the desired single
+instance, and the save/boot/upgrade gates pass) — `-Wl,-force_load` turns those
+warnings into errors, so don't use it here; ordinary transitive archive pulls
+bring in the live runtime's object and its `coil_live_*` entry points, which
+JIT-compiled code resolves through `dlsym` at runtime.
+
+An application that links the archive must **not** also import
+`experiments.heap-inspector.live`: the archive owns the live runtime's
+registries, and a second import would create a disjoint set of cells. Everything
+an app needs is exported through the C ABI in `jit_host.coil`.
 
 ## Compiler limits met while building this (recorded in the `coil-bugs` pad)
 

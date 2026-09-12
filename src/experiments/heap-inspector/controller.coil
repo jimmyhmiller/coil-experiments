@@ -37,7 +37,38 @@
    ; candidate and never used to classify source.
    (native-callbacks-published bool)
    (native-demo bool)
-   (live-app bool)])
+   (live-app bool)
+   (auto-redraw bool)
+   ; Diagnostic of the last dry-run check (live-controller-submit! with
+   ; check-only). Kept apart from the broken/pending state, which describes
+   ; the running world and is never touched by a check.
+   (check-diagnostic (slice u8))
+   (check-diagnostic-owned bool)
+   ; The compiler's condition kind for that rejection: 1 = a layout change
+   ; needs a transition (migrate/default), anything else = does not check.
+   (check-condition i64)])
+
+; How a rejected candidate affects the running program.
+;  - DEFERRED: definitions that check are published; a function that does not
+;    check becomes a typed Broken entry that raises a live condition only when
+;    execution reaches it. The editor/REPL policy.
+;  - STRICT: nothing is published unless the whole candidate checks, loads and
+;    migrates, and no condition is raised: the program keeps running its
+;    accepted generation untouched. The file-watcher policy.
+(const LIVE-POLICY-DEFERRED 0)
+(const LIVE-POLICY-STRICT 1)
+
+; File hosts can verify their immutable inputs immediately before publication.
+; The callback runs under the controller lock and must not reenter it.
+(defstruct LivePrecommit [(enabled bool) (callback (fnptr c [] i64))])
+(defn live-controller-precommit [] (-> (ptr LivePrecommit))
+  (primitive/alloc-static LivePrecommit))
+(defn live-controller-set-precommit! [(callback (fnptr c [] i64))] (-> i64)
+  (set! (.callback (live-controller-precommit)) callback)
+  (set! (.enabled (live-controller-precommit)) true) 0)
+(defn live-controller-inputs-current? [] (-> bool)
+  (let [guard (live-controller-precommit)]
+    (if (.enabled guard) (let [callback (.callback guard)] (= (callback) 0)) true)))
 
 (defn live-controller [] (-> (ptr LiveController))
   (primitive/alloc-static LiveController))
@@ -71,8 +102,14 @@
 
 (defn live-controller-enable-app! [] (-> i64)
   (let [status (live-controller-init!)]
-    (when (= status 0) (set! (.live-app (live-controller)) true))
+    (when (= status 0)
+      (set! (.live-app (live-controller)) true)
+      (set! (.auto-redraw (live-controller)) true))
     status))
+
+; Project hosts leave UI scheduling to the application's native event loop.
+(defn live-controller-set-auto-redraw! [(enabled bool)] (-> i64)
+  (set! (.auto-redraw (live-controller)) enabled) 0)
 
 (defn live-controller-init! [] (-> i64)
   ; Keep every C ABI entry used by candidate-generated code reachable in the
@@ -121,6 +158,7 @@
                           (set! (.native-callback-generation controller) 0)
                           (set! (.pending-live controller) "")
                           (set! (.broken-diagnostic controller) "")
+                          (set! (.check-diagnostic controller) "")
                           (set! (.repairs controller)
                                 (al-new [LiveRepair] (alloc/malloc-allocator)))
                           (set! (.native-callbacks-published controller) false)
@@ -273,31 +311,55 @@
 ; reflected schemas and transition fnptrs through the host C ABI, stages every
 ; affected root, and publishes the staged roots only if all transitions succeed.
 ; The gate covers both that entry and the backend's final generation swap.
-(defn live-controller-edit! [(source (slice u8)) (entry (slice u8))] (-> i64)
+(defn live-controller-edit! [(source (slice u8))
+                              (entry (slice u8))
+                              (policy i64)
+                              (check-only bool)] (-> i64)
   (live-controller-init!)
-  (let [controller (live-controller)]
+  (let [controller (live-controller)
+        strict (= policy LIVE-POLICY-STRICT)]
     (live-controller-set-phase! 2)
     (if (!= (jit/jit-prepare-replace-with-entry!
               (field controller session) source entry)
             0)
-        (do
-          (live-controller-save-broken-diagnostic!)
-          (live-controller-save-repairs!)
-          (let [condition-kind
-                  (if (= (jit/jit-condition-kind (field controller session)) 1)
-                      1 2)
-                recovered
-                  (if (= condition-kind 2)
-                      (= (live-controller-publish-broken-candidate!) 0)
-                      false)]
-            ; A typed Broken entry raises only when native execution reaches the
-            ; affected definition. Failures that cannot form the old ABI retain
-            ; the immediate global condition policy.
-            (if (not recovered)
-                (live/live-condition-raise! condition-kind 1) 0)
-            (live-controller-set-phase! (if (= condition-kind 1) 9 15))
-            (set! (.last-result controller) 1)
-            1))
+        (if check-only
+            ; A dry run reports why the candidate would be rejected and
+            ; changes nothing: no Broken entries, no condition, no pending.
+            (do (live-controller-save-check-diagnostic!) 1)
+            (do
+              (live-controller-save-broken-diagnostic!)
+              (live-controller-save-repairs!)
+              (let [condition-kind
+                      (if (= (jit/jit-condition-kind (field controller session)) 1)
+                          1 2)
+                    recovered
+                      (if (and (= condition-kind 2) (not strict))
+                          (= (live-controller-publish-broken-candidate!) 0)
+                          false)]
+                ; DEFERRED: a typed Broken entry raises only when native execution
+                ; reaches the affected definition, and failures that cannot form
+                ; the old ABI retain the immediate global condition policy.
+                ; STRICT: the accepted generation keeps running as it is.
+                (if (and (not recovered) (not strict))
+                    (live/live-condition-raise! condition-kind 1) 0)
+                (live-controller-set-phase!
+                  (cond (= condition-kind 1) 9
+                        strict 3
+                        :else 15))
+                (set! (.last-result controller) 1)
+                1)))
+        (if (not (live-controller-inputs-current?))
+            (do
+              (jit/jit-abort-prepared! (field controller session))
+              (live-controller-set-phase! 16)
+              1)
+        (if check-only
+            ; The whole candidate checked, monomorphized and staged: discard it.
+            ; Its entry (schema registration, migration) never runs.
+            (do
+              (jit/jit-abort-prepared! (field controller session))
+              (live-controller-clear-check-diagnostic!)
+              0)
         (do
           (live-controller-set-phase! 4)
           (live-controller-set-phase! 6)
@@ -315,7 +377,8 @@
                       (do
                   (if (.native-demo controller) (demo/native-demo-publish-staged!) 0)
                   (if (.live-app controller) (app/live-app-publish-staged!) 0)
-                  (if (.live-app controller) (app/live-app-request-redraw!) 0)
+                  (if (and (.live-app controller) (.auto-redraw controller))
+                      (app/live-app-request-redraw!) 0)
                   ; Native callbacks and the app's one-shot main-loop entry
                   ; remain reachable after publication. Retain the exact image
                   ; that owns them, not a later current generation.
@@ -334,7 +397,7 @@
                   (live/live-clear-staged-code-owners!)
                   (if (.native-demo controller) (demo/native-demo-abort-staged!) 0)
                   (if (.live-app controller) (app/live-app-abort-staged!) 0)
-                  (live/live-condition-raise! 3 (load status))))
+                  (unless strict (live/live-condition-raise! 3 (load status)) 0)))
             (live/live-end-affected-publication!)
             (set! (.last-result controller) (load status))
             (live-controller-set-phase!
@@ -345,12 +408,31 @@
                         (= (load status) -14) 13
                         (= (load status) -11) 14
                         :else 8))
-            (load status))))))
+            (load status))))))))
 
+; The editor/REPL path: a rejected candidate stays pending so the next snippet
+; can repair it, and functions that fail to check become Broken entries.
 (defn live-controller-edit-source! [(source (slice u8))] (-> i64)
+  (live-controller-submit! source LIVE-POLICY-DEFERRED false false))
+
+; Submit SOURCE (one or more top-level forms) as a live transaction.
+;  - POLICY: LIVE-POLICY-DEFERRED or LIVE-POLICY-STRICT (see above).
+;  - REPLACE-PENDING: the candidate is SOURCE alone rather than the retained
+;    rejected branch plus SOURCE. A caller that always submits its complete
+;    changeset against the accepted program (the file adapter) needs this: a
+;    definition reverted to its accepted form must not linger from an earlier
+;    rejection.
+;  - CHECK-ONLY: check, monomorphize and stage the candidate, then discard it.
+;    Nothing is published, pending and the reported state are untouched, and a
+;    rejection's reason is read from live-controller-check-diagnostic.
+(defn live-controller-submit! [(source (slice u8))
+                               (policy i64)
+                               (replace-pending bool)
+                               (check-only bool)] (-> i64)
   ; Phase is published before taking the mutation lock. A status request that
   ; sees a transient phase uses stable user-source fields and never touches the
   ; JIT session while this worker mutates it.
+  (let [prior-phase (live-controller-phase)]
   (live-controller-set-phase! 2)
   (live-controller-lock!)
   (let [controller (live-controller)]
@@ -369,15 +451,17 @@
                (not (.native-callbacks-published controller)))]
     ; Rejected source is an editable candidate branch. A following snippet
     ; repairs that branch while migration still compares it with committed code.
-    (when (> (slice-len (.pending-live controller)) 0)
+    (when (and (not replace-pending) (> (slice-len (.pending-live controller)) 0))
       (str/sb-push-str! (mut candidate) (.pending-live controller))
       (str/sb-push-str! (mut candidate) "\n"))
     (str/sb-push-str! (mut candidate) source)
     (let [candidate-source (str/sb-finish! (mut candidate))]
-    (if (.pending-live-owned controller)
-        (alloc/free [u8] a (.pending-live controller)) 0)
-    (set! (.pending-live controller) (live-controller-copy candidate-source))
-    (set! (.pending-live-owned controller) true)
+    (unless check-only
+      (if (.pending-live-owned controller)
+          (alloc/free [u8] a (.pending-live controller)) 0)
+      (set! (.pending-live controller) (live-controller-copy candidate-source))
+      (set! (.pending-live-owned controller) true)
+      0)
     (str/sb-push-str! (mut wrapper)
       "(live-source-request \"")
     (live-controller-append-string! (mut wrapper) candidate-source)
@@ -386,8 +470,8 @@
             stage-app-callbacks "\" :app)"
             :else "\" :normal)"))
       (let [status (live-controller-edit! (str/sb-finish! (mut wrapper))
-                                        "0")]
-      (if (= status 0)
+                                        "0" policy check-only)]
+      (if (and (= status 0) (not check-only))
           (do
             (if (or stage-native-callbacks stage-app-callbacks)
                 (set! (.native-callbacks-published controller) true) 0)
@@ -395,9 +479,43 @@
             (set! (.pending-live controller) "")
             (set! (.pending-live-owned controller) false))
           0)
+      ; A check leaves the reported state exactly as it found it.
+      (if check-only (live-controller-set-phase! prior-phase) 0)
       (alloc/free [u8] a candidate-source)
       (live-controller-unlock!)
-      status)))))
+      status))))))
+
+(defn live-controller-save-check-diagnostic! [] (-> i64)
+  (let [controller (live-controller)
+        a (alloc/malloc-allocator)]
+    (if (.check-diagnostic-owned controller)
+        (alloc/free [u8] a (.check-diagnostic controller)) 0)
+    (set! (.check-diagnostic controller)
+          (live-controller-copy
+            (jit/jit-diagnostic (field controller session))))
+    (set! (.check-diagnostic-owned controller) true)
+    (set! (.check-condition controller)
+          (jit/jit-condition-kind (field controller session)))
+    0))
+
+(defn live-controller-clear-check-diagnostic! [] (-> i64)
+  (let [controller (live-controller)]
+    (if (.check-diagnostic-owned controller)
+        (alloc/free [u8] (alloc/malloc-allocator)
+          (.check-diagnostic controller)) 0)
+    (set! (.check-diagnostic controller) "")
+    (set! (.check-diagnostic-owned controller) false)
+    (set! (.check-condition controller) 0)
+    0))
+
+; Why the last dry-run check rejected its candidate; "" after one that passed.
+(defn live-controller-check-diagnostic [] (-> (slice u8))
+  (.check-diagnostic (live-controller)))
+
+; Whether the last dry-run check was rejected for a layout change that needs a
+; transition (a `migrate`, or a default for a new field).
+(defn live-controller-check-needs-transition? [] (-> bool)
+  (= (.check-condition (live-controller)) 1))
 
 ; Test/UI text utility only. Transaction state classification never calls this;
 ; it uses `jit-condition-kind` above.
@@ -441,10 +559,32 @@
       (jit/jit-source (field (live-controller) session))
       ""))
 
-(defn live-controller-pending [] (-> (slice u8))
-  (if (.initialized (live-controller))
-      (jit/jit-pending (field (live-controller) session))
-      ""))
+; The rejected candidate awaiting repair: the controller's own pending branch,
+; the source the next repair snippet composes with. Not the compiler session's
+; last rejected text -- a failed dry-run check is recorded there too, and it is
+; neither pending nor awaiting anything. Copied into A under the controller lock
+; so a concurrent submission cannot free it mid-read; "" while a transaction is
+; in flight, exactly as the snapshot reports it.
+(defn live-controller-pending-copy [(a (dyn alloc/Allocator))] (-> (slice u8))
+  (if (not (.initialized (live-controller)))
+      ""
+      (let [phase (live-controller-phase)]
+        (if (or (= phase 2) (or (= phase 4) (or (= phase 5) (= phase 6))))
+            ""
+            (do
+              (live-controller-lock!)
+              (let [pending (.pending-live (live-controller))
+                    copy
+                      (match (alloc/alloc [u8] a (slice-len pending))
+                        (None [] "")
+                        (Some [bytes]
+                              (do
+                                (for [i 0 (slice-len pending)]
+                                  (set! (primitive/index (alloc/alloc-slice-data bytes) i)
+                                        (slice-get pending i)))
+                                bytes)))]
+                (live-controller-unlock!)
+                copy))))))
 
 (defn live-controller-diagnostic [] (-> (slice u8))
   (if (.initialized (live-controller))

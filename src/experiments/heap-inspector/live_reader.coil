@@ -14,7 +14,32 @@
             (primitive/code-eq (primitive/code-nth form 0) head))))
 
 (defn lr-name=? [(a Code) (b Code)] (-> bool)
-  (meta/live-text=? (primitive/code-str a) (primitive/code-str b)))
+  (registry/registry-name=? a b))
+
+; Runtime identities are independent of the spelling visible in an importing
+; module. Project registries supply this artifact; standalone source sessions
+; keep their original names for compatibility.
+(defn lr-record-runtime-name [(record Code)] (-> Code)
+  (let [artifact (registry/registry-find-artifact record `:runtime-name)]
+    (if (lr-head? artifact `artifact)
+        (primitive/code-nth artifact 2)
+        (registry/registry-record-name record))))
+
+(defn lr-nominal-name [(live-registry Code) (name Code)] (-> Code)
+  (let [struct-record (registry/registry-find live-registry `:struct name)
+        sum-record (registry/registry-find live-registry `:sum name)
+        closure-record (registry/registry-find live-registry `:closure name)]
+    (cond (lr-head? struct-record `live-definition) (lr-record-runtime-name struct-record)
+          (lr-head? sum-record `live-definition) (lr-record-runtime-name sum-record)
+          (lr-head? closure-record `live-definition) (lr-record-runtime-name closure-record)
+          :else name)))
+
+(defn lr-edge-runtime-defs-name [(live-registry Code) (T Code)
+                                  (adapter Code) (abort Code) (retire Code)
+                                  (registrar Code) (schema-registrar Code)] (-> Code)
+  (let [nominal (lr-nominal-name live-registry T)]
+    (meta/live-edge-runtime-defs-with-prior nominal adapter abort retire registrar schema-registrar
+      `(~(primitive/syntax->datum `coil_live_prior_schema) ~(meta/live-name-hash nominal)))))
 
 (defn lr-find-struct [(forms Code) (name Code) (i i64)] (-> Code)
   (if (>= i (primitive/code-count forms))
@@ -134,7 +159,16 @@
 (defn lr-rename-struct [(form Code) (name Code)] (-> Code)
   (if (= (primitive/code-count form) 3)
       `(defstruct ~name ~(primitive/code-nth form 2))
-      `(defstruct ~name ~(primitive/code-nth form 2) ~(primitive/code-nth form 3))))
+        `(defstruct ~name ~(primitive/code-nth form 2) ~(primitive/code-nth form 3))))
+
+; Schema identity may be qualified without renaming the source variants.
+(defn lr-rename-sum-logical [(form Code) (name Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (primitive/code-list-push! out `defsum)
+    (primitive/code-list-push! out name)
+    (for [i 2 (primitive/code-count form)]
+      (primitive/code-list-push! out (primitive/code-nth form i)))
+    (primitive/code-list-done out)))
 
 (defn lr-rename-sum [(form Code) (name Code)] (-> Code)
   (let [out (primitive/code-list-new)]
@@ -408,6 +442,27 @@
                 (if (lr-name=? expected head) (set! found decl) 0))) 0)))
     (load found)))
 
+(defn lr-receiver-nominal [(T Code)] (-> Code)
+  (if (and (primitive/code-list? T)
+           (and (= (primitive/code-count T) 2)
+                (or (lr-head? T `ptr) (lr-head? T `ref) (lr-head? T `mut))))
+      (lr-receiver-nominal (primitive/code-nth T 1))
+      T))
+
+(defn lr-field-declaration [(forms Code) (env Code) (live-registry Code)
+                            (head Code) (receiver Code)] (-> Code)
+  (let [T (lr-receiver-nominal
+            (lr-live-expression-type receiver env forms live-registry))
+        decl (if (primitive/code-sym? T) (lr-find-struct forms T 0) `:unknown)
+        (mut matches) false]
+    (when (lr-head? decl `defstruct)
+      (for [i 0 (primitive/code-count (meta/live-struct-fields decl))]
+        (when (lr-name=? head
+                (primitive/code-symbol "." (meta/live-raw-field-name decl i)))
+          (set! matches true) 0))
+      0)
+    (if (load matches) decl `:unknown)))
+
 (defn lr-form-return-type [(forms Code) (name Code)] (-> Code)
   (let [(mut result) `:unknown]
     (for [i 0 (primitive/code-count forms)]
@@ -454,8 +509,10 @@
           (let [head (primitive/code-nth form 0)
                 struct (if (primitive/code-sym? head)
                            (lr-find-struct forms head 0) head)
-                field-struct (if (primitive/code-sym? head)
-                                 (lr-struct-for-field-head forms head) head)]
+                field-struct (if (and (primitive/code-sym? head)
+                                     (> (primitive/code-count form) 1))
+                                 (lr-field-declaration forms env live-registry head
+                                   (primitive/code-nth form 1)) head)]
             (cond
               (lr-head? struct `defstruct) (primitive/code-nth struct 1)
               (lr-head? (lr-find-sum-for-variant forms head) `defsum)
@@ -464,7 +521,7 @@
                 (let [receiver-type (lr-live-expression-type
                                       (primitive/code-nth form 1) env forms live-registry)
                       expected (primitive/code-nth field-struct 1)]
-                  (if (lr-name=? receiver-type expected)
+                  (if (lr-name=? (lr-receiver-nominal receiver-type) expected)
                       (let [(mut result) `:unknown]
                         (for [i 0 (primitive/code-count (meta/live-struct-fields field-struct))]
                           (let [field (meta/live-raw-field-name field-struct i)
@@ -522,16 +579,56 @@
         `(~(lr-artifact-symbol record `:handle-cloner) ~value)
         `(clone ~value))))
 
+
+; Resolve each authored variant through its own import spelling, then verify it
+; belongs to the scrutinee's nominal sum. Metadata views share exact source IDs.
+(defn lr-rewrite-live-match-arm [(arm Code) (record Code) (env Code)
+                                (forms Code) (live-registry Code)] (-> Code)
+  (let [name (primitive/code-nth arm 0) out (primitive/code-list-new)]
+    (if (lr-name=? name `_)
+        (do
+          (primitive/code-list-push! out name)
+          (for [i 1 (primitive/code-count arm)]
+            (primitive/code-list-push! out
+              (lr-rewrite-live-expr (primitive/code-nth arm i) env forms live-registry))) 0)
+        (let [decl (lr-find-sum-for-variant forms name)]
+          (unless (lr-head? decl `defsum)
+            (primitive/error (primitive/code-str "live match: unknown variant '" name "'")) 0)
+          (let [visible (registry/registry-find live-registry `:sum (primitive/code-nth decl 1))
+                variant (lr-find-variant decl name)
+                fields (if (> (primitive/code-count variant) 1) (primitive/code-nth variant 1) `[])
+                bindings (primitive/code-nth arm 1)
+                (mut arm-env) env]
+            (unless (registry/registry-id=? (registry/registry-record-id visible)
+                                            (registry/registry-record-id record))
+              (primitive/error (primitive/code-str "live match: variant '" name "' belongs to another sum")) 0)
+            (for [i 0 (primitive/code-count bindings)]
+              (when (< i (primitive/code-count fields))
+                (set! arm-env (lr-env-bind (load arm-env) (primitive/code-nth bindings i)
+                               (primitive/code-nth (primitive/code-nth fields i) 1))) 0))
+            (primitive/code-list-push! out (lr-keyed-artifact-symbol visible `:payload-variant name))
+            (primitive/code-list-push! out bindings)
+            (for [i 2 (primitive/code-count arm)]
+              (primitive/code-list-push! out
+                (lr-rewrite-live-expr (primitive/code-nth arm i) (load arm-env) forms live-registry))) 0)))
+    (primitive/code-list-done out)))
+
 (defn lr-rewrite-live-expr [(form Code) (env Code) (forms Code)
                             (live-registry Code)] (-> Code)
   (if (primitive/code-sym? form)
-      (let [root (lr-root-for-name (lr-letonces forms) form)
+      (let [local (lr-env-type env form)
+            root (lr-root-for-name (lr-letonces forms) form)
             function (registry/registry-find live-registry `:function form)]
+        (if (not (primitive/code-eq local `:unknown))
+            form
         (if (primitive/code-list? root)
-            `(~(lr-root-accessor (primitive/code-nth root 1)))
+            (let [record (registry/registry-find live-registry `:root form)]
+              `(~(lr-artifact-symbol record `:root-accessor)))
             (if (lr-head? function `live-definition)
-                (lr-artifact-symbol function `:public-entry)
-                form)))
+                (if (lr-head? (registry/registry-find-artifact function `:project-reference) `artifact)
+                    form
+                    (lr-artifact-symbol function `:public-entry))
+                form))))
       (if (not (primitive/code-list? form))
           form
           (if (= (primitive/code-count form) 0)
@@ -543,8 +640,10 @@
                       (if (primitive/code-sym? head)
                           (lr-find-sum-for-variant forms head) `:missing)
                     field-decl
-                      (if (primitive/code-sym? head)
-                          (lr-struct-for-field-head forms head) head)]
+                      (if (and (primitive/code-sym? head)
+                               (> (primitive/code-count form) 1))
+                          (lr-field-declaration forms env live-registry head
+                            (primitive/code-nth form 1)) head)]
                 (cond
                   (and (primitive/code-eq head `clone)
                        (= (primitive/code-count form) 2))
@@ -592,7 +691,7 @@
                               (primitive/code-list-push! args
                                 (lr-live-clone-expression field-type rewritten live-registry))
                               (primitive/code-list-push! args rewritten))))
-                      `(~(lr-handle-constructor-name T version)
+                      `(~(lr-artifact-symbol record `:handle-constructor)
                         ~@(primitive/code-list-done args)))
                   (lr-head? sum-constructor-decl `defsum)
                     (let [T (primitive/code-nth sum-constructor-decl 1)
@@ -649,32 +748,9 @@
                               `(~(lr-artifact-symbol record `:sum-payload-accessor)
                                 ~scrutinee-owner))
                             (for [i 2 (primitive/code-count form)]
-                              (let [arm (primitive/code-nth form i)
-                                    variant-name (primitive/code-nth arm 0)
-                                    bindings (primitive/code-nth arm 1)
-                                    variant (lr-find-variant sum-decl variant-name)
-                                    fields (if (> (primitive/code-count variant) 1)
-                                               (primitive/code-nth variant 1) `[])
-                                    (mut arm-env) env
-                                    rewritten-arm (primitive/code-list-new)]
-                                (for [j 0 (primitive/code-count bindings)]
-                                  (if (< j (primitive/code-count fields))
-                                      (set! arm-env
-                                        (lr-env-bind (load arm-env)
-                                          (primitive/code-nth bindings j)
-                                          (primitive/code-nth
-                                            (primitive/code-nth fields j) 1))) 0))
-                                (primitive/code-list-push! rewritten-arm
-                                  (lr-keyed-artifact-symbol
-                                    record `:payload-variant variant-name))
-                                (primitive/code-list-push! rewritten-arm bindings)
-                                (for [j 2 (primitive/code-count arm)]
-                                  (primitive/code-list-push! rewritten-arm
-                                    (lr-rewrite-live-expr
-                                      (primitive/code-nth arm j) (load arm-env)
-                                      forms live-registry)))
-                                (primitive/code-list-push! out
-                                  (primitive/code-list-done rewritten-arm))))
+                              (primitive/code-list-push! out
+                                (lr-rewrite-live-match-arm (primitive/code-nth form i)
+                                  record env forms live-registry)))
                             `(let [~scrutinee-owner ~rewritten-scrutinee]
                                ~(primitive/code-list-done out)))))
                   (and (primitive/code-eq head `set!)
@@ -682,7 +758,9 @@
                             (primitive/code-list? (primitive/code-nth form 1))))
                     (let [place (primitive/code-nth form 1)
                           place-head (primitive/code-nth place 0)
-                          decl (lr-struct-for-field-head forms place-head)]
+                          decl (if (> (primitive/code-count place) 1)
+                                   (lr-field-declaration forms env live-registry place-head
+                                     (primitive/code-nth place 1)) `:unknown)]
                       (if (not (lr-head? decl `defstruct))
                           `(set! ~(lr-rewrite-live-expr place env forms live-registry)
                                  ~(lr-rewrite-live-expr (primitive/code-nth form 2)
@@ -698,7 +776,7 @@
                                                  (primitive/code-symbol "." candidate)))]
                                 (if (lr-name=? expected place-head)
                                     (set! field candidate) 0)))
-                            `(~(lr-handle-setter-name T (load field) version)
+                            `(~(lr-keyed-artifact-symbol record `:field-setter (load field))
                               ~(lr-rewrite-live-expr (primitive/code-nth place 1)
                                  env forms live-registry)
                               ~(lr-rewrite-live-expr (primitive/code-nth form 2)
@@ -714,7 +792,7 @@
                                          (primitive/syntax->datum
                                            (primitive/code-symbol "." candidate)))]
                           (if (lr-name=? expected head) (set! field candidate) 0)))
-                      `(~(lr-handle-getter-name T (load field) version)
+                      `(~(lr-keyed-artifact-symbol record `:field-getter (load field))
                         ~(lr-rewrite-live-expr (primitive/code-nth form 1)
                            env forms live-registry)))
                   (primitive/code-eq head `let)
@@ -819,7 +897,8 @@
                 (registry/registry-record-kind record) `:closure)
               `(.environment (~accessor))
               `(~(lr-artifact-symbol record `:handle-pointer) (~accessor)))
-        literal (meta/live-c-literal name)]
+        runtime-name (lr-record-runtime-name (registry/registry-find live-registry `:root name))
+        literal (meta/live-c-literal runtime-name)]
     `((defn ~slot [] (-> (ptr (ptr i8))) (primitive/alloc-static (ptr i8)))
       (defn ~initialized [] (-> (ptr bool)) (primitive/alloc-static bool))
       (defn ~accessor [] (-> (ptr ~T))
@@ -837,13 +916,13 @@
                     ; live wrappers intentionally need no blanket Clone impl.
                     (store! (primitive/cast (ptr ~T) memory) ~owned-value)
                     (store! (~slot) memory)
-                    (store! (~initialized) true))))
-            0)
-        ; Source roots and managed handles are distinct registries. The root
-        ; names a stable handle; nested handles remain managed graph vertices.
-        (~(primitive/syntax->datum `coil_live_register_handle_root)
-          (primitive/cast (ptr u8) ~literal) ~(slice-len (primitive/code-str name))
-          ~root-handle)))))
+                    (store! (~initialized) true)
+                    (~(primitive/syntax->datum `coil_live_stage_new_root)
+                      (primitive/cast (ptr u8) ~literal) ~(slice-len (primitive/code-str runtime-name))
+                      ~root-handle (~slot) (~initialized)))))
+            (~(primitive/syntax->datum `coil_live_register_handle_root)
+              (primitive/cast (ptr u8) ~literal) ~(slice-len (primitive/code-str runtime-name))
+              ~root-handle))))))
 
 (defn lr-defn? [(form Code)] (-> bool)
   (and (lr-head? form `defn) (>= (primitive/code-count form) 5)))
@@ -1196,6 +1275,14 @@
                                   (registry/registry-record-form record) i)]
                           (set! result
                             (registry/registry-register-artifact (load result) id
+                              `(artifact :field-getter ~field-name
+                                 ~(lr-handle-getter-name name field-name version))))
+                          (set! result
+                            (registry/registry-register-artifact (load result) id
+                              `(artifact :field-setter ~field-name
+                                 ~(lr-handle-setter-name name field-name version))))
+                          (set! result
+                            (registry/registry-register-artifact (load result) id
                               `(artifact :field-transition ~field-name
                                  ~(lr-field-transition-name name field-name version))))))
                       0)
@@ -1340,7 +1427,9 @@
       (primitive/code-eq role `:sum-payload-accessor) true
       (primitive/code-eq role `:payload-variant) true
       (primitive/code-eq role `:variant-constructor) true
-      (primitive/code-eq role `:field-transition) true
+      (or (primitive/code-eq role `:field-getter)
+            (primitive/code-eq role `:field-setter)
+            (primitive/code-eq role `:field-transition)) true
       :else false)))
 
 (defn lr-refresh-schema-artifacts [(live-registry Code) (kind Code)
@@ -2160,7 +2249,7 @@
         Payload (lr-payload-name T version)
         payload-decl (lr-rename-struct (lr-normalize-struct decl) Payload)
         fields (meta/live-struct-fields decl)
-        constructor (lr-handle-constructor-name T version)
+        constructor (lr-artifact-symbol record `:handle-constructor)
         registrar (lr-schema-registrar-name T version)
         destructor (lr-artifact-symbol record `:schema-destructor)
         handle-pointer (lr-artifact-symbol record `:handle-pointer)
@@ -2175,8 +2264,8 @@
       (let [field (primitive/code-nth fields i)
             name (primitive/code-nth field 0)
             ty (primitive/code-nth field 1)
-            getter (lr-handle-getter-name T name version)
-            setter (lr-handle-setter-name T name version)
+            getter (lr-keyed-artifact-symbol record `:field-getter name)
+            setter (lr-keyed-artifact-symbol record `:field-setter name)
             nested-live?
               (or (lr-head? (lr-find-struct forms ty 0) `defstruct)
                   (lr-head? (lr-find-sum forms ty 0) `defsum))
@@ -2193,7 +2282,7 @@
             setter-value (primitive/fresh-identifier "live_set_value")
             next-value (primitive/fresh-identifier "live_next_value")]
         (if nested-live?
-            (do (primitive/code-list-push! handle-fields `(~name ~ty)) 0) 0)
+            (do (primitive/code-list-push! handle-fields `(~name ~(lr-nominal-name live-registry ty))) 0) 0)
         (primitive/code-list-push! params `(~name ~ty))
         (primitive/code-list-push! initializers
           `(set! (field (primitive/cast (ptr ~Payload) ~payload) ~name) ~name))
@@ -2201,7 +2290,7 @@
           `(defn ~getter [(~getter-value (ref ~T))] (-> ~ty)
              (let [~getter-p (primitive/cast (ptr ~Payload)
                                (~(primitive/syntax->datum `coil_live_handle_payload)
-                                 (~handle-pointer ~getter-value) ~(meta/live-name-hash T)
+                                 (~handle-pointer ~getter-value) ~(meta/live-name-hash (lr-nominal-name live-registry T))
                                  (~registrar)))]
                ~@(if nested-live?
                      `((~(lr-artifact-symbol nested-record `:handle-cloner)
@@ -2211,7 +2300,7 @@
           `(defn ~setter [(~setter-value (mut ~T)) (~next-value ~ty)] (-> i64)
              (let [~setter-p (primitive/cast (ptr ~Payload)
                                (~(primitive/syntax->datum `coil_live_handle_payload)
-                                 (~handle-pointer ~setter-value) ~(meta/live-name-hash T)
+                                 (~handle-pointer ~setter-value) ~(meta/live-name-hash (lr-nominal-name live-registry T))
                                  (~registrar)))]
                ~@(if nested-live?
                      `((let [~prior (take! [~ty] (field ~setter-p ~name))]
@@ -2237,7 +2326,7 @@
         (let [owned (load (primitive/cast (ptr ~Payload) p))]
           0)
         0)
-      ~@(meta/live-schema-runtime-defs-for-name T payload-decl
+      ~@(meta/live-schema-runtime-defs-for-name (lr-nominal-name live-registry T) payload-decl
           (lr-struct-fingerprint `(do ~decl) decl) registrar
           (lr-artifact-symbol record `:schema-show)
           (lr-artifact-symbol record `:schema-json)
@@ -2248,7 +2337,7 @@
           ~@(primitive/code-list-done initializers)
           (let [~handle
                   (~(primitive/syntax->datum `coil_live_handle_new)
-                    ~(meta/live-name-hash T)
+                    ~(meta/live-name-hash (lr-nominal-name live-registry T))
                     (~registrar) ~payload)]
             (~T :live-handle
               (live-handle-owner-new ~handle)))))
@@ -2307,7 +2396,7 @@
                    ~@(primitive/code-list-done args)))
                (let [~handle
                        (~(primitive/syntax->datum `coil_live_handle_new)
-                         ~(meta/live-name-hash T) (~registrar) ~payload)]
+                         ~(meta/live-name-hash (lr-nominal-name live-registry T)) (~registrar) ~payload)]
                  (~PublicT :live-handle
                    (live-handle-owner-new ~handle))))))))
     `(~@(if emit-public
@@ -2325,7 +2414,8 @@
         (let [owned (load (primitive/cast (ptr ~Payload) p))]
           0)
         0)
-      ~@(meta/live-sum-schema-runtime-defs-for-name decl payload-decl registrar destructor
+      ~@(meta/live-sum-schema-runtime-defs-for-name
+          (lr-rename-sum-logical decl (lr-nominal-name live-registry T)) payload-decl registrar destructor
           (lr-artifact-symbol record `:schema-show)
           (lr-artifact-symbol record `:schema-json))
       (defn ~payload-cloner [(payload-value (ref ~Payload))] (-> ~Payload)
@@ -2335,7 +2425,7 @@
         (let [payload-p (primitive/cast (ptr ~Payload)
                           (~(primitive/syntax->datum `coil_live_handle_payload)
                             (~handle-pointer ~value)
-                            ~(meta/live-name-hash T)
+                            ~(meta/live-name-hash (lr-nominal-name live-registry T))
                             (~registrar)))]
           (~payload-cloner payload-p)))
       ~@(primitive/code-list-done constructors))))
@@ -2549,9 +2639,9 @@
                     (set! i (+ (load i) 1))))))
     (load historical)))
 
-(defn lr-register-schemas [(forms Code) (live-registry Code) (i i64)] (-> Code)
+(defn lr-register-schemas-then [(forms Code) (live-registry Code) (i i64) (next Code)] (-> Code)
   (if (>= i (primitive/code-count forms))
-      (lr-commit-types forms live-registry 0)
+      next
       (let [form (primitive/code-nth forms i)]
         (if (lr-head? form `defclosure)
             (let [record (registry/registry-find live-registry `:closure
@@ -2561,7 +2651,7 @@
                  (if (< ~schema 0)
                      (do (~(primitive/syntax->datum `coil_live_cancel_staged_locked))
                          (~(primitive/syntax->datum `coil_live_set_status) ~schema))
-                     ~(lr-register-schemas forms live-registry (+ i 1)))))
+                     ~(lr-register-schemas-then forms live-registry (+ i 1) next))))
             (if (and (or (lr-head? form `defstruct) (lr-head? form `defsum))
                  (and (not (lr-old-declaration? forms form))
                       (not (lr-head?
@@ -2576,8 +2666,12 @@
                  (if (< ~schema 0)
                      (do (~(primitive/syntax->datum `coil_live_cancel_staged_locked))
                          (~(primitive/syntax->datum `coil_live_set_status) ~schema))
-                     ~(lr-register-schemas forms live-registry (+ i 1)))))
-                (lr-register-schemas forms live-registry (+ i 1)))))))
+                     ~(lr-register-schemas-then forms live-registry (+ i 1) next))))
+                (lr-register-schemas-then forms live-registry (+ i 1) next))))))
+
+(defn lr-register-schemas [(forms Code) (live-registry Code) (i i64)] (-> Code)
+  (lr-register-schemas-then forms live-registry i
+    (lr-commit-types forms live-registry 0)))
 
 (defn lr-register-type-roots [(forms Code) (roots Code) (T Code)
                                (schema Code) (i i64) (next Code)] (-> Code)
@@ -2606,7 +2700,7 @@
                 ~(if (lr-head? closure-record `live-definition)
                      `(~(lr-artifact-symbol closure-record `:schema-registrar))
                      `(~(primitive/syntax->datum `coil_live_latest_schema)
-                       ~(meta/live-name-hash T)))]
+                       ~(meta/live-name-hash (lr-nominal-name live-registry T))))]
            (if (< ~schema 0)
                (~(primitive/syntax->datum `coil_live_set_status) -21)
                (let [~status (~(lr-root-register (primitive/code-nth root 1)) ~schema)]
@@ -2633,7 +2727,7 @@
                      ~(lr-register-type-roots forms (lr-letonces forms) T schema 0
                         `(let [~staged
                                 (~(primitive/syntax->datum `coil_live_stage_type_roots_locked)
-                                  ~(meta/live-name-hash T) ~schema)]
+                                  ~(meta/live-name-hash (lr-nominal-name live-registry T)) ~schema)]
                            (if (!= ~staged 0)
                                (do (~(primitive/syntax->datum `coil_live_cancel_staged_locked))
                                    (~(primitive/syntax->datum `coil_live_set_status) ~staged))
@@ -2728,9 +2822,9 @@
                      ~(lr-stage-changed-source-ids accepted-registry
                         candidate-registry (+ i 1) next))))))))
 
-(defn lr-lower [(parsed Code)] (-> Code)
-  (let [forms (if (lr-head? parsed `do) (primitive/code-rest parsed) parsed)
-        live-registry (lr-build-registry `replsession forms)
+(defn lr-lower-module [(local-forms Code) (forms Code)
+                        (live-registry Code) (emit-commit bool)] (-> Code)
+  (let [
         out (primitive/code-list-new)]
     (primitive/code-list-push! out `(import "coil.primitive" :as primitive))
     (primitive/code-list-push! out `(import "coil.alloc" :as alloc))
@@ -2738,6 +2832,8 @@
       `(extern ~(primitive/syntax->datum `calloc) :cc c [u64 u64] (-> (ptr i8))))
     (primitive/code-list-push! out
       `(extern ~(primitive/syntax->datum `coil_live_latest_schema) :cc c [i64] (-> i64)))
+    (primitive/code-list-push! out
+      `(extern ~(primitive/syntax->datum `coil_live_prior_schema) :cc c [i64] (-> i64)))
     (primitive/code-list-push! out
       `(extern ~(primitive/syntax->datum `coil_live_register_type) :cc c
          [(ptr u8) i64 i64 i64 i64 i64 i64 (ptr i8) (ptr i8)] (-> i64)))
@@ -2763,6 +2859,9 @@
       `(extern ~(primitive/syntax->datum `coil_live_register_handle_root) :cc c
          [(ptr u8) i64 (ptr i8)] (-> i64)))
     (primitive/code-list-push! out
+      `(extern ~(primitive/syntax->datum `coil_live_stage_new_root) :cc c
+         [(ptr u8) i64 (ptr i8) (ptr (ptr i8)) (ptr bool)] (-> i64)))
+    (primitive/code-list-push! out
       `(extern ~(primitive/syntax->datum `coil_live_register_reference_field) :cc c
          [i64 i64 i64 i64] (-> i64)))
     (primitive/code-list-push! out
@@ -2774,6 +2873,8 @@
       `(extern ~(primitive/syntax->datum `coil_live_stage_type_roots_locked) :cc c [i64 i64] (-> i64)))
     (primitive/code-list-push! out
       `(extern ~(primitive/syntax->datum `coil_live_publish_staged_locked) :cc c [] (-> i64)))
+    (primitive/code-list-push! out
+      `(extern ~(primitive/syntax->datum `coil_live_validate_staged) :cc c [] (-> i64)))
     (primitive/code-list-push! out
       `(extern ~(primitive/syntax->datum `coil_live_cancel_staged_locked) :cc c [] (-> i64)))
     (primitive/code-list-push! out
@@ -2816,8 +2917,8 @@
     (primitive/code-list-push! out
       `(extern ~(primitive/syntax->datum `coil_live_handle_release) :cc c
          [(ptr i8)] (-> i64)))
-    (for [i 0 (primitive/code-count forms)]
-      (let [form (primitive/code-nth forms i)]
+    (for [i 0 (primitive/code-count local-forms)]
+      (let [form (primitive/code-nth local-forms i)]
         (cond
           (lr-marker? form) 0
           (lr-letonce? form) (lr-push-list! out
@@ -2844,7 +2945,7 @@
                         (lr-artifact-symbol record `:transition-abort)
                         (lr-artifact-symbol record `:transition-retire)))
                     (lr-push-list! out
-                      (meta/live-edge-runtime-defs-name T
+                      (lr-edge-runtime-defs-name live-registry T
                         (lr-artifact-symbol record `:transition-adapter)
                         (lr-artifact-symbol record `:transition-abort)
                         (lr-artifact-symbol record `:transition-retire)
@@ -2880,7 +2981,8 @@
                     (primitive/code-list-push! out
                       (lr-rewrite-root-refs form (lr-letonces forms)))
                     0)))))
-    (primitive/code-list-push! out
+    (when emit-commit
+      (primitive/code-list-push! out
       `(defn ~(primitive/syntax->datum `__live_candidate_commit) [] (-> i64)
          (let [status
                  (do (~(primitive/syntax->datum `coil_live_begin_staging_locked))
@@ -2891,7 +2993,12 @@
            (if (= status 0)
                ~(lr-bind-live-functions live-registry 0)
                status))))
+      0)
     `(do ~@(primitive/code-list-done out))))
+
+(defn lr-lower [(parsed Code)] (-> Code)
+  (let [forms (if (lr-head? parsed `do) (primitive/code-rest parsed) parsed)]
+    (lr-lower-module forms forms (lr-build-registry `replsession forms) true)))
 
 ; Normal Coil source uses the built-in s-expression reader. `migrate` is a
 ; reader-level declaration, just like `letonce`; neither is a runtime DSL.
@@ -2989,10 +3096,27 @@
                       (lr-name=? (registry/registry-definition-name a)
                                  (registry/registry-definition-name b))))))))
 
+; Consts exist only at compile time. The session's retained checked declarations
+; carry every accepted extern and definition into the next candidate, but not a
+; const, so each candidate must see the accepted consts again (lr-context-forms).
+; For that, and only that, a const is identified by its name: a newer version
+; replaces an older one in the accepted forms instead of accumulating beside it.
+; Consts still never enter the live registry.
+(defn lr-carried-context? [(form Code)] (-> bool)
+  (and (lr-head? form `const) (> (primitive/code-count form) 1)))
+
+(defn lr-same-context? [(a Code) (b Code)] (-> bool)
+  (and (lr-carried-context? a)
+       (and (lr-carried-context? b)
+            (lr-name=? (primitive/code-nth a 1) (primitive/code-nth b 1)))))
+
+(defn lr-same-identity? [(a Code) (b Code)] (-> bool)
+  (or (lr-same-definition? a b) (lr-same-context? a b)))
+
 (defn lr-incoming-replaces? [(incoming Code) (old Code)] (-> bool)
   (let [(mut found) false]
     (for [i 0 (primitive/code-count incoming)]
-      (if (lr-same-definition? (primitive/code-nth incoming i) old)
+      (if (lr-same-identity? (primitive/code-nth incoming i) old)
           (set! found true) 0))
     (load found)))
 
@@ -3001,10 +3125,23 @@
         current (primitive/code-nth incoming at)]
     (loop (if (or (load found) (>= (load i) (primitive/code-count incoming)))
               (break)
-              (if (lr-same-definition? (primitive/code-nth incoming (load i)) current)
+              (if (lr-same-identity? (primitive/code-nth incoming (load i)) current)
                   (set! found true)
                   (set! i (+ (load i) 1)))))
     (load found)))
+
+; The accepted consts a candidate must see again: every carried context form of
+; the merged program except those this submission itself carries, which it
+; emits as it always has.
+(defn lr-context-forms [(forms Code) (incoming Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count forms)]
+      (let [form (primitive/code-nth forms i)]
+        (when (and (lr-carried-context? form)
+                   (not (lr-incoming-replaces? incoming form)))
+          (primitive/code-list-push! out form)
+          0)))
+    (primitive/code-list-done out)))
 
 (defn lr-validate-duplicate-migrations! [(incoming Code)] (-> i64)
   (for [i 0 (primitive/code-count incoming)]
@@ -3237,7 +3374,7 @@
         0)
     `~(load count)))
 
-(defn lr-bind-changed-functions [(accepted-registry Code)
+(defn lr-bind-changed-functions-validated [(accepted-registry Code)
                                  (candidate-registry Code) (i i64)
                                  (next Code)] (-> Code)
   (if (>= i (registry/registry-record-count candidate-registry))
@@ -3265,10 +3402,24 @@
                        `())
                  (~(primitive/syntax->datum `coil_live_stage_code_owner)
                    ~(lr-source-runtime-token candidate 0))
-                 ~(lr-bind-changed-functions accepted-registry candidate-registry
+                 ~(lr-bind-changed-functions-validated accepted-registry candidate-registry
                     (+ i 1) next))
-            (lr-bind-changed-functions accepted-registry candidate-registry
+            (lr-bind-changed-functions-validated accepted-registry candidate-registry
               (+ i 1) next)))))
+
+(defn lr-validate-before-bind [(next Code)] (-> Code)
+  (let [status (primitive/fresh-identifier "publication_validation")]
+    `(let [~status (~(primitive/syntax->datum `coil_live_validate_staged))]
+       (if (!= ~status 0)
+           (do (~(primitive/syntax->datum `coil_live_cancel_staged_locked))
+               (~(primitive/syntax->datum `coil_live_set_status) ~status))
+           ~next))))
+
+(defn lr-bind-changed-functions [(accepted-registry Code)
+                                 (candidate-registry Code) (i i64)
+                                 (next Code)] (-> Code)
+  (lr-validate-before-bind
+    (lr-bind-changed-functions-validated accepted-registry candidate-registry i next)))
 
 (defn lr-publish-and-clear-broken [] (-> Code)
   (let [status (primitive/fresh-identifier "live_publish_status")]
@@ -3350,19 +3501,16 @@
                    (~(primitive/syntax->datum `coil_live_set_status) ~status))
                ~(lr-stage-affected-ids live-registry ids (+ i 1) next))))))
 
-(defn lr-incremental-commit [(incoming Code) (accepted-registry Code)
+(defn lr-incremental-stage [(incoming Code) (accepted-registry Code)
                              (candidate-registry Code) (i i64)
                              (next Code)] (-> Code)
   (if (< i 0)
-      `(do
-         (~(primitive/syntax->datum `coil_live_begin_staging_locked))
-         ~(lr-stage-changed-source-ids accepted-registry candidate-registry 0
-            (lr-begin-affected-publication next)))
+      next
       (let [form (primitive/code-nth incoming i)
             kind (registry/registry-definition-kind form)]
         (cond
           (primitive/code-eq kind `:function)
-            (lr-incremental-commit incoming accepted-registry candidate-registry
+            (lr-incremental-stage incoming accepted-registry candidate-registry
               (- i 1) next)
           (primitive/code-eq kind `:closure)
             (let [name (primitive/code-nth form 1)
@@ -3375,7 +3523,7 @@
                           (lr-artifact-symbol candidate `:closure-environment-type)
                         schema (primitive/fresh-identifier "closure_schema")
                         staged (primitive/fresh-identifier "closure_stage_status")]
-                    (lr-incremental-commit incoming accepted-registry candidate-registry
+                    (lr-incremental-stage incoming accepted-registry candidate-registry
                       (- i 1)
                       `(let [~schema
                               (~(lr-artifact-symbol candidate `:transition-registrar))]
@@ -3394,18 +3542,25 @@
                                      (~(primitive/syntax->datum
                                          `coil_live_set_status) ~staged))
                                    ~next))))))
-                  (lr-incremental-commit incoming accepted-registry candidate-registry
+                  (lr-incremental-stage incoming accepted-registry candidate-registry
                     (- i 1) next)))
           (primitive/code-eq kind `:struct)
             (let [T (primitive/code-nth form 1)
                   accepted (registry/registry-find accepted-registry `:struct T)
                   candidate (registry/registry-find candidate-registry `:struct T)]
               (if (not (lr-head? accepted `live-definition))
-                  (lr-incremental-commit incoming accepted-registry candidate-registry
-                    (- i 1) next)
+                  (let [schema (primitive/fresh-identifier "new_struct_schema")]
+                    (lr-incremental-stage incoming accepted-registry candidate-registry
+                      (- i 1)
+                      `(let [~schema (~(lr-artifact-symbol candidate `:schema-registrar))]
+                         (if (< ~schema 0)
+                             (do
+                               (~(primitive/syntax->datum `coil_live_cancel_staged_locked))
+                               (~(primitive/syntax->datum `coil_live_set_status) ~schema))
+                             ~next))))
                   (let [schema (primitive/fresh-identifier "candidate_schema")
                         staged (primitive/fresh-identifier "stage_status")]
-                    (lr-incremental-commit incoming accepted-registry candidate-registry
+                    (lr-incremental-stage incoming accepted-registry candidate-registry
                       (- i 1)
                       `(let [~schema
                               (~(lr-artifact-symbol candidate `:transition-registrar))]
@@ -3416,7 +3571,7 @@
                              (let [~staged
                                      (~(primitive/syntax->datum
                                          `coil_live_stage_type_roots_locked)
-                                       ~(meta/live-name-hash T) ~schema)]
+                                       ~(meta/live-name-hash (lr-nominal-name candidate-registry T)) ~schema)]
                                (if (!= ~staged 0)
                                    (do
                                      (~(primitive/syntax->datum
@@ -3431,7 +3586,7 @@
                   schema (primitive/fresh-identifier "candidate_sum_schema")]
               (if (lr-head? accepted `live-definition)
                   (let [staged (primitive/fresh-identifier "sum_stage_status")]
-                    (lr-incremental-commit incoming accepted-registry candidate-registry
+                    (lr-incremental-stage incoming accepted-registry candidate-registry
                       (- i 1)
                       `(let [~schema
                               (~(lr-artifact-symbol candidate `:transition-registrar))]
@@ -3442,7 +3597,7 @@
                              (let [~staged
                                      (~(primitive/syntax->datum
                                          `coil_live_stage_type_roots_locked)
-                                       ~(meta/live-name-hash T) ~schema)]
+                                       ~(meta/live-name-hash (lr-nominal-name candidate-registry T)) ~schema)]
                                (if (!= ~staged 0)
                                    (do
                                      (~(primitive/syntax->datum
@@ -3450,7 +3605,7 @@
                                      (~(primitive/syntax->datum
                                          `coil_live_set_status) ~staged))
                                    ~next))))))
-                  (lr-incremental-commit incoming accepted-registry candidate-registry
+                  (lr-incremental-stage incoming accepted-registry candidate-registry
                     (- i 1)
                     `(let [~schema (~(lr-artifact-symbol candidate `:schema-registrar))]
                        (if (< ~schema 0)
@@ -3459,6 +3614,10 @@
                              (~(primitive/syntax->datum `coil_live_set_status) ~schema))
                            ~next)))))
           (primitive/code-eq kind `:root)
+            (if (lr-head? (registry/registry-find accepted-registry `:root
+                            (primitive/code-nth form 1)) `live-definition)
+                (lr-incremental-stage incoming accepted-registry candidate-registry
+                  (- i 1) next)
             (let [initializer (primitive/code-nth form 2)
                   T (if (and (primitive/code-list? initializer)
                              (> (primitive/code-count initializer) 0))
@@ -3477,7 +3636,7 @@
                     (primitive/code-str "live root '"
                       (primitive/code-str (primitive/code-nth form 1))
                       "' does not have a live struct or sum type")) 0)
-              (lr-incremental-commit incoming accepted-registry candidate-registry
+              (lr-incremental-stage incoming accepted-registry candidate-registry
                 (- i 1)
                 `(let [~schema (~(lr-artifact-symbol type-record `:schema-registrar))
                        ~status (~(lr-root-register (primitive/code-nth form 1)) ~schema)]
@@ -3485,10 +3644,19 @@
                        (do
                          (~(primitive/syntax->datum `coil_live_cancel_staged_locked))
                          (~(primitive/syntax->datum `coil_live_set_status) ~status))
-                       ~next))))
+                       ~next)))))
           :else
-            (lr-incremental-commit incoming accepted-registry candidate-registry
+            (lr-incremental-stage incoming accepted-registry candidate-registry
               (- i 1) next)))))
+
+(defn lr-incremental-commit [(incoming Code) (accepted-registry Code)
+                             (candidate-registry Code) (i i64)
+                             (next Code)] (-> Code)
+  `(do
+     (~(primitive/syntax->datum `coil_live_begin_staging_locked))
+     ~(lr-stage-changed-source-ids accepted-registry candidate-registry 0
+        (lr-begin-affected-publication
+          (lr-incremental-stage incoming accepted-registry candidate-registry i next)))))
 
 (defn lr-incoming-depends-on-id? [(incoming Code) (live-registry Code)
                                   (target-id Code)] (-> bool)
@@ -3589,6 +3757,7 @@
     ; path. They are source context, not live definitions, and are safe to emit
     ; again in the candidate generation.
     (lr-push-list! out (lr-import-forms new-forms))
+    (lr-push-list! out (lr-context-forms new-forms incoming))
     (lr-emit-required-trait-closure! out incoming candidate-registry)
     (for [i 0 (primitive/code-count incoming)]
       (let [form (primitive/code-nth incoming i)
@@ -3599,7 +3768,8 @@
                   accepted (registry/registry-find accepted-registry `:struct T)
                   candidate (registry/registry-find candidate-registry `:struct T)]
               (if (not (lr-head? accepted `live-definition))
-                  (primitive/error "live incremental schema addition is not implemented")
+                  (lr-push-list! out
+                    (lr-live-struct-defs new-forms candidate-registry form candidate true))
                   (let [old-form (registry/registry-record-form accepted)
                         old-payload
                           (lr-rename-struct old-form
@@ -3619,7 +3789,7 @@
                         (lr-artifact-symbol candidate `:transition-abort)
                         (lr-artifact-symbol candidate `:transition-retire)))
                     (lr-push-list! out
-                      (meta/live-edge-runtime-defs-name T
+                      (lr-edge-runtime-defs-name candidate-registry T
                         (lr-artifact-symbol candidate `:transition-adapter)
                         (lr-artifact-symbol candidate `:transition-abort)
                         (lr-artifact-symbol candidate `:transition-retire)
@@ -3644,7 +3814,7 @@
                         (lr-artifact-symbol candidate `:transition-abort)
                         (lr-artifact-symbol candidate `:transition-retire)))
                     (lr-push-list! out
-                      (meta/live-edge-runtime-defs-name T
+                      (lr-edge-runtime-defs-name candidate-registry T
                         (lr-artifact-symbol candidate `:transition-adapter)
                         (lr-artifact-symbol candidate `:transition-abort)
                         (lr-artifact-symbol candidate `:transition-retire)
@@ -3699,7 +3869,24 @@
                       (primitive/error
                         "live closure signature edit lowering is not implemented"))))
           (primitive/code-eq kind `:root)
-            (lr-push-list! out (lr-letonce-defs new-forms form candidate-registry))
+            (let [accepted (registry/registry-find accepted-registry `:root
+                             (primitive/code-nth form 1))]
+              (if (lr-head? accepted `live-definition)
+                  (let [T (lr-letonce-type new-forms form)
+                        old-T (lr-letonce-type old-forms (registry/registry-record-form accepted))]
+                    (unless (lr-name=? T old-T)
+                      (primitive/error "a letonce root cannot change nominal type; migrate its fields or restart the program")
+                      0)
+                    ; A letonce initializer is for fresh starts. Check its new
+                    ; spelling against the candidate schema, but retain the
+                    ; original slot, accessor and initialized value. Field
+                    ; migrations already move that value transactionally.
+                    (primitive/code-list-push! out
+                      `(defn ~(primitive/fresh-identifier "live_root_initializer_check") [] (-> ~T)
+                         ~(lr-rewrite-live-expr (primitive/code-nth form 2)
+                            (lr-env-empty) new-forms candidate-registry)))
+                    0)
+                  (lr-push-list! out (lr-letonce-defs new-forms form candidate-registry))))
           (primitive/code-eq kind `:impl)
             (lr-push-list! out
               (lr-live-impl-defs new-forms form candidate-registry false))
@@ -3724,7 +3911,8 @@
       (let [candidate (registry/registry-record-at candidate-registry i)
             accepted (registry/registry-find-by-id accepted-registry
                        (registry/registry-record-id candidate))]
-        (if (and (primitive/code-eq
+        (if (and (not (lr-head? (registry/registry-find-artifact candidate `:project-reference) `artifact))
+                 (primitive/code-eq
                    (registry/registry-record-kind candidate) `:function)
                  (or (or (not (lr-head? accepted `live-definition))
                          (not (primitive/code-eq (primitive/code-nth accepted 4)
@@ -3832,6 +4020,7 @@
                       defs (lr-dynamic-function-update-defs
                              (lr-record-with-form record rewritten))
                       imports (lr-import-forms new-forms)
+                      context (lr-context-forms new-forms incoming)
                       binder (lr-artifact-symbol record `:slot-binder)
                       gated
                         (lr-begin-affected-publication
@@ -3847,6 +4036,7 @@
                           candidate-registry 0 repaired-staging)]
                   `(do
                      ~@imports
+                     ~@context
                      ~@defs
                      (defn ~(primitive/syntax->datum `__live_candidate_commit)
                        [] (-> i64)
@@ -3918,8 +4108,20 @@
     (primitive/code-list-done out)))
 
 (defn lr-source-provider-program [(prefix Code) (generated Code) (mode Code)
-                                  (app-start Code)] (-> Code)
-  (let [body (if (lr-head? generated `do) (primitive/code-rest generated) generated)]
+                                  (app-hooks Code)] (-> Code)
+  (let [body (if (lr-head? generated `do) (primitive/code-rest generated) generated)
+        app-start (primitive/code-nth app-hooks 1)
+        has-redraw (not (primitive/code-eq (primitive/code-nth app-hooks 2) `:none))
+        redraw-fn
+          (if has-redraw
+              (primitive/syntax->datum `redraw)
+              (primitive/syntax->datum `__live_app_no_redraw))
+        ; Without an app `redraw`, a generated no-op stands in: edits still
+        ; publish, and the app observes them the next time it runs edited code.
+        no-redraw-defs
+          (if has-redraw
+              (primitive/code-list-done (primitive/code-list-new))
+              `((defn ~redraw-fn [] (-> i64) 0)))]
     (cond (primitive/code-eq mode `:native)
         `(do
            ~@prefix
@@ -3942,6 +4144,7 @@
            ~@prefix
            (import "experiments.heap-inspector.live-types" :use *)
            ~@body
+           ~@no-redraw-defs
            (extern ~(primitive/syntax->datum `coil_live_app_stage_callbacks) :cc c
              [(fnptr c [] i64) (fnptr c [] i64)] (-> i64))
            (defn ~(primitive/syntax->datum `__live_app_candidate_commit) [] (-> i64)
@@ -3949,7 +4152,7 @@
                (if (= status 0)
                    (~(primitive/syntax->datum `coil_live_app_stage_callbacks)
                      (primitive/fnptr-of ~app-start)
-                     (primitive/fnptr-of ~(primitive/syntax->datum `redraw)))
+                     (primitive/fnptr-of ~redraw-fn))
                    status)))
            (defn ~(primitive/syntax->datum `__live_app_entry) [] (-> i64)
              (~(primitive/syntax->datum `__live_app_candidate_commit)))
@@ -3978,19 +4181,27 @@
           form)))
 
 (defn lr-source-provider-program-at [(prefix Code) (generated Code) (mode Code)
-                                     (app-start Code) (site Code)] (-> Code)
+                                     (app-hooks Code) (site Code)] (-> Code)
   ; Reader output has no target macro-call scope. Re-anchor the complete emitted
   ; program at the request syntax so target imports, local artifact names, and
   ; fnptr-of references resolve exactly as they do for an ordinary macro call.
-  (lr-recontext (lr-source-provider-program prefix generated mode app-start) site))
+  (lr-recontext (lr-source-provider-program prefix generated mode app-hooks) site))
 
-(defn lr-initial-app-start [(snippet Code) (site Code)] (-> Code)
+; A live app's host hooks, found once in its initial submission:
+; `(live-app-hooks START REDRAW)`. START is `main`'s private implementation, which
+; the host enters as the app's one-shot UI loop; REDRAW is `:redraw` when the app
+; defines `redraw` (the host calls it after each accepted edit) and `:none`
+; otherwise -- a hook the app does not need is not one it must write.
+(defn lr-initial-app-hooks [(snippet Code) (site Code)] (-> Code)
   (let [forms (lr-normal-forms-at snippet site)
         registry (lr-program-state-registry (lr-make-program-state forms))
-        record (registry/registry-find registry `:function `main)]
+        record (registry/registry-find registry `:function `main)
+        redraw (registry/registry-find registry `:function `redraw)]
     (if (not (lr-head? record `live-definition))
         (primitive/error "live app source must define main")
-        (lr-artifact-symbol record `:private-implementation))))
+        `(live-app-hooks
+           ~(lr-artifact-symbol record `:private-implementation)
+           ~(if (lr-head? redraw `live-definition) `:redraw `:none)))))
 
 (defn live-source-provider [(context Code)] (-> Code)
   (let [source (primitive/code-nth context 2)
@@ -4001,13 +4212,24 @@
         request (lr-source-request forms)]
     (if (not (lr-head? request `live-source-request))
         (primitive/error "live source provider: missing live-source-request")
+        (let [candidate (primitive/code-read (primitive/code-nth request 1)
+                           `(reader-config :unquote #\~ :alternate-unquote #\, :splice #\@))
+              project (if (and (lr-head? candidate `do)
+                               (= (primitive/code-count candidate) 2))
+                          (primitive/code-nth candidate 1) `:none)]
+        (if (lr-head? project `live-project)
+            `(do
+               (module replsession)
+               (import ~(primitive/code-nth project 1))
+               (import "experiments.heap-inspector.live-project-enable")
+               (live-project-request ~project))
         (let [mode (primitive/code-nth request 2)
               request-site (primitive/code-nth request 0)
-              app-start
+              app-hooks
                 (if (primitive/code-eq mode `:app)
-                    (lr-initial-app-start
+                    (lr-initial-app-hooks
                       (primitive/code-nth request 1) request-site)
-                    `main)
+                    `(live-app-hooks main :none))
               generated
                 (if (primitive/code-eq mode `:recovery)
                     (live-submit-rejected-condition)
@@ -4015,4 +4237,4 @@
                       (primitive/code-nth request 1)
                       request-site)) ]
           (lr-source-provider-program-at
-            prefix generated mode app-start request)))))
+            prefix generated mode app-hooks request)))))))

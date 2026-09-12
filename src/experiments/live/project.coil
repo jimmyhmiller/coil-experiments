@@ -1,0 +1,162 @@
+(module experiments.live.project)
+
+;;; Capture the source graph with Coil's loader. Module identity, import lookup,
+;;; and dependency discovery are the compiler's; this layer owns immutable bytes.
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use [ArrayList al-new len get push! al-elem])
+(import "coil.fs" :as fs)
+(import "coil.result" :use *)
+(import "coil.slice" :use [slice-len slice-get subslice])
+(import "coil.str" :as str)
+(import "coil.jit" :as jit)
+(import "experiments.live.digest" :use [digest digest-hex])
+(import "experiments.live.ledger" :use *)
+
+(defstruct ProjectFile
+  [(module (slice u8)) (path (slice u8)) (text (slice u8)) (digest i64)])
+
+(defstruct Project
+  [(ledger Ledger)
+   (files (ArrayList ProjectFile))
+   (entry-module (slice u8))
+   (message (slice u8))
+   (error-file (slice u8))
+   (error-line i64)])
+
+(defn under? [(root (slice u8)) (path (slice u8))] (-> bool)
+  (let [n (slice-len root)]
+    (and (> (slice-len path) n)
+         (and (= (subslice path 0 n) root)
+              (= (slice-get path n) (primitive/cast u8 47))))))
+
+(defn quoted! [(sb (mut str/StrBuf)) (s (slice u8))] (-> i64)
+  (str/sb-push-str! (mut sb) "\"")
+  (for [i 0 (slice-len s)]
+    (let [c (primitive/cast i64 (slice-get s i))]
+      (cond (= c 34) (str/sb-push-str! (mut sb) "\\\"")
+            (= c 92) (str/sb-push-str! (mut sb) "\\\\")
+            (= c 10) (str/sb-push-str! (mut sb) "\\n")
+            (= c 13) (str/sb-push-str! (mut sb) "\\r")
+            (= c 9) (str/sb-push-str! (mut sb) "\\t")
+            :else (str/sb-push-byte! (mut sb) (slice-get s i)))))
+  (str/sb-push-str! (mut sb) "\"")
+  0)
+
+(defn project-source [(a (dyn alloc/Allocator)) (p (ptr Project))] (-> (slice u8))
+  (let [(mut sb) (str/sb-new a)
+        files (.files p)]
+    (str/sb-push-str! (mut sb) "(live-project ")
+    (quoted! (mut sb) (.entry-module p))
+    (for [i 0 (len files)]
+      (let [f (get files i)]
+        (str/sb-push-str! (mut sb) "\n (file ")
+        (quoted! (mut sb) (.module f))
+        (str/sb-push-str! (mut sb) " ")
+        (quoted! (mut sb) (.path f))
+        (str/sb-push-str! (mut sb) " ")
+        (quoted! (mut sb) (.text f))
+        (str/sb-push-str! (mut sb) ")")))
+    (str/sb-push-str! (mut sb) ")")
+    (str/sb-finish! (mut sb))))
+
+(defn project-empty [(a (dyn alloc/Allocator))] (-> Project)
+  (Project
+    :ledger (ledger-empty a)
+    :files (al-new [ProjectFile] a)
+    :entry-module ""
+    :message ""
+    :error-file ""
+    :error-line 0))
+
+; A fingerprint of exactly the files in a snapshot, optionally read afresh.
+; Names and paths participate, so identical bytes in different modules differ.
+(defn files-digest [(a (dyn alloc/Allocator))
+                    (files (ArrayList ProjectFile))
+                    (fresh bool)] (-> i64)
+  (let [(mut sb) (str/sb-new a)]
+    (for [i 0 (len files)]
+      (let [f (get files i)
+            h
+              (if fresh
+                  (match (fs/read-file a (.path f))
+                    (Ok [s] (digest s))
+                    (Err [_] 0))
+                  (.digest f))]
+        (quoted! (mut sb) (.module f))
+        (quoted! (mut sb) (.path f))
+        (str/sb-push-str! (mut sb) (digest-hex a h))))
+    (digest (str/sb-finish! (mut sb)))))
+
+; A owns the immutable snapshot; the SDK discards its private loader AST.
+(defn project-read [(a (dyn alloc/Allocator))
+                    (entry (slice u8))
+                    (root (slice u8))] (-> Project)
+  (let [(mut result) (project-empty a)
+        (mut graph) (jit/jit-read-source-graph a entry)]
+    (set! (.ok (.ledger result)) (jit/jit-source-graph-ok? (mut graph)))
+    (set! (.entry-module result) (jit/jit-source-graph-entry (mut graph)))
+    (set! (.message result) (jit/jit-source-graph-diagnostic (mut graph)))
+    (set! (.error-file result) (jit/jit-source-graph-error-path (mut graph)))
+    (set! (.error-line result) (jit/jit-source-graph-error-line (mut graph)))
+    (for [i 0 (jit/jit-source-graph-count (mut graph))]
+      (let [path (jit/jit-source-graph-path (mut graph) i)
+            text (jit/jit-source-graph-text (mut graph) i)
+            module (jit/jit-source-graph-module (mut graph) i)]
+        (when (or (= path entry)
+                  (and (under? root path) (> (slice-len module) 0)))
+          (let [f
+                  (ProjectFile
+                    :module module
+                    :path path
+                    :text text
+                    :digest (digest text))
+                file-ledger (ledger-read a text)]
+            (push! (mut (.files result)) f)
+            (unless (.ok file-ledger)
+              (set! (.ok (.ledger result)) false)
+              (set! (.error-file result) path)
+              0)
+            (for [k 0 (len (.forms file-ledger))]
+              (let [(mut form) (get (.forms file-ledger) k)]
+                (set! (.module form) module)
+                (set! (.file form) path)
+                (push! (mut (.forms (.ledger result))) (load form)))))
+          0)))
+    (when (= (len (.files result)) 0)
+      (push! (mut (.files result))
+             (ProjectFile
+               :module ""
+               :path (copy-bytes a entry)
+               :text ""
+               :digest 0))
+      0)
+    (set! (.source (.ledger result)) (project-source a (mut result)))
+    (load result)))
+
+; Retain missing/previous graph paths while a load fails. Recreating an imported
+; file must itself wake the watcher; no unrelated entry-file save is required.
+(defn project-watch-failures! [(a (dyn alloc/Allocator))
+                               (p (ptr Project))
+                               (prior (ArrayList ProjectFile))] (-> i64)
+  (unless (.ok (.ledger p))
+    (for [i 0 (len prior)]
+      (let [old (get prior i)
+            (mut present) false]
+        (for [j 0 (len (.files p))]
+          (let [f (get (.files p) j)]
+            (when (= (.path f) (.path old)) (set! present true) 0)))
+        (unless (load present)
+          (let [text
+                  (match (fs/read-file a (.path old))
+                    (Ok [s] s)
+                    (Err [_] ""))]
+            (push! (mut (.files p))
+                   (ProjectFile
+                     :module (copy-bytes a (.module old))
+                     :path (copy-bytes a (.path old))
+                     :text text
+                     :digest (if (= (slice-len text) 0) 0 (digest text))))
+            0)))
+      0))
+  0)
