@@ -117,6 +117,11 @@ Unicode 15.1's compressed two-level ID_Start/ID_Continue bitmap and leaves the
 ASCII path table-free. Its exhaustive test visits every Unicode scalar and
 pins the complete non-ASCII membership counts, while the Oxc oracle compares
 structured generic TypeScript trees whose names contain BMP and astral UTF-8.
+The direct backend decodes fixed and braced Unicode escapes as one logical word
+even though the structural tape exposes punctuation inside a braced escape.
+Canonical code-point hashing/equality makes raw and escaped names identical for
+bindings, references, captures, and labels without materializing normalized
+identifier strings.
 
 `benchmarks/check-typescript-type-oracle.sh` supplies the independent type-tree
 oracle. Canonical snippets are parsed by local Oxc and by Coil's generated

@@ -78,10 +78,45 @@
             (source-byte state position) (cast u8 0))))))
 
 (defn next-event-byte [(state (ptr DirectParseState)) (distance i64)] (-> u8)
-  (let [index (+ (.event-index state) distance)]
+  (let [index (logical-event-index state (.event-index state) distance)]
     (if (>= index (.event-count state)) (cast u8 0)
       (source-byte state
         (event-position (load (p/index (.events state) index)))))))
+
+(defn logical-event-index
+  [(state (ptr DirectParseState)) (start i64) (distance i64)] (-> i64)
+  (let [(mut index) start (mut step) 0]
+    (loop
+      (if (or (>= (load step) distance) (>= (load index) (.event-count state))) (break)
+        (do
+          (store! index (event-index-after-token state (load index)))
+          (set! step (+ (load step) 1)))))
+    (load index)))
+
+(defn event-index-after-token
+  [(state (ptr DirectParseState)) (index i64)] (-> i64)
+  (let [(mut next) (+ index 1)]
+    ;; Only braced identifier escapes create structural events inside one
+    ;; logical word. Checking the immediately following `{` keeps ordinary
+    ;; words—including template text containing `$`—on the one-increment path.
+    (if (and (< (load next) (.event-count state))
+             (= (event-kind (load (p/index (.events state) index))) tape/EVENT-WORD))
+        (let [next-position
+                (event-position (load (p/index (.events state) (load next))))
+              braced-escape
+                (and (>= next-position (cast u32 2))
+                     (= (source-byte state next-position) (cast u8 123))
+                     (= (source-byte state (- next-position (cast u32 1))) (cast u8 117))
+                     (= (source-byte state (- next-position (cast u32 2))) (cast u8 92)))]
+          (if braced-escape
+              (let [end (word-end state
+                          (event-position (load (p/index (.events state) index))))]
+          (loop
+            (if (or (>= (load next) (.event-count state))
+                    (>= (event-position
+                          (load (p/index (.events state) (load next)))) end)) (break)
+                    (set! next (+ (load next) 1))))) 0)) 0)
+    (load next)))
 
 (defn advance! [(state (ptr DirectParseState))] (-> i64)
   (if (< (.event-index state) (.event-count state))
@@ -175,6 +210,7 @@
    (previous-token-end previous-token-end)
    (span-equals span-equals?)
    (spans-equal spans-equal?)
+   (identifier-span-equals identifier-span-equals-text?)
    (push-label push-label!)
    (pop-label pop-label!)
    (clear-pending-labels clear-pending-labels!)
@@ -304,6 +340,75 @@
 (defn utf8-continuation? [(byte u8)] (-> bool)
   (= (p/iand (cast u64 byte) (cast u64 192)) (cast u64 128)))
 
+(defn identifier-start-codepoint? [(codepoint u32)] (-> bool)
+  (if (< codepoint (cast u32 128))
+      (or (= codepoint (cast u32 36)) (= codepoint (cast u32 95))
+          (and (>= codepoint (cast u32 65)) (<= codepoint (cast u32 90)))
+          (and (>= codepoint (cast u32 97)) (<= codepoint (cast u32 122))))
+    (unicode-id/id-start? codepoint)))
+
+(defn identifier-continue-codepoint? [(codepoint u32)] (-> bool)
+  (if (< codepoint (cast u32 128))
+      (or (identifier-start-codepoint? codepoint)
+          (and (>= codepoint (cast u32 48)) (<= codepoint (cast u32 57))))
+    (or (unicode-id/id-continue? codepoint)
+        (= codepoint (cast u32 8204)) (= codepoint (cast u32 8205)))))
+
+(defn hex-value [(byte u8)] (-> i64)
+  (cond (and (>= byte (cast u8 48)) (<= byte (cast u8 57)))
+          (- (cast i64 byte) 48)
+        (and (>= byte (cast u8 65)) (<= byte (cast u8 70)))
+          (+ (- (cast i64 byte) 65) 10)
+        (and (>= byte (cast u8 97)) (<= byte (cast u8 102)))
+          (+ (- (cast i64 byte) 97) 10)
+        :else -1))
+
+(defn decode-identifier-codepoint
+  [(state (ptr DirectParseState)) (start u32)] (-> Utf8Decode)
+  (if (!= (source-byte state start) (cast u8 92)) (decode-utf8 state start)
+    (let [size (cast u32 (.source-size state)) u (+ start (cast u32 1))]
+      (if (or (>= u size) (!= (source-byte state u) (cast u8 117)))
+          (Utf8Decode :codepoint (cast u32 0) :end (+ start (cast u32 1)) :valid false)
+        (let [digits (+ u (cast u32 1))]
+          (if (and (< digits size) (= (source-byte state digits) (cast u8 123)))
+              (let [(mut at) (+ digits (cast u32 1)) (mut value) (cast u32 0)
+                    (mut count) 0 (mut valid) true]
+                (loop
+                  (if (or (>= (load at) size) (>= (load count) 6)
+                          (= (source-byte state (load at)) (cast u8 125))) (break)
+                    (let [digit (hex-value (source-byte state (load at)))]
+                      (if (< digit 0) (do (store! valid false) (break))
+                        (do
+                          (store! value (+ (p/ishl (load value) (cast u32 4))
+                                           (cast u32 digit)))
+                          (set! count (+ (load count) 1))
+                          (set! at (+ (load at) (cast u32 1))))))))
+                (let [closed (and (< (load at) size)
+                                   (= (source-byte state (load at)) (cast u8 125)))
+                      scalar (and (> (load count) 0) (load valid) closed
+                                  (<= (load value) (cast u32 1114111))
+                                  (or (< (load value) (cast u32 55296))
+                                      (> (load value) (cast u32 57343))))]
+                  (Utf8Decode :codepoint (load value)
+                    :end (if closed (+ (load at) (cast u32 1)) (load at))
+                    :valid scalar)))
+            (let [(mut at) digits (mut value) (cast u32 0) (mut count) 0
+                  (mut valid) true]
+              (loop
+                (if (>= (load count) 4) (break)
+                  (if (>= (load at) size) (store! valid false)
+                    (let [digit (hex-value (source-byte state (load at)))]
+                      (if (< digit 0) (do (store! valid false) (break))
+                        (do
+                          (store! value (+ (p/ishl (load value) (cast u32 4))
+                                           (cast u32 digit)))
+                          (set! count (+ (load count) 1))
+                          (set! at (+ (load at) (cast u32 1)))))))))
+              (Utf8Decode :codepoint (load value) :end (load at)
+                :valid (and (load valid) (= (load count) 4)
+                            (or (< (load value) (cast u32 55296))
+                                (> (load value) (cast u32 57343))))))))))))
+
 (defn decode-utf8 [(state (ptr DirectParseState)) (start u32)] (-> Utf8Decode)
   (let [size (cast u32 (.source-size state)) first (source-byte state start)]
     (cond
@@ -359,15 +464,25 @@
     (loop
       (if (>= (load at) (.source-size state)) (break)
         (let [byte (load (p/index (.source state) (load at)))]
-          (if (or (ascii-word? byte) (>= byte (cast u8 128)))
-              (set! at (+ (load at) 1)) (break)))))
+          (if (= byte (cast u8 92))
+              (let [decoded (decode-identifier-codepoint state (cast u32 (load at)))]
+                (if (.valid decoded) (set! at (cast i64 (.end decoded))) (break)))
+            (if (or (ascii-word? byte) (>= byte (cast u8 128)))
+                (set! at (+ (load at) 1)) (break))))))
     (cast u32 (load at))))
 
 (defn identifier-end! :inline (Always)
   [(state (ptr DirectParseState)) (start u32)] (-> u32)
   (let [first-byte (source-byte state start) (mut at) start
-        (mut identifier) true (mut valid) true]
-    (if (< first-byte (cast u8 128))
+        (mut identifier) true (mut valid) true (mut braced-escape) false]
+    (if (= first-byte (cast u8 92))
+        (let [decoded (decode-identifier-codepoint state start)]
+          (if (= (source-byte state (+ start (cast u32 2))) (cast u8 123))
+              (store! braced-escape true) 0)
+          (if (and (.valid decoded) (identifier-start-codepoint? (.codepoint decoded)))
+              (store! at (.end decoded))
+            (do (fail! state DIRECT-PARSE-EXPECTED) (store! valid false))))
+      (if (< first-byte (cast u8 128))
         (if (or (= first-byte (cast u8 36)) (= first-byte (cast u8 95))
                 (and (>= first-byte (cast u8 65)) (<= first-byte (cast u8 90)))
                 (and (>= first-byte (cast u8 97)) (<= first-byte (cast u8 122))))
@@ -378,13 +493,21 @@
             (store! at (.end decoded))
           (do
             (fail! state DIRECT-PARSE-EXPECTED)
-            (store! valid false)))))
+            (store! valid false))))))
     (loop
       (if (or (not (load identifier))
               (>= (cast i64 (load at)) (.source-size state))
               (not (load valid))) (break)
         (let [byte (source-byte state (load at))]
           (cond
+            (= byte (cast u8 92))
+              (let [decoded (decode-identifier-codepoint state (load at))]
+                (if (= (source-byte state (+ (load at) (cast u32 2))) (cast u8 123))
+                    (store! braced-escape true) 0)
+                (if (and (.valid decoded)
+                         (identifier-continue-codepoint? (.codepoint decoded)))
+                    (store! at (.end decoded))
+                  (store! valid false)))
             (ascii-word? byte)
               (store! at (+ (load at) (cast u32 1)))
             (>= byte (cast u8 128))
@@ -398,7 +521,15 @@
     (if (not (load identifier)) (word-end state start)
       (if (not (load valid))
         (do (fail! state DIRECT-PARSE-EXPECTED) (word-end state start))
-        (load at)))))
+        (do
+          (if (load braced-escape)
+              (loop
+                (let [next (+ (.event-index state) 1)]
+                  (if (or (>= next (.event-count state))
+                          (>= (event-position
+                                (load (p/index (.events state) next))) (load at))) (break)
+                    (set! (.event-index state) next)))) 0)
+          (load at))))))
 
 (defn previous-token-end [(state (ptr DirectParseState))] (-> u32)
   (if (<= (.event-index state) 0) (cast u32 0)
@@ -444,6 +575,66 @@
             (set! offset (+ (load offset) (cast u32 1))))))
       (load same))))
 
+(defn identifier-span-equals-text?
+  [(state (ptr DirectParseState)) (start u32) (end u32) (text (slice u8))] (-> bool)
+  (let [(mut at) start (mut index) 0 (mut same) true]
+    (loop
+      (if (or (>= (load at) end) (not (load same))) (break)
+        (let [decoded (decode-identifier-codepoint state (load at))]
+          (if (or (not (.valid decoded)) (>= (.codepoint decoded) (cast u32 128))
+                  (>= (load index) (len text))
+                  (!= (cast u8 (.codepoint decoded))
+                      (load (p/index (slice-data text) (load index)))))
+              (store! same false)
+            (do
+              (store! at (.end decoded))
+              (set! index (+ (load index) 1)))))))
+    (and (load same) (= (load at) end) (= (load index) (len text)))))
+
+(defn identifier-spans-equal?
+  [(state (ptr DirectParseState)) (left-start u32) (left-end u32)
+   (right-start u32) (right-end u32)] (-> bool)
+  (let [(mut fast-left) left-start (mut fast-right) right-start (mut raw-same) true]
+    (loop
+      (if (or (>= (load fast-left) left-end) (>= (load fast-right) right-end)
+              (not (load raw-same))) (break)
+        (if (= (source-byte state (load fast-left))
+               (source-byte state (load fast-right)))
+            (do (store! fast-left (+ (load fast-left) (cast u32 1)))
+                (store! fast-right (+ (load fast-right) (cast u32 1))))
+          (store! raw-same false))))
+    (if (and (load raw-same) (= (load fast-left) left-end)
+             (= (load fast-right) right-end)) true
+      (let [(mut left) left-start (mut right) right-start (mut same) true]
+    (loop
+      (if (or (>= (load left) left-end) (>= (load right) right-end)
+              (not (load same))) (break)
+        (let [a (decode-identifier-codepoint state (load left))
+              b (decode-identifier-codepoint state (load right))]
+          (if (or (not (.valid a)) (not (.valid b))
+                  (!= (.codepoint a) (.codepoint b)))
+              (store! same false)
+            (do (store! left (.end a)) (store! right (.end b)))))))
+        (and (load same) (= (load left) left-end) (= (load right) right-end))))))
+
+(defn identifier-span-hash
+  [(state (ptr DirectParseState)) (start u32) (end u32)] (-> u64)
+  (let [(mut hash) (cast u64 1469598103934665603) (mut at) start]
+    (loop
+      (if (>= (load at) end) (break)
+        (if (or (= (source-byte state (load at)) (cast u8 92))
+                (>= (source-byte state (load at)) (cast u8 128)))
+            (let [decoded (decode-identifier-codepoint state (load at))]
+              (store! hash (p/ixor (load hash) (cast u64 (.codepoint decoded))))
+              (store! hash (* (load hash) (cast u64 1099511628211)))
+              (store! at (.end decoded)))
+          (do
+            (store! hash (p/ixor (load hash)
+                           (cast u64 (source-byte state (load at)))))
+            (store! hash (* (load hash) (cast u64 1099511628211)))
+            (store! at (+ (load at) (cast u32 1)))))))
+    (load hash)))
+
 ;; Labels are parser-semantic state rather than syntax nodes waiting in an AST.
 ;; The fixed caller-local stack is sufficient for ordinary programs, and an
 ;; explicit capacity error keeps pathological nesting memory-safe.
@@ -455,7 +646,7 @@
           (set! index (- (load index) 1))
           (if (and (= (load (p/index (.label-function-scopes state) (load index)))
                       (.function-scope state))
-                   (spans-equal? state start end
+                   (identifier-spans-equal? state start end
                      (load (p/index (.label-starts state) (load index)))
                      (load (p/index (.label-ends state) (load index)))))
               (store! duplicate true) 0))))
@@ -516,7 +707,7 @@
           (set! index (- (load index) 1))
           (if (and (= (load (p/index (.label-function-scopes state) (load index)))
                       (.function-scope state))
-                   (spans-equal? state start end
+                   (identifier-spans-equal? state start end
                      (load (p/index (.label-starts state) (load index)))
                      (load (p/index (.label-ends state) (load index)))))
               (if continue?
@@ -563,25 +754,17 @@
                 candidate-scope (load (p/index (.binding-scopes arena)
                                                 (cast i64 (load index))))]
             (if (and (ir/scope-ancestor? arena candidate-scope (.scope state))
-                     (= (- end start) (- candidate-end candidate-start))
-                     (let [(mut i) (cast u32 0) (mut same) true]
-                       (loop
-                         (if (or (>= (load i) (- end start)) (not (load same))) (break)
-                           (do
-                             (if (!= (source-byte state (+ start (load i)))
-                                     (source-byte state (+ candidate-start (load i))))
-                                 (store! same false) 0)
-                             (set! i (+ (load i) (cast u32 1))))))
-                       (load same)))
+                     (identifier-spans-equal? state start end
+                       candidate-start candidate-end))
                 (store! found (load index)) 0)))))
     (load found)))
 
 (defn find-binding [(state (ptr DirectParseState)) (start u32) (end u32)] (-> u32)
-  (let [arena (.arena (.builder state)) hash (span-hash state start end)
+  (let [arena (.arena (.builder state)) hash (identifier-span-hash state start end)
         slot (cast i64 (% hash (cast u64 (.lookup-capacity state))))
         hit (and (!= (load (p/index (.lookup-valid state) slot)) (cast u8 0))
                  (= (load (p/index (.lookup-hashes state) slot)) hash)
-                 (spans-equal? state start end
+                 (identifier-spans-equal? state start end
                    (load (p/index (.lookup-starts state) slot))
                    (load (p/index (.lookup-ends state) slot))))
         cached (if hit (load (p/index (.lookup-bindings state) slot))
@@ -658,7 +841,7 @@
 
 (defn next-event-keyword? :inline (Always)
   [(state (ptr DirectParseState)) (distance i64) (keyword (slice u8))] (-> bool)
-  (let [index (+ (.event-index state) distance)]
+  (let [index (logical-event-index state (.event-index state) distance)]
     (if (or (< index 0) (>= index (.event-count state))) false
       (let [event (load (p/index (.events state) index))]
         (if (!= (event-kind event) (cast u8 tape/EVENT-WORD)) false
@@ -667,7 +850,7 @@
 
 (defn next-event-kind :inline (Always)
   [(state (ptr DirectParseState)) (distance i64)] (-> u8)
-  (let [index (+ (.event-index state) distance)]
+  (let [index (logical-event-index state (.event-index state) distance)]
     (if (or (< index 0) (>= index (.event-count state))) (cast u8 0)
       (event-kind (load (p/index (.events state) index))))))
 

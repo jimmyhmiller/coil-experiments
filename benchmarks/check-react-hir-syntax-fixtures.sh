@@ -18,6 +18,23 @@ for fixture in "$benchmark_dir"/react-hir-syntax-fixtures/*.ts \
   count=$((count + 1))
 done
 
+# Escaped and raw spellings are one ECMAScript identifier identity. Acceptance
+# alone would not catch a parser that created unresolved references for the
+# escaped spellings, so pin the binding links in the verified textual IR.
+escaped_ir=$(mktemp "${TMPDIR:-/tmp}/react-hir-escaped-identifiers.XXXXXX")
+trap 'rm -f "$escaped_ir"' EXIT HUP INT TERM
+"$checker" "$benchmark_dir/react-hir-syntax-fixtures/escaped-identifiers.ts" \
+  --dump-ir >"$escaped_ir"
+for expected in \
+  'reference 0 binding(0)' \
+  'reference 1 binding(0)' \
+  'reference 2 binding(2)'; do
+  if ! grep -F "$expected" "$escaped_ir" >/dev/null; then
+    printf 'escaped identifier lost canonical binding identity: %s\n' "$expected" >&2
+    exit 1
+  fi
+done
+
 rejected=0
 for fixture in "$benchmark_dir"/react-hir-invalid-syntax-fixtures/*.ts \
                "$benchmark_dir"/react-hir-invalid-syntax-fixtures/*.tsx; do

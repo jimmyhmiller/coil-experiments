@@ -75,6 +75,7 @@ const CASES: &[Case] = &[
     Case { name: "import-meta-context", source: "const meta=import.meta;const url=import.meta.url;function f(){return new.target;}" },
     Case { name: "labeled-statement-context", source: "outer: inner: for(let i=0;i<3;i++){if(i===1)continue outer;if(i===2)break inner;} \n block: {if(done)break block;work();} \n" },
     Case { name: "unicode-type-identifiers", source: "type 类型<参数 extends 基础 = 默认> = 命名空间.成员<参数>;" },
+    Case { name: "escaped-type-identifiers", source: "type \\u0054<\\u0055 extends 基础 = 默认> = T<U>;" },
 ];
 
 struct Shape {
