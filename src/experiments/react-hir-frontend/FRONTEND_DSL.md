@@ -57,6 +57,8 @@ Coil function bodies. Generator algorithms currently include:
   postfix, intersection, union, and conditional types, including mapped types,
   `infer`, `keyof`/`readonly`/`unique`, type-level `typeof`, and typed or
   untyped property signatures with ordinary, quoted, numeric, or computed names.
+  Union and intersection nodes preserve an optional leading `|` or `&`, even
+  for the TypeScript-valid single-member form.
   Call, construct, method, and getter signatures retain whether a return type
   was written, while function and constructor type expressions require one;
 - `type-binding-pattern` for structured object, array, rest, assignment, and
