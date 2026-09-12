@@ -35,7 +35,15 @@
    (break-target u32) (continue-target u32)
    (error i64) (error-offset u32) (terminated bool) (ambient bool)
    (ambient-context bool)
-   (in-conditional-extends bool)])
+   (in-conditional-extends bool)
+   ;; Cursor cache. Reading the current token's byte otherwise costs two
+   ;; dependent loads - the event word, then a random access into the source at
+   ;; the position it carries - and the statement and expression dispatchers
+   ;; peek at it dozens of times per token. The event array and the source
+   ;; buffer are separate allocations the compiler cannot prove disjoint, so it
+   ;; cannot hoist those loads itself. These three fields are refreshed at the
+   ;; only two places the event index moves.
+   (cursor-event u32) (cursor-position u32) (cursor-byte u8)])
 
 (defstruct ExprResult [(value u32) (start u32) (end u32)])
 
@@ -55,20 +63,30 @@
   (!= (p/iand (cast u64 event) (cast u64 tape/PARSE-EVENT-LINE-BREAK))
       (cast u64 0)))
 
-(defn current-event [(state (ptr DirectParseState))] (-> u32)
-  (if (>= (.event-index state) (.event-count state)) (cast u32 0)
-    (load (p/index (.events state) (.event-index state)))))
-
-(defn current-position [(state (ptr DirectParseState))] (-> u32)
-  (if (>= (.event-index state) (.event-count state)) (cast u32 (.source-size state))
-    (event-position (current-event state))))
-
 (defn source-byte [(state (ptr DirectParseState)) (position u32)] (-> u8)
   (if (>= (cast i64 position) (.source-size state)) (cast u8 0)
     (load (p/index (.source state) (cast i64 position)))))
 
+;; Recompute the cursor cache from the event index. Every mutation of
+;; `.event-index` must be followed by this.
+(defn refresh-cursor! [(state (ptr DirectParseState))] (-> i64)
+  (let [past-end (>= (.event-index state) (.event-count state))
+        event (if past-end (cast u32 0)
+                (load (p/index (.events state) (.event-index state))))
+        position (if past-end (cast u32 (.source-size state)) (event-position event))]
+    (set! (.cursor-event state) event)
+    (set! (.cursor-position state) position)
+    (set! (.cursor-byte state) (source-byte state position)))
+  0)
+
+(defn current-event [(state (ptr DirectParseState))] (-> u32)
+  (.cursor-event state))
+
+(defn current-position [(state (ptr DirectParseState))] (-> u32)
+  (.cursor-position state))
+
 (defn current-byte [(state (ptr DirectParseState))] (-> u8)
-  (source-byte state (current-position state)))
+  (.cursor-byte state))
 
 (defn adjacent-event-byte [(state (ptr DirectParseState)) (distance i64)] (-> u8)
   (let [index (+ (.event-index state) distance)]
@@ -118,9 +136,18 @@
                     (set! next (+ (load next) 1))))) 0)) 0)
     (load next)))
 
+;; The only supported way to move the event cursor other than advancing: a
+;; lookahead that scans ahead and rewinds must go through this, or the cursor
+;; cache keeps the byte it read at the far end of the scan.
+(defn seek-events! [(state (ptr DirectParseState)) (index i64)] (-> i64)
+  (set! (.event-index state) index)
+  (refresh-cursor! state)
+  0)
+
 (defn advance! [(state (ptr DirectParseState))] (-> i64)
   (if (< (.event-index state) (.event-count state))
-      (set! (.event-index state) (+ (.event-index state) 1)) 0)
+      (do (set! (.event-index state) (+ (.event-index state) 1))
+          (refresh-cursor! state)) 0)
   0)
 
 (defn advance-count! [(state (ptr DirectParseState)) (count i64)] (-> i64)
@@ -193,6 +220,8 @@
    (expression-result-type ExprResult)
    (direct-result-type DirectParseResult)
    (parser-scratch-type DirectParserScratch)
+   (refresh-cursor refresh-cursor!)
+   (seek-events seek-events!)
    (current-position current-position)
    (current-byte current-byte)
    (adjacent-event-byte adjacent-event-byte)
@@ -528,7 +557,8 @@
                   (if (or (>= next (.event-count state))
                           (>= (event-position
                                 (load (p/index (.events state) next))) (load at))) (break)
-                    (set! (.event-index state) next)))) 0)
+                    (do (set! (.event-index state) next)
+                        (refresh-cursor! state))))) 0)
           (load at))))))
 
 (defn previous-token-end [(state (ptr DirectParseState))] (-> u32)
