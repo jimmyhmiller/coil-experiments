@@ -1,0 +1,1 @@
+type Invalid = abstract value;
