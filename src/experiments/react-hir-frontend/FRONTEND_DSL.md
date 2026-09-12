@@ -102,6 +102,13 @@ IR also passes the complete verifier.
 `direct_parser_test.coil` registers every structural check as a `deftest`, so
 the project suite executes its IR-shape and deliberate-corruption assertions.
 
+`benchmarks/check-typescript-type-oracle.sh` supplies the independent type-tree
+oracle. Canonical snippets are parsed by local Oxc and by Coil's generated
+parser; an exhaustive Oxc visitor normalizes the intentional difference that
+Coil materializes entity-name leaves as SSA values, then compares the ordered
+type/signature node shape. It covers every non-JSDoc `TSType` and every
+`TSSignature` variant and is part of the generated-core gate.
+
 For now compiler and semantic specification share `parser_generator.coil`.
 Coil expands an imported `Code -> Code` helper as a nested macro before its
 caller can supply runtime Code values, so splitting them cleanly requires a

@@ -11,3 +11,4 @@ else
 fi
 
 "$checker" "$benchmark_dir/fixtures/typescript-generated-core.ts"
+REACT_HIR_CHECKER="$checker" "$benchmark_dir/check-typescript-type-oracle.sh"
