@@ -3,6 +3,8 @@ use std::{env, fs, path::PathBuf, process::Command};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     ExportAllDeclaration, ExportNamedDeclaration, ExportSpecifier, Function, FunctionType,
+    ImportDeclaration, ImportDefaultSpecifier, ImportNamespaceSpecifier, ImportSpecifier,
+    ImportAttribute, WithClause,
     TSClassImplements, TSEnumDeclaration, TSEnumMember, TSGlobalDeclaration,
     TSExportAssignment, TSImportEqualsDeclaration, TSInterfaceBody, TSInterfaceHeritage,
     TSModuleDeclaration, TSModuleReference, TSNamespaceExportDeclaration, TSOptionalType,
@@ -63,6 +65,8 @@ const CASES: &[Case] = &[
     Case { name: "module-statement-context", source: "import fs=require('fs'); import Alias=A.B.C; import type Types=require('types'); export=Alias; export as namespace Library;" },
     Case { name: "function-overload-context", source: "declare function convert<T>(input:T):T\ndeclare function convert(input:string):number; function convert(input:unknown):unknown{return input;}" },
     Case { name: "structured-export-context", source: "export type {Foo,Bar as Baz};export type {Qux} from 'pkg';export type * from 'types';export * as ns from 'runtime';export type * as types from 'types2';export {type Hidden,value as renamed,'strange-name' as strange} from 'mixed';" },
+    Case { name: "structured-import-context", source: "import type DefaultType from 'types-default';import type {Foo,Bar as Baz} from 'types';import source moduleValue from 'module-source';import defer * as deferred from 'deferred';import ordinary,* as namespace from 'runtime';import {'strange-name' as strange} from 'weird';import 'effects';" },
+    Case { name: "module-attributes-context", source: "import data from 'data' with {type:'json','resolution-mode':'import'};import legacy from 'legacy' assert {type:'json'};export {value} from 'data' with {type:'json'};export * from 'legacy' assert {type:'json'};" },
 ];
 
 struct Shape {
@@ -220,6 +224,22 @@ fn field_checks(name: &str) -> &'static [FieldCheck] {
                 (0, 1), (0, 0), (0, 0),
             ] },
         ],
+        "structured-import-context" => &[
+            FieldCheck { opcode: 50, expected: &[
+                (2, 257), (3, 513), (2, 258), (2, 260),
+                (3, 512), (2, 256), (1, 0),
+            ] },
+            FieldCheck { opcode: 51, expected: &[
+                (0, 2), (0, 0), (0, 0), (0, 2), (0, 4),
+                (0, 2), (0, 4), (0, 0),
+            ] },
+        ],
+        "module-attributes-context" => &[
+            FieldCheck { opcode: 50, expected: &[(3, 264), (3, 264)] },
+            FieldCheck { opcode: 139, expected: &[(3, 280), (2, 26)] },
+            FieldCheck { opcode: 141, expected: &[(2, 0), (1, 1), (1, 0), (1, 1)] },
+            FieldCheck { opcode: 142, expected: &[(1, 0); 5] },
+        ],
         _ => &[],
     }
 }
@@ -259,6 +279,42 @@ impl Shape {
 }
 
 impl<'a> Visit<'a> for Shape {
+    fn visit_with_clause(&mut self, clause: &WithClause<'a>) {
+        walk::walk_with_clause(self, clause);
+        let span = clause.span();
+        self.push("js.import_attributes", Some((span.start, span.end)));
+    }
+
+    fn visit_import_attribute(&mut self, attribute: &ImportAttribute<'a>) {
+        walk::walk_import_attribute(self, attribute);
+        let span = attribute.span();
+        self.push("js.import_attribute", Some((span.start, span.end)));
+    }
+
+    fn visit_import_declaration(&mut self, declaration: &ImportDeclaration<'a>) {
+        walk::walk_import_declaration(self, declaration);
+        let span = declaration.span();
+        self.push("js.import", Some((span.start, span.end)));
+    }
+
+    fn visit_import_specifier(&mut self, specifier: &ImportSpecifier<'a>) {
+        walk::walk_import_specifier(self, specifier);
+        let span = specifier.span();
+        self.push("js.import_specifier", Some((span.start, span.end)));
+    }
+
+    fn visit_import_default_specifier(&mut self, specifier: &ImportDefaultSpecifier<'a>) {
+        walk::walk_import_default_specifier(self, specifier);
+        let span = specifier.span();
+        self.push("js.import_specifier", Some((span.start, span.end)));
+    }
+
+    fn visit_import_namespace_specifier(&mut self, specifier: &ImportNamespaceSpecifier<'a>) {
+        walk::walk_import_namespace_specifier(self, specifier);
+        let span = specifier.span();
+        self.push("js.import_specifier", Some((span.start, span.end)));
+    }
+
     fn visit_export_named_declaration(&mut self, declaration: &ExportNamedDeclaration<'a>) {
         walk::walk_export_named_declaration(self, declaration);
         if declaration.declaration.is_none() {
@@ -474,6 +530,8 @@ fn coil_shape(output: &str) -> Vec<&str> {
         "ts.module_reference", "ts.import_equals", "ts.export_assignment",
         "ts.namespace_export",
         "js.export_specifier", "js.export_declaration",
+        "js.import_specifier", "js.import",
+        "js.import_attribute", "js.import_attributes",
     ];
     output.lines().filter_map(|line| {
         let op = line.trim().split_once(" = ").map_or_else(
