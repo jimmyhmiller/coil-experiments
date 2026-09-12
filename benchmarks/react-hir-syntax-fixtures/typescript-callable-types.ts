@@ -13,4 +13,6 @@ type CallableMembers = {
   'data-value'?: string;
   42: boolean;
   "run"<T>(value: T): T;
+  [Symbol.iterator](): Iterator<number>;
+  readonly [Symbol.dispose]?: () => void;
 };
