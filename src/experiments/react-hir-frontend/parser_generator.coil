@@ -157,6 +157,48 @@
               (p/code-str "production has more than one (repeat ...) step for role: " role)) -1)
       :else (load found))))
 
+;; Index of the single (separated RULE BYTE) step matching `rule`. A bracketed,
+;; comma separated list is one grammar step; the terminals that bracket it sit
+;; immediately either side of it.
+(defn separated-step-index [(steps Code) (rule Code) (role (slice u8))] (-> i64)
+  (let [(mut i) 0 (mut found) -1 (mut count) 0]
+    (loop
+      (if (>= (load i) (p/code-count steps)) (break)
+        (let [step (p/code-nth steps (load i))]
+          (if (and (step-form? step "separated") (= (p/code-count step) 3)
+                   (p/code-sym? (p/code-nth step 1)) (p/code-sym? rule)
+                   (= (p/code-sym (p/code-nth step 1)) (p/code-sym rule)))
+              (do (if (< (load found) 0) (store! found (load i)) 0)
+                  (set! count (+ (load count) 1))) 0)
+          (set! i (+ (load i) 1)))))
+    (cond
+      (= (load count) 0)
+        (do (p/report steps
+              (p/code-str "production has no (separated ...) step for role: " role)) -1)
+      (> (load count) 1)
+        (do (p/report steps
+              (p/code-str "production has more than one (separated ...) step for role: " role)) -1)
+      :else (load found))))
+
+;; Separator byte of a (separated RULE BYTE) step.
+(defn separated-step-byte [(steps Code) (index i64) (role (slice u8))] (-> Code)
+  (if (or (< index 0) (>= index (p/code-count steps))
+          (not (step-form? (p/code-nth steps index) "separated")))
+      (do (p/report steps
+            (p/code-str "production needs a separated step for: " role))
+          `(cast u8 0))
+    `(cast u8 ~(p/code-nth (p/code-nth steps index) 2))))
+
+;; Raw integer byte of a (terminal B) or (terminator B) step, for comparing the
+;; shapes of two productions that must agree. A step that carries no byte is -1,
+;; which compares unequal to every real byte and so fails that comparison.
+(defn step-byte-value [(steps Code) (index i64)] (-> i64)
+  (if (or (< index 0) (>= index (p/code-count steps))
+          (not (= (p/code-count (p/code-nth steps index)) 2))
+          (not (p/code-int? (p/code-nth (p/code-nth steps index) 1))))
+      -1
+    (p/code-int (p/code-nth (p/code-nth steps index) 1))))
+
 ;; Byte of a (terminal B) step, for a strategy that must both stop a repetition
 ;; at a closing terminal and then consume it.
 (defn terminal-step-byte [(steps Code) (index i64) (role (slice u8))] (-> Code)
@@ -1016,12 +1058,37 @@
                           (p/code-sym (field-value production "quoted-parser")))
           expected-error (backend-value backend "expected-error")
           literal-event (field-value production "literal-event")
-          object-open (field-value production "object-open")
-          object-close (field-value production "object-close")
-          array-open (field-value production "array-open")
-          array-close (field-value production "array-close")
-          comma (field-value production "separator")
-          colon (field-value production "colon")
+          ;; Both bracketed patterns are shaped like the grammar's object and
+          ;; array: one (separated RULE BYTE) step between two terminals, which
+          ;; supplies both brackets and the separator. Only the recursion
+          ;; between them, which no production expresses, stays here.
+          object-steps (named-steps production "object-steps")
+          object-element-index (separated-step-index object-steps
+                                 (field-value production "object-element")
+                                 "object pattern element")
+          object-open (terminal-step-byte object-steps (- object-element-index 1)
+                        "object pattern open")
+          object-close (terminal-step-byte object-steps (+ object-element-index 1)
+                         "object pattern close")
+          comma (separated-step-byte object-steps object-element-index
+                  "object pattern separator")
+          array-steps (named-steps production "array-steps")
+          array-element-index (separated-step-index array-steps
+                                (field-value production "array-element")
+                                "array pattern element")
+          array-open (terminal-step-byte array-steps (- array-element-index 1)
+                       "array pattern open")
+          array-close (terminal-step-byte array-steps (+ array-element-index 1)
+                        "array pattern close")
+          ;; `{ key: pattern }` is the grammar's object property, so the byte
+          ;; that ends the key comes from that production's shape.
+          property-steps (named-steps production "property-steps")
+          property-key-index (rule-step-index property-steps
+                               (field-value production "property-key")
+                               "property key")
+          colon (terminal-step-byte property-steps (+ property-key-index 1)
+                  "property key separator")
+          ;; A default initializer has no production of its own yet.
           equals (field-value production "equals")
           dot (field-value production "rest-byte")
           identifier-op (field-value production "identifier-op")
@@ -1032,6 +1099,8 @@
           assignment-op (field-value production "assignment-op")
           elision-op (field-value production "elision-op")
           state (p/fresh-identifier "state")]
+      (if (or (< object-element-index 0) (< array-element-index 0)
+              (< property-key-index 0)) `(do 0)
       `(defn ~function-name
          [(~state (ptr ~state-type)) (allow-default bool)] (-> ~result-type)
          (let [start (~current-position-code ~state)
@@ -1237,7 +1306,7 @@
                      (~result-type :value value :start (.start current)
                        :end (.end initializer)))) 0)
              0)
-           (load completed))))))
+           (load completed)))))))
 
 (defn compile-structured-type-parser [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production)
@@ -4844,15 +4913,43 @@
           parse-type-code (backend-value backend
                             (p/code-sym (field-value production "type-parser")))
           expected-error (backend-value backend "expected-error")
-          object-open (field-value production "object-open")
-          object-close (field-value production "object-close")
-          array-open (field-value production "array-open")
-          array-close (field-value production "array-close")
-          comma (field-value production "separator") colon (field-value production "colon")
+          ;; An object or array binding pattern is bracketed exactly like the
+          ;; grammar's object and array: one (separated RULE BYTE) step between
+          ;; two terminals. The brackets and the separator come from there. The
+          ;; recursion between the two patterns is what no production expresses,
+          ;; so only that stays here.
+          object-steps (named-steps production "object-steps")
+          object-element-index (separated-step-index object-steps
+                                 (field-value production "object-element")
+                                 "object pattern element")
+          object-open (terminal-step-byte object-steps (- object-element-index 1)
+                        "object pattern open")
+          object-close (terminal-step-byte object-steps (+ object-element-index 1)
+                         "object pattern close")
+          comma (separated-step-byte object-steps object-element-index
+                  "object pattern separator")
+          array-steps (named-steps production "array-steps")
+          array-element-index (separated-step-index array-steps
+                                (field-value production "array-element")
+                                "array pattern element")
+          array-open (terminal-step-byte array-steps (- array-element-index 1)
+                       "array pattern open")
+          array-close (terminal-step-byte array-steps (+ array-element-index 1)
+                        "array pattern close")
+          ;; `{ key: pattern }` renames a binding through the grammar's object
+          ;; property, so its separator comes from that production's shape.
+          property-steps (named-steps production "property-steps")
+          property-key-index (rule-step-index property-steps
+                               (field-value production "property-key")
+                               "property key")
+          colon (terminal-step-byte property-steps (+ property-key-index 1)
+                  "property key separator")
+          ;; A type annotation and a default initializer have no production of
+          ;; their own yet, so these two bytes are still spelled directly.
+          annotation-colon (field-value production "annotation-colon")
           equals (field-value production "equals") question (field-value production "optional")
           greater (field-value production "greater")
           dot (field-value production "rest-byte")
-          parameter-close (field-value production "parameter-close")
           invalid-keywords (field-value production "invalid-keywords")
           escaped-invalid-keywords (field-value production "escaped-invalid-keywords")
           state (p/fresh-identifier "state")
@@ -4863,6 +4960,8 @@
           property-end-id (p/fresh-identifier "property-end")
           property-key-id (p/fresh-identifier "property-key")
           property-invalid-id (p/fresh-identifier "property-invalid")]
+      (if (or (< object-element-index 0) (< array-element-index 0)
+              (< property-key-index 0)) `(do 0)
       `(defn ~function-name
          [(~state (ptr ~state-type)) (allow-default bool) (pattern-stop-a u8) (pattern-stop-b u8)]
          (-> i64)
@@ -4912,7 +5011,7 @@
                    (~check-build-code ~state binding))
                  (if (= (~current-byte-code ~state) ~question)
                      (do (~advance-code ~state) 0) 0)
-                 (if (= (~current-byte-code ~state) ~colon)
+                 (if (= (~current-byte-code ~state) ~annotation-colon)
                      (do (~parse-type-code ~state pattern-stop-a pattern-stop-b) 0) 0)
                  (if (and allow-default (= (~current-byte-code ~state) ~equals)
                           (!= (~adjacent-byte-code ~state 1) ~greater))
@@ -4990,7 +5089,7 @@
                    (~consume-code ~state ~object-close)
                    (if (= (~current-byte-code ~state) ~question)
                        (do (~advance-code ~state) 0) 0)
-                   (if (= (~current-byte-code ~state) ~colon)
+                   (if (= (~current-byte-code ~state) ~annotation-colon)
                        (do (~parse-type-code ~state pattern-stop-a pattern-stop-b) 0) 0)
                    (if (and allow-default (= (~current-byte-code ~state) ~equals)
                             (!= (~adjacent-byte-code ~state 1) ~greater))
@@ -5014,14 +5113,14 @@
                      (~consume-code ~state ~array-close)
                      (if (= (~current-byte-code ~state) ~question)
                          (do (~advance-code ~state) 0) 0)
-                     (if (= (~current-byte-code ~state) ~colon)
+                     (if (= (~current-byte-code ~state) ~annotation-colon)
                          (do (~parse-type-code ~state pattern-stop-a pattern-stop-b) 0) 0)
                      (if (and allow-default (= (~current-byte-code ~state) ~equals)
                               (!= (~adjacent-byte-code ~state 1) ~greater))
                          (do (~advance-code ~state) (~parse-expression-code ~state 0) 0) 0)
                      0)
                  (do (~fail-code ~state ~expected-error) 0)))))
-         0))))
+         0)))))
 
 (defn compile-arrow-expression [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 18)
@@ -6464,8 +6563,64 @@
                      (load ~modifier-bits))) 0) 0)
            (~binding-parser ~state ~allow-default ~stop-a ~stop-b))))))
 
+;; A declaration kind is [STEPS DECL-IMMEDIATE]: the production that spells the
+;; declaration, and the immediate the parser records for it.
+(defn declaration-kind-steps [(kinds Code) (index i64)] (-> Code)
+  (let [kind (p/code-nth kinds index)]
+    (if (and (p/code-vector? kind) (= (p/code-count kind) 2)
+             (p/code-vector? (p/code-nth kind 0)))
+        (p/code-nth kind 0)
+      (generator-fail kind
+        "declaration kind expects [PRODUCTION-STEPS DECL-IMMEDIATE]"))))
+
+;; const, let and var differ only in the keyword they begin with, so one shape
+;; drives the parser. A kind that disagrees is a hard expansion error rather
+;; than a shape silently taken from whichever kind happened to be first.
+(defn declaration-kinds-agree?
+  [(kinds Code) (binding-role Code) (value-role Code)] (-> bool)
+  (let [first-steps (declaration-kind-steps kinds 0)
+        keyword-index (keyword-step-index first-steps "declaration keyword")
+        binding-index (rule-step-index first-steps binding-role "declaration binding")
+        value-index (rule-step-index first-steps value-role "declaration value")
+        terminator-index (terminator-step-index first-steps "declaration statement end")
+        (mut i) 1 (mut agrees) true]
+    (loop
+      (if (>= (load i) (p/code-count kinds)) (break)
+        (let [steps (declaration-kind-steps kinds (load i))]
+          (if (not (and (= (p/code-count steps) (p/code-count first-steps))
+                        (= (keyword-step-index steps "declaration keyword") keyword-index)
+                        (= (rule-step-index steps binding-role "declaration binding")
+                           binding-index)
+                        (= (rule-step-index steps value-role "declaration value")
+                           value-index)
+                        (= (terminator-step-index steps "declaration statement end")
+                           terminator-index)
+                        (= (step-byte-value steps (- value-index 1))
+                           (step-byte-value first-steps (- value-index 1)))
+                        (= (step-byte-value steps terminator-index)
+                           (step-byte-value first-steps terminator-index))))
+              (do (p/report steps
+                    "declaration kinds must share one shape apart from their keyword")
+                  (store! agrees false)) 0)
+          (set! i (+ (load i) 1)))))
+    (load agrees)))
+
+;; Which declaration keyword is present decides the kind, so the keywords are
+;; tested here rather than emitted as a step: each kind contributes the spelling
+;; its own production declares.
+(defn compile-declaration-kind-dispatch
+  [(kinds Code) (index i64) (span-equals-code Code) (state Code)
+   (start Code) (end Code) (fallback Code)] (-> Code)
+  (if (>= index (p/code-count kinds)) fallback
+    (let [steps (declaration-kind-steps kinds index)]
+      `(if (~span-equals-code ~state ~start ~end
+             ~(keyword-step-text steps (keyword-step-index steps "declaration keyword")))
+           ~(p/code-nth (p/code-nth kinds index) 1)
+         ~(compile-declaration-kind-dispatch kinds (+ index 1) span-equals-code
+            state start end fallback)))))
+
 (defn compile-binding-declaration [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 18)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 21)
                 (generator-form? production "binding-declaration")))
       (generator-fail production "invalid binding-declaration production")
     (let [state-type (backend-value backend "state-type")
@@ -6489,44 +6644,74 @@
           check-build-code (backend-value backend "check-build")
           ok-error (backend-value backend "ok-error")
           expected-error (backend-value backend "expected-error")
+          ;; Each kind names the production that spells it. They share one shape
+          ;; after the keyword, and that shape supplies the keyword text, the
+          ;; byte before the initializer, and the ASI statement terminator.
           kinds (field-value production "kinds")
-          equals (field-value production "equals")
+          binding-role (field-value production "binding")
+          value-role (field-value production "value")
+          fallback-kind (field-value production "fallback-kind")
+          kind-steps (declaration-kind-steps kinds 0)
+          kinds-agree (declaration-kinds-agree? kinds binding-role value-role)
+          keyword-index (keyword-step-index kind-steps "declaration keyword")
+          binding-index (rule-step-index kind-steps binding-role "declaration binding")
+          value-index (rule-step-index kind-steps value-role "declaration value")
+          equals (terminal-step-byte kind-steps (- value-index 1)
+                   "declaration initializer")
+          terminator-index (terminator-step-index kind-steps "declaration statement end")
+          ;; A declarator list is not expressible as a production: the comma
+          ;; below is still borrowed and needs a declaration of its own.
           separator (field-value production "separator")
           initializer-required-kinds (field-value production "initializer-required-kinds")
           await-keyword (field-value production "await-keyword")
           using-keyword (field-value production "using-keyword")
-          object-pattern-open (field-value production "object-pattern-open")
-          array-pattern-open (field-value production "array-pattern-open")
+          ;; A declaration whose binding is a destructuring pattern must be
+          ;; initialized, so the two pattern openers come from the grammar's
+          ;; bracketed object and array.
+          object-steps (named-steps production "object-steps")
+          object-element-index (separated-step-index object-steps
+                                 (field-value production "object-element")
+                                 "object pattern element")
+          object-pattern-open (terminal-step-byte object-steps
+                                (- object-element-index 1) "object pattern open")
+          array-steps (named-steps production "array-steps")
+          array-element-index (separated-step-index array-steps
+                                (field-value production "array-element")
+                                "array pattern element")
+          array-pattern-open (terminal-step-byte array-steps
+                               (- array-element-index 1) "array pattern open")
           undefined-op (field-value production "undefined-op")
           uninitialized-flag (field-value production "uninitialized-flag")
-          terminator (field-value production "terminator")
           opcode (field-value production "emit-op")
           ambient-op (field-value production "ambient-op")
-          first-kind (p/code-nth kinds 0) second-kind (p/code-nth kinds 1)
-          third-kind (p/code-nth kinds 2) fourth-kind (p/code-nth kinds 3)
           declaration-kind-id (p/fresh-identifier "declaration-kind")
+          start-id (p/fresh-identifier "start")
+          keyword-start-id (p/fresh-identifier "keyword-start")
+          keyword-end-id (p/fresh-identifier "keyword-end")
           state (p/fresh-identifier "state")]
+      (if (or (not kinds-agree) (< keyword-index 0) (< binding-index 0)
+              (< value-index 0) (< terminator-index 0)
+              (< object-element-index 0) (< array-element-index 0)) `(do 0)
+       (if (or (!= value-index (+ binding-index 2))
+               (!= terminator-index (+ value-index 1))
+               (!= terminator-index (- (p/code-count kind-steps) 1)))
+           (generator-fail production
+             "binding-declaration requires a keyword, a binding rule, the initializer terminal, a value rule, and a trailing terminator")
       `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
-         (let [start (~current-position-code ~state)
+         (let [~start-id (~current-position-code ~state)
                await-using (and (~current-keyword-code ~state ~await-keyword)
                                 (~next-event-keyword-code ~state 1 ~using-keyword))
                _await (if await-using (~advance-code ~state) 0)
-               keyword-start (~current-position-code ~state)
-               keyword-end (~word-end-code ~state keyword-start)
+               ~keyword-start-id (~current-position-code ~state)
+               ~keyword-end-id (~word-end-code ~state ~keyword-start-id)
                ~declaration-kind-id
                  (if await-using (cast u64 ir/DECL-AWAIT-USING)
-                   (if (~span-equals-code ~state keyword-start keyword-end
-                         ~(p/code-nth first-kind 0))
-                       ~(p/code-nth first-kind 1)
-                     (if (~span-equals-code ~state keyword-start keyword-end
-                           ~(p/code-nth second-kind 0))
-                         ~(p/code-nth second-kind 1)
-                       (if (~span-equals-code ~state keyword-start keyword-end
-                             ~(p/code-nth third-kind 0))
-                           ~(p/code-nth third-kind 1)
-                         ~(p/code-nth fourth-kind 1)))))]
+                   ~(compile-declaration-kind-dispatch kinds 0 span-equals-code state
+                      keyword-start-id keyword-end-id fallback-kind))]
            (~advance-code ~state)
-           (let [initializer-required
+           ~(compile-step-range backend kind-steps (+ keyword-index 1) binding-index
+              state false
+           `(let [initializer-required
                    (or (and (not (.ambient ~state))
                          (or ~@(let [checks (p/code-list-new) (mut k) 0]
                                 (loop
@@ -6548,7 +6733,7 @@
                  (~pattern-parser-code ~state false ~equals ~separator)
                  (let [name-end (if (= name-start initial-name-end)
                                     (~current-position-code ~state) initial-name-end)
-                       operation-start (if (load first) start name-start)]
+                       operation-start (if (load first) ~start-id name-start)]
                    (if (= (~current-byte-code ~state) ~equals)
                        (if (.ambient ~state)
                            (do (~fail-code ~state ~expected-error) 0)
@@ -6606,8 +6791,8 @@
                                       (load (p/index (.op-starts (.arena (.builder ~state)))
                                                      (cast i64 (load last-op))))
                                       statement-end)]
-                         (~check-build-code ~state spanned)) 0)) 0)))
-         0))))
+                         (~check-build-code ~state spanned)) 0)) 0))))
+         0))))))
 
 (defn compile-template-value [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 9)
@@ -9082,12 +9267,14 @@
         (function parse-type-binding-pattern)
         (quoted-parser parse-property-name-string)
         (literal-event tape/PARSE-EVENT-LITERAL)
-        (object-open (syntax/object-production-terminal 0))
-        (object-close (syntax/object-production-terminal 2))
-        (array-open (syntax/array-production-terminal 0))
-        (array-close (syntax/array-production-terminal 2))
-        (separator (syntax/object-production-terminal 1))
-        (colon (syntax/property-production-terminal 1))
+        (object-steps ~(syntax/object-production-steps))
+        (object-element property)
+        (array-steps ~(syntax/array-production-steps))
+        (array-element expression)
+        (property-steps ~(syntax/property-production-steps))
+        (property-key property-name)
+        ;; A default initializer's equals is not declared by any production; it
+        ;; needs one of its own.
         (equals (syntax/assignment-production-terminal 1))
         (rest-byte (syntax/terminal-byte syntax/dot))
         (identifier-op ir/OP-JS-BINDING-IDENTIFIER)
@@ -9493,17 +9680,19 @@
       (binding-pattern arrow-binding-pattern
         (function parse-binding-pattern)
         (type-parser parse-type-annotation)
-        (object-open (syntax/object-production-terminal 0))
-        (object-close (syntax/object-production-terminal 2))
-        (array-open (syntax/array-production-terminal 0))
-        (array-close (syntax/array-production-terminal 2))
-        (separator (syntax/object-production-terminal 1))
-        (colon (syntax/property-production-terminal 1))
+        (object-steps ~(syntax/object-production-steps))
+        (object-element property)
+        (array-steps ~(syntax/array-production-steps))
+        (array-element expression)
+        (property-steps ~(syntax/property-production-steps))
+        (property-key property-name)
+        ;; A type annotation's colon and a default initializer's equals are not
+        ;; declared by any production; they need one of their own.
+        (annotation-colon (syntax/property-production-terminal 1))
         (equals (syntax/assignment-production-terminal 1))
         (greater (syntax/terminal-byte syntax/greater-than))
         (optional (syntax/terminal-byte syntax/question))
         (rest-byte (syntax/terminal-byte syntax/dot))
-        (parameter-close (syntax/group-production-terminal 2))
         (invalid-keywords ~(javascript-reserved-keywords))
         (escaped-invalid-keywords ~(javascript-escaped-reserved-keywords)))
       (class-parameter constructor-parameter
@@ -9752,21 +9941,28 @@
         (scope true))
       (binding-declaration variable-declaration
         (function parse-declaration)
-        (kinds [[(syntax/variable-production-keyword 0) ir/DECL-CONST]
-                [(syntax/let-production-keyword 0) ir/DECL-LET]
-                [(syntax/var-production-keyword 0) ir/DECL-VAR]
-                ["using" ir/DECL-USING]])
-        (equals (syntax/variable-production-terminal 2))
+        ;; Each kind is the production that spells it. They share one shape
+        ;; apart from the keyword, and it supplies the keyword, the byte that
+        ;; introduces the initializer, and the ASI statement terminator.
+        (kinds [[~(syntax/variable-production-steps) ir/DECL-CONST]
+                [~(syntax/let-production-steps) ir/DECL-LET]
+                [~(syntax/var-production-steps) ir/DECL-VAR]])
+        (binding binding)
+        (value expression)
+        (fallback-kind ir/DECL-USING)
+        ;; No production declares a list of declarators, so the comma between
+        ;; them is still borrowed and needs a declaration of its own.
         (separator (syntax/call-production-terminal 1))
         (initializer-required-kinds [ir/DECL-CONST ir/DECL-USING ir/DECL-AWAIT-USING])
         (await-keyword "await")
         (using-keyword "using")
-        (object-pattern-open (syntax/object-production-terminal 0))
-        (array-pattern-open (syntax/array-production-terminal 0))
+        (object-steps ~(syntax/object-production-steps))
+        (object-element property)
+        (array-steps ~(syntax/array-production-steps))
+        (array-element expression)
         (undefined-op ir/OP-JS-UNDEFINED)
         (uninitialized-flag ir/DECL-UNINITIALIZED)
         (pattern-parser parse-binding-pattern)
-        (terminator (syntax/variable-production-terminal 4))
         (terminator-parser parse-statement-end)
         (emit-op ir/OP-JS-DECLARE)
         (ambient-op ir/OP-TS-AMBIENT-VARIABLE))
