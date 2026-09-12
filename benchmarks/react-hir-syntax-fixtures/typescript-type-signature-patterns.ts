@@ -1,5 +1,6 @@
 type FunctionPattern = (
-  { x, y: alias = 1, ...rest }: { x: number; y?: number },
+  { x, y: alias = 1, "quoted": quoted, 0: numeric, [key]: computed, ...rest }:
+    { x: number; y?: number },
   [head, , ...tail]: [string, undefined, ...number[]],
 ) => void;
 

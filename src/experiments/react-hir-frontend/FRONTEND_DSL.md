@@ -55,9 +55,11 @@ Coil function bodies. Generator algorithms currently include:
   `structured-type-parameters`, and `structured-type-arguments` for generated
   TypeScript type trees. The precedence ladder currently emits primary,
   postfix, intersection, union, and conditional types, including mapped types,
-  `infer`, `keyof`/`readonly`/`unique`, and type-level `typeof`;
+  `infer`, `keyof`/`readonly`/`unique`, type-level `typeof`, and typed or
+  untyped property signatures with ordinary, quoted, numeric, or computed names;
 - `type-binding-pattern` for structured object, array, rest, assignment, and
-  elision patterns in function, constructor, and method type parameters;
+  elision patterns in function, constructor, and method type parameters,
+  including quoted, numeric, and computed object keys;
 - `erased-declaration` for type-alias declaration ownership;
 - `structured-interface` for interface type parameters, heritage, and the
   structured type-literal body;
