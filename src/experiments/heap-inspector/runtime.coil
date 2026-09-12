@@ -8,6 +8,9 @@
 (import "experiments.heap-inspector.live-api" :as live-api)
 
 (extern printf :cc c [(ptr i8) ...] (-> i32))
+(extern fflush :cc c [(ptr i8)] (-> i32))
+(extern getpid :cc c [] (-> i32))
+(extern abort :cc c [] (-> void))
 (extern malloc :cc c [u64] (-> (ptr i8)))
 (extern calloc :cc c [u64 u64] (-> (ptr i8)))
 (extern realloc :cc c [(ptr i8) u64] (-> (ptr i8)))
@@ -29,8 +32,18 @@
    (container-kind i64)
    (bytes i64)
    (align i64)
+   (source-file (slice u8))
+   (source-line i64)
+   (source-column i64)
+   (site-id i64)
    (live bool)
    (show (fnptr c [(ptr i8)] i64))])
+(defstruct AllocationSite
+  [(file (slice u8)) (line i64) (column i64)
+   (total-count i64) (total-bytes i64)
+   (live-count i64) (live-bytes i64) (peak-bytes i64)])
+(defstruct SourceSiteCache
+  [(file-address i64) (line i64) (column i64) (site-id i64)])
 (defstruct TypeInfo
   [(name (slice u8))
    (runtime-id i64)
@@ -75,10 +88,61 @@
 (defstruct FunctionParam
   [(name (slice u8)) (type-name (slice u8)) (size i64) (binding i64)])
 
-; Deliberately bounded: this is an experiment and avoids making registry allocations
-; recursively inspectable. The transform excludes this package in any case.
-(defn entries [] (-> (ptr (array Entry 4096)))
-  (primitive/alloc-static (array Entry 4096)))
+; The registry uses libc directly, outside the transformed allocation protocol.
+; Large zeroed tables are allocated lazily so they do not push Mach-O static data
+; past arm64's addressing range or consume physical pages before use.
+(defn entries-cell [] (-> (ptr (ptr (array Entry 33554432))))
+  (primitive/alloc-static (ptr (array Entry 33554432))))
+(defn entries [] (-> (ptr (array Entry 33554432)))
+  (let [cell (entries-cell)]
+    (if (= (primitive/cast i64 (load cell)) 0)
+        (let [memory (calloc (primitive/cast u64 1)
+                             (primitive/cast u64 (primitive/sizeof (array Entry 33554432))))]
+          (if (= (primitive/cast i64 memory) 0)
+              (do (printf c"debug allocator: failed to allocate entry table\n")
+                  (abort) 0)
+              (set! cell (primitive/cast (ptr (array Entry 33554432)) memory)))
+          0)
+        0)
+    (load cell)))
+(defn pointer-slots-cell [] (-> (ptr (ptr (array i64 67108864))))
+  (primitive/alloc-static (ptr (array i64 67108864))))
+(defn pointer-slots [] (-> (ptr (array i64 67108864)))
+  (let [cell (pointer-slots-cell)]
+    (if (= (primitive/cast i64 (load cell)) 0)
+        (let [memory (calloc (primitive/cast u64 1)
+                             (primitive/cast u64 (primitive/sizeof (array i64 67108864))))]
+          (if (= (primitive/cast i64 memory) 0)
+              (do (printf c"debug allocator: failed to allocate pointer index\n")
+                  (abort) 0)
+              (set! cell (primitive/cast (ptr (array i64 67108864)) memory)))
+          0)
+        0)
+    (load cell)))
+(defn reusable-entries-cell [] (-> (ptr (ptr (array i64 33554432))))
+  (primitive/alloc-static (ptr (array i64 33554432))))
+(defn reusable-entries [] (-> (ptr (array i64 33554432)))
+  (let [cell (reusable-entries-cell)]
+    (if (= (primitive/cast i64 (load cell)) 0)
+        (let [memory (calloc (primitive/cast u64 1)
+                             (primitive/cast u64 (primitive/sizeof (array i64 33554432))))]
+          (if (= (primitive/cast i64 memory) 0)
+              (do (printf c"debug allocator: failed to allocate reuse index\n")
+                  (abort) 0)
+              (set! cell (primitive/cast (ptr (array i64 33554432)) memory)))
+          0)
+        0)
+    (load cell)))
+(defn reusable-entry-n [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+(defn allocation-sites [] (-> (ptr (array AllocationSite 16384)))
+  (primitive/alloc-static (array AllocationSite 16384)))
+(defn allocation-site-slots [] (-> (ptr (array i64 32768)))
+  (primitive/alloc-static (array i64 32768)))
+(defn source-site-cache [] (-> (ptr (array SourceSiteCache 32768)))
+  (primitive/alloc-static (array SourceSiteCache 32768)))
+(defn allocation-site-n [] (-> (ptr i64))
+  (primitive/alloc-static i64))
 (defn types [] (-> (ptr (array TypeInfo 256)))
   (primitive/alloc-static (array TypeInfo 256)))
 (defn fields [] (-> (ptr (array FieldInfo 4096)))
@@ -581,8 +645,30 @@
               (if (= (.container-kind e) 1) (json-quoted! "ArrayList") (json-text! "null"))
               (json-text! ",\"bytes\":") (json-int! (.bytes e))
               (json-text! ",\"align\":") (json-int! (.align e))
+              (json-text! ",\"sourceFile\":") (json-quoted! (.source-file e))
+              (json-text! ",\"sourceLine\":") (json-int! (.source-line e))
+              (json-text! ",\"sourceColumn\":") (json-int! (.source-column e))
               (json-byte! (primitive/cast u8 #\})))
             0)))
+    (json-byte! (primitive/cast u8 #\]))
+    (json-text! ",\"sites\":[")
+    (let [(mut first-site) true]
+      (for [site-index 0 (load (allocation-site-n))]
+      (let [site (primitive/index (allocation-sites) site-index)]
+        (if (> (.total-count site) 0)
+        (do
+        (if (load first-site) (set! first-site false)
+            (json-byte! (primitive/cast u8 #\,)))
+        (json-text! "{\"file\":") (json-quoted! (.file site))
+        (json-text! ",\"line\":") (json-int! (.line site))
+        (json-text! ",\"column\":") (json-int! (.column site))
+        (json-text! ",\"totalCount\":") (json-int! (.total-count site))
+        (json-text! ",\"totalBytes\":") (json-int! (.total-bytes site))
+        (json-text! ",\"liveCount\":") (json-int! (.live-count site))
+        (json-text! ",\"liveBytes\":") (json-int! (.live-bytes site))
+        (json-text! ",\"peakBytes\":") (json-int! (.peak-bytes site))
+        (json-byte! (primitive/cast u8 #\})))
+        0))))
     (json-byte! (primitive/cast u8 #\]))
     (json-text! ",\"summary\":{\"allocations\":") (json-int! (load live-count))
     (json-text! ",\"bytes\":") (json-int! (load total-bytes)) (json-text! "}}"))
@@ -696,7 +782,8 @@
 ;;; beneath a semantically recognizable runtime call makes the transform fixpoint-safe.
 (defn track-create [T] [(o (Option (ptr T)))
                         (tid i64)
-                        (show (fnptr c [(ptr i8)] i64))] (-> (Option (ptr T)))
+                        (show (fnptr c [(ptr i8)] i64))
+                        (file (slice u8)) (line i64) (column i64)] (-> (Option (ptr T)))
   (match o
     (None [] o)
     (Some [p]
@@ -711,6 +798,7 @@
                 (set! (.show e) show)
                 (set! (.initialized e) 1))))
         (unlock!)
+        (mark-allocation-site (primitive/cast (ptr i8) p) file line column)
         (if (and (>= tid 0) (< tid (load (type-n))))
             (let [t (primitive/index (types) tid)]
               (live-api/live-api-track-object!
@@ -720,7 +808,8 @@
         o))))
 (defn track-alloc [T] [(o (Option (slice T)))
                        (tid i64)
-                       (show (fnptr c [(ptr i8)] i64))] (-> (Option (slice T)))
+                       (show (fnptr c [(ptr i8)] i64))
+                       (file (slice u8)) (line i64) (column i64)] (-> (Option (slice T)))
   (match o
     (None [] o)
     (Some [s]
@@ -735,6 +824,7 @@
                 (set! (.show e) show)
                 (set! (.initialized e) (slice-len s)))))
         (unlock!)
+        (mark-allocation-site (primitive/cast (ptr i8) (slice-data s)) file line column)
         (if (and (>= tid 0) (< tid (load (type-n))))
             (let [t (primitive/index (types) tid)]
               (live-api/live-api-track-object!
@@ -768,21 +858,73 @@
 (defn register-instance [(p (ptr i8)) (tid i64) (show (fnptr c [(ptr i8)] i64))] (-> i64)
   (register-allocation p (alloc/AllocRequest :type-id tid :count 1 :bytes 0 :align 0) show))
 
+(defn pointer-hash [(p (ptr i8))] (-> i64)
+  (let [address (primitive/cast i64 p)
+        word (primitive/idiv address 16)
+        mixed (primitive/imul (primitive/ixor word (primitive/idiv word 65536))
+                              6364136223846793005)]
+    (primitive/cast i64
+      (primitive/udiv (primitive/cast u64 mixed)
+                      (primitive/cast u64 274877906944)))))
+
+(defn pointer-slot [(p (ptr i8))] (-> i64)
+  (let [(mut at) (pointer-hash p) (mut probes) 0 (mut found) -1]
+    (loop (if (>= (load probes) 67108864)
+              (break)
+              (let [slot (load (primitive/index (pointer-slots) (load at)))]
+                (if (= slot 0)
+                    (break)
+                    (if (> slot 0)
+                        (let [e (primitive/index (entries) (- slot 1))]
+                          (if (and (.live e)
+                                   (= (primitive/cast i64 (.p e)) (primitive/cast i64 p)))
+                              (do (set! found (load at)) (break))
+                              0))
+                        0))
+                (set! at (primitive/iand (+ (load at) 1) 67108863))
+                (set! probes (+ (load probes) 1)))))
+    (load found)))
+
+(defn pointer-insert! [(p (ptr i8)) (entry-index i64)] (-> i64)
+  (let [(mut at) (pointer-hash p) (mut probes) 0 (mut tomb) -1]
+    (loop (if (>= (load probes) 67108864)
+              (break)
+              (let [slot (load (primitive/index (pointer-slots) (load at)))]
+                (if (= slot -1)
+                    (if (< (load tomb) 0) (set! tomb (load at)) 0)
+                    (if (= slot 0)
+                        (do (set! (primitive/index (pointer-slots)
+                                                   (if (>= (load tomb) 0) (load tomb) (load at)))
+                                   (+ entry-index 1))
+                            (break))
+                        0))
+                (set! at (primitive/iand (+ (load at) 1) 67108863))
+                (set! probes (+ (load probes) 1)))))
+    (if (>= (load probes) 67108864)
+        (if (>= (load tomb) 0)
+            (do (set! (primitive/index (pointer-slots) (load tomb)) (+ entry-index 1)) 0)
+            (do (printf c"debug allocator: pointer index exhausted\n") (abort) -1))
+        0)))
+
 (defn register-allocation [(p (ptr i8))
                            (request alloc/AllocRequest)
                            (show (fnptr c [(ptr i8)] i64))] (-> i64)
   (lock!)
-  (let [(mut scan) 0 (mut reusable) -1
+  (let [available (load (reusable-entry-n))
+        i (if (> available 0)
+              (load (primitive/index (reusable-entries) (- available 1)))
+              (load (entry-n)))
         id (+ (load (next-id)) 1)]
-    (loop (if (>= (load scan) (load (entry-n)))
-              (break)
-              (if (not (.live (primitive/index (entries) (load scan))))
-                  (do (set! reusable (load scan)) (break))
-                  (set! scan (+ (load scan) 1)))))
-    (let [i (if (>= (load reusable) 0) (load reusable) (load (entry-n)))]
-    (if (>= i 4096)
-        (do (unlock!) -1)
+    (if (>= i 33554432)
+        (do (unlock!)
+            (printf c"debug allocator: allocation registry exhausted at 33554432 live entries\n")
+            (print-site-census)
+            (fflush (primitive/cast (ptr i8) 0))
+            (abort)
+            -1)
         (let [e (primitive/index (entries) i)]
+          (if (> available 0) (set! (reusable-entry-n) (- available 1))
+              (set! (entry-n) (+ i 1)))
           (set! (next-id) id)
           (set! (.id e) id)
           (set! (.p e) p)
@@ -793,44 +935,210 @@
           (set! (.container-kind e) 0)
           (set! (.bytes e) (.bytes request))
           (set! (.align e) (.align request))
+          (set! (.source-file e) "")
+          (set! (.source-line e) 0)
+          (set! (.source-column e) 0)
+          (set! (.site-id e) -1)
           (set! (.live e) true)
           (set! (.show e) show)
-          (if (< (load reusable) 0) (set! (entry-n) (+ i 1)) 0)
+          (pointer-insert! p i)
+          (if (= (% id 100000) 0)
+              (do (print-site-census)
+                  (fflush (primitive/cast (ptr i8) 0)) 0)
+              0)
           (unlock!)
-          id)))))
+          id))))
+
+(defn same-source? [(a (slice u8)) (b (slice u8))] (-> bool)
+  (if (!= (slice-len a) (slice-len b))
+      false
+      (if (= (primitive/cast i64 (slice-data a))
+             (primitive/cast i64 (slice-data b)))
+          true
+      (let [(mut at) 0 (mut equal) true]
+        (loop (if (>= (load at) (slice-len a))
+                  (break)
+                  (do (if (!= (slice-get a (load at)) (slice-get b (load at)))
+                          (set! equal false) 0)
+                      (set! at (+ (load at) 1)))))
+        (load equal)))))
+
+(defn source-hash [(file (slice u8)) (line i64) (column i64)] (-> i64)
+  (let [(mut hash) (primitive/ixor (primitive/imul line 16777619) column)]
+    (for [i 0 (slice-len file)]
+      (set! hash (primitive/imul
+                   (primitive/ixor (load hash)
+                                    (primitive/cast i64 (slice-get file i)))
+                   16777619)))
+    (primitive/iand (load hash) 32767)))
+
+(defn find-or-add-site [(file (slice u8)) (line i64) (column i64)] (-> i64)
+  (let [(mut slot) (source-hash file line column)
+        (mut probes) 0
+        (mut result) -1]
+    (loop (if (>= (load probes) 32768)
+              (break)
+              (let [existing (load (primitive/index (allocation-site-slots) (load slot)))]
+                (if (= existing 0)
+                    (let [id (load (allocation-site-n))]
+                      (if (>= id 16384)
+                          (do (printf c"debug allocator: source-site registry exhausted\n")
+                              (abort) 0)
+                          (let [site (primitive/index (allocation-sites) id)]
+                            (set! (.file site) file)
+                            (set! (.line site) line)
+                            (set! (.column site) column)
+                            (set! (.total-count site) 0)
+                            (set! (.total-bytes site) 0)
+                            (set! (.live-count site) 0)
+                            (set! (.live-bytes site) 0)
+                            (set! (.peak-bytes site) 0)
+                            (set! (allocation-site-n) (+ id 1))
+                            (set! (primitive/index (allocation-site-slots) (load slot)) (+ id 1))
+                            (set! result id)
+                            (break))))
+                    (let [id (- existing 1)
+                          site (primitive/index (allocation-sites) id)]
+                      (if (and (= (.line site) line)
+                               (and (= (.column site) column)
+                                    (same-source? (.file site) file)))
+                          (do (set! result id) (break))
+                          0)))
+                (set! slot (primitive/iand (+ (load slot) 1) 32767))
+                (set! probes (+ (load probes) 1)))))
+    (if (< (load result) 0)
+        (do (printf c"debug allocator: source-site hash index exhausted\n")
+            (abort)
+            -1)
+        (load result))))
+
+(defn cached-site [(file (slice u8)) (line i64) (column i64)] (-> i64)
+  (let [address (primitive/cast i64 (slice-data file))
+        (mut slot) (primitive/iand
+                     (primitive/ixor (primitive/idiv address 16)
+                                      (primitive/ixor (primitive/imul line 16777619)
+                                                       column))
+                     32767)
+        (mut probes) 0
+        (mut result) -1]
+    (loop (if (>= (load probes) 32768)
+              (break)
+              (let [entry (primitive/index (source-site-cache) (load slot))]
+                (if (= (.file-address entry) 0)
+                    (do (set! result (find-or-add-site file line column))
+                        (set! (.file-address entry) address)
+                        (set! (.line entry) line)
+                        (set! (.column entry) column)
+                        (set! (.site-id entry) (load result))
+                        (break))
+                    (if (and (= (.file-address entry) address)
+                             (and (= (.line entry) line)
+                                  (= (.column entry) column)))
+                        (do (set! result (.site-id entry)) (break))
+                        0))
+                (set! slot (primitive/iand (+ (load slot) 1) 32767))
+                (set! probes (+ (load probes) 1)))))
+    (if (< (load result) 0)
+        (do (printf c"debug allocator: source-site cache exhausted\n")
+            (abort)
+            -1)
+        (load result))))
+
+(defn print-site-census [] (-> i64)
+  (printf c"COIL_DEBUG_ALLOCATOR_SITES_BEGIN pid=%d allocation_id=%lld\n"
+          (getpid) (load (next-id)))
+  (for [i 0 (load (allocation-site-n))]
+    (let [site (primitive/index (allocation-sites) i)]
+      (if (> (.total-count site) 0)
+          (printf c"%.*s:%lld:%lld total=%lld total_bytes=%lld live=%lld live_bytes=%lld peak_bytes=%lld\n"
+                  (slice-len (.file site)) (slice-data (.file site))
+                  (.line site) (.column site) (.total-count site) (.total-bytes site)
+                  (.live-count site) (.live-bytes site) (.peak-bytes site))
+          0)))
+  (printf c"COIL_DEBUG_ALLOCATOR_SITES_END\n")
+  0)
+
+(defn mark-allocation-site [(p (ptr i8)) (file (slice u8)) (line i64) (column i64)] (-> i64)
+  (lock!)
+  (let [e (find-live-entry p)]
+    (if (= (primitive/cast i64 e) 0)
+        0
+        (let [id (cached-site file line column)]
+          (if (>= (.site-id e) 0)
+              (let [prior (primitive/index (allocation-sites) (.site-id e))]
+                (set! (.total-count prior) (- (.total-count prior) 1))
+                (set! (.total-bytes prior) (- (.total-bytes prior) (.bytes e)))
+                (set! (.live-count prior) (- (.live-count prior) 1))
+                (set! (.live-bytes prior) (- (.live-bytes prior) (.bytes e)))
+                (if (= (.total-count prior) 0)
+                    (set! (.peak-bytes prior) 0) 0))
+              0)
+          (let [site (primitive/index (allocation-sites) id)]
+            (set! (.total-count site) (+ (.total-count site) 1))
+            (set! (.total-bytes site) (+ (.total-bytes site) (.bytes e)))
+            (set! (.live-count site) (+ (.live-count site) 1))
+            (set! (.live-bytes site) (+ (.live-bytes site) (.bytes e)))
+            (if (> (.live-bytes site) (.peak-bytes site))
+                (set! (.peak-bytes site) (.live-bytes site)) 0))
+          (set! (.site-id e) id)
+          (set! (.source-file e) file)
+            (set! (.source-line e) line)
+            (set! (.source-column e) column))))
+  (unlock!)
+  0)
+
+(defn mark-created-site [T] [(result (Option (ptr T)))
+                             (file (slice u8)) (line i64) (column i64)] (-> (Option (ptr T)))
+  (match result
+    (None [] result)
+    (Some [p] (do (mark-allocation-site (primitive/cast (ptr i8) p) file line column)
+                  result))))
+
+(defn mark-slice-site [T] [(result (Option (slice T)))
+                           (file (slice u8)) (line i64) (column i64)] (-> (Option (slice T)))
+  (match result
+    (None [] result)
+    (Some [s] (do (mark-allocation-site (primitive/cast (ptr i8) (slice-data s)) file line column)
+                  result))))
 
 (defn unregister-instance [(p (ptr i8))] (-> i64)
   (lock!)
-  (let [(mut i) 0]
-    (loop (if (>= (load i) (load (entry-n)))
-              (break)
-              (let [e (primitive/index (entries) (load i))]
-                (if (and (.live e) (= (primitive/cast i64 (.p e)) (primitive/cast i64 p)))
-                    (set! (.live e) false)
-                    0)
-                (set! i (+ (load i) 1)))))
+  (let [slot (pointer-slot p)]
+    (if (>= slot 0)
+        (let [i (- (load (primitive/index (pointer-slots) slot)) 1)
+              e (primitive/index (entries) i)
+              reusable (load (reusable-entry-n))]
+          (if (>= (.site-id e) 0)
+              (let [site (primitive/index (allocation-sites) (.site-id e))]
+                (set! (.live-count site) (- (.live-count site) 1))
+                (set! (.live-bytes site) (- (.live-bytes site) (.bytes e))))
+              0)
+          (set! (.live e) false)
+          (set! (primitive/index (pointer-slots) slot) -1)
+          (set! (primitive/index (reusable-entries) reusable) i)
+          (set! (reusable-entry-n) (+ reusable 1)))
+        0))
     (unlock!)
     (live-api/live-api-untrack-object! p)
-    0))
+    0)
 
 (defn find-live-entry [(p (ptr i8))] (-> (ptr Entry))
-  (let [(mut i) 0
-        (mut found) (primitive/cast (ptr Entry) 0)]
-    (loop (if (>= (load i) (load (entry-n)))
-              (break)
-              (let [e (primitive/index (entries) (load i))]
-                (if (and (.live e) (= (primitive/cast i64 (.p e)) (primitive/cast i64 p)))
-                    (do (set! found e) (break))
-                    (set! i (+ (load i) 1))))))
-    (load found)))
+  (let [slot (pointer-slot p)]
+    (if (< slot 0)
+        (primitive/cast (ptr Entry) 0)
+        (primitive/index (entries)
+                         (- (load (primitive/index (pointer-slots) slot)) 1)))))
 
 ; These four functions are the transform's runtime markers. The original checked
 ; raw operation remains underneath, making the transform fixpoint-safe.
-(defn inspect-raw-alloc [(a (dyn alloc/Allocator)) (request alloc/AllocRequest)] (-> (Option (ptr i8)))
+(defn inspect-raw-alloc [(a (dyn alloc/Allocator)) (request alloc/AllocRequest)
+                         (file (slice u8)) (line i64) (column i64)] (-> (Option (ptr i8)))
   (let [result (alloc/raw-alloc a request)]
     (match result
       (None [] result)
-      (Some [p] (do (register-allocation p request (primitive/fnptr-of show-raw)) result)))))
+      (Some [p] (do (register-allocation p request (primitive/fnptr-of show-raw))
+                    (mark-allocation-site p file line column)
+                    result)))))
 
 (defn inspect-raw-resize [(a (dyn alloc/Allocator))
                           (memory (ptr i8))
@@ -844,6 +1152,14 @@
                   (do (set! (.type-id e) (.type-id new))
                       (set! (.schema-id e) -1)
                       (set! (.count e) (.count new))
+                      (if (>= (.site-id e) 0)
+                          (let [site (primitive/index (allocation-sites) (.site-id e))
+                                delta (- (.bytes new) (.bytes e))]
+                            (set! (.total-bytes site) (+ (.total-bytes site) delta))
+                            (set! (.live-bytes site) (+ (.live-bytes site) delta))
+                            (if (> (.live-bytes site) (.peak-bytes site))
+                                (set! (.peak-bytes site) (.live-bytes site)) 0))
+                          0)
                       (set! (.bytes e) (.bytes new))
                       (set! (.align e) (.align new)))))
             (unlock!) 0)
@@ -862,10 +1178,24 @@
             (let [e (find-live-entry memory)]
               (if (= (primitive/cast i64 e) 0)
                   0
-                  (do (set! (.p e) p)
+                  (do (if (!= (primitive/cast i64 p) (primitive/cast i64 memory))
+                          (let [slot (pointer-slot memory)
+                                entry-index (- (load (primitive/index (pointer-slots) slot)) 1)]
+                            (set! (primitive/index (pointer-slots) slot) -1)
+                            (pointer-insert! p entry-index))
+                          0)
+                      (set! (.p e) p)
                       (set! (.type-id e) (.type-id new))
                       (set! (.schema-id e) -1)
                       (set! (.count e) (.count new))
+                      (if (>= (.site-id e) 0)
+                          (let [site (primitive/index (allocation-sites) (.site-id e))
+                                delta (- (.bytes new) (.bytes e))]
+                            (set! (.total-bytes site) (+ (.total-bytes site) delta))
+                            (set! (.live-bytes site) (+ (.live-bytes site) delta))
+                            (if (> (.live-bytes site) (.peak-bytes site))
+                                (set! (.peak-bytes site) (.live-bytes site)) 0))
+                          0)
                       (set! (.bytes e) (.bytes new))
                       (set! (.align e) (.align new)))))
             (unlock!)
