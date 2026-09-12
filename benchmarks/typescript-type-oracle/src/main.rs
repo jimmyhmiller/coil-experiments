@@ -4,7 +4,7 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     ExportAllDeclaration, ExportNamedDeclaration, ExportSpecifier, Function, FunctionType,
     ImportDeclaration, ImportDefaultSpecifier, ImportNamespaceSpecifier, ImportSpecifier,
-    ImportAttribute, WithClause,
+    ImportAttribute, VariableDeclaration, VariableDeclarationKind, WithClause,
     TSClassImplements, TSEnumDeclaration, TSEnumMember, TSGlobalDeclaration,
     TSExportAssignment, TSImportEqualsDeclaration, TSInterfaceBody, TSInterfaceHeritage,
     TSModuleDeclaration, TSModuleReference, TSNamespaceExportDeclaration, TSOptionalType,
@@ -67,6 +67,8 @@ const CASES: &[Case] = &[
     Case { name: "structured-export-context", source: "export type {Foo,Bar as Baz};export type {Qux} from 'pkg';export type * from 'types';export * as ns from 'runtime';export type * as types from 'types2';export {type Hidden,value as renamed,'strange-name' as strange} from 'mixed';" },
     Case { name: "structured-import-context", source: "import type DefaultType from 'types-default';import type {Foo,Bar as Baz} from 'types';import source moduleValue from 'module-source';import defer * as deferred from 'deferred';import ordinary,* as namespace from 'runtime';import {'strange-name' as strange} from 'weird';import 'effects';" },
     Case { name: "module-attributes-context", source: "import data from 'data' with {type:'json','resolution-mode':'import'};import legacy from 'legacy' assert {type:'json'};export {value} from 'data' with {type:'json'};export * from 'legacy' assert {type:'json'};" },
+    Case { name: "resource-declaration-context", source: "using resource:Disposable=acquire();using first=openA(),second:Disposable=openB();await using asyncResource:AsyncDisposable=acquireAsync();" },
+    Case { name: "resource-loop-context", source: "for(using item of resources){}for(await using asyncItem of asyncResources){}for(using of resources){}" },
 ];
 
 struct Shape {
@@ -75,6 +77,8 @@ struct Shape {
     module_spans: Vec<(u32, u32)>,
     function_spans: Vec<(u32, u32)>,
     function_flags: Vec<u64>,
+    resource_spans: Vec<(u32, u32)>,
+    resource_kinds: Vec<u64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -240,6 +244,14 @@ fn field_checks(name: &str) -> &'static [FieldCheck] {
             FieldCheck { opcode: 141, expected: &[(2, 0), (1, 1), (1, 0), (1, 1)] },
             FieldCheck { opcode: 142, expected: &[(1, 0); 5] },
         ],
+        "resource-declaration-context" => &[FieldCheck {
+            opcode: 38,
+            expected: &[(1, 4), (1, 4), (1, 4), (1, 5)],
+        }],
+        "resource-loop-context" => &[FieldCheck {
+            opcode: 38,
+            expected: &[(1, 4), (1, 5)],
+        }],
         _ => &[],
     }
 }
@@ -270,6 +282,7 @@ impl Shape {
     fn new() -> Self { Self {
         nodes: Vec::new(), spans: Vec::new(), module_spans: Vec::new(),
         function_spans: Vec::new(), function_flags: Vec::new(),
+        resource_spans: Vec::new(), resource_kinds: Vec::new(),
     } }
 
     fn push(&mut self, kind: &'static str, span: Option<(u32, u32)>) {
@@ -279,6 +292,27 @@ impl Shape {
 }
 
 impl<'a> Visit<'a> for Shape {
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        walk::walk_variable_declaration(self, declaration);
+        let kind = match declaration.kind {
+            VariableDeclarationKind::Using => 4,
+            VariableDeclarationKind::AwaitUsing => 5,
+            _ => return,
+        };
+        for (index, declarator) in declaration.declarations.iter().enumerate() {
+            let span = declarator.span();
+            self.resource_spans.push((
+                if index == 0 { declaration.span.start } else { span.start },
+                if index + 1 == declaration.declarations.len() {
+                    declaration.span.end
+                } else {
+                    span.end
+                },
+            ));
+            self.resource_kinds.push(kind);
+        }
+    }
+
     fn visit_with_clause(&mut self, clause: &WithClause<'a>) {
         walk::walk_with_clause(self, clause);
         let span = clause.span();
@@ -643,6 +677,17 @@ fn main() {
                 eprintln!("FUNCTION_MISMATCH {}\n  oxc spans={:?} flags={:?}\n  coil spans={:?} flags={:?}",
                     case.name, expected.function_spans, expected.function_flags,
                     actual_spans, actual_flags);
+                failures += 1;
+            }
+        }
+        if !expected.resource_spans.is_empty() {
+            let actual_spans = coil_opcode_spans(&dump, 38);
+            let actual_kinds: Vec<_> = coil_metadata(&dump, 38)
+                .into_iter().map(|meta| meta.immediate).collect();
+            if actual_spans != expected.resource_spans || actual_kinds != expected.resource_kinds {
+                eprintln!("RESOURCE_MISMATCH {}\n  oxc spans={:?} kinds={:?}\n  coil spans={:?} kinds={:?}",
+                    case.name, expected.resource_spans, expected.resource_kinds,
+                    actual_spans, actual_kinds);
                 failures += 1;
             }
         }
