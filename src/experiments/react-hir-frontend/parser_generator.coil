@@ -159,7 +159,8 @@
 
 ;; Index of the single (separated NAME BYTE) step matching `rule`. A strategy
 ;; that owns a comma-separated list claims it by role the same way a repetition
-;; is claimed, so the delimiters around the list are found relative to it.
+;; is claimed: the step ranges have no action for it, so the delimiters around
+;; the list are found relative to it.
 (defn separated-step-index [(steps Code) (rule Code) (role (slice u8))] (-> i64)
   (let [(mut i) 0 (mut found) -1 (mut count) 0]
     (loop
@@ -184,7 +185,8 @@
 ;; byte between elements, so it is read from the grammar rather than borrowed.
 (defn separated-step-byte [(steps Code) (index i64) (role (slice u8))] (-> Code)
   (if (or (< index 0) (>= index (p/code-count steps))
-          (not (step-form? (p/code-nth steps index) "separated")))
+          (not (step-form? (p/code-nth steps index) "separated"))
+          (!= (p/code-count (p/code-nth steps index)) 3))
       (do (p/report steps
             (p/code-str "production needs a separated step for: " role))
           `(cast u8 0))
@@ -313,20 +315,24 @@
 ;; Emit the terminal and keyword steps in [from, to) around the rule steps a
 ;; strategy handles itself, wrapping `rest`. `dispatched-prefix` marks a leading
 ;; keyword the statement dispatcher already matched, which is advanced past
-;; rather than re-checked.
-(defn compile-step-range
+;; rather than re-checked. `failure` is the value a missing token yields, so a
+;; strategy whose generated function returns a parse result supplies its own
+;; failure result instead of a status code.
+(defn compile-value-step-range
   [(backend Code) (steps Code) (from i64) (to i64) (state Code)
-   (dispatched-prefix bool) (rest Code)] (-> Code)
+   (dispatched-prefix bool) (failure Code) (rest Code)] (-> Code)
   (if (>= from to) rest
     (let [step (p/code-nth steps from)
-          tail (compile-step-range backend steps (+ from 1) to state
-                                   dispatched-prefix rest)
+          tail (compile-value-step-range backend steps (+ from 1) to state
+                                         dispatched-prefix failure rest)
           consume-code (backend-value backend "consume-byte")
           advance-code (backend-value backend "advance")
           current-keyword-code (backend-value backend "current-keyword")]
       (cond
+        ;; consume-byte records the expected-token error itself, so a mismatch
+        ;; only has to hand back the failure value.
         (and (step-form? step "terminal") (= (p/code-count step) 2))
-          `(if (not (~consume-code ~state (cast u8 ~(p/code-nth step 1)))) 0 ~tail)
+          `(if (not (~consume-code ~state (cast u8 ~(p/code-nth step 1)))) ~failure ~tail)
         ;; A keyword the dispatcher already matched is only advanced past. Any
         ;; later keyword is a real requirement of the production, so a mismatch
         ;; records the expected-token error rather than returning quietly.
@@ -335,14 +341,53 @@
               `(let [_dispatched-keyword (~advance-code ~state)] ~tail)
             `(if (not (~current-keyword-code ~state ~(p/code-nth step 1)))
                  (do (~(backend-value backend "fail") ~state
-                       ~(backend-value backend "expected-error")) 0)
+                       ~(backend-value backend "expected-error")) ~failure)
                (let [_keyword (~advance-code ~state)] ~tail)))
         :else
           (generator-fail step
             "this production step has no generated action in this strategy")))))
 
+(defn compile-step-range
+  [(backend Code) (steps Code) (from i64) (to i64) (state Code)
+   (dispatched-prefix bool) (rest Code)] (-> Code)
+  (compile-value-step-range backend steps from to state dispatched-prefix `0 rest))
+
+;; The leading run of (terminal B) steps of a production, as a lookahead
+;; condition over the bytes at the cursor. A spread's `...` is three separate
+;; dot steps in the grammar, so the width of the test follows the production
+;; rather than a hand-written count.
+(defn compile-terminal-prefix-condition
+  [(backend Code) (steps Code) (state Code) (role (slice u8))] (-> Code)
+  (let [current-byte-code (backend-value backend "current-byte")
+        adjacent-byte-code (backend-value backend "adjacent-event-byte")
+        checks (p/code-list-new) (mut i) 0]
+    (loop
+      (if (or (>= (load i) (p/code-count steps))
+              (not (and (step-form? (p/code-nth steps (load i)) "terminal")
+                        (= (p/code-count (p/code-nth steps (load i))) 2)))) (break)
+        (do
+          (p/code-list-push! checks
+            (if (= (load i) 0)
+                `(= (~current-byte-code ~state)
+                    (cast u8 ~(p/code-nth (p/code-nth steps 0) 1)))
+              `(= (~adjacent-byte-code ~state ~(load i))
+                  (cast u8 ~(p/code-nth (p/code-nth steps (load i)) 1)))))
+          (set! i (+ (load i) 1)))))
+    (let [conditions (p/code-list-done checks)]
+      (cond
+        (= (p/code-count conditions) 0)
+          (do (p/report steps
+                (p/code-str "production has no leading terminal steps for: " role))
+              `false)
+        (= (p/code-count conditions) 1) (p/code-nth conditions 0)
+        :else `(and ~@conditions)))))
+
+;; A prefix-marked value. The grammar owns the marker: `...` is three separate
+;; dot steps, so the tokens consumed ahead of the value follow the production
+;; rather than a hand-written width. The strategies that dispatch to this parser
+;; test the same steps, so the lookahead and the consumption stay in step.
 (defn compile-spread-value [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 5)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 6)
                 (generator-form? production "spread-value")))
       (generator-fail production "invalid spread-value production")
     (let [state-type (backend-value backend "state-type")
@@ -350,24 +395,30 @@
           function-name (backend-value backend
                           (p/code-sym (field-value production "function")))
           current-position-code (backend-value backend "current-position")
-          advance-count-code (backend-value backend "advance-count")
           parse-expression-code (backend-value backend "parse-expression")
           check-build-code (backend-value backend "check-build")
-          width (field-value production "width")
+          fail-code (backend-value backend "fail")
+          expected-error (backend-value backend "expected-error")
           opcode (field-value production "emit-op")
-          state (p/fresh-identifier "state")]
-      `(defn ~function-name [(~state (ptr ~state-type))] (-> ~result-type)
-         (let [start (~current-position-code ~state)
-               _dots (~advance-count-code ~state ~width)
-               argument (~parse-expression-code ~state 0)
-               arena (.arena (.builder ~state)) value (.value-count arena)
-               operation-result (builder/add-op! (.builder ~state) (.block ~state) ~opcode
-                                  (cast u32 0) (cast u32 0) start (.end argument)
-                                  (cast u32 1))]
-           (let [op (~check-build-code ~state operation-result)
-                 operand (builder/add-operand! (.builder ~state) op (.value argument))]
-             (~check-build-code ~state operand)
-             (~result-type :value value :start start :end (.end argument))))))))
+          steps (production-steps production)
+          value-index (rule-step-index steps (field-value production "value") "value")
+          state (p/fresh-identifier "state")
+          start-id (p/fresh-identifier "start")
+          failure `(~fail-code ~state ~expected-error)]
+      (if (< value-index 0) `(do 0)
+        `(defn ~function-name [(~state (ptr ~state-type))] (-> ~result-type)
+           (let [~start-id (~current-position-code ~state)]
+             ~(compile-value-step-range backend steps 0 value-index state false failure
+                `(let [argument (~parse-expression-code ~state 0)
+                       arena (.arena (.builder ~state)) value (.value-count arena)
+                       operation-result (builder/add-op! (.builder ~state) (.block ~state)
+                                          ~opcode (cast u32 0) (cast u32 0) ~start-id
+                                          (.end argument) (cast u32 1))]
+                   (let [op (~check-build-code ~state operation-result)
+                         operand (builder/add-operand! (.builder ~state) op (.value argument))]
+                     (~check-build-code ~state operand)
+                     (~result-type :value value :start ~start-id
+                                   :end (.end argument)))))))))))
 
 (defn compile-regexp-value [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 13)
@@ -469,9 +520,13 @@
                            (~advance-code ~state)))
                        (~emit-code ~state ~opcode start (load at)))))))))))))
 
+;; A delimited, separated list. The grammar decides the delimiters and the
+;; separator through its (separated RULE BYTE) step; this strategy supplies only
+;; the repetition, the scratch-list lifetime, and the elision and spread
+;; disambiguation that the shape cannot express.
 (defn compile-separated-value [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-vector? backend)
-                (p/code-list? production) (= (p/code-count production) 13)
+                (p/code-list? production) (= (p/code-count production) 12)
                 (generator-form? production "separated-value")
                 (p/code-sym? (p/code-nth production 1))))
       (generator-fail production "invalid separated-value production")
@@ -479,7 +534,6 @@
           result-type (backend-value backend "expression-result-type")
           current-position-code (backend-value backend "current-position")
           current-byte-code (backend-value backend "current-byte")
-          adjacent-byte-code (backend-value backend "adjacent-event-byte")
           advance-code (backend-value backend "advance")
           consume-code (backend-value backend "consume-byte")
           fail-code (backend-value backend "fail")
@@ -495,23 +549,29 @@
           element-parser (backend-value backend (p/code-sym element-role))
           spread-parser (backend-value backend
                           (p/code-sym (field-value production "spread-parser")))
-          spread-byte (field-value production "spread-byte")
+          spread-steps (named-steps production "spread-steps")
           allow-elisions (field-value production "allow-elisions")
           elision-op (field-value production "elision-op")
-          open (field-value production "open")
-          separator (field-value production "separator")
-          close (field-value production "close")
           allow-trailing (field-value production "allow-trailing")
           opcode (field-value production "emit-op")
+          steps (production-steps production)
+          elements-index (separated-step-index steps
+                           (field-value production "elements") "elements")
+          separator (separated-step-byte steps elements-index "element separator")
+          close (terminal-step-byte steps (+ elements-index 1) "separated list end")
           state (p/fresh-identifier "state")
+          scratch-id (p/fresh-identifier "scratch")
+          mark-id (p/fresh-identifier "mark")
+          start-id (p/fresh-identifier "start")
+          end-position-id (p/fresh-identifier "end-position")
+          failure `(~fail-code ~state ~expected-error)
           ordinary-element-call
             (if (= (p/code-count element-form) 2)
                 `(~element-parser ~state ~(p/code-nth element-form 1))
               `(~element-parser ~state))
           spread-element-call
-            `(if (and (= (~current-byte-code ~state) ~spread-byte)
-                      (= (~adjacent-byte-code ~state 1) ~spread-byte)
-                      (= (~adjacent-byte-code ~state 2) ~spread-byte))
+            `(if ~(compile-terminal-prefix-condition backend spread-steps state
+                    "spread element")
                  (~spread-parser ~state) ~ordinary-element-call)
           element-call
             (if (generator-symbol? allow-elisions "true")
@@ -520,26 +580,32 @@
                        (~emit-value-code ~state ~elision-op position position))
                    ~spread-element-call)
               spread-element-call)]
-      `(defn ~function-name [(~state (ptr ~state-type))] (-> ~result-type)
-         (let [scratch (.scratch ~state) mark (.value-count scratch)
-               start (~current-position-code ~state) _open (~advance-code ~state)]
-           (if (= (~current-byte-code ~state) ~close) 0
-             (loop
-               (let [element ~element-call]
-                 (~push-value-code ~state (.value element))
-                 (if (!= (.error ~state) ~ok-error) (break)
-                   (if (= (~current-byte-code ~state) ~separator)
-                       (do
-                         (~advance-code ~state)
-                         (if (and ~(if (generator-symbol? allow-trailing "true") `true `false)
-                                  (= (~current-byte-code ~state) ~close))
-                             (break) 0))
-                     (break))))))
-           (let [end-position (~current-position-code ~state)]
-             (if (not (~consume-code ~state ~close))
-                 (~fail-code ~state ~expected-error)
-               (~emit-list-code ~state ~opcode start
-                 (+ end-position (cast u32 1)) mark))))))))
+      (if (< elements-index 0) `(do 0)
+        `(defn ~function-name [(~state (ptr ~state-type))] (-> ~result-type)
+           (let [~scratch-id (.scratch ~state) ~mark-id (.value-count ~scratch-id)
+                 ~start-id (~current-position-code ~state)]
+             ~(compile-value-step-range backend steps 0 elements-index state false failure
+                `(do
+                   (if (= (~current-byte-code ~state) ~close) 0
+                     (loop
+                       (let [element ~element-call]
+                         (~push-value-code ~state (.value element))
+                         (if (!= (.error ~state) ~ok-error) (break)
+                           (if (= (~current-byte-code ~state) ~separator)
+                               (do
+                                 (~advance-code ~state)
+                                 (if (and ~(if (generator-symbol? allow-trailing "true")
+                                               `true `false)
+                                          (= (~current-byte-code ~state) ~close))
+                                     (break) 0))
+                             (break))))))
+                   (let [~end-position-id (~current-position-code ~state)]
+                     (if (not (~consume-code ~state ~close))
+                         (~fail-code ~state ~expected-error)
+                       ~(compile-value-step-range backend steps (+ elements-index 2)
+                          (p/code-count steps) state false failure
+                          `(~emit-list-code ~state ~opcode ~start-id
+                             (+ ~end-position-id (cast u32 1)) ~mark-id))))))))))))
 
 (defn compile-numeric-value [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 16)
@@ -4294,8 +4360,12 @@
                    (~ensure-capture-code ~state binding)) 0)
              result))))))
 
+;; NAME SEPARATOR VALUE. The grammar owns the separator byte and the span the
+;; two rules sit in; this strategy supplies the quoted-key and shorthand
+;; lookahead, which decides between two productions and so cannot come from one
+;; production's shape.
 (defn compile-named-value [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 9)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 11)
                 (generator-form? production "named-value")))
       (generator-fail production "invalid named-value production")
     (let [state-type (backend-value backend "state-type")
@@ -4315,47 +4385,62 @@
           match-byte-code (backend-value backend "match-byte")
           check-build-code (backend-value backend "check-build")
           expected-error (backend-value backend "expected-error")
-          separator (field-value production "separator")
           opcode (field-value production "emit-op")
           allow-shorthand (field-value production "allow-shorthand")
           quoted-key-bytes (field-value production "quoted-key-bytes")
+          steps (production-steps production)
+          name-index (rule-step-index steps (field-value production "name") "name")
+          value-index (rule-step-index steps (field-value production "value") "value")
+          separator (terminal-step-byte steps (+ name-index 1) "name separator")
           state (p/fresh-identifier "state")
           name-start-id (p/fresh-identifier "name-start")
           name-end-id (p/fresh-identifier "name-end")
           quoted-key-id (p/fresh-identifier "quoted-key")
           quoted-id (p/fresh-identifier "quoted")
-          property-id (p/fresh-identifier "property-value")]
-      `(defn ~function-name [(~state (ptr ~state-type))] (-> ~result-type)
-         (let [~quoted-id
-                 (or ~@(let [checks (p/code-list-new) (mut q) 0]
-                          (loop
-                            (if (>= (load q) (p/code-count quoted-key-bytes)) (break)
-                              (do
-                                (p/code-list-push! checks
-                                  `(= (~current-byte-code ~state)
-                                      ~(p/code-nth quoted-key-bytes (load q))))
-                                (set! q (+ (load q) 1)))))
-                          (p/code-list-done checks)))
-               ~quoted-key-id (if ~quoted-id (~quoted-key-parser ~state) (cast u64 0))
-               ~name-start-id (if ~quoted-id (cast u32 ~quoted-key-id)
-                                (~current-position-code ~state))
-               ~name-end-id (if ~quoted-id
-                              (cast u32 (p/ishr ~quoted-key-id (cast u64 32)))
-                              (~word-end-code ~state ~name-start-id))]
-           (if (= ~name-start-id ~name-end-id) (~fail-code ~state ~expected-error)
-             (do
-               (if ~quoted-id 0 (~advance-code ~state))
-               (if (~match-byte-code ~state ~separator)
-                   (do
-                     (let [~property-id (~parse-expression-code ~state 0)]
-                       ~(compile-named-property-emission state result-type check-build-code
-                          opcode name-start-id name-end-id property-id)))
-                 ~(if (generator-symbol? allow-shorthand "true")
-                      `(let [~property-id
-                              (~shorthand-parser ~state ~name-start-id ~name-end-id)]
-                         ~(compile-named-property-emission state result-type check-build-code
-                            opcode name-start-id name-end-id property-id))
-                    `(~fail-code ~state ~expected-error))))))))))
+          property-id (p/fresh-identifier "property-value")
+          failure `(~fail-code ~state ~expected-error)]
+      (if (or (< name-index 0) (< value-index 0)) `(do 0)
+        (if (!= value-index (+ name-index 2))
+            (generator-fail production
+              "named-value requires the value rule to follow the name rule across one separator terminal")
+          `(defn ~function-name [(~state (ptr ~state-type))] (-> ~result-type)
+             ~(compile-value-step-range backend steps 0 name-index state false failure
+                `(let [~quoted-id
+                        (or ~@(let [checks (p/code-list-new) (mut q) 0]
+                                 (loop
+                                   (if (>= (load q) (p/code-count quoted-key-bytes)) (break)
+                                     (do
+                                       (p/code-list-push! checks
+                                         `(= (~current-byte-code ~state)
+                                             ~(p/code-nth quoted-key-bytes (load q))))
+                                       (set! q (+ (load q) 1)))))
+                                 (p/code-list-done checks)))
+                      ~quoted-key-id (if ~quoted-id (~quoted-key-parser ~state) (cast u64 0))
+                      ~name-start-id (if ~quoted-id (cast u32 ~quoted-key-id)
+                                       (~current-position-code ~state))
+                      ~name-end-id (if ~quoted-id
+                                     (cast u32 (p/ishr ~quoted-key-id (cast u64 32)))
+                                     (~word-end-code ~state ~name-start-id))]
+                  (if (= ~name-start-id ~name-end-id) (~fail-code ~state ~expected-error)
+                    (do
+                      (if ~quoted-id 0 (~advance-code ~state))
+                      ;; The separator is matched, not consumed: the same text
+                      ;; without it is the shorthand production instead, so a
+                      ;; mismatch is a dispatch decision rather than an error.
+                      (if (~match-byte-code ~state ~separator)
+                          (let [~property-id (~parse-expression-code ~state 0)]
+                            ~(compile-value-step-range backend steps (+ value-index 1)
+                               (p/code-count steps) state false failure
+                               (compile-named-property-emission state result-type
+                                 check-build-code opcode name-start-id name-end-id
+                                 property-id)))
+                        ~(if (generator-symbol? allow-shorthand "true")
+                             `(let [~property-id
+                                     (~shorthand-parser ~state ~name-start-id ~name-end-id)]
+                                ~(compile-named-property-emission state result-type
+                                   check-build-code opcode name-start-id name-end-id
+                                   property-id))
+                           `(~fail-code ~state ~expected-error)))))))))))))
 
 (defn compile-postfix-name [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 11)
@@ -4448,40 +4533,53 @@
                    (~check-build-code ~state operand)
                    (~result-type :value value :start (.start ~input) :end name-end))))))))))
 
+;; A delimited expression applied to an already-parsed operand. The grammar owns
+;; the delimiters around the inner rule; this strategy supplies only the two
+;; operand IR emission.
 (defn compile-postfix-expression [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 5)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 6)
                 (generator-form? production "postfix-expression")))
       (generator-fail production "invalid postfix-expression production")
     (let [state-type (backend-value backend "state-type")
           result-type (backend-value backend "expression-result-type")
           function-name (backend-value backend
                           (p/code-sym (field-value production "function")))
-          advance-code (backend-value backend "advance")
           consume-code (backend-value backend "consume-byte")
           parse-expression-code (backend-value backend "parse-expression")
           fail-code (backend-value backend "fail")
           check-build-code (backend-value backend "check-build")
           expected-error (backend-value backend "expected-error")
-          close (field-value production "close") opcode (field-value production "emit-op")
-          state (p/fresh-identifier "state") input (p/fresh-identifier "input")]
-      `(defn ~function-name [(~state (ptr ~state-type)) (~input ~result-type)]
-         (-> ~result-type)
-         (let [_open (~advance-code ~state) property (~parse-expression-code ~state 0)]
-           (if (not (~consume-code ~state ~close))
-               (~fail-code ~state ~expected-error)
-             (let [arena (.arena (.builder ~state)) value (.value-count arena)
-                   operation-result
-                     (builder/add-op! (.builder ~state) (.block ~state) ~opcode
-                       (cast u32 0) (cast u32 0) (.start ~input)
-                       (+ (.end property) (cast u32 1)) (cast u32 1))]
-               (let [op (~check-build-code ~state operation-result)
-                     object-operand (builder/add-operand! (.builder ~state) op (.value ~input))
-                     property-operand (builder/add-operand! (.builder ~state) op
-                                                            (.value property))]
-                 (~check-build-code ~state object-operand)
-                 (~check-build-code ~state property-operand)
-                 (~result-type :value value :start (.start ~input)
-                               :end (+ (.end property) (cast u32 1)))))))))))
+          opcode (field-value production "emit-op")
+          steps (production-steps production)
+          property-index (rule-step-index steps (field-value production "property")
+                                          "property")
+          close (terminal-step-byte steps (+ property-index 1) "delimited expression end")
+          state (p/fresh-identifier "state") input (p/fresh-identifier "input")
+          property-id (p/fresh-identifier "property")
+          failure `(~fail-code ~state ~expected-error)]
+      (if (< property-index 0) `(do 0)
+        `(defn ~function-name [(~state (ptr ~state-type)) (~input ~result-type)]
+           (-> ~result-type)
+           ~(compile-value-step-range backend steps 0 property-index state false failure
+              `(let [~property-id (~parse-expression-code ~state 0)]
+                 (if (not (~consume-code ~state ~close))
+                     (~fail-code ~state ~expected-error)
+                   ~(compile-value-step-range backend steps (+ property-index 2)
+                      (p/code-count steps) state false failure
+                      `(let [arena (.arena (.builder ~state)) value (.value-count arena)
+                             operation-result
+                               (builder/add-op! (.builder ~state) (.block ~state) ~opcode
+                                 (cast u32 0) (cast u32 0) (.start ~input)
+                                 (+ (.end ~property-id) (cast u32 1)) (cast u32 1))]
+                         (let [op (~check-build-code ~state operation-result)
+                               object-operand (builder/add-operand! (.builder ~state) op
+                                                                    (.value ~input))
+                               property-operand (builder/add-operand! (.builder ~state) op
+                                                                      (.value ~property-id))]
+                           (~check-build-code ~state object-operand)
+                           (~check-build-code ~state property-operand)
+                           (~result-type :value value :start (.start ~input)
+                                         :end (+ (.end ~property-id) (cast u32 1))))))))))))))
 
 (defn compile-postfix-marker [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 4)
@@ -4587,6 +4685,10 @@
                    (~check-build-code ~state immediate)
                    (~result-type :value value :start (.start ~input) :end end))))))))))
 
+;; A separated argument list applied to an already-parsed callee. The grammar
+;; owns the delimiters and the separator through its (separated RULE BYTE) step;
+;; this strategy supplies the scratch-list lifetime and the special-callee rule
+;; that no production shape can state.
 (defn compile-postfix-separated [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 12)
                 (generator-form? production "postfix-separated")))
@@ -4599,7 +4701,6 @@
           current-byte-code (backend-value backend "current-byte")
           word-end-code (backend-value backend "identifier-end")
           span-equals-code (backend-value backend "span-equals")
-          adjacent-byte-code (backend-value backend "adjacent-event-byte")
           advance-code (backend-value backend "advance")
           consume-code (backend-value backend "consume-byte")
           fail-code (backend-value backend "fail")
@@ -4609,79 +4710,96 @@
           emit-list-code (backend-value backend "emit-scratch-list-op")
           ok-error (backend-value backend "ok-error")
           expected-error (backend-value backend "expected-error")
-          separator (field-value production "separator")
-          close (field-value production "close")
           allow-trailing (field-value production "allow-trailing")
           precedence (field-value production "element-precedence")
-          spread-byte (field-value production "spread-byte")
+          spread-steps (named-steps production "spread-steps")
           spread-parser (backend-value backend
                           (p/code-sym (field-value production "spread-parser")))
           opcode (field-value production "emit-op")
           special-callee (field-value production "special-callee")
           special-opcode (field-value production "special-emit-op")
-          state (p/fresh-identifier "state") input (p/fresh-identifier "input")]
-      `(defn ~function-name [(~state (ptr ~state-type)) (~input ~result-type)]
-         (-> ~result-type)
-         (let [scratch (.scratch ~state) mark (.value-count scratch)
-               arena (.arena (.builder ~state))
-               definition-kind
-                 (load (p/index (.value-def-kinds arena) (cast i64 (.value ~input))))
-               definition-index
-                 (load (p/index (.value-def-indices arena) (cast i64 (.value ~input))))
-               special
-                 (and (= definition-kind (cast u8 ir/DEF-OP-RESULT))
-                      (= (load (p/index (.opcodes arena) (cast i64 definition-index)))
-                         (cast u16 ir/OP-JS-IDENTIFIER))
-                      (~span-equals-code ~state (.start ~input)
-                        (~word-end-code ~state (.start ~input)) ~special-callee))
-               _open (~advance-code ~state)]
-           (if (= (~current-byte-code ~state) ~close) 0
-             (loop
-               (let [element
-                      (if (and (= (~current-byte-code ~state) ~spread-byte)
-                               (= (~adjacent-byte-code ~state 1) ~spread-byte)
-                               (= (~adjacent-byte-code ~state 2) ~spread-byte))
-                          (~spread-parser ~state)
-                        (~parse-expression-code ~state ~precedence))]
-                 (~push-value-code ~state (.value element))
-                 (if (!= (.error ~state) ~ok-error) (break)
-                   (if (= (~current-byte-code ~state) ~separator)
-                       (do
-                         (~advance-code ~state)
-                         (if (and ~(if (generator-symbol? allow-trailing "true") `true `false)
-                                  (= (~current-byte-code ~state) ~close))
-                             (break) 0))
-                     (break))))))
-           (let [end-position (~current-position-code ~state)]
-             (if (not (~consume-code ~state ~close))
-                 (~fail-code ~state ~expected-error)
-               (let [end (+ end-position (cast u32 1))
-                     argument-count (- (.value-count scratch) mark)
-                     (mut invalid-special-argument) false]
-                 (if special
-                     (let [(mut argument-index) mark]
-                       (loop
-                         (if (>= (load argument-index) (.value-count scratch)) (break)
-                           (let [argument-value
-                                   (load (p/index (.values scratch) (load argument-index)))
-                                 argument-definition
-                                   (load (p/index (.value-def-indices arena)
-                                           (cast i64 argument-value)))]
-                             (if (and
-                                   (= (load (p/index (.value-def-kinds arena)
-                                              (cast i64 argument-value)))
-                                      (cast u8 ir/DEF-OP-RESULT))
-                                   (= (load (p/index (.opcodes arena)
-                                              (cast i64 argument-definition)))
-                                      (cast u16 ir/OP-JS-SPREAD)))
-                                 (store! invalid-special-argument true) 0)
-                             (set! argument-index (+ (load argument-index) 1)))))) 0)
-                 (if special
-                     (if (or (load invalid-special-argument)
-                             (or (< argument-count 1) (> argument-count 2)))
+          steps (production-steps production)
+          arguments-index (separated-step-index steps
+                            (field-value production "arguments") "arguments")
+          separator (separated-step-byte steps arguments-index "argument separator")
+          close (terminal-step-byte steps (+ arguments-index 1) "argument list end")
+          state (p/fresh-identifier "state") input (p/fresh-identifier "input")
+          scratch-id (p/fresh-identifier "scratch")
+          mark-id (p/fresh-identifier "mark")
+          arena-id (p/fresh-identifier "arena")
+          special-id (p/fresh-identifier "special")
+          end-position-id (p/fresh-identifier "end-position")
+          failure `(~fail-code ~state ~expected-error)]
+      (if (< arguments-index 0) `(do 0)
+        `(defn ~function-name [(~state (ptr ~state-type)) (~input ~result-type)]
+           (-> ~result-type)
+           (let [~scratch-id (.scratch ~state) ~mark-id (.value-count ~scratch-id)
+                 ~arena-id (.arena (.builder ~state))
+                 definition-kind
+                   (load (p/index (.value-def-kinds ~arena-id) (cast i64 (.value ~input))))
+                 definition-index
+                   (load (p/index (.value-def-indices ~arena-id) (cast i64 (.value ~input))))
+                 ~special-id
+                   (and (= definition-kind (cast u8 ir/DEF-OP-RESULT))
+                        (= (load (p/index (.opcodes ~arena-id) (cast i64 definition-index)))
+                           (cast u16 ir/OP-JS-IDENTIFIER))
+                        (~span-equals-code ~state (.start ~input)
+                          (~word-end-code ~state (.start ~input)) ~special-callee))]
+             ~(compile-value-step-range backend steps 0 arguments-index state false failure
+                `(do
+                   (if (= (~current-byte-code ~state) ~close) 0
+                     (loop
+                       (let [element
+                              (if ~(compile-terminal-prefix-condition backend spread-steps
+                                     state "spread argument")
+                                  (~spread-parser ~state)
+                                (~parse-expression-code ~state ~precedence))]
+                         (~push-value-code ~state (.value element))
+                         (if (!= (.error ~state) ~ok-error) (break)
+                           (if (= (~current-byte-code ~state) ~separator)
+                               (do
+                                 (~advance-code ~state)
+                                 (if (and ~(if (generator-symbol? allow-trailing "true")
+                                               `true `false)
+                                          (= (~current-byte-code ~state) ~close))
+                                     (break) 0))
+                             (break))))))
+                   (let [~end-position-id (~current-position-code ~state)]
+                     (if (not (~consume-code ~state ~close))
                          (~fail-code ~state ~expected-error)
-                       (~emit-list-code ~state ~special-opcode (.start ~input) end mark))
-                   (~emit-code ~state ~opcode ~input end mark))))))))))
+                       ~(compile-value-step-range backend steps (+ arguments-index 2)
+                          (p/code-count steps) state false failure
+                          `(let [end (+ ~end-position-id (cast u32 1))
+                                 argument-count (- (.value-count ~scratch-id) ~mark-id)
+                                 (mut invalid-special-argument) false]
+                             (if ~special-id
+                                 (let [(mut argument-index) ~mark-id]
+                                   (loop
+                                     (if (>= (load argument-index) (.value-count ~scratch-id))
+                                         (break)
+                                       (let [argument-value
+                                               (load (p/index (.values ~scratch-id)
+                                                       (load argument-index)))
+                                             argument-definition
+                                               (load (p/index (.value-def-indices ~arena-id)
+                                                       (cast i64 argument-value)))]
+                                         (if (and
+                                               (= (load (p/index (.value-def-kinds ~arena-id)
+                                                          (cast i64 argument-value)))
+                                                  (cast u8 ir/DEF-OP-RESULT))
+                                               (= (load (p/index (.opcodes ~arena-id)
+                                                          (cast i64 argument-definition)))
+                                                  (cast u16 ir/OP-JS-SPREAD)))
+                                             (store! invalid-special-argument true) 0)
+                                         (set! argument-index
+                                               (+ (load argument-index) 1)))))) 0)
+                             (if ~special-id
+                                 (if (or (load invalid-special-argument)
+                                         (or (< argument-count 1) (> argument-count 2)))
+                                     (~fail-code ~state ~expected-error)
+                                   (~emit-list-code ~state ~special-opcode (.start ~input)
+                                     end ~mark-id))
+                               (~emit-code ~state ~opcode ~input end ~mark-id))))))))))))))
 
 (defn compile-postfix-type-arguments [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 5)
@@ -9720,7 +9838,8 @@
         (assert-flag ir/IMPORT-ATTRIBUTES-ASSERT))
       (spread-value spread-expression
         (function parse-spread)
-        (width 3)
+        (steps ~(syntax/spread-production-steps))
+        (value expression)
         (emit-op ir/OP-JS-SPREAD))
       (regexp-value regexp-expression
         (function parse-regexp)
@@ -9737,26 +9856,24 @@
         (emit-op ir/OP-JS-REGEXP))
       (separated-value array-expression
         (function parse-array)
+        (steps ~(syntax/array-production-steps))
+        (elements expression)
         (element (parse-expression 0))
-        (open (syntax/array-production-terminal 0))
-        (separator (syntax/array-production-terminal 1))
-        (close (syntax/array-production-terminal 2))
         (allow-trailing true)
         (allow-elisions true)
         (elision-op ir/OP-JS-ELISION)
-        (spread-byte (syntax/spread-production-terminal 0))
+        (spread-steps ~(syntax/spread-production-steps))
         (spread-parser parse-spread)
         (emit-op ir/OP-JS-ARRAY))
       (separated-value object-expression
         (function parse-object)
+        (steps ~(syntax/object-production-steps))
+        (elements property)
         (element (parse-property))
-        (open (syntax/object-production-terminal 0))
-        (separator (syntax/object-production-terminal 1))
-        (close (syntax/object-production-terminal 2))
         (allow-trailing true)
         (allow-elisions false)
         (elision-op ir/OP-JS-ELISION)
-        (spread-byte (syntax/spread-production-terminal 0))
+        (spread-steps ~(syntax/spread-production-steps))
         (spread-parser parse-spread)
         (emit-op ir/OP-JS-OBJECT))
       (terminated-expression return-statement
@@ -9792,7 +9909,9 @@
         (identifier-op ir/OP-JS-IDENTIFIER))
       (named-value object-property
         (function parse-property)
-        (separator (syntax/property-production-terminal 1))
+        (steps ~(syntax/property-production-steps))
+        (name property-name)
+        (value expression)
         (emit-op ir/OP-JS-PROPERTY)
         (allow-shorthand true)
         (shorthand-parser parse-object-shorthand)
@@ -9811,15 +9930,16 @@
         (special-immediate ir/META-PROPERTY-IMPORT-META))
       (postfix-expression computed-member-expression
         (function parse-computed-member)
-        (close (syntax/computed-member-production-terminal 2))
+        (steps ~(syntax/computed-member-production-steps))
+        (property expression)
         (emit-op ir/OP-JS-COMPUTED-MEMBER))
       (postfix-separated call-expression
         (function parse-call)
-        (separator (syntax/call-production-terminal 1))
-        (close (syntax/call-production-terminal 2))
+        (steps ~(syntax/call-production-steps))
+        (arguments expression)
         (allow-trailing true)
         (element-precedence 0)
-        (spread-byte (syntax/spread-production-terminal 0))
+        (spread-steps ~(syntax/spread-production-steps))
         (spread-parser parse-spread)
         (emit-op ir/OP-JS-CALL)
         (special-callee "import")
