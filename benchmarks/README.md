@@ -58,11 +58,14 @@ full IR verifier. Coverage is reported both by whole files and source bytes.
 `check-typescript-type-oracle.sh` is the structural type-grammar gate. It parses
 isolated canonical specimens independently with Oxc and the generated Coil
 frontend, projects both trees into the same post-order type/signature shape,
-and requires exact equality. Its Rust match over `TSType` is exhaustive, so an
+and requires exact equality. It also compares every principal node's source
+span and pins operand counts/immediate flags for modifier-rich cases. Its Rust
+match over `TSType` is exhaustive, so an
 Oxc type variant addition breaks compilation until the catalog and
 normalization are updated. The catalog covers every non-JSDoc `TSType` variant
 and all five `TSSignature` variants. This is stronger than corpus acceptance:
-it caught the previous loss of every `${...}` operand in template-literal types.
+it caught the previous loss of every `${...}` operand in template-literal types,
+the `(A)`/function-type ambiguity, and multiple delimiter/trivia span errors.
 
 The initial frozen local corpus consists of:
 

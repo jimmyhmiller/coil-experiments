@@ -2,11 +2,12 @@ use std::{env, fs, path::PathBuf, process::Command};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    TSOptionalType, TSRestType, TSSignature, TSType,
+    TSOptionalType, TSRestType, TSSignature, TSType, TSTypePredicateName,
+    TSTypeQueryExprName,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
-use oxc_span::SourceType;
+use oxc_span::{GetSpan, SourceType};
 
 struct Case {
     name: &'static str,
@@ -38,14 +39,158 @@ const CASES: &[Case] = &[
     Case { name: "type-literal-call", source: "type T = { <X>(x: X): X; new <Y>(y: Y): C<Y> };" },
     Case { name: "type-literal-methods", source: "type T = { get value(): A; set value(x: A); method?<X>(x: X): X };" },
     Case { name: "type-literal-index", source: "type T = { readonly [name: string]: number };" },
+    Case { name: "delimiter-span-trivia", source: "type A0 = [A] ; type A1 = { x: A } ; type A2 = (A) ; type A3 = import('x').A<B> ; type A4 = `${A}` ; type A5 = A | B ; type A6 = A & B ; type A7 = A extends B ? C : D ; type A8 = { [K in A]: B } ; type A9 = keyof A ;" },
+    Case { name: "mapped-variants", source: "type M0<K> = { [P in K]: A }; type M1<K> = { +readonly [P in K]-?: A }; type M2<K> = { -readonly [P in K]+?: A }; type M3<K> = { [P in K as Q] };" },
+    Case { name: "import-variants", source: "type I0=import('x');type I1=typeof import('x');type I2=import('x').A;type I3=import('x')<A>;type I4=import('x',{with:{type:'json'}});" },
+    Case { name: "predicate-variants", source: "type P0=(x:A)=>asserts x;type P1=()=>this is B;type P2=()=>asserts this;" },
+    Case { name: "unnamed-tuple-wrappers", source: "type T=[A?,...B[]];" },
+    Case { name: "computed-signatures", source: "type T={ [key]: A; 'quoted'?(): B; 0<C>(x:C):C; [method]<D>(x:D):D };" },
+    Case { name: "callable-binding-patterns", source: "type F=({x:y=init,...rest}: A,[head,,...tail]: B)=>C;" },
 ];
 
 struct Shape {
     nodes: Vec<&'static str>,
+    spans: Vec<Option<(u32, u32)>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Meta {
+    operands: u32,
+    immediate: u64,
+}
+
+struct FieldCheck {
+    opcode: u16,
+    expected: &'static [(u32, u64)],
+}
+
+fn field_checks(name: &str) -> &'static [FieldCheck] {
+    match name {
+        "keywords" => &[FieldCheck { opcode: 90, expected: &[(0, 0); 14] }],
+        "reference-qualified-generics" => &[
+            FieldCheck { opcode: 97, expected: &[(2, 0)] },
+            FieldCheck { opcode: 89, expected: &[(0, 0), (0, 0), (0, 0), (2, 0)] },
+        ],
+        "literals" => &[
+            FieldCheck { opcode: 91, expected: &[(0, 0); 6] },
+            FieldCheck { opcode: 92, expected: &[(6, 0)] },
+        ],
+        "array-parenthesized" => &[
+            FieldCheck { opcode: 92, expected: &[(2, 0)] },
+            FieldCheck { opcode: 96, expected: &[(1, 0)] },
+            FieldCheck { opcode: 94, expected: &[(1, 0)] },
+        ],
+        "conditional-infer" => &[
+            FieldCheck { opcode: 105, expected: &[(4, 0)] },
+            FieldCheck { opcode: 106, expected: &[(1, 0)] },
+            FieldCheck { opcode: 111, expected: &[(0, 0), (1, 1)] },
+        ],
+        "intersection-leading" => &[FieldCheck { opcode: 93, expected: &[(2, 1)] }],
+        "union-leading" => &[FieldCheck { opcode: 92, expected: &[(2, 1)] }],
+        "indexed-access" => &[FieldCheck { opcode: 99, expected: &[(2, 0)] }],
+        "operators" => &[FieldCheck { opcode: 100, expected: &[(1, 1), (1, 2), (1, 3)] }],
+        "query" => &[FieldCheck { opcode: 101, expected: &[(2, 3)] }],
+        "function" => &[
+            FieldCheck { opcode: 102, expected: &[(5, 65)] },
+            FieldCheck { opcode: 120, expected: &[(1, 20), (1, 17), (1, 18)] },
+        ],
+        "constructor" => &[FieldCheck { opcode: 103, expected: &[(3, 67)] }],
+        "tuple" => &[
+            FieldCheck { opcode: 95, expected: &[(3, 0)] },
+            FieldCheck { opcode: 117, expected: &[(1, 0), (1, 1), (1, 0)] },
+            FieldCheck { opcode: 118, expected: &[] },
+            FieldCheck { opcode: 119, expected: &[(1, 0)] },
+        ],
+        "mapped" => &[
+            FieldCheck { opcode: 107, expected: &[(3, 53)] },
+            FieldCheck { opcode: 111, expected: &[(1, 1), (1, 1)] },
+            FieldCheck { opcode: 108, expected: &[(3, 0)] },
+        ],
+        "template" => &[
+            FieldCheck { opcode: 108, expected: &[(5, 0)] },
+            FieldCheck { opcode: 123, expected: &[(0, 0), (0, 0), (0, 0)] },
+        ],
+        "import" => &[FieldCheck { opcode: 109, expected: &[(3, 7)] }],
+        "predicate" => &[FieldCheck { opcode: 110, expected: &[(2, 2)] }],
+        "assertion-predicate" => &[FieldCheck { opcode: 110, expected: &[(2, 3)] }],
+        "type-literal-properties" => &[
+            FieldCheck { opcode: 104, expected: &[(4, 0)] },
+            FieldCheck { opcode: 112, expected: &[(1, 11), (0, 0), (1, 9), (2, 13)] },
+        ],
+        "type-literal-call" => &[
+            FieldCheck { opcode: 104, expected: &[(2, 0)] },
+            FieldCheck { opcode: 114, expected: &[(3, 65)] },
+            FieldCheck { opcode: 115, expected: &[(3, 65)] },
+        ],
+        "type-literal-methods" => &[
+            FieldCheck { opcode: 104, expected: &[(3, 0)] },
+            FieldCheck { opcode: 113, expected: &[(1, 80), (1, 32), (3, 69)] },
+        ],
+        "type-literal-index" => &[
+            FieldCheck { opcode: 104, expected: &[(1, 0)] },
+            FieldCheck { opcode: 116, expected: &[(2, 2)] },
+        ],
+        "mapped-variants" => &[FieldCheck {
+            opcode: 107,
+            expected: &[(2, 32), (2, 46), (2, 43), (2, 16)],
+        }],
+        "import-variants" => &[
+            FieldCheck { opcode: 109, expected: &[(0, 0), (0, 0), (1, 2), (1, 4), (1, 1)] },
+            FieldCheck { opcode: 101, expected: &[(1, 1)] },
+        ],
+        "predicate-variants" => &[FieldCheck {
+            opcode: 110,
+            expected: &[(1, 1), (2, 6), (1, 5)],
+        }],
+        "unnamed-tuple-wrappers" => &[
+            FieldCheck { opcode: 95, expected: &[(2, 0)] },
+            FieldCheck { opcode: 118, expected: &[(1, 0)] },
+            FieldCheck { opcode: 119, expected: &[(1, 0)] },
+        ],
+        "computed-signatures" => &[
+            FieldCheck { opcode: 104, expected: &[(4, 0)] },
+            FieldCheck { opcode: 112, expected: &[(2, 12)] },
+            FieldCheck { opcode: 113, expected: &[(1, 68), (3, 65), (4, 73)] },
+        ],
+        "callable-binding-patterns" => &[
+            FieldCheck { opcode: 102, expected: &[(3, 64)] },
+            FieldCheck { opcode: 120, expected: &[(2, 24), (2, 24)] },
+            FieldCheck { opcode: 128, expected: &[(2, 0)] },
+            FieldCheck { opcode: 129, expected: &[(3, 0)] },
+        ],
+        _ => &[],
+    }
+}
+
+fn coil_metadata(output: &str, opcode: u16) -> Vec<Meta> {
+    output.lines().filter_map(|line| {
+        if !line.starts_with("meta ") { return None; }
+        let mut found_opcode = None;
+        let mut operands = None;
+        let mut immediate = None;
+        for field in line.split_whitespace() {
+            if let Some(value) = field.strip_prefix("opcode=") {
+                found_opcode = value.parse::<u16>().ok();
+            } else if let Some(value) = field.strip_prefix("operands=") {
+                operands = value.parse::<u32>().ok();
+            } else if let Some(value) = field.strip_prefix("immediate=") {
+                immediate = value.parse::<u64>().ok();
+            }
+        }
+        (found_opcode == Some(opcode)).then(|| Meta {
+            operands: operands.expect("metadata operand count"),
+            immediate: immediate.expect("metadata immediate"),
+        })
+    }).collect()
 }
 
 impl Shape {
-    fn new() -> Self { Self { nodes: Vec::new() } }
+    fn new() -> Self { Self { nodes: Vec::new(), spans: Vec::new() } }
+
+    fn push(&mut self, kind: &'static str, span: Option<(u32, u32)>) {
+        self.nodes.push(kind);
+        self.spans.push(span);
+    }
 }
 
 impl<'a> Visit<'a> for Shape {
@@ -56,16 +201,25 @@ impl<'a> Visit<'a> for Shape {
         // the normalized Oxc projection before visiting child types.
         match ty {
             TSType::TSTypeReference(node) if node.type_arguments.is_some() =>
-                self.nodes.push("ts.type_reference"),
+                self.push("ts.type_reference", None),
             TSType::TSTypeQuery(node) if node.type_arguments.is_some() =>
-                self.nodes.push("ts.type_reference"),
+                self.push("ts.type_reference", None),
+            TSType::TSTypeQuery(node)
+                if matches!(node.expr_name, TSTypeQueryExprName::TSImportType(_)) =>
+                self.push("ts.import_type", None),
             TSType::TSImportType(node) if node.qualifier.is_some() =>
-                self.nodes.push("ts.type_reference"),
-            TSType::TSTypePredicate(_) => self.nodes.push("ts.type_reference"),
+                self.push("ts.type_reference", None),
+            TSType::TSTypePredicate(node) => self.push(
+                match node.parameter_name {
+                    TSTypePredicateName::Identifier(_) => "ts.type_reference",
+                    TSTypePredicateName::This(_) => "ts.keyword_type",
+                },
+                None,
+            ),
             _ => {}
         }
         walk::walk_ts_type(self, ty);
-        self.nodes.push(match ty {
+        let kind = match ty {
             TSType::TSAnyKeyword(_) | TSType::TSBigIntKeyword(_)
             | TSType::TSBooleanKeyword(_) | TSType::TSIntrinsicKeyword(_)
             | TSType::TSNeverKeyword(_) | TSType::TSNullKeyword(_)
@@ -95,28 +249,34 @@ impl<'a> Visit<'a> for Shape {
             TSType::TSParenthesizedType(_) => "ts.parenthesized_type",
             TSType::JSDocNullableType(_) | TSType::JSDocNonNullableType(_)
             | TSType::JSDocUnknownType(_) => panic!("JSDoc type in TypeScript specimen"),
-        });
+        };
+        let span = ty.span();
+        self.push(kind, Some((span.start, span.end)));
     }
 
     fn visit_ts_optional_type(&mut self, ty: &TSOptionalType<'a>) {
         walk::walk_ts_optional_type(self, ty);
-        self.nodes.push("ts.optional_type");
+        let span = ty.span();
+        self.push("ts.optional_type", Some((span.start, span.end)));
     }
 
     fn visit_ts_rest_type(&mut self, ty: &TSRestType<'a>) {
         walk::walk_ts_rest_type(self, ty);
-        self.nodes.push("ts.rest_type");
+        let span = ty.span();
+        self.push("ts.rest_type", Some((span.start, span.end)));
     }
 
     fn visit_ts_signature(&mut self, signature: &TSSignature<'a>) {
         walk::walk_ts_signature(self, signature);
-        self.nodes.push(match signature {
+        let kind = match signature {
             TSSignature::TSIndexSignature(_) => "ts.index_signature",
             TSSignature::TSPropertySignature(_) => "ts.property_signature",
             TSSignature::TSCallSignatureDeclaration(_) => "ts.call_signature",
             TSSignature::TSConstructSignatureDeclaration(_) => "ts.construct_signature",
             TSSignature::TSMethodSignature(_) => "ts.method_signature",
-        });
+        };
+        let span = signature.span();
+        self.push(kind, Some((span.start, span.end)));
     }
 }
 
@@ -137,6 +297,21 @@ fn coil_shape(output: &str) -> Vec<&str> {
             |(_, rhs)| rhs.split_whitespace().next(),
         )?;
         PRINCIPAL.contains(&op).then_some(op)
+    }).collect()
+}
+
+fn coil_spans(output: &str) -> Vec<(u32, u32)> {
+    let kinds = coil_shape(output);
+    output.lines().filter_map(|line| {
+        let trimmed = line.trim();
+        let op = trimmed.split_once(" = ").map_or_else(
+            || trimmed.split_whitespace().next(),
+            |(_, rhs)| rhs.split_whitespace().next(),
+        )?;
+        if !kinds.iter().any(|kind| *kind == op) { return None; }
+        let location = trimmed.rsplit_once("loc(")?.1.strip_suffix(')')?;
+        let (start, end) = location.split_once(':')?;
+        Some((start.parse().ok()?, end.parse().ok()?))
     }).collect()
 }
 
@@ -172,6 +347,33 @@ fn main() {
             failures += 1;
         } else {
             println!("ok {} nodes={}", case.name, actual.len());
+        }
+        let actual_spans = coil_spans(&dump);
+        if actual_spans.len() != expected.spans.len() {
+            eprintln!("SPAN_COUNT_MISMATCH {} expected={} actual={}",
+                case.name, expected.spans.len(), actual_spans.len());
+            failures += 1;
+        } else {
+            for (node_index, (expected_span, actual_span)) in
+                expected.spans.iter().zip(&actual_spans).enumerate()
+            {
+                if expected_span.is_some_and(|span| span != *actual_span) {
+                    eprintln!("SPAN_MISMATCH {} node={} kind={} expected={:?} actual={:?}",
+                        case.name, node_index, expected.nodes[node_index], expected_span,
+                        actual_span);
+                    failures += 1;
+                }
+            }
+        }
+        for check in field_checks(case.name) {
+            let actual = coil_metadata(&dump, check.opcode);
+            let expected: Vec<_> = check.expected.iter().map(|&(operands, immediate)|
+                Meta { operands, immediate }).collect();
+            if actual != expected {
+                eprintln!("FIELD_MISMATCH {} opcode={}\n  expected: {:?}\n  actual:   {:?}",
+                    case.name, check.opcode, expected, actual);
+                failures += 1;
+            }
         }
     }
     assert_eq!(failures, 0, "{failures} TypeScript structural oracle failures");
