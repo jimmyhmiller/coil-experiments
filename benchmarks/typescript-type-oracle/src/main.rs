@@ -3,8 +3,8 @@ use std::{env, fs, path::PathBuf, process::Command};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     ExportAllDeclaration, ExportNamedDeclaration, ExportSpecifier, Function, FunctionType,
-    ImportDeclaration, ImportDefaultSpecifier, ImportNamespaceSpecifier, ImportSpecifier,
-    ImportAttribute, TaggedTemplateExpression, VariableDeclaration, VariableDeclarationKind,
+    ImportDeclaration, ImportDefaultSpecifier, ImportExpression, ImportNamespaceSpecifier, ImportSpecifier,
+    ImportAttribute, MetaProperty, TaggedTemplateExpression, VariableDeclaration, VariableDeclarationKind,
     WithClause,
     TSClassImplements, TSEnumDeclaration, TSEnumMember, TSGlobalDeclaration,
     TSExportAssignment, TSImportEqualsDeclaration, TSInterfaceBody, TSInterfaceHeritage,
@@ -71,6 +71,8 @@ const CASES: &[Case] = &[
     Case { name: "resource-declaration-context", source: "using resource:Disposable=acquire();using first=openA(),second:Disposable=openB();await using asyncResource:AsyncDisposable=acquireAsync();" },
     Case { name: "resource-loop-context", source: "for(using item of resources){}for(await using asyncItem of asyncResources){}for(using of resources){}" },
     Case { name: "tagged-template-context", source: "const a=tag`a${x}b`;const b=ns.tag<A,B>`c${y}d`;" },
+    Case { name: "dynamic-import-context", source: "const a=import('pkg');const b=import('data',{with:{type:'json'}});" },
+    Case { name: "import-meta-context", source: "const meta=import.meta;const url=import.meta.url;function f(){return new.target;}" },
 ];
 
 struct Shape {
@@ -82,6 +84,8 @@ struct Shape {
     resource_spans: Vec<(u32, u32)>,
     resource_kinds: Vec<u64>,
     tagged_template_spans: Vec<(u32, u32)>,
+    import_expression_spans: Vec<(u32, u32)>,
+    meta_property_spans: Vec<(u32, u32)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -261,6 +265,14 @@ fn field_checks(name: &str) -> &'static [FieldCheck] {
             FieldCheck { opcode: 52, expected: &[(2, 0)] },
             FieldCheck { opcode: 143, expected: &[(2, 0), (2, 0)] },
         ],
+        "dynamic-import-context" => &[FieldCheck {
+            opcode: 144,
+            expected: &[(1, 0), (2, 0)],
+        }],
+        "import-meta-context" => &[FieldCheck {
+            opcode: 145,
+            expected: &[(0, 1), (0, 1), (0, 2)],
+        }],
         _ => &[],
     }
 }
@@ -293,6 +305,8 @@ impl Shape {
         function_spans: Vec::new(), function_flags: Vec::new(),
         resource_spans: Vec::new(), resource_kinds: Vec::new(),
         tagged_template_spans: Vec::new(),
+        import_expression_spans: Vec::new(),
+        meta_property_spans: Vec::new(),
     } }
 
     fn push(&mut self, kind: &'static str, span: Option<(u32, u32)>) {
@@ -302,6 +316,18 @@ impl Shape {
 }
 
 impl<'a> Visit<'a> for Shape {
+    fn visit_meta_property(&mut self, expression: &MetaProperty<'a>) {
+        walk::walk_meta_property(self, expression);
+        let span = expression.span();
+        self.meta_property_spans.push((span.start, span.end));
+    }
+
+    fn visit_import_expression(&mut self, expression: &ImportExpression<'a>) {
+        walk::walk_import_expression(self, expression);
+        let span = expression.span();
+        self.import_expression_spans.push((span.start, span.end));
+    }
+
     fn visit_tagged_template_expression(&mut self, expression: &TaggedTemplateExpression<'a>) {
         walk::walk_tagged_template_expression(self, expression);
         let span = expression.span();
@@ -712,6 +738,22 @@ fn main() {
             if actual != expected.tagged_template_spans {
                 eprintln!("TAGGED_TEMPLATE_SPAN_MISMATCH {}\n  oxc:  {:?}\n  coil: {:?}",
                     case.name, expected.tagged_template_spans, actual);
+                failures += 1;
+            }
+        }
+        if !expected.import_expression_spans.is_empty() {
+            let actual = coil_opcode_spans(&dump, 144);
+            if actual != expected.import_expression_spans {
+                eprintln!("IMPORT_EXPRESSION_SPAN_MISMATCH {}\n  oxc:  {:?}\n  coil: {:?}",
+                    case.name, expected.import_expression_spans, actual);
+                failures += 1;
+            }
+        }
+        if !expected.meta_property_spans.is_empty() {
+            let actual = coil_opcode_spans(&dump, 145);
+            if actual != expected.meta_property_spans {
+                eprintln!("META_PROPERTY_SPAN_MISMATCH {}\n  oxc:  {:?}\n  coil: {:?}",
+                    case.name, expected.meta_property_spans, actual);
                 failures += 1;
             }
         }
