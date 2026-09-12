@@ -56,9 +56,11 @@ Coil function bodies. Generator algorithms currently include:
   TypeScript type trees. The precedence ladder currently emits primary,
   postfix, intersection, union, and conditional types, including mapped types,
   `infer`, `keyof`/`readonly`/`unique`, and type-level `typeof`;
-- `erased-declaration` and `erased-braced-declaration` for declaration shells
-  whose names and attached structured type operands are retained while their
-  complete declaration-member semantics are still being migrated;
+- `erased-declaration` for type-alias declaration ownership;
+- `structured-interface` for interface type parameters, heritage, and the
+  structured type-literal body;
+- `opaque-braced-declaration` for the ambient-module shell whose nested
+  statement ownership is still being migrated;
 - `statement-terminator` for explicit semicolons and JavaScript ASI boundaries;
 - `import-declaration` for side-effect, default, namespace, named, aliased, and
   type-only imports, creating runtime bindings only for value imports.
@@ -72,7 +74,7 @@ runtime interpreter or production tables.
 No handwritten `parse-*` definition remains in `direct_parser.coil`.
 `benchmarks/check-generated-direct-parser.sh` enforces both halves of that
 contract: the runtime source must contain none, while macro expansion must
-contain all 66 expected generated definitions.
+contain all 70 expected generated definitions.
 
 Language-coverage changes additionally run through `react-hir-check`, which
 executes the generated parser and the complete IR verifier for one source file.

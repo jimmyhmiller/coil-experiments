@@ -1,4 +1,8 @@
 interface Source {}
+interface Derived<Item extends Source> extends Base<Item>, Namespace.Contract {
+  readonly value?: Item;
+  map<Result>(input: Item): Result;
+}
 interface Variance<in Input, out Output extends Source = Source> {
   input: Input;
   output: Output;
