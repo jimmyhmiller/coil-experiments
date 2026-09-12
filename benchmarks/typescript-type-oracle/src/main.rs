@@ -2,9 +2,9 @@ use std::{env, fs, path::PathBuf, process::Command};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    TSClassImplements, TSEnumDeclaration, TSEnumMember, TSInterfaceBody,
-    TSInterfaceHeritage, TSOptionalType, TSRestType, TSSignature, TSType,
-    TSTypePredicateName, TSTypeQueryExprName,
+    TSClassImplements, TSEnumDeclaration, TSEnumMember, TSGlobalDeclaration,
+    TSInterfaceBody, TSInterfaceHeritage, TSModuleDeclaration, TSOptionalType,
+    TSRestType, TSSignature, TSType, TSTypePredicateName, TSTypeQueryExprName,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
@@ -56,11 +56,13 @@ const CASES: &[Case] = &[
     Case { name: "call-new-type-context", source: "const a = fn<A, B>(x); const b = new C<D>(x); const c = fn<E>;" },
     Case { name: "angle-assertion-context", source: "const plain=<A>input; const nested=<A<B>>input;" },
     Case { name: "enum-context", source: "enum Plain { A, B=2, 'quoted'='value', ['computed']=4, [`templ`] } const enum Fixed { X=1, Y } declare enum Ambient { A, B='b' }" },
+    Case { name: "module-context", source: "namespace A.B { export type T=string; export const x:number=1; } module M { interface I { x:string } } declare module 'pkg' { export interface X { y:number } } declare global { interface Window { z:boolean } } declare module 'bodyless';" },
 ];
 
 struct Shape {
     nodes: Vec<&'static str>,
     spans: Vec<Option<(u32, u32)>>,
+    module_spans: Vec<(u32, u32)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -187,6 +189,10 @@ fn field_checks(name: &str) -> &'static [FieldCheck] {
                 (1, 4), (0, 0), (0, 0), (1, 4),
             ] },
         ],
+        "module-context" => &[FieldCheck {
+            opcode: 126,
+            expected: &[(0, 17), (0, 17), (0, 16), (0, 28), (0, 22), (0, 12)],
+        }],
         _ => &[],
     }
 }
@@ -214,7 +220,7 @@ fn coil_metadata(output: &str, opcode: u16) -> Vec<Meta> {
 }
 
 impl Shape {
-    fn new() -> Self { Self { nodes: Vec::new(), spans: Vec::new() } }
+    fn new() -> Self { Self { nodes: Vec::new(), spans: Vec::new(), module_spans: Vec::new() } }
 
     fn push(&mut self, kind: &'static str, span: Option<(u32, u32)>) {
         self.nodes.push(kind);
@@ -347,6 +353,18 @@ impl<'a> Visit<'a> for Shape {
         let span = declaration.span();
         self.push("ts.enum", Some((span.start, span.end)));
     }
+
+    fn visit_ts_module_declaration(&mut self, declaration: &TSModuleDeclaration<'a>) {
+        let span = declaration.span();
+        self.module_spans.push((span.start, span.end));
+        walk::walk_ts_module_declaration(self, declaration);
+    }
+
+    fn visit_ts_global_declaration(&mut self, declaration: &TSGlobalDeclaration<'a>) {
+        let span = declaration.span();
+        self.module_spans.push((span.start, span.end));
+        walk::walk_ts_global_declaration(self, declaration);
+    }
 }
 
 fn coil_shape(output: &str) -> Vec<&str> {
@@ -380,6 +398,16 @@ fn coil_spans(output: &str) -> Vec<(u32, u32)> {
         )?;
         if !kinds.iter().any(|kind| *kind == op) { return None; }
         let location = trimmed.rsplit_once("loc(")?.1.strip_suffix(')')?;
+        let (start, end) = location.split_once(':')?;
+        Some((start.parse().ok()?, end.parse().ok()?))
+    }).collect()
+}
+
+fn coil_opcode_spans(output: &str, opcode: u16) -> Vec<(u32, u32)> {
+    output.lines().filter_map(|line| {
+        if !line.starts_with("meta ") || !line.split_whitespace()
+            .any(|field| field == format!("opcode={opcode}")) { return None; }
+        let location = line.split_whitespace().find_map(|field| field.strip_prefix("loc="))?;
         let (start, end) = location.split_once(':')?;
         Some((start.parse().ok()?, end.parse().ok()?))
     }).collect()
@@ -442,6 +470,14 @@ fn main() {
             if actual != expected {
                 eprintln!("FIELD_MISMATCH {} opcode={}\n  expected: {:?}\n  actual:   {:?}",
                     case.name, check.opcode, expected, actual);
+                failures += 1;
+            }
+        }
+        if !expected.module_spans.is_empty() {
+            let actual = coil_opcode_spans(&dump, 126);
+            if actual != expected.module_spans {
+                eprintln!("MODULE_SPAN_MISMATCH {}\n  oxc:  {:?}\n  coil: {:?}",
+                    case.name, expected.module_spans, actual);
                 failures += 1;
             }
         }

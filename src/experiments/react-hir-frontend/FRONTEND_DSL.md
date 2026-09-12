@@ -67,8 +67,11 @@ Coil function bodies. Generator algorithms currently include:
 - `erased-declaration` for type-alias declaration ownership;
 - `structured-interface` for interface type parameters, heritage, and the
   structured type-literal body;
-- `opaque-braced-declaration` for the ambient-module shell whose nested
-  statement ownership is still being migrated;
+- `structured-module` for internal modules, namespaces, dotted namespace
+  chains, quoted external modules, and global augmentations, with every body
+  represented by an owned region and lexical scope;
+- `enum-declaration` for ordinary, const, and ambient enums with structured
+  members, exact name forms, and optional initializer operands;
 - `statement-terminator` for explicit semicolons and JavaScript ASI boundaries;
 - `import-declaration` for side-effect, default, namespace, named, aliased, and
   type-only imports, creating runtime bindings only for value imports.
