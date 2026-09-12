@@ -1,0 +1,1 @@
+import Invalid = require(name);

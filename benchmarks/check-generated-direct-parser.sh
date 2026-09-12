@@ -23,7 +23,7 @@ for production in \
   type-annotation type-alias-body implements-clause type-parameters type-alias statement-end import \
   type-template type-import type-query type-prefix type-predicate type-conditional type-arguments \
   type-arguments-before-call arrow-lookahead binding-pattern type-binding-pattern class-parameter decorated-parameter arrow jsx named-export interface \
-  type-assertion prefix-type-assertion angle-assertion-lookahead enum \
+  type-assertion prefix-type-assertion angle-assertion-lookahead enum ts-module-statement \
   prefix-keyword template debugger non-null postfix-update-lookahead postfix-update optional-postfix
 do
   if ! rg -Uq "\(defn\\*?[[:space:]]+parse-$production!([[:space:]]|$)" \
@@ -33,4 +33,4 @@ do
   fi
 done
 
-printf '%s\n' 'all 74 direct-parser productions are generated'
+printf '%s\n' 'all 75 direct-parser productions are generated'

@@ -3,7 +3,8 @@ use std::{env, fs, path::PathBuf, process::Command};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     TSClassImplements, TSEnumDeclaration, TSEnumMember, TSGlobalDeclaration,
-    TSInterfaceBody, TSInterfaceHeritage, TSModuleDeclaration, TSOptionalType,
+    TSExportAssignment, TSImportEqualsDeclaration, TSInterfaceBody, TSInterfaceHeritage,
+    TSModuleDeclaration, TSModuleReference, TSNamespaceExportDeclaration, TSOptionalType,
     TSRestType, TSSignature, TSType, TSTypePredicateName, TSTypeQueryExprName,
 };
 use oxc_ast_visit::{walk, Visit};
@@ -57,6 +58,7 @@ const CASES: &[Case] = &[
     Case { name: "angle-assertion-context", source: "const plain=<A>input; const nested=<A<B>>input;" },
     Case { name: "enum-context", source: "enum Plain { A, B=2, 'quoted'='value', ['computed']=4, [`templ`] } const enum Fixed { X=1, Y } declare enum Ambient { A, B='b' }" },
     Case { name: "module-context", source: "namespace A.B { export type T=string; export const x:number=1; } module M { interface I { x:string } } declare module 'pkg' { export interface X { y:number } } declare global { interface Window { z:boolean } } declare module 'bodyless';" },
+    Case { name: "module-statement-context", source: "import fs=require('fs'); import Alias=A.B.C; import type Types=require('types'); export=Alias; export as namespace Library;" },
 ];
 
 struct Shape {
@@ -193,6 +195,12 @@ fn field_checks(name: &str) -> &'static [FieldCheck] {
             opcode: 126,
             expected: &[(0, 17), (0, 17), (0, 16), (0, 28), (0, 22), (0, 12)],
         }],
+        "module-statement-context" => &[
+            FieldCheck { opcode: 135, expected: &[(0, 1), (0, 0), (0, 1)] },
+            FieldCheck { opcode: 136, expected: &[(1, 0), (1, 0), (1, 1)] },
+            FieldCheck { opcode: 137, expected: &[(1, 0)] },
+            FieldCheck { opcode: 138, expected: &[(0, 0)] },
+        ],
         _ => &[],
     }
 }
@@ -365,6 +373,30 @@ impl<'a> Visit<'a> for Shape {
         self.module_spans.push((span.start, span.end));
         walk::walk_ts_global_declaration(self, declaration);
     }
+
+    fn visit_ts_module_reference(&mut self, reference: &TSModuleReference<'a>) {
+        walk::walk_ts_module_reference(self, reference);
+        let span = reference.span();
+        self.push("ts.module_reference", Some((span.start, span.end)));
+    }
+
+    fn visit_ts_import_equals_declaration(&mut self, declaration: &TSImportEqualsDeclaration<'a>) {
+        walk::walk_ts_import_equals_declaration(self, declaration);
+        let span = declaration.span();
+        self.push("ts.import_equals", Some((span.start, span.end)));
+    }
+
+    fn visit_ts_export_assignment(&mut self, assignment: &TSExportAssignment<'a>) {
+        walk::walk_ts_export_assignment(self, assignment);
+        let span = assignment.span();
+        self.push("ts.export_assignment", Some((span.start, span.end)));
+    }
+
+    fn visit_ts_namespace_export_declaration(&mut self, declaration: &TSNamespaceExportDeclaration<'a>) {
+        walk::walk_ts_namespace_export_declaration(self, declaration);
+        let span = declaration.span();
+        self.push("ts.namespace_export", Some((span.start, span.end)));
+    }
 }
 
 fn coil_shape(output: &str) -> Vec<&str> {
@@ -378,6 +410,8 @@ fn coil_shape(output: &str) -> Vec<&str> {
         "ts.construct_signature", "ts.index_signature", "ts.named_tuple_member",
         "ts.optional_type", "ts.rest_type",
         "ts.enum_member", "ts.enum",
+        "ts.module_reference", "ts.import_equals", "ts.export_assignment",
+        "ts.namespace_export",
     ];
     output.lines().filter_map(|line| {
         let op = line.trim().split_once(" = ").map_or_else(
