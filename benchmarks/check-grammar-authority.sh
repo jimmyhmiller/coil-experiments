@@ -108,4 +108,34 @@ grep -q 'cf.cond_br' "$work/renamed-loop.ir" \
   || fail "renamed do/while produced no conditional branch"
 cp "$work/spec.orig" "$spec"
 
-printf 'grammar shapes are authoritative: 4 perturbations followed the grammar\n'
+# 5. try/catch spelling and the catch binding's delimiters come from the try and
+#    catch-clause productions, including the optional-binding form.
+python3 - "$spec" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = """     (try-production
+       [(keyword "try") (rule block)])"""
+new = """     (try-production
+       [(keyword "attempt") (rule block)])"""
+assert old in s, "try-production not found in expected form"
+s = s.replace(old, new, 1)
+old = """       [(keyword "catch") (terminal lparen) (rule binding) (terminal rparen)"""
+new = """       [(keyword "rescue") (terminal lbracket) (rule binding) (terminal rbracket)"""
+assert old in s, "catch-clause-production not found in expected form"
+open(p, "w").write(s.replace(old, new, 1))
+PY
+build || fail "renamed try/catch clauses failed to build"
+printf 'attempt {\n  work();\n} rescue [failure] {\n  handle(failure);\n}\nattempt {\n  work();\n} finally {\n  done();\n}\n' \
+  >"$work/renamed-try.js"
+"$work/check" "$work/renamed-try.js" --dump-ir >"$work/renamed-try.ir" 2>&1 \
+  || fail "renamed try/catch did not parse"
+grep -q 'js.try' "$work/renamed-try.ir" \
+  || fail "renamed try/catch produced no try operation"
+printf 'try {\n  work();\n} catch (e) {\n  handle(e);\n}\n' >"$work/original-try.js"
+if "$work/check" "$work/original-try.js" >/dev/null 2>&1; then
+  fail "the original try/catch spelling still parsed after the grammar was renamed"
+fi
+cp "$work/spec.orig" "$spec"
+
+printf 'grammar shapes are authoritative: 5 perturbations followed the grammar\n'
