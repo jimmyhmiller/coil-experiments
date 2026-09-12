@@ -45,6 +45,31 @@
           (generator-fail backend (p/code-str "parser backend is missing role: " name))
         (load found)))))
 
+(defn validate-generated-if-arities [(value Code)] (-> i64)
+  (if (or (p/code-list? value) (p/code-vector? value))
+      (do
+        (if (and (p/code-list? value) (> (p/code-count value) 0)
+                 (generator-symbol? (p/code-nth value 0) "if")
+                 (!= (p/code-count value) 4))
+            (do
+              (p/report value
+                (p/code-str "generated if arity=" (p/code-count value)))
+              (let [(mut child) 0]
+                (loop
+                  (if (>= (load child) (p/code-count value)) (break)
+                    (do
+                      (p/report (p/code-nth value (load child))
+                        (p/code-str "generated if child=" (load child)))
+                      (set! child (+ (load child) 1))))))
+              0) 0)
+        (let [(mut i) 0]
+          (loop
+            (if (>= (load i) (p/code-count value)) (break)
+              (do (validate-generated-if-arities (p/code-nth value (load i)))
+                  (set! i (+ (load i) 1))))))
+        0)
+    0))
+
 ;; Backend ABI is a vector of `(role value)` bindings. Compilers use named
 ;; roles so adding a production cannot silently shift every following slot.
 ;;
@@ -609,8 +634,8 @@
           expected-error (backend-value backend "expected-error")
           prefix (field-value production "prefix")
           prefix-kind (field-value production "prefix-kind")
-          word-event (field-value production "word-event")
           line-break-stop (field-value production "line-break-stop")
+          word-event (field-value production "word-event")
           continuation-keywords (field-value production "continuation-keywords")
           continuation-bytes (field-value production "continuation-bytes")
           opcode (field-value production "emit-op")
@@ -697,6 +722,385 @@
                                       (cast u32 0))]
                      (~check-build-code ~state operation)))))))
          0))))
+
+;; Generate the recursive, value-producing core of the TypeScript type parser.
+;; Type grammar is deliberately emitted from the frontend specification: the
+;; parser backend supplies cursor/building primitives but contains no type
+;; spellings or precedence decisions.
+(defn compile-structured-type-parser [(backend Code) (production Code)] (-> Code)
+  (if (not (and (p/code-list? production)
+                (generator-form? production "structured-type-parser")))
+      (generator-fail production "invalid structured-type-parser production")
+    (let [state-type (backend-value backend "state-type")
+          result-type (backend-value backend "expression-result-type")
+          primary-name (backend-value backend
+                         (p/code-sym (field-value production "primary-function")))
+          postfix-name (backend-value backend
+                         (p/code-sym (field-value production "postfix-function")))
+          intersection-name (backend-value backend
+                              (p/code-sym (field-value production "intersection-function")))
+          union-name (backend-value backend
+                       (p/code-sym (field-value production "union-function")))
+          current-position-code (backend-value backend "current-position")
+          current-byte-code (backend-value backend "current-byte")
+          adjacent-byte-code (backend-value backend "adjacent-event-byte")
+          next-event-byte-code (backend-value backend "next-event-byte")
+          current-event-code (backend-value backend "current-event")
+          event-kind-code (backend-value backend "event-kind")
+          word-end-code (backend-value backend "word-end")
+          current-keyword-code (backend-value backend "current-keyword")
+          advance-code (backend-value backend "advance")
+          consume-code (backend-value backend "consume-byte")
+          fail-code (backend-value backend "fail")
+          check-build-code (backend-value backend "check-build")
+          emit-value-code (backend-value backend "emit-value-op")
+          push-value-code (backend-value backend "push-scratch-value")
+          emit-list-code (backend-value backend "emit-scratch-list-op")
+          quoted-parser (backend-value backend
+                          (p/code-sym (field-value production "quoted-parser")))
+          expected-error (backend-value backend "expected-error")
+          ok-error (backend-value backend "ok-error")
+          word-event (field-value production "word-event")
+          quote-a (field-value production "quote-a") quote-b (field-value production "quote-b")
+          keywords (field-value production "keyword-types")
+          lparen (field-value production "lparen") rparen (field-value production "rparen")
+          lbracket (field-value production "lbracket")
+          rbracket (field-value production "rbracket")
+          lbrace (field-value production "lbrace") rbrace (field-value production "rbrace")
+          colon (field-value production "colon") question (field-value production "question")
+          semicolon (field-value production "semicolon")
+          equals (field-value production "equals")
+          less (field-value production "less") greater (field-value production "greater")
+          comma (field-value production "comma") dot (field-value production "dot")
+          pipe (field-value production "pipe") ampersand (field-value production "ampersand")
+          reference-op (field-value production "reference-op")
+          keyword-op (field-value production "keyword-op")
+          literal-op (field-value production "literal-op")
+          union-op (field-value production "union-op")
+          intersection-op (field-value production "intersection-op")
+          array-op (field-value production "array-op")
+          tuple-op (field-value production "tuple-op")
+          parenthesized-op (field-value production "parenthesized-op")
+          arguments-op (field-value production "arguments-op")
+          qualified-op (field-value production "qualified-op")
+          indexed-op (field-value production "indexed-op")
+          function-op (field-value production "function-op")
+          parameter-op (field-value production "parameter-op")
+          type-literal-op (field-value production "type-literal-op")
+          property-signature-op (field-value production "property-signature-op")
+          state (p/fresh-identifier "state")]
+      `(do
+         (defn ~primary-name [(~state (ptr ~state-type))] (-> ~result-type)
+           (let [start (~current-position-code ~state) byte (~current-byte-code ~state)]
+             (if (= (~event-kind-code (~current-event-code ~state))
+                    (cast u8 ~word-event))
+                 (let [end (~word-end-code ~state start)
+                       keyword (or
+                         ~@(let [checks (p/code-list-new) (mut i) 0]
+                             (loop
+                               (if (>= (load i) (p/code-count keywords)) (break)
+                                 (do
+                                   (p/code-list-push! checks
+                                     `(~current-keyword-code ~state
+                                       ~(p/code-nth keywords (load i))))
+                                   (set! i (+ (load i) 1)))))
+                             (p/code-list-done checks)))]
+                   (~advance-code ~state)
+                   (~emit-value-code ~state (if keyword ~keyword-op
+                                              (if (and (>= byte (cast u8 48))
+                                                       (<= byte (cast u8 57)))
+                                                  ~literal-op ~reference-op))
+                                     start end))
+               (if (or (= byte ~quote-a) (= byte ~quote-b))
+                   (let [span (~quoted-parser ~state)
+                         literal-start (cast u32 span)
+                         literal-end (cast u32 (p/ishr span (cast u64 32)))]
+                     (~emit-value-code ~state ~literal-op literal-start literal-end))
+                 (if (= byte ~lparen)
+                   (do
+                     (~advance-code ~state)
+                     (if (and (= (~event-kind-code (~current-event-code ~state))
+                                  (cast u8 ~word-event))
+                              (or (= (~next-event-byte-code ~state 1) ~colon)
+                                  (and (= (~next-event-byte-code ~state 1) ~question)
+                                       (= (~next-event-byte-code ~state 2) ~colon))))
+                         (let [mark (.value-count (.scratch ~state))]
+                           (loop
+                             (let [parameter-start (~current-position-code ~state)
+                                   parameter-end (~word-end-code ~state parameter-start)
+                                   _name (~advance-code ~state)
+                                   optional (= (~current-byte-code ~state) ~question)
+                                   _optional (if optional (~advance-code ~state) 0)]
+                               (if (not (~consume-code ~state ~colon))
+                                   (do (~fail-code ~state ~expected-error) 0)
+                                 (let [parameter-type (~union-name ~state)
+                                       arena (.arena (.builder ~state)) value (.value-count arena)
+                                       operation (builder/add-op! (.builder ~state) (.block ~state)
+                                                   ~parameter-op parameter-start parameter-end
+                                                   parameter-start (.end parameter-type)
+                                                   (cast u32 1))]
+                                   (let [op (~check-build-code ~state operation)
+                                         operand (builder/add-operand! (.builder ~state) op
+                                                   (.value parameter-type))
+                                         immediate (builder/set-op-immediate! (.builder ~state) op
+                                                     (if optional (cast u64 1) (cast u64 0)))]
+                                     (~check-build-code ~state operand)
+                                     (~check-build-code ~state immediate)
+                                     (~push-value-code ~state value))))
+                               (if (= (~current-byte-code ~state) ~comma)
+                                   (do (~advance-code ~state) 0) (break))))
+                           (if (not (~consume-code ~state ~rparen))
+                               (do (~fail-code ~state ~expected-error)
+                                   (~result-type :value (cast u32 ir/INVALID-ID)
+                                     :start start :end start))
+                             (if (and (~consume-code ~state ~equals)
+                                      (~consume-code ~state ~greater))
+                                 (let [return-type (~union-name ~state)]
+                                   (~push-value-code ~state (.value return-type))
+                                   (~emit-list-code ~state ~function-op start
+                                     (.end return-type) mark))
+                               (do (~fail-code ~state ~expected-error)
+                                   (~result-type :value (cast u32 ir/INVALID-ID)
+                                     :start start :end start)))))
+                       (let [inner (~union-name ~state)]
+                         (if (not (~consume-code ~state ~rparen))
+                             (~fail-code ~state ~expected-error)
+                           (let [arena (.arena (.builder ~state))
+                                 value (.value-count arena)
+                                 operation (builder/add-op! (.builder ~state) (.block ~state)
+                                             ~parenthesized-op (cast u32 0) (cast u32 0)
+                                             start (~current-position-code ~state) (cast u32 1))]
+                             (let [op (~check-build-code ~state operation)
+                                   operand (builder/add-operand! (.builder ~state) op
+                                             (.value inner))]
+                               (~check-build-code ~state operand)
+                               (~result-type :value value :start start
+                                 :end (~current-position-code ~state))))))))
+                 (if (= byte ~lbrace)
+                     (let [mark (.value-count (.scratch ~state)) _open (~advance-code ~state)]
+                       (loop
+                         (if (or (= (~current-byte-code ~state) ~rbrace)
+                                 (!= (.error ~state) ~ok-error)) (break)
+                           (let [member-start (~current-position-code ~state)
+                                 member-end (~word-end-code ~state member-start)]
+                             (if (= member-start member-end)
+                                 (do (~fail-code ~state ~expected-error) 0)
+                               (do
+                                 (~advance-code ~state)
+                                 (let [optional (= (~current-byte-code ~state) ~question)
+                                       _optional (if optional (~advance-code ~state) 0)]
+                                   (if (not (~consume-code ~state ~colon))
+                                       (do (~fail-code ~state ~expected-error) 0)
+                                     (let [member-type (~union-name ~state)
+                                           arena (.arena (.builder ~state)) value (.value-count arena)
+                                           operation (builder/add-op! (.builder ~state) (.block ~state)
+                                                       ~property-signature-op member-start member-end
+                                                       member-start (.end member-type) (cast u32 1))]
+                                       (let [op (~check-build-code ~state operation)
+                                             operand (builder/add-operand! (.builder ~state) op
+                                                       (.value member-type))
+                                             immediate (builder/set-op-immediate! (.builder ~state) op
+                                                         (if optional (cast u64 1) (cast u64 0)))]
+                                         (~check-build-code ~state operand)
+                                         (~check-build-code ~state immediate)
+                                         (~push-value-code ~state value)))))))
+                             (if (or (= (~current-byte-code ~state) ~semicolon)
+                                     (= (~current-byte-code ~state) ~comma))
+                                 (~advance-code ~state) 0))))
+                       (if (not (~consume-code ~state ~rbrace))
+                           (~fail-code ~state ~expected-error)
+                         (~emit-list-code ~state ~type-literal-op start
+                           (~current-position-code ~state) mark)))
+                   (if (= byte ~lbracket)
+                     (do
+                       (let [mark (.value-count (.scratch ~state))]
+                         (~advance-code ~state)
+                         (loop
+                           (if (or (= (~current-byte-code ~state) ~rbracket)
+                                   (!= (.error ~state) ~ok-error)) (break)
+                             (let [element (~union-name ~state)]
+                               (~push-value-code ~state (.value element))
+                               (if (= (~current-byte-code ~state) ~comma)
+                                   (~advance-code ~state) (break)))))
+                         (if (not (~consume-code ~state ~rbracket))
+                             (~fail-code ~state ~expected-error)
+                           (~emit-list-code ~state ~tuple-op start
+                             (~current-position-code ~state) mark))))
+                   (~fail-code ~state ~expected-error))))))))
+
+         (defn ~postfix-name [(~state (ptr ~state-type))] (-> ~result-type)
+           (let [(mut completed) (~primary-name ~state)]
+             (loop
+               (let [byte (~current-byte-code ~state) current (load completed)]
+                 (if (= byte ~lbracket)
+                     (let [start (.start current)]
+                       (~advance-code ~state)
+                       (if (= (~current-byte-code ~state) ~rbracket)
+                           (do
+                             (~advance-code ~state)
+                             (let [arena (.arena (.builder ~state)) value (.value-count arena)
+                                   operation (builder/add-op! (.builder ~state) (.block ~state)
+                                               ~array-op (cast u32 0) (cast u32 0) start
+                                               (~current-position-code ~state) (cast u32 1))]
+                               (let [op (~check-build-code ~state operation)
+                                     operand (builder/add-operand! (.builder ~state) op
+                                               (.value current))]
+                                 (~check-build-code ~state operand)
+                                 (store! completed (~result-type :value value :start start
+                                   :end (~current-position-code ~state))))))
+                         (let [index (~union-name ~state)]
+                           (if (not (~consume-code ~state ~rbracket))
+                               (do (~fail-code ~state ~expected-error) 0)
+                             (let [arena (.arena (.builder ~state)) value (.value-count arena)
+                                   operation (builder/add-op! (.builder ~state) (.block ~state)
+                                               ~indexed-op (cast u32 0) (cast u32 0) start
+                                               (~current-position-code ~state) (cast u32 1))]
+                               (let [op (~check-build-code ~state operation)
+                                     base-operand (builder/add-operand! (.builder ~state) op
+                                                    (.value current))
+                                     index-operand (builder/add-operand! (.builder ~state) op
+                                                     (.value index))]
+                                 (~check-build-code ~state base-operand)
+                                 (~check-build-code ~state index-operand)
+                                 (store! completed (~result-type :value value :start start
+                                   :end (~current-position-code ~state)))))))))
+                   (if (= byte ~dot)
+                       (let [start (.start current) _dot (~advance-code ~state)
+                             name-start (~current-position-code ~state)
+                             name-end (~word-end-code ~state name-start)]
+                         (if (= name-start name-end)
+                             (do (~fail-code ~state ~expected-error) 0)
+                           (do
+                             (~advance-code ~state)
+                             (let [arena (.arena (.builder ~state)) value (.value-count arena)
+                                   operation (builder/add-op! (.builder ~state) (.block ~state)
+                                               ~qualified-op name-start name-end start name-end
+                                               (cast u32 1))]
+                               (let [op (~check-build-code ~state operation)
+                                     operand (builder/add-operand! (.builder ~state) op
+                                               (.value current))]
+                                 (~check-build-code ~state operand)
+                                 (store! completed (~result-type :value value :start start
+                                                      :end name-end)))))))
+                     (if (= byte ~less)
+                         (let [start (.start current)
+                               mark (.value-count (.scratch ~state)) _open (~advance-code ~state)]
+                           (loop
+                             (if (or (= (~current-byte-code ~state) ~greater)
+                                     (!= (.error ~state) ~ok-error)) (break)
+                               (let [argument (~union-name ~state)]
+                                 (~push-value-code ~state (.value argument))
+                                 (if (= (~current-byte-code ~state) ~comma)
+                                     (~advance-code ~state) (break)))))
+                           (if (not (~consume-code ~state ~greater))
+                               (do (~fail-code ~state ~expected-error) 0)
+                             (let [arguments (~emit-list-code ~state ~arguments-op start
+                                               (~current-position-code ~state) mark)
+                                   arena (.arena (.builder ~state)) value (.value-count arena)
+                                   operation (builder/add-op! (.builder ~state) (.block ~state)
+                                               ~reference-op (cast u32 0) (cast u32 0) start
+                                               (~current-position-code ~state) (cast u32 1))]
+                               (let [op (~check-build-code ~state operation)
+                                     base-operand (builder/add-operand! (.builder ~state) op
+                                                    (.value current))
+                                     args-operand (builder/add-operand! (.builder ~state) op
+                                                    (.value arguments))]
+                                 (~check-build-code ~state base-operand)
+                                 (~check-build-code ~state args-operand)
+                                 (store! completed (~result-type :value value :start start
+                                   :end (~current-position-code ~state)))))))
+                       (break))))))
+             (load completed)))
+
+         (defn ~intersection-name [(~state (ptr ~state-type))] (-> ~result-type)
+           (let [(mut completed) (~postfix-name ~state)]
+             (if (= (~current-byte-code ~state) ~ampersand)
+                 (let [initial (load completed) mark (.value-count (.scratch ~state))]
+                   (~push-value-code ~state (.value initial))
+                   (loop
+                     (if (!= (~current-byte-code ~state) ~ampersand) (break)
+                       (do (~advance-code ~state)
+                           (let [right (~postfix-name ~state)]
+                             (~push-value-code ~state (.value right))))))
+                   (store! completed (~emit-list-code ~state ~intersection-op
+                                      (.start initial)
+                                      (~current-position-code ~state) mark))) 0)
+             (load completed)))
+
+         (defn ~union-name [(~state (ptr ~state-type))] (-> ~result-type)
+           (let [(mut completed) (~intersection-name ~state)]
+             (if (= (~current-byte-code ~state) ~pipe)
+                 (let [initial (load completed) mark (.value-count (.scratch ~state))]
+                   (~push-value-code ~state (.value initial))
+                   (loop
+                     (if (!= (~current-byte-code ~state) ~pipe) (break)
+                       (do (~advance-code ~state)
+                           (let [right (~intersection-name ~state)]
+                             (~push-value-code ~state (.value right))))))
+                   (store! completed (~emit-list-code ~state ~union-op
+                                      (.start initial)
+                                      (~current-position-code ~state) mark))) 0)
+             (load completed)))))))
+
+(defn compile-structured-type-span [(backend Code) (production Code)] (-> Code)
+  (if (not (and (p/code-list? production)
+                (generator-form? production "structured-type-span")))
+      (generator-fail production "invalid structured-type-span production")
+    (let [state-type (backend-value backend "state-type")
+          function-name (backend-value backend
+                          (p/code-sym (field-value production "function")))
+          type-parser (backend-value backend
+                        (p/code-sym (field-value production "type-parser")))
+          current-position-code (backend-value backend "current-position")
+          current-byte-code (backend-value backend "current-byte")
+          current-line-break-code (backend-value backend "current-line-break")
+          current-keyword-code (backend-value backend "current-keyword")
+          advance-code (backend-value backend "advance")
+          fail-code (backend-value backend "fail")
+          check-build-code (backend-value backend "check-build")
+          expected-error (backend-value backend "expected-error")
+          ok-error (backend-value backend "ok-error")
+          prefix (field-value production "prefix")
+          prefix-kind (field-value production "prefix-kind")
+          line-break-stop (field-value production "line-break-stop")
+          terminators (field-value production "terminators")
+          opcode (field-value production "emit-op")
+          state (p/fresh-identifier "state") stop-a (p/fresh-identifier "stop-a")
+          stop-b (p/fresh-identifier "stop-b")]
+      `(defn ~function-name
+         [(~state (ptr ~state-type)) (~stop-a u8) (~stop-b u8)] (-> i64)
+         (let [annotation-start (~current-position-code ~state)]
+           (if ~(if (generator-symbol? prefix-kind "keyword")
+                    `(not (~current-keyword-code ~state ~prefix))
+                  `(!= (~current-byte-code ~state) ~prefix))
+               (do (~fail-code ~state ~expected-error) 0)
+             (do
+               (~advance-code ~state)
+               (let [root (~type-parser ~state) end (~current-position-code ~state)
+                     stopped (or (>= (.event-index ~state) (.event-count ~state))
+                                 (= (~current-byte-code ~state) ~stop-a)
+                                 (= (~current-byte-code ~state) ~stop-b)
+                                 (or
+                                   ~@(let [checks (p/code-list-new) (mut i) 0]
+                                       (loop
+                                         (if (>= (load i) (p/code-count terminators)) (break)
+                                           (do
+                                             (p/code-list-push! checks
+                                               `(= (~current-byte-code ~state)
+                                                   ~(p/code-nth terminators (load i))))
+                                             (set! i (+ (load i) 1)))))
+                                       (p/code-list-done checks)))
+                                 ~(if (generator-symbol? line-break-stop "true")
+                                      `(~current-line-break-code ~state) `false))]
+                 (if (or (!= (.error ~state) ~ok-error) (not stopped))
+                     (do (~fail-code ~state ~expected-error) 0)
+                   (let [operation (builder/add-op! (.builder ~state) (.block ~state)
+                                      ~opcode (.start root) (.end root)
+                                      annotation-start end (cast u32 0))]
+                     (let [op (~check-build-code ~state operation)
+                           operand (builder/add-operand! (.builder ~state) op (.value root))]
+                       (~check-build-code ~state operand)))))))
+         0)))))
 
 (defn compile-erased-type-parameters [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 7)
@@ -5178,25 +5582,64 @@
         (close (syntax/terminal-byte syntax/rbrace))
         (backslash (syntax/terminal-byte syntax/backslash))
         (emit-op ir/OP-JS-TEMPLATE))
-      (erased-type-span type-annotation
+      (structured-type-parser typescript-type-expression
+        (primary-function parse-type-primary)
+        (postfix-function parse-type-postfix)
+        (intersection-function parse-type-intersection)
+        (union-function parse-type-union)
+        (word-event tape/EVENT-WORD)
+        (quoted-parser parse-property-name-string)
+        (quote-a (syntax/terminal-byte syntax/single-quote))
+        (quote-b (syntax/terminal-byte syntax/double-quote))
+        (keyword-types ["any" "bigint" "boolean" "intrinsic" "never" "null"
+                        "number" "object" "string" "symbol" "this" "undefined"
+                        "unknown" "void"])
+        (lparen (syntax/terminal-byte syntax/lparen))
+        (rparen (syntax/terminal-byte syntax/rparen))
+        (lbracket (syntax/terminal-byte syntax/lbracket))
+        (rbracket (syntax/terminal-byte syntax/rbracket))
+        (lbrace (syntax/terminal-byte syntax/lbrace))
+        (rbrace (syntax/terminal-byte syntax/rbrace))
+        (colon (syntax/terminal-byte syntax/colon))
+        (question (syntax/terminal-byte syntax/question))
+        (semicolon (syntax/terminal-byte syntax/semicolon))
+        (equals (syntax/terminal-byte syntax/equals))
+        (less (syntax/terminal-byte syntax/less-than))
+        (greater (syntax/terminal-byte syntax/greater-than))
+        (comma (syntax/terminal-byte syntax/comma))
+        (dot (syntax/terminal-byte syntax/dot))
+        (pipe (syntax/terminal-byte syntax/pipe))
+        (ampersand (syntax/terminal-byte syntax/ampersand))
+        (reference-op ir/OP-TS-TYPE-REFERENCE)
+        (keyword-op ir/OP-TS-KEYWORD-TYPE)
+        (literal-op ir/OP-TS-LITERAL-TYPE)
+        (union-op ir/OP-TS-UNION-TYPE)
+        (intersection-op ir/OP-TS-INTERSECTION-TYPE)
+        (array-op ir/OP-TS-ARRAY-TYPE)
+        (tuple-op ir/OP-TS-TUPLE-TYPE)
+        (parenthesized-op ir/OP-TS-PARENTHESIZED-TYPE)
+        (arguments-op ir/OP-TS-TYPE-ARGUMENTS)
+        (qualified-op ir/OP-TS-QUALIFIED-TYPE)
+        (indexed-op ir/OP-TS-INDEXED-ACCESS-TYPE)
+        (function-op ir/OP-TS-FUNCTION-TYPE)
+        (parameter-op ir/OP-TS-TYPE-PARAMETER)
+        (type-literal-op ir/OP-TS-TYPE-LITERAL)
+        (property-signature-op ir/OP-TS-PROPERTY-SIGNATURE))
+      (structured-type-span type-annotation
         (function parse-type-annotation)
+        (type-parser parse-type-union)
         (prefix (syntax/property-production-terminal 1))
         (prefix-kind byte)
-        (word-event tape/EVENT-WORD)
         (line-break-stop false)
-        (continuation-keywords [])
-        (continuation-bytes [])
+        (terminators [(syntax/terminal-byte syntax/semicolon)])
         (emit-op ir/OP-TS-TYPE))
-      (erased-type-span type-alias-body
+      (structured-type-span type-alias-body
         (function parse-type-alias-body)
+        (type-parser parse-type-union)
         (prefix (syntax/assignment-production-terminal 1))
         (prefix-kind byte)
-        (word-event tape/EVENT-WORD)
         (line-break-stop true)
-        (continuation-keywords ["extends"])
-        (continuation-bytes [(syntax/terminal-byte syntax/ampersand)
-                             (syntax/terminal-byte syntax/pipe)
-                             (syntax/terminal-byte syntax/dot)])
+        (terminators [(syntax/terminal-byte syntax/semicolon)])
         (emit-op ir/OP-TS-TYPE))
       (erased-type-span implements-clause
         (function parse-implements-clause)
@@ -5880,6 +6323,15 @@
             (generator-form? production "template-value")
               (do (p/code-list-push! definitions
                     (compile-template-value backend production)) 0)
+            (generator-form? production "structured-type-parser")
+              (do
+                (let [generated (compile-structured-type-parser backend production)]
+                  (validate-generated-if-arities generated)
+                  (p/code-list-push! definitions generated))
+                0)
+            (generator-form? production "structured-type-span")
+              (do (p/code-list-push! definitions
+                    (compile-structured-type-span backend production)) 0)
             (generator-form? production "erased-type-span")
               (do (p/code-list-push! definitions
                     (compile-erased-type-span backend production)) 0)
