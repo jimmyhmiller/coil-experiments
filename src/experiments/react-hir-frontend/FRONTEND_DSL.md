@@ -43,6 +43,9 @@ Coil function bodies. Generator algorithms currently include:
 - `terminated-expression`, `binding-declaration`, `statement-dispatch`, and
   `scoped-repeat` for statements and lexical blocks;
 - `conditional-statement` and `loop-statement` for explicit CFG construction;
+- `labeled-statement` and `control-transfer` for source-named labels, lazy
+  labeled-break exits, loop-specific continue targets, duplicate detection,
+  restricted-production line breaks, and function-boundary isolation;
 - `try-statement` for structured try/catch/finally operations with owned
   regions, catch scopes, and explicit region-yield terminators;
 - `arrow-lookahead` and `arrow-expression` for balanced TypeScript-aware
@@ -85,7 +88,8 @@ runtime interpreter or production tables.
 No handwritten `parse-*` definition remains in `direct_parser.coil`.
 `benchmarks/check-generated-direct-parser.sh` enforces both halves of that
 contract: the runtime source must contain none, while macro expansion must
-contain all 75 expected generated definitions, including prefix type
+contain all 77 expected generated definitions, including labeled statements,
+their control-transfer resolution, prefix type
 assertions, their JSX-disambiguating lookahead, and structured enums.
 The module-statement production also owns import-equals, export assignment,
 and namespace-export declarations.

@@ -131,13 +131,15 @@ const result = condition ? foo(a + b) : <Component value={x} />;
 
 The remaining explicit frontier is tracked by the feature inventory in
 `pad://react-hir-frontend`, independently of corpus acceptance. The largest
-unimplemented structural families are the remaining TypeScript declaration
-and module forms, Unicode
-identifiers, labels/`with`, tagged templates and special import/meta
-expressions, recovery, and the final React compiler HIR schema. Generated
+unimplemented structural families are Unicode and escaped identifiers,
+script-mode `with`, remaining JSX/TSX ambiguity and lexical edges, contextual
+early errors, recovery, and the final React compiler HIR schema. Generated
 paths now cover the principal CFG statements, structured try/catch/finally,
 async/generator function declarations, expression-bodied and async arrows,
 optional/computed access, spreads, regexps, numeric forms, and ASI.
+They also cover source-named labeled statements and labeled `break`/`continue`
+with CFG-resolved targets, structured TypeScript declarations and modules,
+resource declarations, tagged templates, dynamic imports, and meta properties.
 
 The SSA/CFG schema, direct builder, verifier, printer, and a working direct
 parser slice exist. The broader legacy `parser.coil` coverage has not yet been

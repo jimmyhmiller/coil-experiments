@@ -19,7 +19,7 @@ cd "$project_dir"
 
 for production in \
   word string property-name-string number spread regexp primary property object-shorthand object call member computed-member postfix expression declaration \
-  return throw break continue expression-statement block if try class decorated-class class-expression class-field while do-while for-kind classic-for iterator-for for switch function function-expression statement direct-program \
+  return throw break continue labeled-statement expression-statement block if try class decorated-class class-expression class-field while do-while for-kind classic-for iterator-for for switch function function-expression statement direct-program \
   type-annotation type-alias-body implements-clause type-parameters type-alias statement-end import \
   type-template type-import type-query type-prefix type-predicate type-conditional type-arguments \
   type-arguments-before-call arrow-lookahead binding-pattern type-binding-pattern class-parameter decorated-parameter arrow jsx named-export interface \
@@ -33,4 +33,4 @@ do
   fi
 done
 
-printf '%s\n' 'all 76 direct-parser productions are generated'
+printf '%s\n' 'all 77 direct-parser productions are generated'

@@ -26,6 +26,10 @@
    (lookup-valid (ptr u8)) (lookup-hashes (ptr u64))
    (lookup-bindings (ptr u32)) (lookup-counts (ptr u32))
    (lookup-starts (ptr u32)) (lookup-ends (ptr u32)) (lookup-capacity i64)
+   (label-starts (ptr u32)) (label-ends (ptr u32))
+   (label-break-targets (ptr u32)) (label-continue-targets (ptr u32))
+   (label-function-scopes (ptr u32)) (label-pending (ptr u8))
+   (label-count i64) (label-capacity i64)
    (block u32) (scope u32) (function-scope u32)
    (break-target u32) (continue-target u32)
    (error i64) (error-offset u32) (terminated bool) (ambient bool)
@@ -164,8 +168,14 @@
    (current-event current-event)
    (event-position event-position)
    (word-end word-end)
+   (previous-token-end previous-token-end)
    (span-equals span-equals?)
    (spans-equal spans-equal?)
+   (push-label push-label!)
+   (pop-label pop-label!)
+   (clear-pending-labels clear-pending-labels!)
+   (publish-loop-labels publish-loop-labels!)
+   (resolve-label-target resolve-label-target!)
    (source-byte source-byte)
    (emit-value-op emit-value-op!)
    (find-binding find-binding)
@@ -278,6 +288,7 @@
    (parse-throw parse-throw!)
    (parse-break parse-break!)
    (parse-continue parse-continue!)
+   (parse-labeled-statement parse-labeled-statement!)
    (parse-expression-statement parse-expression-statement!)])
 
 (defn ascii-word? [(byte u8)] (-> bool)
@@ -293,6 +304,14 @@
               (not (ascii-word? (load (p/index (.source state) (load at))))))
           (break) (set! at (+ (load at) 1))))
     (cast u32 (load at))))
+
+(defn previous-token-end [(state (ptr DirectParseState))] (-> u32)
+  (if (<= (.event-index state) 0) (cast u32 0)
+    (let [event (load (p/index (.events state) (- (.event-index state) 1)))
+          start (event-position event)]
+      (if (= (event-kind event) tape/EVENT-WORD)
+          (word-end state start)
+        (+ start (cast u32 1))))))
 
 (defn span-equals? [(state (ptr DirectParseState)) (start u32) (end u32)
                     (text (slice u8))] (-> bool)
@@ -329,6 +348,95 @@
                 (store! same false) 0)
             (set! offset (+ (load offset) (cast u32 1))))))
       (load same))))
+
+;; Labels are parser-semantic state rather than syntax nodes waiting in an AST.
+;; The fixed caller-local stack is sufficient for ordinary programs, and an
+;; explicit capacity error keeps pathological nesting memory-safe.
+(defn push-label! [(state (ptr DirectParseState)) (start u32) (end u32)] (-> bool)
+  (let [(mut index) (.label-count state) (mut duplicate) false]
+    (loop
+      (if (or (<= (load index) 0) (load duplicate)) (break)
+        (do
+          (set! index (- (load index) 1))
+          (if (and (= (load (p/index (.label-function-scopes state) (load index)))
+                      (.function-scope state))
+                   (spans-equal? state start end
+                     (load (p/index (.label-starts state) (load index)))
+                     (load (p/index (.label-ends state) (load index)))))
+              (store! duplicate true) 0))))
+    (if (or (load duplicate) (>= (.label-count state) (.label-capacity state)))
+        (do
+          (fail! state (if (load duplicate) DIRECT-PARSE-EXPECTED
+                         DIRECT-PARSE-SCRATCH-CAPACITY))
+          false)
+      (let [slot (.label-count state)]
+        (store! (p/index (.label-starts state) slot) start)
+        (store! (p/index (.label-ends state) slot) end)
+        (store! (p/index (.label-break-targets state) slot) (cast u32 ir/INVALID-ID))
+        (store! (p/index (.label-continue-targets state) slot) (cast u32 ir/INVALID-ID))
+        (store! (p/index (.label-function-scopes state) slot) (.function-scope state))
+        (store! (p/index (.label-pending state) slot) (cast u8 1))
+        (set! (.label-count state) (+ slot 1))
+        true))))
+
+(defn pop-label! [(state (ptr DirectParseState))] (-> i64)
+  (if (> (.label-count state) 0)
+      (set! (.label-count state) (- (.label-count state) 1)) 0)
+  0)
+
+(defn clear-pending-labels! [(state (ptr DirectParseState))] (-> i64)
+  (let [(mut index) (.label-count state) (mut scanning) true]
+    (loop
+      (if (or (<= (load index) 0) (not (load scanning))) (break)
+        (do
+          (set! index (- (load index) 1))
+          (if (and (= (load (p/index (.label-function-scopes state) (load index)))
+                      (.function-scope state))
+                   (!= (load (p/index (.label-pending state) (load index))) (cast u8 0)))
+              (store! (p/index (.label-pending state) (load index)) (cast u8 0))
+            (store! scanning false))))))
+  0)
+
+(defn publish-loop-labels! [(state (ptr DirectParseState)) (target u32)] (-> i64)
+  (let [(mut index) (.label-count state) (mut scanning) true]
+    (loop
+      (if (or (<= (load index) 0) (not (load scanning))) (break)
+        (do
+          (set! index (- (load index) 1))
+          (if (and (= (load (p/index (.label-function-scopes state) (load index)))
+                      (.function-scope state))
+                   (!= (load (p/index (.label-pending state) (load index))) (cast u8 0)))
+              (do
+                (store! (p/index (.label-continue-targets state) (load index)) target)
+                (store! (p/index (.label-pending state) (load index)) (cast u8 0)))
+            (store! scanning false))))))
+  0)
+
+(defn resolve-label-target! [(state (ptr DirectParseState)) (start u32) (end u32)
+                             (continue? bool)] (-> u32)
+  (let [(mut index) (.label-count state) (mut found) (cast u32 ir/INVALID-ID)]
+    (loop
+      (if (or (<= (load index) 0) (!= (load found) (cast u32 ir/INVALID-ID))) (break)
+        (do
+          (set! index (- (load index) 1))
+          (if (and (= (load (p/index (.label-function-scopes state) (load index)))
+                      (.function-scope state))
+                   (spans-equal? state start end
+                     (load (p/index (.label-starts state) (load index)))
+                     (load (p/index (.label-ends state) (load index)))))
+              (if continue?
+                  (store! found
+                    (load (p/index (.label-continue-targets state) (load index))))
+                (let [existing (load (p/index (.label-break-targets state) (load index)))]
+                  (if (!= existing (cast u32 ir/INVALID-ID)) (store! found existing)
+                    (let [arena (.arena (.builder state))
+                          region (load (p/index (.block-regions arena)
+                                         (cast i64 (.block state))))
+                          target (check-build! state
+                                   (builder/add-block! (.builder state) region))]
+                      (store! (p/index (.label-break-targets state) (load index)) target)
+                      (store! found target))))) 0))))
+    (load found)))
 
 (defn consume-byte! [(state (ptr DirectParseState)) (expected u8)] (-> bool)
   (if (and (< (.event-index state) (.event-count state))

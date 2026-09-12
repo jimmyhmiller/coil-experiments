@@ -4,7 +4,7 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     ExportAllDeclaration, ExportNamedDeclaration, ExportSpecifier, Function, FunctionType,
     ImportDeclaration, ImportDefaultSpecifier, ImportExpression, ImportNamespaceSpecifier, ImportSpecifier,
-    ImportAttribute, MetaProperty, TaggedTemplateExpression, VariableDeclaration, VariableDeclarationKind,
+    ImportAttribute, LabeledStatement, MetaProperty, TaggedTemplateExpression, VariableDeclaration, VariableDeclarationKind,
     WithClause,
     TSClassImplements, TSEnumDeclaration, TSEnumMember, TSGlobalDeclaration,
     TSExportAssignment, TSImportEqualsDeclaration, TSInterfaceBody, TSInterfaceHeritage,
@@ -73,6 +73,7 @@ const CASES: &[Case] = &[
     Case { name: "tagged-template-context", source: "const a=tag`a${x}b`;const b=ns.tag<A,B>`c${y}d`;" },
     Case { name: "dynamic-import-context", source: "const a=import('pkg');const b=import('data',{with:{type:'json'}});" },
     Case { name: "import-meta-context", source: "const meta=import.meta;const url=import.meta.url;function f(){return new.target;}" },
+    Case { name: "labeled-statement-context", source: "outer: inner: for(let i=0;i<3;i++){if(i===1)continue outer;if(i===2)break inner;} \n block: {if(done)break block;work();} \n" },
 ];
 
 struct Shape {
@@ -86,6 +87,8 @@ struct Shape {
     tagged_template_spans: Vec<(u32, u32)>,
     import_expression_spans: Vec<(u32, u32)>,
     meta_property_spans: Vec<(u32, u32)>,
+    labeled_statement_spans: Vec<(u32, u32)>,
+    labeled_statement_name_spans: Vec<(u32, u32)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -307,6 +310,8 @@ impl Shape {
         tagged_template_spans: Vec::new(),
         import_expression_spans: Vec::new(),
         meta_property_spans: Vec::new(),
+        labeled_statement_spans: Vec::new(),
+        labeled_statement_name_spans: Vec::new(),
     } }
 
     fn push(&mut self, kind: &'static str, span: Option<(u32, u32)>) {
@@ -316,6 +321,14 @@ impl Shape {
 }
 
 impl<'a> Visit<'a> for Shape {
+    fn visit_labeled_statement(&mut self, statement: &LabeledStatement<'a>) {
+        let span = statement.span();
+        let name = statement.label.span();
+        self.labeled_statement_spans.push((span.start, span.end));
+        self.labeled_statement_name_spans.push((name.start, name.end));
+        walk::walk_labeled_statement(self, statement);
+    }
+
     fn visit_meta_property(&mut self, expression: &MetaProperty<'a>) {
         walk::walk_meta_property(self, expression);
         let span = expression.span();
@@ -643,6 +656,16 @@ fn coil_opcode_spans(output: &str, opcode: u16) -> Vec<(u32, u32)> {
     }).collect()
 }
 
+fn coil_opcode_name_spans(output: &str, opcode: u16) -> Vec<(u32, u32)> {
+    output.lines().filter_map(|line| {
+        if !line.starts_with("meta ") || !line.split_whitespace()
+            .any(|field| field == format!("opcode={opcode}")) { return None; }
+        let location = line.split_whitespace().find_map(|field| field.strip_prefix("name="))?;
+        let (start, end) = location.split_once(':')?;
+        Some((start.parse().ok()?, end.parse().ok()?))
+    }).collect()
+}
+
 fn main() {
     let checker = PathBuf::from(env::args_os().nth(1)
         .expect("usage: typescript-type-oracle CHECKER"));
@@ -754,6 +777,17 @@ fn main() {
             if actual != expected.meta_property_spans {
                 eprintln!("META_PROPERTY_SPAN_MISMATCH {}\n  oxc:  {:?}\n  coil: {:?}",
                     case.name, expected.meta_property_spans, actual);
+                failures += 1;
+            }
+        }
+        if !expected.labeled_statement_spans.is_empty() {
+            let actual_spans = coil_opcode_spans(&dump, 146);
+            let actual_names = coil_opcode_name_spans(&dump, 146);
+            if actual_spans != expected.labeled_statement_spans
+                || actual_names != expected.labeled_statement_name_spans {
+                eprintln!("LABELED_STATEMENT_MISMATCH {}\n  oxc spans={:?} names={:?}\n  coil spans={:?} names={:?}",
+                    case.name, expected.labeled_statement_spans,
+                    expected.labeled_statement_name_spans, actual_spans, actual_names);
                 failures += 1;
             }
         }

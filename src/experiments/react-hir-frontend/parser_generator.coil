@@ -5646,7 +5646,7 @@
          0))))
 
 (defn compile-control-transfer [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 5)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 6)
                 (generator-form? production "control-transfer")))
       (generator-fail production "invalid control-transfer production")
     (let [state-type (backend-value backend "state-type")
@@ -5654,25 +5654,108 @@
                           (p/code-sym (field-value production "function")))
           current-position-code (backend-value backend "current-position")
           advance-code (backend-value backend "advance")
+          current-event-code (backend-value backend "current-event")
+          event-kind-code (backend-value backend "event-kind")
+          current-line-break-code (backend-value backend "current-line-break")
+          word-end-code (backend-value backend "word-end")
+          resolve-label-code (backend-value backend "resolve-label-target")
           terminator-parser (backend-value backend
                               (p/code-sym (field-value production "terminator-parser")))
           emit-branch-code (backend-value backend "emit-branch")
           fail-code (backend-value backend "fail")
           expected-error (backend-value backend "expected-error")
           target-kind (field-value production "target")
+          word-event (field-value production "word-event")
           state (p/fresh-identifier "state")
           target-expression (if (generator-symbol? target-kind "break")
                                 `(.break-target ~state) `(.continue-target ~state))]
       `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
          (let [start (~current-position-code ~state) _keyword (~advance-code ~state)
-               target ~target-expression]
-           (~terminator-parser ~state start)
+               labeled (and (not (~current-line-break-code ~state))
+                            (< (.event-index ~state) (.event-count ~state))
+                            (= (~event-kind-code (~current-event-code ~state))
+                               (cast u8 ~word-event)))
+               label-start (~current-position-code ~state)
+               label-end (if labeled (~word-end-code ~state label-start) label-start)
+               target (if labeled
+                          (~resolve-label-code ~state label-start label-end
+                            ~(if (generator-symbol? target-kind "continue") true false))
+                        ~target-expression)
+               _label (if labeled (~advance-code ~state) 0)]
+           (~terminator-parser ~state (if labeled label-end start))
            (if (= target (cast u32 ir/INVALID-ID))
                (do (~fail-code ~state ~expected-error) 0)
              (do
                (~emit-branch-code ~state (.block ~state) target)
                (set! (.terminated ~state) true)
                0)))))))
+
+(defn compile-labeled-statement [(backend Code) (production Code)] (-> Code)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 7)
+                (generator-form? production "labeled-statement")))
+      (generator-fail production "invalid labeled-statement production")
+    (let [state-type (backend-value backend "state-type")
+          function-name (backend-value backend
+                          (p/code-sym (field-value production "function")))
+          statement-parser (backend-value backend
+                             (p/code-sym (field-value production "statement-parser")))
+          current-position-code (backend-value backend "current-position")
+          word-end-code (backend-value backend "word-end")
+          previous-token-end-code (backend-value backend "previous-token-end")
+          span-equals-code (backend-value backend "span-equals")
+          advance-code (backend-value backend "advance")
+          consume-code (backend-value backend "consume-byte")
+          push-label-code (backend-value backend "push-label")
+          pop-label-code (backend-value backend "pop-label")
+          emit-branch-code (backend-value backend "emit-branch")
+          check-build-code (backend-value backend "check-build")
+          fail-code (backend-value backend "fail")
+          expected-error (backend-value backend "expected-error")
+          colon (field-value production "colon")
+          opcode (field-value production "emit-op")
+          invalid-keywords (field-value production "invalid-keywords")
+          state (p/fresh-identifier "state")
+          start-id (p/fresh-identifier "label-start")
+          name-end-id (p/fresh-identifier "label-name-end")]
+      `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
+         (let [~start-id (~current-position-code ~state)
+               ~name-end-id (~word-end-code ~state ~start-id)
+               invalid (or ~@(let [checks (p/code-list-new) (mut i) 0]
+                               (loop
+                                 (if (>= (load i) (p/code-count invalid-keywords)) (break)
+                                   (do
+                                     (p/code-list-push! checks
+                                       `(~span-equals-code ~state
+                                          ~start-id ~name-end-id
+                                          ~(p/code-nth invalid-keywords (load i))))
+                                     (set! i (+ (load i) 1)))))
+                               (p/code-list-done checks)))]
+           (if invalid (do (~fail-code ~state ~expected-error) 0)
+             (let [
+               slot (.label-count ~state)
+               operation-result (builder/add-op! (.builder ~state) (.block ~state) ~opcode
+                                  (cast u32 0) (cast u32 0) ~start-id ~name-end-id
+                                  (cast u32 0))
+               operation (~check-build-code ~state operation-result)]
+           (~check-build-code ~state
+             (builder/set-op-name-span! (.builder ~state) operation ~start-id ~name-end-id))
+           (~advance-code ~state)
+           (if (and (~consume-code ~state ~colon)
+                    (~push-label-code ~state ~start-id ~name-end-id))
+               (do
+                 (~statement-parser ~state)
+                 (let [end (~previous-token-end-code ~state)
+                       target (load (p/index (.label-break-targets ~state) slot))]
+                   (~check-build-code ~state
+                     (builder/set-op-span! (.builder ~state) operation ~start-id end))
+                   (~pop-label-code ~state)
+                   (if (!= target (cast u32 ir/INVALID-ID))
+                       (do
+                         (if (not (.terminated ~state))
+                             (~emit-branch-code ~state (.block ~state) target) 0)
+                         (set! (.block ~state) target)
+                         (set! (.terminated ~state) false)) 0))) 0))))
+         0))))
 
 (defn compile-switch-statement [(backend Code) (production Code)] (-> Code)
   (if (not (and (p/code-list? production) (= (p/code-count production) 12)
@@ -5834,13 +5917,15 @@
          0))))
 
 (defn compile-statement-dispatch [(backend Code) (production Code)] (-> Code)
-  (if (not (and (p/code-list? production) (= (p/code-count production) 66)
+  (if (not (and (p/code-list? production) (= (p/code-count production) 68)
                 (generator-form? production "statement-dispatch")))
       (generator-fail production "invalid statement-dispatch production")
     (let [state-type (backend-value backend "state-type")
           function-role (field-value production "function")
           function-name (backend-value backend (p/code-sym function-role))
           current-byte-code (backend-value backend "current-byte")
+          current-event-code (backend-value backend "current-event")
+          event-kind-code (backend-value backend "event-kind")
           next-event-byte-code (backend-value backend "next-event-byte")
           next-event-keyword-code (backend-value backend "next-event-keyword")
           next-event-kind-code (backend-value backend "next-event-kind")
@@ -5848,6 +5933,9 @@
           current-position-code (backend-value backend "current-position")
           advance-code (backend-value backend "advance")
           check-build-code (backend-value backend "check-build")
+          clear-pending-labels-code (backend-value backend "clear-pending-labels")
+          label-parser (backend-value backend
+                         (p/code-sym (field-value production "label-parser")))
           block-parser (backend-value backend (p/code-sym (field-value production "block-parser")))
           declaration-parser (backend-value backend (p/code-sym (field-value production "declaration-parser")))
           return-parser (backend-value backend (p/code-sym (field-value production "return-parser")))
@@ -5887,6 +5975,7 @@
           using-keyword (field-value production "using-keyword")
           await-keyword (field-value production "await-keyword")
           word-event (field-value production "word-event")
+          colon (field-value production "colon")
           return-keyword (field-value production "return-keyword")
           throw-keyword (field-value production "throw-keyword")
           break-keyword (field-value production "break-keyword")
@@ -5923,7 +6012,17 @@
           state (p/fresh-identifier "state")]
       `(defn ~function-name [(~state (ptr ~state-type))] (-> i64)
          (let [modifier-start (~current-position-code ~state)
-               (mut ambient-start) modifier-start (mut modifiers) 0]
+               (mut ambient-start) modifier-start (mut modifiers) 0
+               labeled (and (= (~next-event-byte-code ~state 1) ~colon)
+                            (< (.event-index ~state) (.event-count ~state))
+                            (= (~event-kind-code (~current-event-code ~state))
+                               (cast u8 ~word-event)))]
+           (if (and (> (.label-count ~state) 0)
+                    (not (or labeled
+                             (~current-keyword-code ~state ~while-keyword)
+                             (~current-keyword-code ~state ~do-keyword)
+                             (~current-keyword-code ~state ~for-keyword))))
+               (~clear-pending-labels-code ~state) 0)
            (set! (.ambient ~state) (.ambient-context ~state))
            (loop
              (if (or (and (~current-keyword-code ~state ~export-keyword)
@@ -5957,6 +6056,7 @@
                                   (cast u32 0))]
                  (~check-build-code ~state operation)) 0)
            (cond
+             labeled (~label-parser ~state)
              (= (~current-byte-code ~state) ~decorator-prefix) (~decorator-parser ~state)
              (= (~current-byte-code ~state) ~empty-terminal) (~advance-code ~state)
              (or (and (~current-keyword-code ~state ~import-keyword)
@@ -6634,7 +6734,13 @@
                lookup-bindings (p/alloc-stack (array u32 64))
                lookup-counts (p/alloc-stack (array u32 64))
                lookup-starts (p/alloc-stack (array u32 64))
-               lookup-ends (p/alloc-stack (array u32 64))]
+               lookup-ends (p/alloc-stack (array u32 64))
+               label-starts (p/alloc-stack (array u32 64))
+               label-ends (p/alloc-stack (array u32 64))
+               label-break-targets (p/alloc-stack (array u32 64))
+               label-continue-targets (p/alloc-stack (array u32 64))
+               label-function-scopes (p/alloc-stack (array u32 64))
+               label-pending (p/alloc-stack (array u8 64))]
            (let [(mut cache-index) 0]
              (loop
                (if (>= (load cache-index) 64) (break)
@@ -6651,6 +6757,13 @@
                           :lookup-starts (p/cast (ptr u32) lookup-starts)
                           :lookup-ends (p/cast (ptr u32) lookup-ends)
                           :lookup-capacity 64
+                          :label-starts (p/cast (ptr u32) label-starts)
+                          :label-ends (p/cast (ptr u32) label-ends)
+                          :label-break-targets (p/cast (ptr u32) label-break-targets)
+                          :label-continue-targets (p/cast (ptr u32) label-continue-targets)
+                          :label-function-scopes (p/cast (ptr u32) label-function-scopes)
+                          :label-pending (p/cast (ptr u8) label-pending)
+                          :label-count 0 :label-capacity 64
                           :block root-block :scope root-scope :function-scope root-scope
                           :break-target (cast u32 ir/INVALID-ID)
                           :continue-target (cast u32 ir/INVALID-ID)
@@ -7471,6 +7584,7 @@
           parse-statement-code (backend-value backend "parse-statement")
           emit-branch-code (backend-value backend "emit-branch")
           check-build-code (backend-value backend "check-build")
+          publish-loop-labels-code (backend-value backend "publish-loop-labels")
           open (field-value production "open") close (field-value production "close")
           branch-op (field-value production "branch-op")
           state (p/fresh-identifier "state")]
@@ -7506,6 +7620,7 @@
                            parent-continue-target (.continue-target ~state)]
                        (set! (.break-target ~state) exit-block)
                        (set! (.continue-target ~state) header)
+                       (~publish-loop-labels-code ~state header)
                        (set! (.block ~state) body)
                        (set! (.terminated ~state) false)
                        (~parse-statement-code ~state)
@@ -7534,6 +7649,7 @@
                               (p/code-sym (field-value production "terminator-parser")))
           emit-branch-code (backend-value backend "emit-branch")
           check-build-code (backend-value backend "check-build")
+          publish-loop-labels-code (backend-value backend "publish-loop-labels")
           fail-code (backend-value backend "fail")
           expected-error (backend-value backend "expected-error")
           while-keyword (field-value production "while-keyword")
@@ -7555,6 +7671,7 @@
            (~emit-branch-code ~state origin body)
            (set! (.break-target ~state) exit-block)
            (set! (.continue-target ~state) condition-block)
+           (~publish-loop-labels-code ~state condition-block)
            (set! (.block ~state) body)
            (set! (.terminated ~state) false)
            (~parse-statement-code ~state)
@@ -7705,6 +7822,7 @@
                            (p/code-sym (field-value production "pattern-parser")))
           emit-branch-code (backend-value backend "emit-branch")
           check-build-code (backend-value backend "check-build")
+          publish-loop-labels-code (backend-value backend "publish-loop-labels")
           fail-code (backend-value backend "fail")
           expected-error (backend-value backend "expected-error")
           open (field-value production "open") close (field-value production "close")
@@ -7883,6 +8001,7 @@
                                  parent-continue-target (.continue-target ~state)]
                              (set! (.break-target ~state) exit-block)
                              (set! (.continue-target ~state) header)
+                             (~publish-loop-labels-code ~state header)
                              (set! (.terminated ~state) false)
                              (~parse-statement-code ~state)
                              (if (not (.terminated ~state))
@@ -7917,6 +8036,7 @@
                                (p/code-sym (field-value production "declaration-parser")))
           emit-branch-code (backend-value backend "emit-branch")
           check-build-code (backend-value backend "check-build")
+          publish-loop-labels-code (backend-value backend "publish-loop-labels")
           fail-code (backend-value backend "fail")
           expected-error (backend-value backend "expected-error")
           open (field-value production "open") close (field-value production "close")
@@ -7993,6 +8113,7 @@
                                parent-continue-target (.continue-target ~state)]
                            (set! (.break-target ~state) exit-block)
                            (set! (.continue-target ~state) update-block)
+                           (~publish-loop-labels-code ~state update-block)
                            (set! (.block ~state) body)
                            (set! (.terminated ~state) false)
                            (~parse-statement-code ~state)
@@ -9222,11 +9343,26 @@
       (control-transfer break-statement
         (function parse-break)
         (target break)
+        (word-event tape/EVENT-WORD)
         (terminator-parser parse-statement-end))
       (control-transfer continue-statement
         (function parse-continue)
         (target continue)
+        (word-event tape/EVENT-WORD)
         (terminator-parser parse-statement-end))
+      (labeled-statement labeled-statement
+        (function parse-labeled-statement)
+        (statement-parser parse-statement)
+        (colon (syntax/case-production-terminal 2))
+        (emit-op ir/OP-JS-LABELED-STATEMENT)
+        (invalid-keywords
+          ["await" "break" "case" "catch" "class" "const" "continue"
+           "debugger" "default" "delete" "do" "else" "enum" "export"
+           "extends" "false" "finally" "for" "function" "if" "implements"
+           "import" "in" "instanceof" "interface" "let" "new" "null"
+           "package" "private" "protected" "public" "return" "static"
+           "super" "switch" "this" "throw" "true" "try" "typeof" "var"
+           "void" "while" "with" "yield"]))
       (switch-statement switch-statement
         (function parse-switch)
         (open (syntax/switch-production-terminal 1))
@@ -9250,6 +9386,8 @@
         (using-keyword "using")
         (await-keyword "await")
         (word-event tape/EVENT-WORD)
+        (colon (syntax/case-production-terminal 2))
+        (label-parser parse-labeled-statement)
         (declaration-parser parse-declaration)
         (return-keyword (syntax/return-production-keyword 0))
         (return-parser parse-return)
@@ -9755,6 +9893,9 @@
             (generator-form? production "control-transfer")
               (do (p/code-list-push! definitions
                     (compile-control-transfer backend production)) 0)
+            (generator-form? production "labeled-statement")
+              (do (p/code-list-push! definitions
+                    (compile-labeled-statement backend production)) 0)
             (generator-form? production "switch-statement")
               (do (p/code-list-push! definitions
                     (compile-switch-statement backend production)) 0)
