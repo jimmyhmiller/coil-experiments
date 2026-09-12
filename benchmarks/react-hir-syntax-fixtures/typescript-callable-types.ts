@@ -10,4 +10,7 @@ type CallableMembers = {
   map?<T>(this: Context, value: T): T;
   readonly [name: string]: number;
   [index: number]: string;
+  'data-value'?: string;
+  42: boolean;
+  "run"<T>(value: T): T;
 };
