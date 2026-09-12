@@ -287,13 +287,66 @@ prepared-tape-to-SSA separately from complete text-to-SSA. The matching
 `benchmarks/run-oxc-parser-comparison.sh` parses identical bytes with the local
 Oxc checkout (`OXC_DIR` overrides its location).
 
-On the local Apple M2 Max, release builds measured approximately 0.180 GB/s for
-Coil tape-to-SSA, 0.147 GB/s for Coil text-to-SSA, and 0.186–0.187 GB/s for Oxc
-text-to-AST. Oxc is about 27% faster than Coil end to end on this shared-subset
-fixture. Coil's result includes direct SSA values, CFG blocks and successors,
-block parameters, bindings/captures, scopes, and finalized membership; Oxc's
-measurement stops after AST parsing. These numbers are not full-language
-equivalence because the Coil frontend still accepts a narrower grammar.
+### Throughput, and what it is fair to compare against
+
+Measured on the local Apple M2 Max, same 165,000-byte fixture, same 100 rounds,
+best of nine runs. The Oxc harness reports four modes and they do very different
+amounts of work, so the mode chosen decides the answer:
+
+| what it produces | GB/s |
+| --- | --- |
+| Coil text-to-SSA — SSA, CFG, blocks, scopes, bindings, references, captures | 0.119 |
+| Coil prepared-tape-to-SSA — the same, minus the scan | 0.138 |
+| `oxc cold parse` — AST only | 0.191 |
+| `oxc reset+parse` — AST only, reused allocator | 0.176 |
+| `oxc parse+semantic` — AST, scopes, symbols, references | 0.076 |
+| `oxc parse+semantic+cfg` — the above plus a control flow graph | 0.063 |
+
+Against the Oxc mode whose output is comparable to ours, Coil is about 89%
+faster. Against Oxc's AST-only parse, Coil is about 38% slower while also
+building SSA, a CFG, scopes, bindings and captures that the AST parse does not.
+An earlier revision of this file compared our full semantic output against Oxc's
+AST-only number and reported Oxc as 27% faster; that was the wrong row.
+
+Two further asymmetries are worth stating rather than buried. The Oxc harness
+parses with `SourceType::mjs()`, so it is parsing JavaScript only, while this
+frontend carries JavaScript, TypeScript and JSX in one path and checks for type
+annotations and assertions on input that has none. And this frontend still
+accepts a narrower grammar than Oxc overall. Neither number is full-language
+equivalence in either direction.
+
+### Where the time goes
+
+`benchmarks/compare-against-baseline.sh REF` builds the checker at a baseline
+ref in a scratch worktree and requires byte-identical textual IR on all 70 valid
+fixtures and identical diagnostics on all 131 invalid ones before reporting
+throughput for both. Every optimisation below was required to pass it.
+
+A floor measurement settles where optimisation effort is worth spending: moving
+the cursor across every event in the tape and reading the byte it caches, with
+no parsing and no IR construction, runs at about 1.25 GB/s. Tape traversal is
+therefore roughly a tenth of parse time, and the remaining nine tenths are
+parsing logic and IR construction. The tape representation is not the limit.
+
+The release profile is flat. The SIMD scan is about 16%, the precedence loop
+about 13%, and no other single function exceeds 6%; twenty-six functions cover
+93%. Optimisation at that shape yields a few percent at a time, and several
+attempts yielded nothing measurable because LLVM had already performed them —
+restructuring the operator table into first-byte switches, deduplicating repeated
+byte loads, and sinking arena loads behind cheaper guards each measured zero in
+an A/B over nine runs.
+
+### A throughput regression that coverage expansion introduced
+
+Commit `cd3012b` measured 0.173 GB/s tape-to-SSA and 0.144 GB/s text-to-SSA,
+matching the figures this file used to quote. Ninety-seven commits of coverage
+expansion later, `a26dcc2` measured 0.093 and 0.085 — a loss of about 40% that
+no single commit caused. Sampling nine points across that range shows a gradual
+slide (0.142, 0.103, 0.124, 0.117, 0.106, 0.103, 0.104, 0.101, 0.084), so bisect
+finds only noise. The optimisations above recovered part of it, to 0.138 and
+0.119, which is still below the `cd3012b` peak. Expanding coverage has a
+throughput cost, and it is only visible if it is measured; the baseline
+comparison script exists so the next expansion does not repeat this silently.
 
 `benchmarks/run-jsir-differential.sh` requires `JSIR_RS_DIR` to point at a
 `jsir-rs` checkout containing the `coil_signature` example (local commit
