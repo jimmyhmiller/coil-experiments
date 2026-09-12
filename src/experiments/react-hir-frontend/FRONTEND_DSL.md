@@ -112,6 +112,12 @@ IR also passes the complete verifier.
 `direct_parser_test.coil` registers every structural check as a `deftest`, so
 the project suite executes its IR-shape and deliberate-corruption assertions.
 
+`unicode_identifier.coil` is the generated-data lexical companion: it embeds
+Unicode 15.1's compressed two-level ID_Start/ID_Continue bitmap and leaves the
+ASCII path table-free. Its exhaustive test visits every Unicode scalar and
+pins the complete non-ASCII membership counts, while the Oxc oracle compares
+structured generic TypeScript trees whose names contain BMP and astral UTF-8.
+
 `benchmarks/check-typescript-type-oracle.sh` supplies the independent type-tree
 oracle. Canonical snippets are parsed by local Oxc and by Coil's generated
 parser; an exhaustive Oxc visitor normalizes the intentional difference that

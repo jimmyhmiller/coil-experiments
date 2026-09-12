@@ -7,6 +7,7 @@
 (import "experiments.react-hir-frontend.parser-generator" :as parser-generator)
 (import "experiments.react-hir-frontend.ir" :as ir)
 (import "experiments.react-hir-frontend.ir-builder" :as builder)
+(import "experiments.react-hir-frontend.unicode-identifier" :as unicode-id)
 
 (const DIRECT-PARSE-OK i64 0)
 (const DIRECT-PARSE-UNEXPECTED i64 1)
@@ -37,6 +38,8 @@
    (in-conditional-extends bool)])
 
 (defstruct ExprResult [(value u32) (start u32) (end u32)])
+
+(defstruct Utf8Decode [(codepoint u32) (end u32) (valid bool)])
 
 (defstruct DirectParseResult
   [(error i64) (error-offset u32) (consumed-events i64)
@@ -168,6 +171,7 @@
    (current-event current-event)
    (event-position event-position)
    (word-end word-end)
+   (identifier-end identifier-end!)
    (previous-token-end previous-token-end)
    (span-equals span-equals?)
    (spans-equal spans-equal?)
@@ -297,13 +301,104 @@
       (and (>= byte (cast u8 97)) (<= byte (cast u8 122)))
       (= byte (cast u8 95)) (= byte (cast u8 36))))
 
+(defn utf8-continuation? [(byte u8)] (-> bool)
+  (= (p/iand (cast u64 byte) (cast u64 192)) (cast u64 128)))
+
+(defn decode-utf8 [(state (ptr DirectParseState)) (start u32)] (-> Utf8Decode)
+  (let [size (cast u32 (.source-size state)) first (source-byte state start)]
+    (cond
+      (< first (cast u8 128))
+        (Utf8Decode :codepoint (cast u32 first) :end (+ start (cast u32 1)) :valid true)
+      (and (>= first (cast u8 194)) (<= first (cast u8 223))
+           (< (+ start (cast u32 1)) size)
+           (utf8-continuation? (source-byte state (+ start (cast u32 1)))))
+        (let [b1 (source-byte state (+ start (cast u32 1)))]
+          (Utf8Decode
+            :codepoint (+ (p/ishl (cast u32 (p/iand (cast u64 first) (cast u64 31)))
+                            (cast u32 6))
+                          (cast u32 (p/iand (cast u64 b1) (cast u64 63))))
+            :end (+ start (cast u32 2)) :valid true))
+      (and (>= first (cast u8 224)) (<= first (cast u8 239))
+           (< (+ start (cast u32 2)) size)
+           (utf8-continuation? (source-byte state (+ start (cast u32 1))))
+           (utf8-continuation? (source-byte state (+ start (cast u32 2)))))
+        (let [b1 (source-byte state (+ start (cast u32 1)))
+              b2 (source-byte state (+ start (cast u32 2)))
+              valid (and (or (!= first (cast u8 224)) (>= b1 (cast u8 160)))
+                         (or (!= first (cast u8 237)) (< b1 (cast u8 160))))]
+          (Utf8Decode
+            :codepoint (+ (p/ishl (cast u32 (p/iand (cast u64 first) (cast u64 15)))
+                            (cast u32 12))
+                          (+ (p/ishl (cast u32 (p/iand (cast u64 b1) (cast u64 63)))
+                               (cast u32 6))
+                             (cast u32 (p/iand (cast u64 b2) (cast u64 63)))))
+            :end (+ start (cast u32 3)) :valid valid))
+      (and (>= first (cast u8 240)) (<= first (cast u8 244))
+           (< (+ start (cast u32 3)) size)
+           (utf8-continuation? (source-byte state (+ start (cast u32 1))))
+           (utf8-continuation? (source-byte state (+ start (cast u32 2))))
+           (utf8-continuation? (source-byte state (+ start (cast u32 3)))))
+        (let [b1 (source-byte state (+ start (cast u32 1)))
+              b2 (source-byte state (+ start (cast u32 2)))
+              b3 (source-byte state (+ start (cast u32 3)))
+              valid (and (or (!= first (cast u8 240)) (>= b1 (cast u8 144)))
+                         (or (!= first (cast u8 244)) (< b1 (cast u8 144))))]
+          (Utf8Decode
+            :codepoint (+ (p/ishl (cast u32 (p/iand (cast u64 first) (cast u64 7)))
+                            (cast u32 18))
+                          (+ (p/ishl (cast u32 (p/iand (cast u64 b1) (cast u64 63)))
+                               (cast u32 12))
+                             (+ (p/ishl (cast u32 (p/iand (cast u64 b2) (cast u64 63)))
+                                  (cast u32 6))
+                                (cast u32 (p/iand (cast u64 b3) (cast u64 63))))))
+            :end (+ start (cast u32 4)) :valid valid))
+      :else (Utf8Decode :codepoint (cast u32 0) :end (+ start (cast u32 1)) :valid false))))
+
 (defn word-end [(state (ptr DirectParseState)) (start u32)] (-> u32)
   (let [(mut at) (cast i64 start)]
     (loop
-      (if (or (>= (load at) (.source-size state))
-              (not (ascii-word? (load (p/index (.source state) (load at))))))
-          (break) (set! at (+ (load at) 1))))
+      (if (>= (load at) (.source-size state)) (break)
+        (let [byte (load (p/index (.source state) (load at)))]
+          (if (or (ascii-word? byte) (>= byte (cast u8 128)))
+              (set! at (+ (load at) 1)) (break)))))
     (cast u32 (load at))))
+
+(defn identifier-end! :inline (Always)
+  [(state (ptr DirectParseState)) (start u32)] (-> u32)
+  (let [first-byte (source-byte state start) (mut at) start
+        (mut identifier) true (mut valid) true]
+    (if (< first-byte (cast u8 128))
+        (if (or (= first-byte (cast u8 36)) (= first-byte (cast u8 95))
+                (and (>= first-byte (cast u8 65)) (<= first-byte (cast u8 90)))
+                (and (>= first-byte (cast u8 97)) (<= first-byte (cast u8 122))))
+            (store! at (+ start (cast u32 1)))
+          (store! identifier false))
+      (let [decoded (decode-utf8 state start)]
+        (if (and (.valid decoded) (unicode-id/id-start? (.codepoint decoded)))
+            (store! at (.end decoded))
+          (do
+            (fail! state DIRECT-PARSE-EXPECTED)
+            (store! valid false)))))
+    (loop
+      (if (or (not (load identifier))
+              (>= (cast i64 (load at)) (.source-size state))
+              (not (load valid))) (break)
+        (let [byte (source-byte state (load at))]
+          (cond
+            (ascii-word? byte)
+              (store! at (+ (load at) (cast u32 1)))
+            (>= byte (cast u8 128))
+              (let [decoded (decode-utf8 state (load at))
+                    allowed (and (.valid decoded)
+                                  (unicode-id/id-continue? (.codepoint decoded)))]
+                (if allowed
+                    (store! at (.end decoded))
+                  (store! valid false)))
+            :else (break)))))
+    (if (not (load identifier)) (word-end state start)
+      (if (not (load valid))
+        (do (fail! state DIRECT-PARSE-EXPECTED) (word-end state start))
+        (load at)))))
 
 (defn previous-token-end [(state (ptr DirectParseState))] (-> u32)
   (if (<= (.event-index state) 0) (cast u32 0)
