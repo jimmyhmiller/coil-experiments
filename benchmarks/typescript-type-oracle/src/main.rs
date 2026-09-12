@@ -2,8 +2,8 @@ use std::{env, fs, path::PathBuf, process::Command};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    TSOptionalType, TSRestType, TSSignature, TSType, TSTypePredicateName,
-    TSTypeQueryExprName,
+    TSClassImplements, TSInterfaceBody, TSInterfaceHeritage, TSOptionalType, TSRestType,
+    TSSignature, TSType, TSTypePredicateName, TSTypeQueryExprName,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
@@ -46,6 +46,14 @@ const CASES: &[Case] = &[
     Case { name: "unnamed-tuple-wrappers", source: "type T=[A?,...B[]];" },
     Case { name: "computed-signatures", source: "type T={ [key]: A; 'quoted'?(): B; 0<C>(x:C):C; [method]<D>(x:D):D };" },
     Case { name: "callable-binding-patterns", source: "type F=({x:y=init,...rest}: A,[head,,...tail]: B)=>C;" },
+    Case { name: "variable-type-context", source: "let x: A<B>; let y: { value: C | D };" },
+    Case { name: "function-type-context", source: "function f<T extends A = B>(this: C, x?: D, ...rest: E[]): F<T> {}" },
+    Case { name: "arrow-type-context", source: "const f = <T,>(x: T): T => x;" },
+    Case { name: "class-type-context", source: "class C<T extends A> extends Base<T> implements I<T>, J { field?: A; method<U>(x: U): U { return x; } }" },
+    Case { name: "interface-type-context", source: "interface I<T> extends A<T>, B { readonly value?: C<D>; method<U>(x: U): U }" },
+    Case { name: "assertion-type-context", source: "const a = value as A<B>; const b = value satisfies C | D; const c = value!;" },
+    Case { name: "call-new-type-context", source: "const a = fn<A, B>(x); const b = new C<D>(x); const c = fn<E>;" },
+    Case { name: "angle-assertion-context", source: "const plain=<A>input; const nested=<A<B>>input;" },
 ];
 
 struct Shape {
@@ -158,6 +166,18 @@ fn field_checks(name: &str) -> &'static [FieldCheck] {
             FieldCheck { opcode: 128, expected: &[(2, 0)] },
             FieldCheck { opcode: 129, expected: &[(3, 0)] },
         ],
+        "assertion-type-context" => &[FieldCheck {
+            opcode: 122,
+            expected: &[(2, 1), (2, 2)],
+        }],
+        "call-new-type-context" => &[FieldCheck {
+            opcode: 52,
+            expected: &[(2, 0), (2, 0), (2, 0)],
+        }],
+        "angle-assertion-context" => &[FieldCheck {
+            opcode: 122,
+            expected: &[(2, 3), (2, 3)],
+        }],
         _ => &[],
     }
 }
@@ -277,6 +297,34 @@ impl<'a> Visit<'a> for Shape {
         };
         let span = signature.span();
         self.push(kind, Some((span.start, span.end)));
+    }
+
+    fn visit_ts_interface_heritage(&mut self, heritage: &TSInterfaceHeritage<'a>) {
+        if heritage.type_arguments.is_some() {
+            self.push("ts.type_reference", None);
+            walk::walk_ts_interface_heritage(self, heritage);
+            let span = heritage.span();
+            self.push("ts.type_reference", Some((span.start, span.end)));
+        } else {
+            walk::walk_ts_interface_heritage(self, heritage);
+            let span = heritage.span();
+            self.push("ts.type_reference", Some((span.start, span.end)));
+        }
+    }
+
+    fn visit_ts_class_implements(&mut self, implementation: &TSClassImplements<'a>) {
+        if implementation.type_arguments.is_some() {
+            self.push("ts.type_reference", None);
+        }
+        walk::walk_ts_class_implements(self, implementation);
+        let span = implementation.span();
+        self.push("ts.type_reference", Some((span.start, span.end)));
+    }
+
+    fn visit_ts_interface_body(&mut self, body: &TSInterfaceBody<'a>) {
+        walk::walk_ts_interface_body(self, body);
+        let span = body.span();
+        self.push("ts.type_literal", Some((span.start, span.end)));
     }
 }
 
