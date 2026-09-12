@@ -138,4 +138,32 @@ if "$work/check" "$work/original-try.js" >/dev/null 2>&1; then
 fi
 cp "$work/spec.orig" "$spec"
 
-printf 'grammar shapes are authoritative: 5 perturbations followed the grammar\n'
+# 6. The TypeScript type-annotation colon lives in one production. Six sites
+#    used to carry their own copy of it, so re-spelling it here must move all of
+#    them together - parameters, return types, bindings and arrows - including
+#    the lookaheads that decide whether an annotation is present at all.
+#    The replacement byte must not also be a binary operator, or the test says
+#    nothing: `a % number` is ambiguous with modulo, `a ~ number` is not.
+python3 - "$spec" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = """     (type-annotation-production
+       [(terminal colon) (rule type)])"""
+new = """     (type-annotation-production
+       [(terminal tilde) (rule type)])"""
+assert old in s, "type-annotation-production not found in expected form"
+open(p, "w").write(s.replace(old, new, 1))
+PY
+build || fail "re-spelled type annotation failed to build"
+printf 'function f(a ~ number) ~ number { return a; }\nconst x ~ number = 1;\nconst g = (p ~ number) ~ number => p;\n' \
+  >"$work/annotated.ts"
+"$work/check" "$work/annotated.ts" >"$work/annotated.out" 2>&1 \
+  || fail "re-spelled type annotations did not parse"
+printf 'function f(a: number): number { return a; }\n' >"$work/old-annotated.ts"
+if "$work/check" "$work/old-annotated.ts" >/dev/null 2>&1; then
+  fail "colon annotation still accepted after the grammar re-spelled it"
+fi
+cp "$work/spec.orig" "$spec"
+
+printf 'grammar shapes are authoritative: 6 perturbations followed the grammar\n'
