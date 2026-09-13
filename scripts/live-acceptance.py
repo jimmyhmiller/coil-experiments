@@ -83,6 +83,33 @@ def tree_pids(root):
     return out
 
 
+def kill_tree(root):
+    """Stop the whole tree before killing it, and kill children before parents.
+    Killing the root first lets its children reparent to init and escape: a
+    project-mode `coil check` runs the real compiler as a child via system(),
+    so an escaped child is a multi-GB process that keeps running and poisons
+    every later measurement."""
+    for pid in tree_pids(root):
+        try: os.kill(pid, signal.SIGSTOP)
+        except Exception: pass
+    pids = tree_pids(root)          # re-walk: catch anything forked before the stop
+    for pid in reversed(pids):      # deepest first
+        try: os.kill(pid, signal.SIGKILL)
+        except Exception: pass
+
+
+def survivors(root_cmd):
+    """Processes matching root_cmd that outlived their run, with RSS."""
+    out = []
+    r = subprocess.run(["ps", "-axo", "pid=,rss=,command="], capture_output=True, text=True)
+    for ln in r.stdout.split("\n"):
+        if root_cmd in ln and "grep" not in ln:
+            f = ln.split(None, 2)
+            if len(f) == 3:
+                out.append((int(f[0]), int(f[1])))
+    return out
+
+
 def rss_kb(pid):
     r = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True)
     try:
@@ -130,15 +157,11 @@ def run_capped(cmd, cwd, cap_mb, timeout_s, env=None, log=None):
         peak = max(peak, tot)
         if tot > cap_mb * 1024:
             verdict = f"KILLED: exceeded {cap_mb}MB"
-            for pid in tree_pids(p.pid):
-                try: os.kill(pid, signal.SIGKILL)
-                except Exception: pass
+            kill_tree(p.pid)
             break
         if time.time() - t0 > timeout_s:
             verdict = f"KILLED: exceeded {timeout_s}s"
-            for pid in tree_pids(p.pid):
-                try: os.kill(pid, signal.SIGKILL)
-                except Exception: pass
+            kill_tree(p.pid)
             break
         time.sleep(0.1)
     rc = p.wait()
@@ -265,9 +288,7 @@ def main():
                 break
             time.sleep(1)
         if not live:
-            for pid in tree_pids(app.pid):
-                try: os.kill(pid, signal.SIGKILL)
-                except Exception: pass
+            kill_tree(app.pid)
             report["outcome"] = "STARTUP FAILED — program never reported live"
             report["startup"] = dict(rss_mb=None)
             return finish(report, out_dir, stamp, a)
@@ -352,14 +373,22 @@ def main():
         else:
             report["outcome"] = "COMPLETED"
 
-        for pid in tree_pids(app.pid):
-            try: os.kill(pid, signal.SIGKILL)
-            except Exception: pass
+        kill_tree(app.pid)
         logf.close()
         return finish(report, out_dir, stamp, a)
     finally:
         src.write_text(original)
         manifest.write_text(manifest_original)
+        subprocess.run(["pkill", "-9", "-f", t["binary"]], capture_output=True)
+        time.sleep(0.5)
+        # Scope this to OUR project path. Matching on "coil" swept in a
+        # teammate's concurrent gate run and reported their live processes as
+        # our orphans; killing on that basis would have destroyed their work.
+        left = [(pid, kb) for pid, kb in survivors(str(proj)) if kb > 200_000]
+        if left:
+            print("[warn] processes outlived this run and will poison later "
+                  "measurements: " + ", ".join(f"pid {p} ({kb/1048576:.1f} GB)"
+                                               for p, kb in left))
         subprocess.run(["pkill", "-9", "-f", t["binary"]], capture_output=True)
 
 
