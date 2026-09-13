@@ -211,20 +211,78 @@
   (or (lp-name=? T name)
       (and (lp-head? T `array) (lp-native-type? (primitive/code-nth T 1) name))))
 
-(defn lp-project-native-use? [(owner Code) (modules Code) (name Code)] (-> bool)
-  (let [(mut found) (lp-native-use? (primitive/code-nth owner 1) name)]
+; Every type a native allocation or pointer names in FORMS. `lp-native-type?`
+; matches a type or, through `array`, its element type, so each level is
+; recorded and membership is exact.
+;
+; Walked breadth-first with an explicit frontier rather than by recursion: a
+; builder cannot be handed to another function -- the CodeBuilder/Code split is
+; deliberate, a finished list cannot be mutated and a list being built cannot be
+; read -- so the collecting builder has to stay inside one body.
+(defn lp-native-use-set [(forms Code)] (-> Code)
+  (let [out (primitive/code-list-new)
+        (mut level) `(~forms)]
+    (loop
+      (if (= (primitive/code-count (load level)) 0)
+          (break)
+          (let [next (primitive/code-list-new)]
+            (for [i 0 (primitive/code-count (load level))]
+              (let [form (primitive/code-nth (load level) i)]
+                (when (or (primitive/code-list? form)
+                          (primitive/code-vector? form))
+                  (when (and (> (primitive/code-count form) 1)
+                             (or (lp-head? form `primitive/alloc-stack)
+                                 (or (lp-head? form `primitive/alloc-static)
+                                     (lp-head? form `ptr))))
+                    (let [(mut T) (primitive/code-nth form 1)]
+                      (primitive/code-list-push! out (load T))
+                      (loop (if (and (lp-head? (load T) `array)
+                                     (> (primitive/code-count (load T)) 1))
+                                (do (set! T (primitive/code-nth (load T) 1))
+                                    (primitive/code-list-push! out (load T)))
+                                (break))))
+                    0)
+                  (for [j 0 (primitive/code-count form)]
+                    (primitive/code-list-push! next (primitive/code-nth form j)))
+                  0)))
+            (set! level (primitive/code-list-done next)))))
+    (primitive/code-list-done out)))
+
+;;; One native-use set per module, in module order. Built once per generation:
+;;; the question "is this struct used natively here" was previously answered by
+;;; walking the module's whole form tree, once per struct per module, for every
+;;; module -- so a project paid modules x defstructs x modules whole-tree walks,
+;;; each node of which allocates.
+(defn lp-native-use-sets [(modules Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count modules)]
+      (primitive/code-list-push! out
+        (lp-native-use-set (primitive/code-nth (primitive/code-nth modules i) 1))))
+    (primitive/code-list-done out)))
+
+(defn lp-in-set? [(set Code) (name Code)] (-> bool)
+  (let [(mut found) false]
+    (for [i 0 (primitive/code-count set)]
+      (when (lp-name=? (primitive/code-nth set i) name)
+        (set! found true)
+        0))
+    (load found)))
+
+(defn lp-project-native-use? [(owner Code) (owner-set Code) (modules Code)
+                              (sets Code) (name Code)] (-> bool)
+  (let [(mut found) (lp-in-set? owner-set name)]
     (for [i 0 (primitive/code-count modules)]
       (let [m (primitive/code-nth modules i)
+            set (primitive/code-nth sets i)
             names (lp-visible-names m owner name)]
-        (when (lp-native-use? (primitive/code-nth m 1)
-                              (lp-qualified (primitive/code-nth owner 0)
-                                            name
-                                            name))
+        (when (lp-in-set? set
+                          (lp-qualified (primitive/code-nth owner 0)
+                                        name
+                                        name))
           (set! found true)
           0)
         (for [j 0 (primitive/code-count names)]
-          (when (lp-native-use? (primitive/code-nth m 1)
-                                (primitive/code-nth names j))
+          (when (lp-in-set? set (primitive/code-nth names j))
             (set! found true)
             0))))
     (load found)))
@@ -239,8 +297,9 @@
       0)
     (load found)))
 
-(defn lp-mask-native-project [(owner Code) (modules Code)] (-> Code)
+(defn lp-mask-native-project [(owner Code) (modules Code) (sets Code)] (-> Code)
   (let [forms (primitive/code-nth owner 1)
+        owner-set (lp-native-use-set forms)
         out (primitive/code-list-new)]
     (for [i 0 (primitive/code-count forms)]
       (let [f (primitive/code-nth forms i)]
@@ -249,7 +308,9 @@
                                            `(live-compile-defn ~@(primitive/code-rest f))
                                          (and (lp-head? f `defstruct)
                                               (lp-project-native-use? owner
+                                                                      owner-set
                                                                       modules
+                                                                      sets
                                                                       (primitive/code-nth f
                                                                                           1)))
                                            `(live-native-struct ~@(primitive/code-rest f))
@@ -257,7 +318,7 @@
     (primitive/code-list-done out)))
 
 (defn lp-mask-native [(forms Code)] (-> Code)
-  (lp-mask-native-project `(:local ~forms) `()))
+  (lp-mask-native-project `(:local ~forms) `() `()))
 
 (defn lp-unmask-native [(form Code)] (-> Code)
   (cond (lp-head? form `live-native-struct)
@@ -296,7 +357,11 @@
                                    `(~(primitive/code-nth m 0) ~(lp-normal-forms snapshot
                                                                                  m
                                                                                  old)))))
-    (let [source-modules (primitive/code-list-done sources)]
+    (let [source-modules (primitive/code-list-done sources)
+          ; Built once for the whole generation, not once per module: the sets
+          ; depend only on the sources, and lp-mask-native-project is called for
+          ; every module against all of them.
+          native-sets (lp-native-use-sets source-modules)]
       (for [i 2 (primitive/code-count request)]
         (let [snapshot (primitive/code-nth request i)
               requested-name (primitive/code-nth snapshot 1)
@@ -311,7 +376,8 @@
                   (lp-mask-native-project (lp-find-module source-modules
                                                           requested-name
                                                           0)
-                                          source-modules)
+                                          source-modules
+                                          native-sets)
                 incoming (lp-incoming raw old)
                 forms (lp-merged-forms (lp-without-migrations raw) old)
                 _valid (lp-validate-native forms old)
@@ -330,27 +396,43 @@
       (primitive/code-list-done out))))
 
 (defn lp-project-tokens [(modules Code) (old-tokens Code)] (-> Code)
-  (let [(mut tokens) old-tokens]
+  ; Every id this generation needs a token for, in one pass, then folded in
+  ; once. Appending with `(~@(load tokens) ~id)` rebuilt the whole token list on
+  ; every addition, so a project whose definitions all need tokens copied the
+  ; list once per definition -- and each Code access allocates, so that copying
+  ; dominated. Order is unchanged: the accepted tokens first, then the new ones
+  ; in the order they are first seen, which is what keeps a token stable for
+  ; code already holding it.
+  (let [candidates (primitive/code-list-new)]
     (for [i 0 (primitive/code-count modules)]
       (let [reg (primitive/code-nth (primitive/code-nth modules i) 2)]
         (for [j 0 (registry/registry-record-count reg)]
-          (let [id
-                  (registry/registry-record-id (registry/registry-record-at reg
-                                                                            j))]
-            (when (= (lp-token (load tokens) id) 0)
-              (set! tokens `(~@(load tokens) ~id))
-              0)
-            (let [kind
-                    (registry/registry-record-kind (registry/registry-record-at reg
-                                                                                j))
-                  schema-id `(live-schema-owner ~id)]
-              (when (and (or (primitive/code-eq kind `:struct)
-                             (primitive/code-eq kind `:sum)
-                             (primitive/code-eq kind `:closure))
-                         (= (lp-token (load tokens) schema-id) 0))
-                (set! tokens `(~@(load tokens) ~schema-id))
-                0))))))
-    (load tokens)))
+          (let [record (registry/registry-record-at reg j)
+                id (registry/registry-record-id record)
+                kind (registry/registry-record-kind record)]
+            (primitive/code-list-push! candidates id)
+            (when (or (primitive/code-eq kind `:struct)
+                      (primitive/code-eq kind `:sum)
+                      (primitive/code-eq kind `:closure))
+              (primitive/code-list-push! candidates `(live-schema-owner ~id))
+              0)))))
+    (let [proposed (primitive/code-list-done candidates)
+          out (primitive/code-list-new)]
+      (for [i 0 (primitive/code-count old-tokens)]
+        (primitive/code-list-push! out (primitive/code-nth old-tokens i)))
+      (for [i 0 (primitive/code-count proposed)]
+        (let [id (primitive/code-nth proposed i)
+              (mut earlier) false]
+          ; A list under construction cannot be read, so a duplicate is found by
+          ; looking back over the proposals rather than over what was pushed.
+          (for [j 0 i]
+            (when (lp-name=? (primitive/code-nth proposed j) id)
+              (set! earlier true)
+              0))
+          (unless (or (load earlier) (!= (lp-token old-tokens id) 0))
+            (primitive/code-list-push! out id)
+            0)))
+      (primitive/code-list-done out))))
 
 (defn lp-option [(form Code) (key Code)] (-> Code)
   (let [(mut found) `:missing]

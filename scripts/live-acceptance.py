@@ -262,8 +262,24 @@ def main():
         for p in (proj / ".coil-live",):
             if p.exists():
                 shutil.rmtree(p)
+        build_log = out_dir / f"{a.target}-{stamp}-build.log"
         b = run_capped([a.compiler, "build"], proj, a.cap_mb, a.build_timeout,
-                       log=str(out_dir / f"{a.target}-{stamp}-build.log"))
+                       log=str(build_log))
+        # A compiler resolves its stdlib and prebuilt units beside ITSELF. A
+        # binary in a worktree has no prebuilt units there, so it recompiles
+        # coil.jit from source on EVERY build -- several GB that the installed
+        # toolchain never pays. Comparing across locations measures that, not
+        # the change. Record it so the two columns can be trusted or discarded.
+        try:
+            rebuilt = sum(1 for L in open(build_log, errors="replace")
+                          if "building coil.jit" in L)
+        except OSError:
+            rebuilt = None
+        b["prebuilt_unit_rebuilds"] = rebuilt
+        if rebuilt:
+            print(f"[build] NOTE: rebuilt prebuilt units {rebuilt}x -- this "
+                  f"compiler has none beside it. Only compare against another "
+                  f"compiler in the same location.")
         report["build"] = b
         print(f"[build] peak={b['peak_rss_mb']}MB {b['seconds']}s exit={b['exit']} {b['verdict']}", flush=True)
         if b["verdict"] != "ok" or b["exit"] != 0:
