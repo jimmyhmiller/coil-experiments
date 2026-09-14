@@ -177,6 +177,87 @@
     (and (not (primitive/code-eq prior `:none))
          (lp-name=? prior form))))
 
+; ── declared code-change hooks ───────────────────────────────────────────────
+; A defn carries its annotations as leading `:key value` pairs between its name
+; and its parameters: `(defn wake :live/on-publish true [] (-> i64) ...)`. The
+; live lowering reads a defn's parts by position, so the annotations are taken
+; off here, at the boundary where a module's source is read, and the names that
+; declared one are carried beside the module instead.
+
+(defn lp-defn-annotations-end [(form Code)] (-> i64)
+  (let [(mut i) 2 (mut stop) -1]
+    (loop (if (>= (load i) (primitive/code-count form))
+              (do (set! stop (load i)) (break))
+              (if (primitive/code-vector? (primitive/code-nth form (load i)))
+                  (do (set! stop (load i)) (break))
+                  (set! i (+ (load i) 2)))))
+    (load stop)))
+
+(defn lp-declares-on-publish? [(form Code)] (-> bool)
+  (if (not (reader/lr-defn? form))
+      false
+      (let [stop (lp-defn-annotations-end form)
+            (mut found) false
+            (mut i) 2]
+        (loop (if (>= (load i) stop)
+                  (break)
+                  (do
+                    (when (primitive/code-eq (primitive/code-nth form (load i))
+                                             `:live/on-publish)
+                      (set! found true))
+                    (set! i (+ (load i) 2)))))
+        (load found))))
+
+(defn lp-strip-annotations [(form Code)] (-> Code)
+  (if (not (reader/lr-defn? form))
+      form
+      (let [stop (lp-defn-annotations-end form)]
+        (if (<= stop 2)
+            form
+            (let [out (primitive/code-list-new)]
+              (primitive/code-list-push! out (primitive/code-nth form 0))
+              (primitive/code-list-push! out (primitive/code-nth form 1))
+              (for [i stop (primitive/code-count form)]
+                (primitive/code-list-push! out (primitive/code-nth form i)))
+              (primitive/code-list-done out))))))
+
+(defn lp-strip-module-annotations [(forms Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count forms)]
+      (primitive/code-list-push! out
+                                 (lp-strip-annotations (primitive/code-nth forms i))))
+    (primitive/code-list-done out)))
+
+(defn lp-declared-hooks [(forms Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count forms)]
+      (let [f (primitive/code-nth forms i)]
+        (when (lp-declares-on-publish? f)
+          (primitive/code-list-push! out (primitive/code-nth f 1))
+          0)))
+    (primitive/code-list-done out)))
+
+;;; Register each declared hook. `live.hooks` resolves its cell by name through
+;;; the process, so the copy compiled into this generation and the one in the
+;;; binary that started share it. Registering with the module's binder means
+;;; every generation that rebinds the module names its own current version of
+;;; the function; the pointer is the function's public entry, which dispatches
+;;; through the slot and so is never left behind in a retired image.
+(defn lp-hook-registrations [(hooks Code) (reg Code) (i i64)] (-> Code)
+  (if (>= i (primitive/code-count hooks))
+      `0
+      (let [name (primitive/code-nth hooks i)
+            record (registry/registry-find reg `:function name)]
+        (if (not (lp-head? record `live-definition))
+            (lp-hook-registrations hooks reg (+ i 1))
+            `(do (~(primitive/syntax->datum `on-code-change!)
+                   (primitive/fnptr-of
+                     ~(reader/lr-artifact-symbol record `:public-entry)))
+                 ~(lp-hook-registrations hooks reg (+ i 1)))))))
+
+(defn lp-module-hooks [(m Code)] (-> Code)
+  (if (> (primitive/code-count m) 5) (primitive/code-nth m 5) `()))
+
 (defn lp-form-present? [(forms Code) (form Code)] (-> bool)
   (let [(mut found) false]
     (for [i 0 (primitive/code-count forms)]
@@ -441,12 +522,14 @@
                                                  requested-name))
             0)
           (let [name (primitive/code-nth source-module 0)
-                raw
+                annotated
                   (lp-mask-native-project (lp-find-module source-modules
                                                           requested-name
                                                           0)
                                           source-modules
                                           native-sets)
+                hooks (lp-declared-hooks annotated)
+                raw (lp-strip-module-annotations annotated)
                 incoming (lp-incoming raw old)
                 forms (lp-merged-forms (lp-without-migrations raw) old)
                 _valid (lp-validate-native forms old)
@@ -461,7 +544,8 @@
                                        `(~name ~forms
                                            ~reg
                                            ~incoming
-                                           ~(lp-migrations raw))))))
+                                           ~(lp-migrations raw)
+                                           ~hooks)))))
       (primitive/code-list-done out))))
 
 (defn lp-project-tokens [(modules Code) (old-tokens Code)] (-> Code)
@@ -1157,6 +1241,12 @@
                                `(import "experiments.heap-inspector.live-types"
                                         :use
                                         [LiveHandleOwner live-handle-owner-new]))
+    (when (> (primitive/code-count (lp-module-hooks m)) 0)
+      (primitive/code-list-push! out
+                                 `(import "live.hooks"
+                                          :use
+                                          [~(primitive/syntax->datum `on-code-change!)]))
+      0)
     (for [i 0 (primitive/code-count generated)]
       (let [f (primitive/code-nth generated i)]
         (unless (and (reader/lr-defn? f)
@@ -1171,6 +1261,7 @@
     (reader/lr-push-list! out (primitive/code-list-done helpers))
     (primitive/code-list-push! out
                                `(defn ~(reader/lr-submission-name `__live_project_bind tag) [] (-> i64)
+                                  ~(lp-hook-registrations (lp-module-hooks m) reg 0)
                                   ~(lp-bind-module reg)))
     (primitive/code-list-push! out
                                `(defn ~(reader/lr-submission-name `__live_project_owners tag) [] (-> i64)
@@ -1353,7 +1444,8 @@
                                                                                2)
                                                            tokens)
                                              ~(primitive/code-nth m 3)
-                                             ~(primitive/code-nth m 4)))))
+                                             ~(primitive/code-nth m 4)
+                                             ~(lp-module-hooks m)))))
           (let [modules (primitive/code-list-done module-builder)]
             (primitive/code-session-stage! `(live-project-state ~modules
                                                                 ~tokens))
