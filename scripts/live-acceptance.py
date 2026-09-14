@@ -348,6 +348,7 @@ def main():
                 state, summary = "NO-REPLY", r.stdout[:120]
 
             alive = app.poll() is None
+            app_exit = None if alive else app.poll()
             time.sleep(1.5)
             lines = list(open(trace_log, errors="replace"))
             seg = lines[prev_lines:]
@@ -361,7 +362,7 @@ def main():
 
             win = (window_signature(t["gui"], proc_name)
                    if (alive and a.visual) else None)
-            e = dict(n=i, state=state, summary=summary[:70],
+            e = dict(n=i, state=state, summary=summary[:70], app_exit=app_exit,
                      names_expected_defn=t["expect_defn"] in summary,
                      alive=alive, rounds=rounds,
                      expand_alloc_mb=round(alloc / 1e6, 1),
@@ -380,7 +381,10 @@ def main():
                   f"rss={e['rss_mb']} footprint={e['footprint_mb']} small={e['malloc_small_mb']} "
                   f"adopted={e['adopted_new_source']} visible={e['window_changed']}", flush=True)
             if not alive:
-                report["outcome"] = f"PROGRAM DIED at edit {i}"
+                sig = -app_exit if (app_exit or 0) < 0 else None
+                report["outcome"] = (f"PROGRAM DIED at edit {i} "
+                                     f"(exit={app_exit}"
+                                     + (f", signal {sig}" if sig else "") + ")")
                 break
             tot = sum(rss_kb(p) or 0 for p in tree_pids(app.pid))
             if tot > a.cap_mb * 1024:
