@@ -1,0 +1,195 @@
+(module experiments.live.ledger-test)
+(import "coil.alloc" :as alloc)
+(import "coil.assert" :use *)
+(import "coil.arraylist" :use [ArrayList len get])
+(import "experiments.live.ledger" :use *)
+
+(defn base-src [] (-> (slice u8))
+  "(module t.app)
+(import \"coil.primitive\" :as primitive)
+(const LIMIT 10)
+(defstruct Ball [(x i64) (r i64)])
+(defn radius [(b Ball)] (-> i64) (.r b))
+(impl Show Ball (show [(b Ball)] (-> i64) 0))
+(defn other [] (-> i64) 7)")
+
+(defn read [(src (slice u8))] (-> Ledger)
+  (ledger-read (alloc/malloc-allocator) src))
+
+(defn diff [(old (slice u8)) (new (slice u8))] (-> LedgerPlan)
+  (let [(mut a) (read old)
+        (mut b) (read new)]
+    (ledger-diff (alloc/malloc-allocator) (mut a) (mut b))))
+
+; Fields of the I'th form of a list (a struct read out of a list is bound first).
+(defn kind-at [(fs (ArrayList LedgerForm)) (i i64)] (-> i64)
+  (let [f (get fs i)] (.kind f)))
+
+(defn head-at [(fs (ArrayList LedgerForm)) (i i64)] (-> (slice u8))
+  (let [f (get fs i)] (.head f)))
+
+(defn name-at [(fs (ArrayList LedgerForm)) (i i64)] (-> (slice u8))
+  (let [f (get fs i)] (.name f)))
+
+(defn target-at [(fs (ArrayList LedgerForm)) (i i64)] (-> (slice u8))
+  (let [f (get fs i)] (.target f)))
+
+(defn line-at [(fs (ArrayList LedgerForm)) (i i64)] (-> i64)
+  (let [f (get fs i)] (.line f)))
+
+(deftest reads-forms-with-live-identities
+         (let [l (read (base-src))
+               fs (.forms l)]
+           (assert (.ok l))
+           (assert-eq 7 (len fs))
+           (assert-eq KIND-MODULE (kind-at fs 0))
+           (assert-eq KIND-IMPORT (kind-at fs 1))
+           (assert-eq KIND-CONTEXT (kind-at fs 2))
+           (assert-eq "LIMIT" (name-at fs 2))
+           (assert-eq KIND-DEFINITION (kind-at fs 3))
+           (assert-eq "defstruct" (head-at fs 3))
+           (assert-eq "Ball" (name-at fs 3))
+           (assert-eq "radius" (name-at fs 4))
+           (assert-eq 5 (line-at fs 4))
+           (assert-eq "impl" (head-at fs 5))
+           (assert-eq "Show Ball" (name-at fs 5))))
+
+(deftest reads-a-migration-as-an-edge-of-its-type
+         (let [l (read "(migrate Ball r old (+ old 1))")
+               fs (.forms l)]
+           (assert-eq KIND-MIGRATION (kind-at fs 0))
+           (assert-eq "Ball r" (name-at fs 0))
+           (assert-eq "Ball" (target-at fs 0))))
+
+(deftest layout-and-comments-change-nothing
+         (let [p
+                 (diff (base-src)
+                       "(module t.app)
+(import \"coil.primitive\"   :as primitive)
+;; the limit
+(const LIMIT 10)
+(defstruct Ball
+  [(x i64)
+   (r i64)])  ; radius
+(defn radius [(b Ball)]
+  (-> i64)
+  (.r b))
+(impl Show Ball (show [(b Ball)] (-> i64) 0))
+(defn other [] (-> i64) 7)")]
+           (assert-eq 0 (len (.submit p)))
+           (assert-eq 0 (len (.removed p)))
+           (assert-eq 0 (len (.unsupported p)))))
+
+(deftest a-body-edit-sends-only-that-definition
+         (let [p
+                 (diff (base-src)
+                       "(module t.app)
+(import \"coil.primitive\" :as primitive)
+(const LIMIT 10)
+(defstruct Ball [(x i64) (r i64)])
+(defn radius [(b Ball)] (-> i64) (* 2 (.r b)))
+(impl Show Ball (show [(b Ball)] (-> i64) 0))
+(defn other [] (-> i64) 7)")]
+           (assert-eq 1 (len (.submit p)))
+           (assert-eq "radius" (name-at (.submit p) 0))
+           (assert-eq 1 (len (.changed p)))
+           (assert-eq 0 (len (.added p)))))
+
+(deftest new-and-removed-definitions
+         (let [p
+                 (diff "(defn a [] (-> i64) 1)
+(defn b [] (-> i64) 2)"
+                       "(defn a [] (-> i64) 1)
+(defn c [] (-> i64) 3)")]
+           (assert-eq 1 (len (.submit p)))
+           (assert-eq "c" (name-at (.added p) 0))
+           (assert-eq 1 (len (.removed p)))
+           (assert-eq "b" (name-at (.removed p) 0))))
+
+(deftest a-migration-travels-with-its-type-change-once
+         (let [v1
+                 "(defstruct Ball [(x i64) (r i64)])
+(defn radius [(b Ball)] (-> i64) (.r b))"
+               v2
+                 "(defstruct Ball [(x i64) (r f64)])
+(migrate Ball r old (primitive/cast f64 old))
+(defn radius [(b Ball)] (-> i64) (primitive/cast i64 (.r b)))"
+               v3
+                 "(defstruct Ball [(x i64) (r f64)])
+(migrate Ball r old (primitive/cast f64 old))
+(defn radius [(b Ball)] (-> i64) (primitive/cast i64 (* 2.0 (.r b))))"
+               p2 (diff v1 v2)
+               p3 (diff v2 v3)]
+           ; the struct, its migration and the dependent function, in file order
+           (assert-eq 3 (len (.submit p2)))
+           (assert-eq "defstruct" (head-at (.submit p2) 0))
+           (assert-eq "migrate" (head-at (.submit p2) 1))
+           (assert-eq 1 (len (.migrations p2)))
+           ; once accepted, the migration stays in the file but is never sent again
+           (assert-eq 1 (len (.submit p3)))
+           (assert-eq "radius" (name-at (.submit p3) 0))
+           (assert-eq 1 (len (.historical p3)))))
+
+(deftest a-new-migration-without-a-type-change-is-not-sent
+         (let [p
+                 (diff "(defstruct Ball [(r i64)])"
+                       "(defstruct Ball [(r i64)])
+(migrate Ball r old old)")]
+           (assert-eq 0 (len (.submit p)))
+           (assert-eq 1 (len (.historical p)))))
+
+(deftest a-changed-const-is-unsupported
+         (let [p
+                 (diff "(const LIMIT 10)
+(defn f [] (-> i64) LIMIT)"
+                       "(const LIMIT 11)
+(defn f [] (-> i64) LIMIT)")]
+           (assert-eq 1 (len (.unsupported p)))
+           (assert-eq "LIMIT" (name-at (.unsupported p) 0))
+           (assert-eq 0 (len (.submit p)))))
+
+(deftest new-context-and-imports-are-sent
+         (let [p
+                 (diff "(defn f [] (-> i64) 1)"
+                       "(import \"coil.primitive\" :as primitive)
+(extern getpid :cc c [] (-> i32))
+(defn f [] (-> i64) 1)")]
+           (assert-eq 2 (len (.submit p)))))
+
+(deftest a-file-that-does-not-read-has-no-forms
+         (let [l (read "(defn f [] (-> i64) (+ 1 2)")]
+           (assert (not (.ok l)))
+           (assert-eq 0 (len (.forms l)))))
+
+(deftest main-edits-require-restart
+         (let [p (diff "(defn main [] (-> i64) 1)" "(defn main [] (-> i64) 2)")]
+           (assert-eq 1 (len (.unsupported p)))
+           (assert-eq 0 (len (.submit p)))))
+
+(deftest duplicate-definitions-and-migrations-have-source-locations
+         (let [(mut l)
+                 (read "(defn f [] (-> i64) 1)\n(defn f [] (-> i64) 2)\n(migrate T x old old)\n(migrate T x old 0)")
+               duplicates (ledger-duplicates (alloc/malloc-allocator) (mut l))]
+           (assert-eq 2 (len duplicates))
+           (assert-eq 2 (line-at duplicates 0))
+           (assert-eq 4 (line-at duplicates 1))))
+
+(deftest removed-context-and-imports-require-restart
+         (let [p
+                 (diff "(import \"coil.primitive\" :as primitive) (const LIMIT 10)"
+                       "")]
+           (assert-eq 2 (len (.unsupported p)))))
+
+(deftest the-first-version-sends-everything-but-module-and-migrations
+         (let [a (alloc/malloc-allocator)
+               (mut empty) (ledger-empty a)
+               (mut l)
+                 (read "(module t.app)
+(defstruct Ball [(r i64)])
+(migrate Ball r old old)
+(defn f [] (-> i64) 1)")
+               (mut p) (ledger-diff a (mut empty) (mut l))]
+           (assert-eq 2 (len (.submit p)))
+           (assert-eq 1 (len (.historical p)))
+           (assert-eq "(defstruct Ball [(r i64)])\n(defn f [] (-> i64) 1)"
+                      (plan-source a (mut p)))))

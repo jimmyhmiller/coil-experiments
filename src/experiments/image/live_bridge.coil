@@ -1,0 +1,642 @@
+(module experiments.image.live-bridge)
+
+; The bridge between an `Image` container and the real heap-inspector live
+; runtime. It links into the same host program as `experiments.heap-inspector.live`
+; and `.runtime`, so it reads the runtime's own registries directly: schema
+; versions and layouts from the inspector `TypeInfo` table, the reference map
+; from the live reference-field table, and the object graph from
+; `LiveRoot`/`LiveHandle`/`LiveManagedObject`.
+;
+; A live payload is serialized reflectively: its native bytes are copied
+; verbatim, and every registered reference field (a handle pointer, a raw
+; pointer into another tracked payload, or a slice into one) becomes a
+; relocation whose word is zeroed in the stored bytes. Nothing about a
+; payload's layout is hard-coded — the runtime already recorded every offset.
+;
+; Save runs under the caller's world quiescence. Load reconstructs the schema
+; registry from the saved records, allocates each payload into fresh `calloc`
+; storage, recreates the stable handles, rewires every relocation, and installs
+; the roots through the same `live-register-handle-root` the generated
+; `letonce` registrars use.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.mem" :use *)
+(import "experiments.image.format" :use *)
+(import "experiments.image.runtime"
+  :use [ImageBlocker IMAGE-BLOCK-NONE IMAGE-BLOCK-UNTRACKED-POINTER
+        IMAGE-BLOCK-UNTRACKED-SLICE IMAGE-BLOCK-UNKNOWN-HANDLE
+        IMAGE-BLOCK-UNREGISTERED-SCHEMA IMAGE-BLOCK-BAD-OBJECT
+        IMAGE-BLOCK-BAD-RELOCATION IMAGE-BLOCK-ALLOCATION-FAILED
+        IMAGE-BLOCK-SCHEMA-MISMATCH image-blocker-name])
+(import "experiments.heap-inspector.runtime" :as inspector)
+(import "experiments.heap-inspector.live" :as live)
+
+(extern calloc :cc c [u64 u64] (-> (ptr i8)))
+(extern free :cc c [(ptr i8)] (-> i64))
+
+; ---- shared save/load state -------------------------------------------------
+
+(defstruct BridgeForward
+  [(address i64)      ; native base address of the object's storage
+   (native-bytes i64) ; native-size * count
+   (native-size i64)  ; one element's native size
+   (object i64)])     ; 1-based image object id
+
+(defstruct BridgeHandle
+  [(address i64)      ; native address of the LiveHandle record
+   (id i64)])         ; 1-based image handle id
+
+; Bridge state lives in one process-global cell; save and materialize are
+; single-transaction operations serialized by the caller.
+(defstruct BridgeState
+  [(ready bool)
+   (a (dyn alloc/Allocator))
+   (forwards (ArrayList BridgeForward))
+   (handles (ArrayList BridgeHandle))
+   ; Materialized object storage and handle addresses, indexed by image id-1.
+   (object-addresses (ArrayList i64))
+   (handle-addresses (ArrayList i64))
+   (blocker ImageBlocker)])
+
+(defn bridge-state [] (-> (ptr BridgeState)) (primitive/alloc-static BridgeState))
+
+(defn bridge-reset! [(a (dyn alloc/Allocator))] (-> i64)
+  (let [s (bridge-state)]
+    (set! (.a s) a)
+    (set! (.forwards s) (al-new [BridgeForward] a))
+    (set! (.handles s) (al-new [BridgeHandle] a))
+    (set! (.object-addresses s) (al-new [i64] a))
+    (set! (.handle-addresses s) (al-new [i64] a))
+    (set! (.blocker s) (primitive/zeroed ImageBlocker))
+    (set! (.ready s) true)
+    0))
+
+(defn bridge-blocker [] (-> (ptr ImageBlocker)) (field (bridge-state) blocker))
+
+(defn bridge-block! [(kind i64) (runtime-id i64) (offset i64) (address i64)
+                     (site (slice u8))] (-> i64)
+  (let [b (bridge-blocker)]
+    (if (= (.kind b) IMAGE-BLOCK-NONE)
+        (do (set! (.kind b) kind) (set! (.runtime-id b) runtime-id)
+            (set! (.offset b) offset) (set! (.address b) address) (set! (.site b) site) 0)
+        0))
+  -1)
+
+(defn bridge-blocked? [] (-> bool) (!= (.kind (bridge-blocker)) IMAGE-BLOCK-NONE))
+
+; ---- schema reflection ------------------------------------------------------
+
+;;; The inspector type index for an exact (runtime-id, fingerprint) schema
+;;; version, or -1. After a reload the index differs from the saved one, so the
+;;; image always resolves a live schema by this identity pair, never by index.
+(defn bridge-schema-index [(runtime-id i64) (fingerprint i64)] (-> i64)
+  (let [types (inspector/types) (mut found) -1]
+    (for [i 0 (load (inspector/type-n))]
+      (let [t (primitive/index types i)]
+        (if (and (< (load found) 0)
+                 (and (= (.runtime-id t) runtime-id) (= (.fingerprint t) fingerprint)))
+            (set! found i) 0)))
+    (load found)))
+
+(defn bridge-type [(schema-id i64)] (-> (ptr inspector/TypeInfo))
+  (if (or (< schema-id 0) (>= schema-id (load (inspector/type-n))))
+      (primitive/cast (ptr inspector/TypeInfo) 0)
+      (primitive/index (inspector/types) schema-id)))
+
+(defn bridge-schema-native-size [(runtime-id i64) (schema-id i64)] (-> i64)
+  (let [t (bridge-type schema-id)] (if (= (primitive/cast i64 t) 0) -1 (.size t))))
+
+;;; The native element size of a nominal type's current schema, for slices.
+(defn bridge-runtime-elem-size [(runtime-id i64)] (-> i64)
+  (let [schema (inspector/live-latest-schema runtime-id)]
+    (if (< schema 0) 1
+        (let [size (live/live-schema-size schema)] (if (<= size 0) 1 size)))))
+
+; ---- save: forward/handle registration --------------------------------------
+
+(defn bridge-forward-for [(address i64)] (-> (ptr BridgeForward))
+  (let [s (bridge-state) (mut found) (primitive/cast (ptr BridgeForward) 0)]
+    (for [i 0 (al-len (.forwards s))]
+      (let [f (al-elem (field s forwards) i)]
+        (if (and (= (primitive/cast i64 (load found)) 0)
+                 (and (>= address (.address f)) (< address (+ (.address f) (.native-bytes f)))))
+            (set! found f) 0)))
+    (load found)))
+
+(defn bridge-handle-id-for [(address i64)] (-> i64)
+  (let [s (bridge-state) (mut found) 0]
+    (for [i 0 (al-len (.handles s))]
+      (let [h (al-elem (field s handles) i)]
+        (if (= (.address h) address) (set! found (.id h)) 0)))
+    (load found)))
+
+(defn bridge-empty-bytes [(a (dyn alloc/Allocator)) (n i64)] (-> ImageBytes)
+  (match (alloc/alloc-bytes a (if (= n 0) 1 n) 8)
+    (None [] (ImageBytes :data ""))
+    (Some [s]
+      (do (memset (primitive/cast (ptr i8) (slice-data s)) (primitive/cast i32 0)
+                  (primitive/cast isize (slice-len s)))
+          (ImageBytes :data (subslice s 0 n))))))
+
+;;; Add one object (count consecutive elements of a schema) to the image and
+;;; the forward table. Returns the 1-based object id, or 0 with a blocker.
+(defn bridge-add-object! [(img (ptr Image)) (address (ptr i8)) (runtime-id i64) (count i64)] (-> i64)
+  (let [s (bridge-state)
+        schema-id (inspector/live-latest-schema runtime-id)
+        raw (primitive/cast i64 address)]
+    (cond
+      (= raw 0) (do (bridge-block! IMAGE-BLOCK-BAD-OBJECT runtime-id 0 0 "") 0)
+      (< schema-id 0) (do (bridge-block! IMAGE-BLOCK-UNREGISTERED-SCHEMA runtime-id 0 raw "") 0)
+      (!= (primitive/cast i64 (bridge-forward-for raw)) 0) (bridge-existing-object raw)
+      :else
+        (let [t (bridge-type schema-id) size (live/live-schema-size schema-id)]
+          (if (<= count 0) (do (bridge-block! IMAGE-BLOCK-BAD-OBJECT runtime-id 0 raw "") 0)
+              (let [id (+ (al-len (.objects img)) 1)
+                    (mut obj) (primitive/zeroed ImageObject)]
+                (set! (.id obj) id)
+                (set! (.runtime-id obj) runtime-id)
+                (set! (.fingerprint obj) (.fingerprint t))
+                (set! (.kind obj) (.kind t))
+                (set! (.count obj) count)
+                (set! (.stride obj) size)
+                (set! (.bytes obj) (* size count))
+                (set! (.align obj) (.align t))
+                (set! (.payload obj) (bridge-empty-bytes (.a s) (* size count)))
+                (set! (.relocations obj) (al-new [ImageRelocation] (.a s)))
+                (set! (.functions obj) (al-new [ImageFunctionValue] (.a s)))
+                (set! (.transient obj) (al-new [i64] (.a s)))
+                (al-push! (mut (.objects img)) (load obj))
+                (al-push! (mut (.forwards s))
+                  (BridgeForward :address raw :native-bytes (* size count)
+                                 :native-size size :object id))
+                id))))))
+
+(defn bridge-existing-object [(raw i64)] (-> i64)
+  (.object (bridge-forward-for raw)))
+
+; ---- save: reference resolution ---------------------------------------------
+
+(defn bridge-zero-word! [(obj (ptr ImageObject)) (off i64) (n i64)] (-> i64)
+  (if (and (>= off 0) (<= (+ off n) (.bytes obj)))
+      (do (memset (primitive/cast (ptr i8)
+                    (primitive/index (slice-data (.data (field obj payload))) off))
+                  (primitive/cast i32 0) (primitive/cast isize n)) 0)
+      0))
+
+(defn bridge-push-reloc! [(obj (ptr ImageObject)) (a (dyn alloc/Allocator))
+                          (off i64) (kind i64) (target i64) (interior i64) (length i64)] (-> i64)
+  (al-push! (mut (.relocations obj))
+    (ImageRelocation :offset off :kind kind :target target :interior interior :length length))
+  0)
+
+;;; Resolve one reference field of a payload element into a relocation. `base`
+;;; is the element's offset in the stored payload; `off` is base + field offset.
+(defn bridge-resolve-ref! [(obj (ptr ImageObject)) (a (dyn alloc/Allocator))
+                           (native (ptr i8)) (base i64) (rf (ptr live/LiveReferenceField))] (-> i64)
+  (let [off (+ base (.offset rf))
+        field-native (primitive/index native (.offset rf))
+        word (primitive/cast i64 (load (primitive/cast (ptr (ptr i8)) field-native)))]
+    (cond
+      (= word 0) 0
+      (= (.kind rf) 4)
+        (let [handle-id (bridge-handle-id-for word)]
+          (if (<= handle-id 0)
+              (bridge-block! IMAGE-BLOCK-UNKNOWN-HANDLE (.runtime-id obj) off word "")
+              (do (bridge-push-reloc! obj a off IMAGE-REF-HANDLE handle-id 0 0)
+                  (bridge-zero-word! obj off 8) 0)))
+      (= (.kind rf) 2)
+        (let [len (load (primitive/cast (ptr i64) (primitive/index native (+ (.offset rf) 8))))
+              elem (bridge-runtime-elem-size (.target-runtime-id rf))
+              fwd (bridge-forward-for word)]
+          (cond
+            (= len 0) (do (bridge-zero-word! obj off 16) 0)
+            (= (primitive/cast i64 fwd) 0)
+              (bridge-block! IMAGE-BLOCK-UNTRACKED-SLICE (.runtime-id obj) off word "")
+            (> (+ word (* len elem)) (+ (.address fwd) (.native-bytes fwd)))
+              (bridge-block! IMAGE-BLOCK-UNTRACKED-SLICE (.runtime-id obj) off word "")
+            :else
+              (do (bridge-push-reloc! obj a off IMAGE-REF-SLICE (.object fwd)
+                    (- word (.address fwd)) len)
+                  (bridge-zero-word! obj off 16) 0)))
+      :else
+        (let [fwd (bridge-forward-for word)]
+          (if (= (primitive/cast i64 fwd) 0)
+              (bridge-block! IMAGE-BLOCK-UNTRACKED-POINTER (.runtime-id obj) off word "")
+              (do (bridge-push-reloc! obj a off IMAGE-REF-OBJECT (.object fwd)
+                    (- word (.address fwd)) 0)
+                  (bridge-zero-word! obj off 8) 0))))))
+
+;;; Serialize the object at forward entry `fi`: copy native bytes and resolve
+;;; every reference field of every element.
+(defn bridge-serialize-object! [(img (ptr Image)) (a (dyn alloc/Allocator)) (fi i64)] (-> i64)
+  (let [s (bridge-state)
+        fwd (al-elem (field s forwards) fi)
+        obj (al-elem (field img objects) fi)
+        schema-id (bridge-schema-index (.runtime-id obj) (.fingerprint obj))]
+    (if (< schema-id 0)
+        (bridge-block! IMAGE-BLOCK-UNREGISTERED-SCHEMA (.runtime-id obj) 0 (.fingerprint obj) "")
+        (do
+          (memcpy (primitive/cast (ptr i8) (slice-data (.data (field obj payload))))
+                  (primitive/cast (ptr i8) (.address fwd))
+                  (primitive/cast isize (.bytes obj)))
+          (let [refs (live/live-reference-fields) (mut status) 0]
+            (for [e 0 (.count obj)]
+              (for [i 0 (load (live/live-reference-field-count))]
+                (let [rf (primitive/index refs i)]
+                  (if (and (= (load status) 0) (= (.schema-id rf) schema-id))
+                      (set! status
+                        (bridge-resolve-ref! obj a
+                          (primitive/cast (ptr i8) (+ (.address fwd) (* e (.native-size fwd))))
+                          (* e (.stride obj)) rf))
+                      0))))
+            (load status))))))
+
+; ---- save: schema records ---------------------------------------------------
+
+(defn bridge-schema-recorded? [(img (ptr Image)) (runtime-id i64) (fingerprint i64)] (-> bool)
+  (let [(mut found) false]
+    (for [i 0 (al-len (.schemas img))]
+      (let [sc (al-elem (field img schemas) i)]
+        (if (and (= (.runtime-id sc) runtime-id) (= (.fingerprint sc) fingerprint))
+            (set! found true) 0)))
+    (load found)))
+
+(defn bridge-describe-schemas! [(img (ptr Image)) (a (dyn alloc/Allocator))] (-> i64)
+  (for [i 0 (al-len (.objects img))]
+    (let [obj (al-elem (field img objects) i)]
+      (if (bridge-schema-recorded? img (.runtime-id obj) (.fingerprint obj)) 0
+          (let [schema-id (bridge-schema-index (.runtime-id obj) (.fingerprint obj))
+                t (bridge-type schema-id)]
+            (if (= (primitive/cast i64 t) 0) 0
+                (let [(mut sc) (primitive/zeroed ImageSchema)]
+                  (set! (.runtime-id sc) (.runtime-id obj))
+                  (set! (.name sc) (.name t))
+                  (set! (.version sc) (.version t))
+                  (set! (.fingerprint sc) (.fingerprint obj))
+                  (set! (.kind sc) (.kind t))
+                  (set! (.size sc) (.size t))
+                  (set! (.align sc) (.align t))
+                  (set! (.stride sc) (.size t))
+                  (set! (.declaration sc) "")
+                  (set! (.fields sc) (al-new [ImageField] a))
+                  (set! (.variants sc) (al-new [ImageVariant] a))
+                  (set! (.references sc) (al-new [ImageReference] a))
+                  (let [refs (live/live-reference-fields)]
+                    (for [k 0 (load (live/live-reference-field-count))]
+                      (let [rf (primitive/index refs k)]
+                        (if (= (.schema-id rf) schema-id)
+                            (do (al-push! (mut (.references sc))
+                                  (ImageReference :offset (.offset rf) :kind (.kind rf)
+                                                  :target (.target-runtime-id rf))) 0)
+                            0))))
+                  (set! (.edges sc) (al-new [i64] a))
+                  (al-push! (mut (.schemas img)) (load sc))
+                  0))))))
+  0)
+
+; ---- save: the world walk ---------------------------------------------------
+
+;;; Walk the live world into `img`. The caller must hold the world quiescent
+;;; (bridge-save! does). Returns 0, or -1 with the bridge blocker set.
+(defn bridge-save! [(a (dyn alloc/Allocator)) (img (ptr Image))] (-> i64)
+  (bridge-reset! a)
+  ; 1. Each live handle's payload becomes an object; record handle->object.
+  (let [(mut handle) (load (live/live-handle-head)) (mut status) 0]
+    (loop
+      (if (or (!= (load status) 0) (= (primitive/cast i64 (load handle)) 0)) (break)
+          (let [h (load handle)]
+            (if (.live h)
+                (let [object (bridge-add-object! img (.payload h) (.runtime-id h) 1)]
+                  (if (<= object 0) (set! status -1)
+                      (let [s (bridge-state) id (+ (al-len (.handles img)) 1)]
+                        (al-push! (mut (.handles img))
+                          (ImageHandle :id id :object object :refs (.refs h) :root (.root-id h)))
+                        (al-push! (mut (.handles s))
+                          (BridgeHandle :address (primitive/cast i64 h) :id id))
+                        0)))
+                0)
+            (set! handle (.next h)))))
+    (if (!= (load status) 0) status
+        (do
+          ; 2. Managed objects not already registered as a handle payload.
+          (bridge-add-managed! img)
+          (if (bridge-blocked?) -1
+              (do
+                ; 3. Roots naming a stable handle.
+                (bridge-add-roots! img)
+                ; 4. Schema records for every version present.
+                (bridge-describe-schemas! img a)
+                ; 5. Serialize every object.
+                (let [s (bridge-state) (mut ss) 0]
+                  (for [fi 0 (al-len (.forwards s))]
+                    (if (= (load ss) 0) (set! ss (bridge-serialize-object! img a fi)) 0))
+                  (if (bridge-blocked?) -1 (load ss)))))))))
+
+(defn bridge-add-managed! [(img (ptr Image))] (-> i64)
+  (let [objects (live/live-managed-objects) (mut status) 0]
+    (for [i 0 (load (live/live-managed-object-count))]
+      (let [o (primitive/index objects i)]
+        (if (and (= (load status) 0) (.live o)
+                 (= (primitive/cast i64 (bridge-forward-for (primitive/cast i64 (.address o)))) 0))
+            (if (<= (bridge-add-object! img (.address o) (.runtime-id o) (.count o)) 0)
+                (set! status -1) 0)
+            0)))
+    (load status)))
+
+(defn bridge-add-roots! [(img (ptr Image))] (-> i64)
+  (let [roots (live/live-roots)]
+    (for [i 0 (load (live/live-root-count))]
+      (let [r (primitive/index roots i)]
+        (if (and (.live r) (!= (primitive/cast i64 (.handle r)) 0))
+            (let [handle-id (bridge-handle-id-for (primitive/cast i64 (.handle r)))]
+              (if (> handle-id 0)
+                  (do (al-push! (mut (.roots img))
+                        (ImageRoot :name (.name r) :runtime-id (.runtime-id r)
+                                   :fingerprint (bridge-root-fingerprint img handle-id)
+                                   :handle handle-id :object 0)) 0)
+                  0))
+            0))))
+  0)
+
+(defn bridge-root-fingerprint [(img (ptr Image)) (handle-id i64)] (-> i64)
+  (let [h (al-elem (field img handles) (- handle-id 1))]
+    (.fingerprint (al-elem (field img objects) (- (.object h) 1)))))
+
+; ---- load: schema reconstruction (data reload, no JIT) ----------------------
+
+(defn bridge-schema-show [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0)
+
+;;; Re-register every schema version in `img` into the live runtime, in order,
+;;; so their (runtime-id, fingerprint) pairs resolve to fresh schema indices.
+;;; This reconstructs the schema registry from the image alone; the full boot
+;;; (image-boot!, phase C) additionally replays code through the controller.
+(defn bridge-reconstruct-schemas! [(img (ptr Image))] (-> i64)
+  (let [(mut status) 0]
+    (for [i 0 (al-len (.schemas img))]
+      (if (= (load status) 0)
+          (let [sc (al-elem (field img schemas) i)
+                schema-id (inspector/register-type (.name sc) (.runtime-id sc) (.fingerprint sc)
+                            (.size sc) (.align sc) (al-len (.fields sc))
+                            (primitive/fnptr-of bridge-schema-show)
+                            (primitive/fnptr-of bridge-schema-show))]
+            (if (< schema-id 0) (set! status -1)
+                (do
+                  (inspector/register-type-kind schema-id (.kind sc))
+                  (for [k 0 (al-len (.references sc))]
+                    (let [rf (al-elem (field sc references) k)]
+                      (live/live-register-reference-field schema-id (.offset rf) (.target rf) (.kind rf))))
+                  0)))
+          0))
+    (load status)))
+
+; ---- load: materialization --------------------------------------------------
+
+;;; Materialize the graph in `img` into the live runtime and install its roots.
+;;; Schemas must already be resolvable. Returns 0, or -1 with a blocker.
+(defn bridge-materialize! [(a (dyn alloc/Allocator)) (img (ptr Image))] (-> i64)
+  (bridge-reset! a)
+  (let [s (bridge-state) (mut status) 0]
+    ; 1. Allocate every object's storage.
+    (for [i 0 (al-len (.objects img))]
+      (if (= (load status) 0)
+          (let [obj (al-elem (field img objects) i)
+                schema-id (bridge-schema-index (.runtime-id obj) (.fingerprint obj))]
+            (if (< schema-id 0)
+                (set! status (bridge-block! IMAGE-BLOCK-SCHEMA-MISMATCH (.runtime-id obj) 0
+                               (.fingerprint obj) ""))
+                (let [storage (calloc 1 (primitive/cast u64 (.bytes obj)))]
+                  (if (= (primitive/cast i64 storage) 0)
+                      (set! status (bridge-block! IMAGE-BLOCK-ALLOCATION-FAILED (.runtime-id obj)
+                                     0 (.bytes obj) ""))
+                      (do (memcpy storage
+                            (primitive/cast (ptr i8) (slice-data (.data (field obj payload))))
+                            (primitive/cast isize (.bytes obj)))
+                          (al-push! (mut (.object-addresses s)) (primitive/cast i64 storage))
+                          0)))))
+          0))
+    (if (!= (load status) 0) status
+        (do
+          ; 2. Create every stable handle over its payload storage.
+          (for [i 0 (al-len (.handles img))]
+            (if (= (load status) 0)
+                (let [h (al-elem (field img handles) i)
+                      obj (al-elem (field img objects) (- (.object h) 1))
+                      storage (al-get (.object-addresses s) (- (.object h) 1))
+                      schema-id (bridge-schema-index (.runtime-id obj) (.fingerprint obj))
+                      handle (live/live-handle-new! (.runtime-id obj) schema-id
+                               (primitive/cast (ptr i8) storage))]
+                  (if (= (primitive/cast i64 handle) 0)
+                      (set! status (bridge-block! IMAGE-BLOCK-ALLOCATION-FAILED (.runtime-id obj) 0 0 ""))
+                      (do (al-push! (mut (.handle-addresses s)) (primitive/cast i64 handle)) 0)))
+                0))
+          (if (!= (load status) 0) status
+              (do
+                ; 3. Rewire every relocation.
+                (for [i 0 (al-len (.objects img))]
+                  (if (= (load status) 0) (set! status (bridge-rewire-object! img s i)) 0))
+                (if (!= (load status) 0) status
+                    ; 4. Install roots.
+                    (bridge-install-roots! img s))))))))
+
+(defn bridge-store-word! [(storage i64) (bytes i64) (off i64) (value i64)] (-> bool)
+  (if (or (< off 0) (> (+ off 8) bytes)) false
+      (do (store! (primitive/cast (ptr i64) (primitive/index (primitive/cast (ptr i8) storage) off))
+                  value)
+          true)))
+
+(defn bridge-rewire-object! [(img (ptr Image)) (s (ptr BridgeState)) (i i64)] (-> i64)
+  (let [obj (al-elem (field img objects) i)
+        storage (al-get (.object-addresses s) i)
+        (mut status) 0]
+    (for [k 0 (al-len (.relocations obj))]
+      (if (= (load status) 0)
+          (let [rel (al-elem (field obj relocations) k)
+                fail (bridge-block! IMAGE-BLOCK-BAD-RELOCATION (.runtime-id obj) (.offset rel)
+                       (.target rel) "")]
+            (set! status
+              (cond
+                (= (.kind rel) IMAGE-REF-HANDLE)
+                  (let [addr (bridge-materialized-handle s (.target rel))]
+                    (if (or (= addr 0) (not (bridge-store-word! storage (.bytes obj) (.offset rel) addr)))
+                        fail (bridge-ok!)))
+                (= (.kind rel) IMAGE-REF-OBJECT)
+                  (let [base (bridge-materialized-object s (.target rel))]
+                    (if (or (= base 0)
+                            (not (bridge-store-word! storage (.bytes obj) (.offset rel)
+                                   (+ base (.interior rel)))))
+                        fail (bridge-ok!)))
+                (= (.kind rel) IMAGE-REF-SLICE)
+                  (let [base (bridge-materialized-object s (.target rel))]
+                    (if (or (= base 0)
+                            (or (not (bridge-store-word! storage (.bytes obj) (.offset rel)
+                                       (+ base (.interior rel))))
+                                (not (bridge-store-word! storage (.bytes obj) (+ (.offset rel) 8)
+                                       (.length rel)))))
+                        fail (bridge-ok!)))
+                :else fail)))
+          0))
+    (load status)))
+
+; Clearing the just-set speculative blocker on success keeps the blocker as the
+; FIRST failure only.
+(defn bridge-ok! [] (-> i64) (set! (.kind (bridge-blocker)) IMAGE-BLOCK-NONE) 0)
+
+(defn bridge-materialized-object [(s (ptr BridgeState)) (id i64)] (-> i64)
+  (if (or (<= id 0) (> id (al-len (.object-addresses s)))) 0
+      (al-get (.object-addresses s) (- id 1))))
+
+(defn bridge-materialized-handle [(s (ptr BridgeState)) (id i64)] (-> i64)
+  (if (or (<= id 0) (> id (al-len (.handle-addresses s)))) 0
+      (al-get (.handle-addresses s) (- id 1))))
+
+(defn bridge-install-roots! [(img (ptr Image)) (s (ptr BridgeState))] (-> i64)
+  (let [(mut status) 0]
+    (for [i 0 (al-len (.roots img))]
+      (if (= (load status) 0)
+          (let [root (al-elem (field img roots) i)
+                addr (bridge-materialized-handle s (.handle root))]
+            (if (= addr 0) (set! status (bridge-block! IMAGE-BLOCK-BAD-OBJECT (.runtime-id root) 0 0 ""))
+                (if (< (live/live-register-handle-root (.name root)
+                         (primitive/cast (ptr live/LiveHandle) addr)) 0)
+                    (set! status (bridge-block! IMAGE-BLOCK-BAD-OBJECT (.runtime-id root) 0 addr ""))
+                    0)))
+          0))
+    (load status)))
+
+; ---- load: in-place overlay restore (full boot) -----------------------------
+;
+; After the ledger is replayed through the controller, the live world has been
+; rebuilt with the same schemas, functions, and letonce roots — but with the
+; base program's initial heap state. The saved image then overlays the captured
+; runtime state onto that isomorphic graph *in place*, so the generated
+; accessors (which read their own root slots) transparently see restored values
+; without any change to the live reader. Handle pointers are left as the live
+; ones; only scalar bytes are copied and the traversal follows the live graph.
+
+(defn bridge-find-live-root [(name (slice u8))] (-> (ptr live/LiveRoot))
+  (let [roots (live/live-roots) (mut found) (primitive/cast (ptr live/LiveRoot) 0)]
+    (for [i 0 (load (live/live-root-count))]
+      (let [r (primitive/index roots i)]
+        (if (and (.live r) (live/live-text=? (.name r) name)) (set! found r) 0)))
+    (load found)))
+
+(defstruct BridgeOverlay
+  [(a (dyn alloc/Allocator))
+   (img (ptr Image))
+   (live-addr (ArrayList i64))   ; image object id-1 -> live payload address (0 = unseen)
+   (work-obj (ArrayList i64))    ; queue of image object ids
+   (work-live (ArrayList i64))]) ; queue of live payload addresses
+
+(defn bridge-overlay-enqueue! [(ov (ptr BridgeOverlay)) (oid i64) (laddr i64)] (-> i64)
+  (if (or (<= oid 0) (= laddr 0)) 0
+      (let [prior (al-get (.live-addr ov) (- oid 1))]
+        (if (!= prior 0) 0
+            (do (al-set! (mut (.live-addr ov)) (- oid 1) laddr)
+                (al-push! (mut (.work-obj ov)) oid)
+                (al-push! (mut (.work-live ov)) laddr)
+                0)))))
+
+;;; Overlay the saved scalar state of image object `oid` onto live payload
+;;; `laddr`, following handle/pointer/slice fields into the live graph.
+(defn bridge-overlay-object! [(ov (ptr BridgeOverlay)) (oid i64) (laddr i64)] (-> i64)
+  (let [img (.img ov)
+        obj (al-elem (field img objects) (- oid 1))
+        size (.stride obj)]
+    (for [e 0 (.count obj)]
+      (let [base (* e size)
+            live-elem (+ laddr (* e size))
+            src (primitive/index (slice-data (.data (field obj payload))) base)]
+        ; Preserve live reference words across the scalar copy.
+        (for [k 0 (al-len (.relocations obj))]
+          (let [rel (al-elem (field obj relocations) k)]
+            (if (and (>= (.offset rel) base) (< (.offset rel) (+ base size)))
+                (bridge-overlay-follow! ov obj rel base live-elem laddr) 0)))
+        ; Copy the element's scalar bytes, then restore the live pointers.
+        (let [saved (bridge-overlay-save-words ov obj base live-elem)]
+          (memcpy (primitive/cast (ptr i8) live-elem) (primitive/cast (ptr i8) src)
+                  (primitive/cast isize size))
+          (bridge-overlay-restore-words ov obj base live-elem saved))))
+    0))
+
+; Temp storage for up to 64 reference words per element, saved across the copy.
+(defn bridge-overlay-save-words [(ov (ptr BridgeOverlay)) (obj (ptr ImageObject))
+                                 (base i64) (live-elem i64)] (-> (ptr i64))
+  (let [scratch (bridge-overlay-scratch) (mut n) 0]
+    (for [k 0 (al-len (.relocations obj))]
+      (let [rel (al-elem (field obj relocations) k)]
+        (if (and (>= (.offset rel) base) (< (.offset rel) (+ base (.stride obj))) (< (load n) 128))
+            (do
+              (store! (primitive/index scratch (* (load n) 2)) (.offset rel))
+              (store! (primitive/index scratch (+ (* (load n) 2) 1))
+                (load (primitive/cast (ptr i64) (primitive/index (primitive/cast (ptr i8) live-elem) (- (.offset rel) base)))))
+              (set! n (+ (load n) 1)))
+            0)))
+    (store! (bridge-overlay-scratch-n) (load n))
+    scratch))
+
+(defn bridge-overlay-scratch [] (-> (ptr i64)) (primitive/cast (ptr i64) (primitive/alloc-static (array i64 256))))
+(defn bridge-overlay-scratch-n [] (-> (ptr i64)) (primitive/alloc-static i64))
+
+(defn bridge-overlay-restore-words [(ov (ptr BridgeOverlay)) (obj (ptr ImageObject))
+                                    (base i64) (live-elem i64) (saved (ptr i64))] (-> i64)
+  (for [i 0 (load (bridge-overlay-scratch-n))]
+    (let [off (load (primitive/index saved (* i 2)))
+          word (load (primitive/index saved (+ (* i 2) 1)))]
+      (store! (primitive/cast (ptr i64)
+                (primitive/index (primitive/cast (ptr i8) live-elem) (- off base))) word)))
+  0)
+
+;;; Enqueue the target of one reference, mapping the image target object to the
+;;; live object the live pointer already names.
+(defn bridge-overlay-follow! [(ov (ptr BridgeOverlay)) (obj (ptr ImageObject))
+                              (rel (ptr ImageRelocation)) (base i64) (live-elem i64)
+                              (laddr i64)] (-> i64)
+  (let [live-word (load (primitive/cast (ptr i64)
+                          (primitive/index (primitive/cast (ptr i8) live-elem) (- (.offset rel) base))))]
+    (if (= live-word 0) 0
+        (cond
+          (= (.kind rel) IMAGE-REF-HANDLE)
+            (let [img (.img ov)
+                  h (al-elem (field img handles) (- (.target rel) 1))
+                  live-payload (.payload (primitive/cast (ptr live/LiveHandle) live-word))]
+              (bridge-overlay-enqueue! ov (.object h) (primitive/cast i64 live-payload)))
+          (= (.kind rel) IMAGE-REF-OBJECT)
+            (bridge-overlay-enqueue! ov (.target rel) (- live-word (.interior rel)))
+          (= (.kind rel) IMAGE-REF-SLICE)
+            (bridge-overlay-enqueue! ov (.target rel) (- live-word (.interior rel)))
+          :else 0))))
+
+;;; Overlay every saved root's captured state onto the live world in place.
+;;; Returns 0, or -1 with a blocker when a saved root has no live counterpart.
+(defn bridge-restore-in-place! [(a (dyn alloc/Allocator)) (img (ptr Image))] (-> i64)
+  (let [ov (primitive/alloc-stack BridgeOverlay)]
+    (set! (.a ov) a)
+    (set! (.img ov) img)
+    (set! (.live-addr ov) (al-new [i64] a))
+    (set! (.work-obj ov) (al-new [i64] a))
+    (set! (.work-live ov) (al-new [i64] a))
+    (for [i 0 (al-len (.objects img))] (al-push! (mut (.live-addr ov)) 0))
+    (let [(mut status) 0]
+      (for [i 0 (al-len (.roots img))]
+        (if (= (load status) 0)
+            (let [root (al-elem (field img roots) i)
+                  live-root (bridge-find-live-root (.name root))]
+              (if (= (primitive/cast i64 live-root) 0)
+                  (set! status (bridge-block! IMAGE-BLOCK-BAD-OBJECT (.runtime-id root) 0 0 (.name root)))
+                  (let [h (al-elem (field img handles) (- (.handle root) 1))
+                        live-handle (.handle live-root)]
+                    (bridge-overlay-enqueue! ov (.object h)
+                      (primitive/cast i64 (.payload live-handle)))
+                    0)))
+            0))
+      (if (!= (load status) 0) status
+          (let [(mut qi) 0]
+            (loop
+              (if (>= (load qi) (al-len (.work-obj ov))) (break)
+                  (do (bridge-overlay-object! ov
+                        (al-get (.work-obj ov) (load qi)) (al-get (.work-live ov) (load qi)))
+                      (set! qi (+ (load qi) 1)))))
+            0)))))

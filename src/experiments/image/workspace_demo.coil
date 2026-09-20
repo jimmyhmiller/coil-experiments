@@ -1,0 +1,189 @@
+(module experiments.image.workspace-demo)
+
+; A visible, real example of a Coil image: a small "workspace" — a counter plus
+; a linked list of notes — that you build in one run, snapshot to an image, and
+; boot straight back into in another process. The boot is timed, so you can see
+; it come up in microseconds into the exact state you saved.
+;
+;   coil run src/experiments/image/workspace_demo.coil -- run   work.coilimage
+;   coil run src/experiments/image/workspace_demo.coil -- boot  work.coilimage
+;   coil run src/experiments/image/workspace_demo.coil -- bake  <self> work.coilimage app
+;   ./app        # a self-booting executable: run it and it IS the workspace
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :use *)
+(import "coil.time" :as time)
+(import "experiments.image.format" :use *)
+(import "experiments.image.image" :as image)
+(import "experiments.image.bake" :as bake)
+(import "experiments.heap-inspector.runtime" :as inspector)
+(import "experiments.heap-inspector.live" :as live)
+
+(extern calloc :cc c [u64 u64] (-> (ptr i8)))
+(extern printf :cc c [(ptr i8) ...] (-> i32))
+
+; A note holds an id, an inline text buffer, and a handle to the next note.
+(defstruct Note [(id i64) (len i64) (text (array u8 32)) (next (ptr i8))])
+; The workspace root: a counter, how many notes, and the head of the list.
+(defstruct Workspace [(counter i64) (count i64) (head (ptr i8))])
+
+(const NOTE-RT 880101)   (const NOTE-FP 660101)
+(const WS-RT 880102)     (const WS-FP 660102)
+
+(defn ashow [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0)
+
+(defn register-schemas! [] (-> i64)
+  (let [ns (inspector/register-type "Note" NOTE-RT NOTE-FP
+             (primitive/sizeof Note) (primitive/alignof Note) 4
+             (primitive/fnptr-of ashow) (primitive/fnptr-of ashow))
+        ws (inspector/register-type "Workspace" WS-RT WS-FP
+             (primitive/sizeof Workspace) (primitive/alignof Workspace) 3
+             (primitive/fnptr-of ashow) (primitive/fnptr-of ashow))]
+    (inspector/register-type-kind ns 1)
+    (inspector/register-type-kind ws 1)
+    (live/live-register-reference-field ns (primitive/offsetof Note next) NOTE-RT 4)
+    (live/live-register-reference-field ws (primitive/offsetof Workspace head) WS-RT 4)
+    0))
+
+(defn note-schema [] (-> i64) (inspector/live-latest-schema NOTE-RT))
+(defn ws-schema [] (-> i64) (inspector/live-latest-schema WS-RT))
+
+(defn set-text! [(p (ptr Note)) (s (slice u8))] (-> i64)
+  (let [n (if (> (slice-len s) 32) 32 (slice-len s))]
+    (set! (.len p) n)
+    (for [i 0 n] (store! (primitive/index (field p text) i) (slice-get s i)))
+    0))
+
+(defn add-note! [(ws (ptr Workspace)) (id i64) (text (slice u8))] (-> i64)
+  (let [p (primitive/cast (ptr Note) (calloc 1 (primitive/cast u64 (primitive/sizeof Note))))]
+    (set! (.id p) id)
+    (set-text! p text)
+    (set! (.next p) (.head ws))   ; prepend
+    (let [h (live/live-handle-new! NOTE-RT (note-schema) (primitive/cast (ptr i8) p))]
+      (set! (.head ws) (primitive/cast (ptr i8) h))
+      (set! (.count ws) (+ (.count ws) 1))
+      0)))
+
+(defn find-workspace [] (-> (ptr Workspace))
+  (let [roots (live/live-roots) (mut found) (primitive/cast (ptr Workspace) 0)]
+    (for [i 0 (load (live/live-root-count))]
+      (let [r (primitive/index roots i)]
+        (if (and (.live r) (live/live-text=? (.name r) "workspace"))
+            (set! found (primitive/cast (ptr Workspace)
+                          (live/live-handle-payload (.handle r) (.runtime-id (.handle r)) (.schema-id (.handle r)))))
+            0)))
+    (load found)))
+
+(defn print-workspace [(ws (ptr Workspace)) (title (slice u8))] (-> i64)
+  (printf c"\n  %.*s\n" (primitive/cast i32 (slice-len title)) (slice-data title))
+  (printf c"  counter = %ld   notes = %ld\n" (.counter ws) (.count ws))
+  (let [(mut h) (.head ws)]
+    (loop (if (= (primitive/cast i64 (load h)) 0) (break)
+              (let [n (primitive/cast (ptr Note)
+                        (live/live-handle-payload (primitive/cast (ptr live/LiveHandle) (load h))
+                          NOTE-RT (note-schema)))]
+                (printf c"    #%ld  %.*s\n" (.id n)
+                        (primitive/cast i32 (.len n)) (primitive/cast (ptr i8) (field n text)))
+                (set! h (.next n))))))
+  0)
+
+; ---- run: build a workspace and snapshot it ---------------------------------
+
+(defn build-and-save! [(path (slice u8))] (-> i64)
+  (register-schemas!)
+  (let [ws (primitive/cast (ptr Workspace) (calloc 1 (primitive/cast u64 (primitive/sizeof Workspace))))]
+    (live/live-register-handle-root "workspace"
+      (live/live-handle-new! WS-RT (ws-schema) (primitive/cast (ptr i8) ws)))
+    (set! (.counter ws) 0)
+    (add-note! ws 1 "buy milk")
+    (add-note! ws 2 "call the compiler")
+    (add-note! ws 3 "snapshot the world")
+    (set! (.counter ws) 42)
+    (print-workspace ws "workspace before snapshot:")
+    (let [rc (image/image-save! path IMAGE-MODE-QUIT)]
+      (if (!= rc 0) (do (printf c"\n  save failed: %ld\n" rc) 1)
+          (do (printf c"\n  saved image -> %.*s\n\n" (primitive/cast i32 (slice-len path)) (slice-data path)) 0)))))
+
+; ---- boot: come up instantly in the saved state -----------------------------
+
+(defn micros-since [(start (ptr time/Instant))] (-> i64)
+  (match (time/monotonic-now)
+    (Err [_] -1)
+    (Ok [now]
+      (let [np (primitive/alloc-stack time/Instant)]
+        (store! np now)
+        (+ (* (- (.sec np) (.sec start)) 1000000)
+           (/ (- (.nsec np) (.nsec start)) 1000))))))
+
+(defn boot! [(path (slice u8))] (-> i64)
+  (register-schemas!)
+  (match (time/monotonic-now)
+    (Err [_] (do (printf c"clock error\n") 1))
+    (Ok [start]
+      (let [sp (primitive/alloc-stack time/Instant) _ (store! sp start)
+            status (image/image-load-data! path)
+            us (micros-since sp)]
+        (if (!= status 0)
+            (do (printf c"\n  boot failed: %ld %.*s\n" status
+                  (primitive/cast i32 (slice-len (image/image-error-name status)))
+                  (slice-data (image/image-error-name status))) 1)
+            (let [ws (find-workspace)]
+              (if (= (primitive/cast i64 ws) 0) (do (printf c"\n  no workspace\n") 1)
+                  (do
+                    (printf c"\n  booted from image in %ld microseconds\n" us)
+                    (print-workspace ws "workspace after boot:")
+                    (printf c"\n")
+                    0))))))))
+
+; ---- self-booting baked binary ----------------------------------------------
+
+(defn self-boot! [(self-path (slice u8))] (-> i64)
+  (register-schemas!)
+  (match (time/monotonic-now)
+    (Err [_] 1)
+    (Ok [start]
+      (let [sp (primitive/alloc-stack time/Instant) _ (store! sp start)
+            status (bake/image-boot-baked-data! self-path)
+            us (micros-since sp)]
+        (if (!= status 0) (do (printf c"\n  not a baked image (%ld)\n" status) 1)
+            (let [ws (find-workspace)]
+              (if (= (primitive/cast i64 ws) 0) (do (printf c"\n  no workspace\n") 1)
+                  (do
+                    (printf c"\n  this executable IS a workspace image. booted in %ld microseconds.\n" us)
+                    (print-workspace ws "workspace:")
+                    (printf c"\n")
+                    0))))))))
+
+(defn cstr [(p (ptr i8))] (-> (slice u8))
+  (let [(mut n) 0]
+    (loop (if (= (primitive/cast i64 (load (primitive/index p (load n)))) 0) (break)
+              (set! n (+ (load n) 1))))
+    (slice-new (primitive/cast (ptr u8) p) (load n))))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (let [argv0 (cstr (load (primitive/index argv 0)))]
+    (cond
+      (< (primitive/cast i64 argc) 2)
+        (if (bake/image-baked? (alloc/malloc-allocator) argv0) (self-boot! argv0)
+            (do (printf c"usage: workspace_demo <run|boot|bake> FILE\n") 2))
+      :else
+        (let [mode (cstr (load (primitive/index argv 1)))]
+          (cond
+            (live/live-text=? mode "bake")
+              (if (< (primitive/cast i64 argc) 5) (do (printf c"usage: bake SELF IMG OUT\n") 2)
+                  (let [rc (bake/image-bake! (alloc/malloc-allocator)
+                             (cstr (load (primitive/index argv 2)))
+                             (cstr (load (primitive/index argv 3)))
+                             (cstr (load (primitive/index argv 4))))]
+                    (if (!= rc 0) (do (printf c"bake failed %ld\n" rc) 1)
+                        (do (printf c"baked -> %.*s\n"
+                              (primitive/cast i32 (slice-len (cstr (load (primitive/index argv 4)))))
+                              (slice-data (cstr (load (primitive/index argv 4))))) 0))))
+            (< (primitive/cast i64 argc) 3) (do (printf c"usage: workspace_demo <run|boot> FILE\n") 2)
+            :else
+              (let [path (cstr (load (primitive/index argv 2)))]
+                (cond
+                  (live/live-text=? mode "run") (build-and-save! path)
+                  (live/live-text=? mode "boot") (boot! path)
+                  :else (do (printf c"unknown mode\n") 2))))))))

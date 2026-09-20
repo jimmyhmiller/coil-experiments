@@ -1,0 +1,144 @@
+(module experiments.image.roundtrip)
+
+; A two-process round trip over the real live runtime, the honest phase-B/C
+; gate: one process builds a live handle graph and saves it; a separate process
+; loads it and verifies every value, pointer, cycle, and shared handle survived.
+;
+;   coil run src/experiments/image/roundtrip.coil -- save FILE
+;   coil run src/experiments/image/roundtrip.coil -- load FILE
+;
+; scripts/image-roundtrip.sh runs the two halves and checks the output.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :use *)
+(import "coil.str" :as str)
+(import "experiments.image.format" :use *)
+(import "experiments.image.image" :as image)
+(import "experiments.image.ledger" :as ledger)
+(import "experiments.heap-inspector.runtime" :as inspector)
+(import "experiments.heap-inspector.live" :as live)
+
+(extern calloc :cc c [u64 u64] (-> (ptr i8)))
+(extern printf :cc c [(ptr i8) ...] (-> i32))
+
+; A node's live payload: a scalar, a handle pointer to another node (forming a
+; cycle), and a slice into a shared managed array of counters.
+(defstruct NodePayload
+  [(value i64)
+   (next (ptr i8))
+   (tags (slice u8))])
+
+(const NODE-RUNTIME 424242)
+(const NODE-FINGERPRINT 777001)
+(const TAGS-RUNTIME 424243)
+(const TAGS-FINGERPRINT 777002)
+
+(defn node-show [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0)
+
+(defn register-node-schema! [] (-> i64)
+  (let [schema (inspector/register-type "Node" NODE-RUNTIME NODE-FINGERPRINT
+                 (primitive/sizeof NodePayload) (primitive/alignof NodePayload) 3
+                 (primitive/fnptr-of node-show) (primitive/fnptr-of node-show))]
+    (inspector/register-type-kind schema 1)
+    ; next: a handle field (kind 4) to another Node.
+    (live/live-register-reference-field schema (primitive/offsetof NodePayload next) NODE-RUNTIME 4)
+    ; tags: a slice (kind 2) into the Tags byte array.
+    (live/live-register-reference-field schema (primitive/offsetof NodePayload tags) TAGS-RUNTIME 2)
+    schema))
+
+(defn register-tags-schema! [] (-> i64)
+  (let [schema (inspector/register-type "Tags" TAGS-RUNTIME TAGS-FINGERPRINT 1 1 0
+                 (primitive/fnptr-of node-show) (primitive/fnptr-of node-show))]
+    (inspector/register-type-kind schema 1)
+    schema))
+
+(defn build-and-save! [(path (slice u8))] (-> i64)
+  (let [node-schema (register-node-schema!)
+        tags-schema (register-tags-schema!)
+        ; A shared managed byte array "abcde".
+        tags (calloc 5 1)]
+    (for [i 0 5] (store! (primitive/index tags i) (primitive/cast i8 (+ 97 i))))
+    (live/live-track-inspector-object! tags TAGS-RUNTIME tags-schema 5 1 5)
+    (let [p1 (primitive/cast (ptr NodePayload) (calloc 1 (primitive/cast u64 (primitive/sizeof NodePayload))))
+          p2 (primitive/cast (ptr NodePayload) (calloc 1 (primitive/cast u64 (primitive/sizeof NodePayload))))]
+      (set! (.value p1) 10)
+      (set! (.value p2) 20)
+      (set! (.tags p1) (slice-new (primitive/cast (ptr u8) tags) 5))
+      ; p2 borrows the middle three bytes "bcd".
+      (set! (.tags p2) (slice-new (primitive/cast (ptr u8) (primitive/index tags 1)) 3))
+      (let [h1 (live/live-handle-new! NODE-RUNTIME node-schema (primitive/cast (ptr i8) p1))
+            h2 (live/live-handle-new! NODE-RUNTIME node-schema (primitive/cast (ptr i8) p2))]
+        (set! (.next p1) (primitive/cast (ptr i8) h2))
+        (set! (.next p2) (primitive/cast (ptr i8) h1))
+        (live/live-register-handle-root "first" h1)
+        (ledger/ledger-record! "(defstruct Node [(value i64)])" IMAGE-LEDGER-BASE)
+        (ledger/ledger-record! "(defn value [(n Node)] (-> i64) (.value n))" IMAGE-LEDGER-EDIT)
+        (let [status (image/image-save! path IMAGE-MODE-QUIT)]
+          (if (!= status 0)
+              (do (printf c"SAVE-FAIL %ld %.*s\n" status
+                    (primitive/cast i32 (slice-len (image/image-error-name status)))
+                    (slice-data (image/image-error-name status))) 1)
+              (do (printf c"SAVE-OK handles=%ld roots=%ld\n"
+                    (load (live/live-handle-count)) (load (live/live-root-count))) 0)))))))
+
+(defn find-root [(name (slice u8))] (-> (ptr live/LiveRoot))
+  (let [roots (live/live-roots) (mut found) (primitive/cast (ptr live/LiveRoot) 0)]
+    (for [i 0 (load (live/live-root-count))]
+      (let [r (primitive/index roots i)]
+        (if (and (.live r) (live/live-text=? (.name r) name)) (set! found r) 0)))
+    (load found)))
+
+(defn node-of [(h (ptr live/LiveHandle))] (-> (ptr NodePayload))
+  (primitive/cast (ptr NodePayload) (live/live-handle-payload h (.runtime-id h) (.schema-id h))))
+
+(defn load-and-verify! [(path (slice u8))] (-> i64)
+  (let [status (image/image-load-data! path)]
+    (if (!= status 0)
+        (do (printf c"LOAD-FAIL %ld %.*s\n" status
+              (primitive/cast i32 (slice-len (image/image-error-name status)))
+              (slice-data (image/image-error-name status))) 1)
+        (let [root (find-root "first")]
+          (if (= (primitive/cast i64 root) 0)
+              (do (printf c"VERIFY-FAIL no-root\n") 1)
+              (let [h1 (.handle root)
+                    n1 (node-of h1)
+                    h2 (primitive/cast (ptr live/LiveHandle) (.next n1))
+                    n2 (node-of h2)]
+                (cond
+                  (!= (.value n1) 10) (do (printf c"VERIFY-FAIL v1=%ld\n" (.value n1)) 1)
+                  (!= (.value n2) 20) (do (printf c"VERIFY-FAIL v2=%ld\n" (.value n2)) 1)
+                  ; the cycle: n2.next is h1 again
+                  (!= (primitive/cast i64 (primitive/cast (ptr live/LiveHandle) (.next n2)))
+                      (primitive/cast i64 h1)) (do (printf c"VERIFY-FAIL cycle\n") 1)
+                  (!= (slice-len (.tags n1)) 5) (do (printf c"VERIFY-FAIL tags1-len=%ld\n" (slice-len (.tags n1))) 1)
+                  (!= (primitive/cast i64 (slice-get (.tags n1) 0)) 97) (do (printf c"VERIFY-FAIL tags1-0\n") 1)
+                  (!= (slice-len (.tags n2)) 3) (do (printf c"VERIFY-FAIL tags2-len=%ld\n" (slice-len (.tags n2))) 1)
+                  (!= (primitive/cast i64 (slice-get (.tags n2) 0)) 98) (do (printf c"VERIFY-FAIL tags2-0\n") 1)
+                  ; the shared array: n1.tags and n2.tags point into one object
+                  (!= (primitive/cast i64 (slice-data (.tags n2)))
+                      (+ (primitive/cast i64 (slice-data (.tags n1))) 1)) (do (printf c"VERIFY-FAIL share\n") 1)
+                  (!= (ledger/ledger-count) 2) (do (printf c"VERIFY-FAIL ledger=%ld\n" (ledger/ledger-count)) 1)
+                  :else (do (printf c"LOAD-OK v1=%ld v2=%ld tags1=%.*s tags2=%.*s ledger=%ld\n"
+                              (.value n1) (.value n2)
+                              (primitive/cast i32 5) (slice-data (.tags n1))
+                              (primitive/cast i32 3) (slice-data (.tags n2))
+                              (ledger/ledger-count)) 0))))))))
+
+(defn streq [(a (ptr i8)) (b (slice u8))] (-> bool)
+  (live/live-text=? (cstr a) b))
+(defn cstr [(p (ptr i8))] (-> (slice u8))
+  (let [(mut n) 0]
+    (loop (if (= (primitive/cast i64 (load (primitive/index p (load n)))) 0) (break)
+              (set! n (+ (load n) 1))))
+    (slice-new (primitive/cast (ptr u8) p) (load n))))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (if (< (primitive/cast i64 argc) 3)
+      (do (printf c"usage: roundtrip <save|load> FILE\n") 2)
+      (let [mode (load (primitive/index argv 1))
+            path (cstr (load (primitive/index argv 2)))]
+        (cond
+          (streq mode "save") (build-and-save! path)
+          (streq mode "load") (load-and-verify! path)
+          :else (do (printf c"unknown mode\n") 2)))))

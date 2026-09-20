@@ -1,0 +1,115 @@
+(module experiments.live-hooks.hooks)
+
+(import "coil.primitive" :as primitive)
+(import "coil.atomic" :as atomic)
+
+;;; What a program asks to be told when the live host publishes a new
+;;; generation of its code.
+;;;
+;;; The hook runs on the publisher's thread, immediately after the generation
+;;; becomes current, and it is a SIGNAL, not a frame: set a flag, wake a run
+;;; loop, post an event. It must not draw, must not touch application state,
+;;; and must not submit an edit. Work that does any of those belongs on the
+;;; thread that owns it, woken by this.
+;;;
+;;; It is not called for an edit that was rejected, that needs a migration, or
+;;; that needs a restart -- in each of those the running program is unchanged --
+;;; nor for the first generation, which is the program starting up.
+;;;
+;;; Two ways to set one, and they share this one cell:
+;;;
+;;;   (defn wake :live/on-publish true [] (-> i64) ...)  ; declared
+;;;   (hooks/on-code-change! (primitive/fnptr-of wake))  ; registered
+;;;
+;;; A declared hook is re-registered by each generation that defines it, so it
+;;; is always the current version of that function and can never be left
+;;; pointing into a retired image. A registered one is whatever pointer it was
+;;; given: register from `main`, whose code the host never replaces. If a
+;;; program does both, the declared hook wins from its first publication.
+
+;;; Marks a function as a code-change hook, as a leading `:key value` pair
+;;; between the name and the parameters. The live coordinator registers the
+;;; annotated function itself, so a program that declares one says nothing else.
+;;; Inert in a program built without the live package: an annotation carries no
+;;; code, and importing this module is what makes it a declared annotation
+;;; rather than an unknown one.
+(defannotation :live/on-publish bool)
+
+(defstruct Hooks
+  [(registered bool)
+   (on-change (fnptr c [] i64))
+   ; Generations published, and generations the program has been told about.
+   ; The host only ever advances the first; the program's own thread advances
+   ; the second as it runs the hook.
+   (generation i64)
+   (served i64)])
+
+;;; The storage, and the one C name that identifies it in this process.
+(defn hooks-storage [] (-> (ptr Hooks))
+  (primitive/alloc-static Hooks))
+
+(export-c [hooks-storage :as "coil_live_hooks_storage"])
+
+(extern dlsym :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+;;; RTLD_DEFAULT: search every image loaded in this process. (void*)-2 on macOS.
+(defn rtld-default [] (-> (ptr i8))
+  (primitive/cast (ptr i8) -2))
+
+;;; One cell per process, not one per compiled copy of this module.
+;;;
+;;; A live program compiles the modules it imports -- this one among them --
+;;; into every generation, and `alloc-static` in that copy is a different cell
+;;; from the one in the binary that started. A hook registered by the running
+;;; program would then be invisible to the host that has to call it. So the
+;;; cell is found by name through the process, where the binary's exported
+;;; storage answers for every copy. A program built without the live package
+;;; resolves to its own, which is the only one there is.
+(defn hooks [] (-> (ptr Hooks))
+  (let [found (dlsym (rtld-default) c"coil_live_hooks_storage")]
+    (if (= (primitive/cast i64 found) 0)
+        (hooks-storage)
+        (primitive/call-ptr (primitive/cast (fnptr c [] (ptr Hooks)) found)))))
+
+;;; Register the hook, replacing any previous one.
+(defn on-code-change! [(f (fnptr c [] i64))] (-> i64)
+  (let [h (hooks)]
+    (set! (.on-change h) f)
+    (set! (.registered h) true)
+    0))
+
+(defn clear-code-change-hook! [] (-> i64)
+  (set! (.registered (hooks)) false) 0)
+
+;;; Record that a generation was published. The live host calls this, on the
+;;; thread that published it, and it does no more than count: it must not call
+;;; the program's code. The publisher's thread cannot run the program's code at
+;;; all -- not drawing, not a one-line signal -- without wedging the thread that
+;;; owns it. The hook runs from `pump!`, below, on the program's own thread.
+(defn note-code-change! [] (-> i64)
+  (atomic/atomic-add (field (hooks) generation) 1))
+
+;;; Run the hook if the program has not yet been told about the newest
+;;; generation. Call it from wherever the program reaches a quiescent point it
+;;; controls -- a frame, a tick, the top of an event loop. Returns 1 if the
+;;; hook ran.
+;;;
+;;; Whatever thread calls this is the thread the hook runs on, which is the
+;;; point: a hook is the program's own code and belongs on the program's own
+;;; thread.
+(defn pump! [] (-> i64)
+  (let [h (hooks)
+        current (atomic/atomic-load (field h generation))]
+    (if (or (= current (load (field h served))) (not (.registered h)))
+        (do (store! (field h served) current) 0)
+        (do
+          (store! (field h served) current)
+          (primitive/call-ptr (.on-change h))
+          1))))
+
+;;; Whether a hook is registered, and how many generations have been published.
+(defn code-change-hook? [] (-> bool)
+  (.registered (hooks)))
+
+(defn code-change-generation [] (-> i64)
+  (atomic/atomic-load (field (hooks) generation)))

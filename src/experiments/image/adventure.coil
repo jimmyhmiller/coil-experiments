@@ -1,0 +1,469 @@
+(module experiments.image.adventure)
+
+; A real application whose entire world is a Coil image: a small text adventure.
+; The world is a live object graph — rooms cross-linked by exits (a cyclic
+; graph), items that live in rooms or in your pack, and a player standing
+; somewhere holding things. You play it; at any point `save FILE` snapshots the
+; running world; `boot FILE` (or a baked executable) brings it back exactly
+; where you left off, in microseconds, and you keep playing.
+;
+;   coil build src/experiments/image/adventure.coil -o build/adventure
+;   build/adventure new                 # a fresh world, reading commands on stdin
+;   build/adventure boot FILE           # resume a saved world
+;
+; Commands: look | go <n|s|e|w> (or just n/s/e/w) | take <item> | drop <item>
+;           inv | score | map | save <file> | help | quit
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :use *)
+(import "coil.time" :as time)
+(import "experiments.image.format" :use *)
+(import "experiments.image.image" :as image)
+(import "experiments.image.bake" :as bake)
+(import "experiments.heap-inspector.runtime" :as inspector)
+(import "experiments.heap-inspector.live" :as live)
+
+(extern calloc :cc c [u64 u64] (-> (ptr i8)))
+(extern free :cc c [(ptr i8)] (-> i64))
+(extern printf :cc c [(ptr i8) ...] (-> i32))
+(extern read :cc c [i32 (ptr i8) i64] (-> i64))
+
+; ---- the world's object layouts --------------------------------------------
+
+; A room: a name, a description, and four exits (handles to other rooms, or 0).
+(defstruct RoomP
+  [(id i64) (namelen i64) (name (array u8 24))
+   (desclen i64) (desc (array u8 160))
+   (exits (array (ptr i8) 4))])   ; 0=north 1=south 2=east 3=west
+
+; An item: a name, whether it can be carried, and where it is (a room handle,
+; or 0 when it is in the player's pack).
+(defstruct ItemP
+  [(id i64) (portable i64) (value i64)
+   (namelen i64) (name (array u8 24))
+   (location (ptr i8))])
+
+; The player: which room they are in, what they carry, and their tally.
+(defstruct PlayerP
+  [(room (ptr i8)) (holds i64) (holding (array (ptr i8) 8))
+   (moves i64) (score i64)])
+
+(const ROOM-RT 900201)  (const ROOM-FP 700201)
+(const ITEM-RT 900202)  (const ITEM-FP 700202)
+(const PLAYER-RT 900203)(const PLAYER-FP 700203)
+
+(defn ashow [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0)
+
+(defn register-schemas! [] (-> i64)
+  (let [rs (inspector/register-type "Room" ROOM-RT ROOM-FP
+             (primitive/sizeof RoomP) (primitive/alignof RoomP) 6
+             (primitive/fnptr-of ashow) (primitive/fnptr-of ashow))
+        is (inspector/register-type "Item" ITEM-RT ITEM-FP
+             (primitive/sizeof ItemP) (primitive/alignof ItemP) 6
+             (primitive/fnptr-of ashow) (primitive/fnptr-of ashow))
+        ps (inspector/register-type "Player" PLAYER-RT PLAYER-FP
+             (primitive/sizeof PlayerP) (primitive/alignof PlayerP) 5
+             (primitive/fnptr-of ashow) (primitive/fnptr-of ashow))]
+    (inspector/register-type-kind rs 1)
+    (inspector/register-type-kind is 1)
+    (inspector/register-type-kind ps 1)
+    ; Room exits: four handle fields to other rooms.
+    (for [d 0 4]
+      (live/live-register-reference-field rs (+ (primitive/offsetof RoomP exits) (* d 8)) ROOM-RT 4))
+    ; Item location: a handle to the room it sits in.
+    (live/live-register-reference-field is (primitive/offsetof ItemP location) ROOM-RT 4)
+    ; Player: current room + up to eight carried items.
+    (live/live-register-reference-field ps (primitive/offsetof PlayerP room) ROOM-RT 4)
+    (for [i 0 8]
+      (live/live-register-reference-field ps (+ (primitive/offsetof PlayerP holding) (* i 8)) ITEM-RT 4))
+    0))
+
+(defn room-schema [] (-> i64) (inspector/live-latest-schema ROOM-RT))
+(defn item-schema [] (-> i64) (inspector/live-latest-schema ITEM-RT))
+(defn player-schema [] (-> i64) (inspector/live-latest-schema PLAYER-RT))
+
+; ---- fixed strings ----------------------------------------------------------
+
+(defn store-text! [(dst (ptr u8)) (cap i64) (s (slice u8))] (-> i64)
+  (let [n (if (> (slice-len s) cap) cap (slice-len s))]
+    (for [i 0 n] (store! (primitive/index dst i) (slice-get s i)))
+    n))
+
+(defn print-text [(p (ptr u8)) (n i64)] (-> i64)
+  (printf c"%.*s" (primitive/cast i32 n) (primitive/cast (ptr i8) p)) 0)
+
+(defn text=? [(p (ptr u8)) (n i64) (s (slice u8))] (-> bool)
+  (if (!= n (slice-len s)) false
+      (let [(mut ok) true]
+        (for [i 0 n] (if (!= (primitive/cast i64 (load (primitive/index p i)))
+                             (primitive/cast i64 (slice-get s i))) (set! ok false) 0))
+        (load ok))))
+
+; ---- object accessors -------------------------------------------------------
+
+(defn room-of [(h (ptr i8))] (-> (ptr RoomP))
+  (primitive/cast (ptr RoomP) (live/live-handle-payload (primitive/cast (ptr live/LiveHandle) h) ROOM-RT (room-schema))))
+(defn item-of [(h (ptr i8))] (-> (ptr ItemP))
+  (primitive/cast (ptr ItemP) (live/live-handle-payload (primitive/cast (ptr live/LiveHandle) h) ITEM-RT (item-schema))))
+(defn player-of [(h (ptr i8))] (-> (ptr PlayerP))
+  (primitive/cast (ptr PlayerP) (live/live-handle-payload (primitive/cast (ptr live/LiveHandle) h) PLAYER-RT (player-schema))))
+
+; ---- app-side indexes (rebuilt from the live graph) -------------------------
+; The world lives in the live runtime; these arrays are just a convenient view
+; the app rebuilds by scanning live handles (after building or after a boot).
+
+(defn all-rooms [] (-> (ptr (array i64 128))) (primitive/alloc-static (array i64 128)))
+(defn all-rooms-n [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn all-items [] (-> (ptr (array i64 128))) (primitive/alloc-static (array i64 128)))
+(defn all-items-n [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn player-handle [] (-> (ptr (ptr i8))) (primitive/alloc-static (ptr i8)))
+
+(defn reindex! [] (-> i64)
+  (store! (all-rooms-n) 0)
+  (store! (all-items-n) 0)
+  (store! (player-handle) (primitive/cast (ptr i8) 0))
+  (let [(mut h) (load (live/live-handle-head))]
+    (loop (if (= (primitive/cast i64 (load h)) 0) (break)
+              (let [hh (load h)]
+                (if (.live hh)
+                    (cond
+                      (= (.runtime-id hh) ROOM-RT)
+                        (do (store! (primitive/index (all-rooms) (load (all-rooms-n))) (primitive/cast i64 hh))
+                            (store! (all-rooms-n) (+ (load (all-rooms-n)) 1)))
+                      (= (.runtime-id hh) ITEM-RT)
+                        (do (store! (primitive/index (all-items) (load (all-items-n))) (primitive/cast i64 hh))
+                            (store! (all-items-n) (+ (load (all-items-n)) 1)))
+                      (= (.runtime-id hh) PLAYER-RT)
+                        (store! (player-handle) (primitive/cast (ptr i8) hh))
+                      :else 0)
+                    0)
+                (set! h (.next hh))))))
+  0)
+
+(defn player [] (-> (ptr PlayerP))
+  (if (= (primitive/cast i64 (load (player-handle))) 0) (primitive/cast (ptr PlayerP) 0)
+      (player-of (load (player-handle)))))
+
+; ---- world construction -----------------------------------------------------
+
+(defn mk-room [(id i64) (name (slice u8)) (desc (slice u8))] (-> (ptr i8))
+  (let [p (primitive/cast (ptr RoomP) (calloc 1 (primitive/cast u64 (primitive/sizeof RoomP))))]
+    (set! (.id p) id)
+    (set! (.namelen p) (store-text! (primitive/cast (ptr u8) (field p name)) 24 name))
+    (set! (.desclen p) (store-text! (primitive/cast (ptr u8) (field p desc)) 160 desc))
+    (primitive/cast (ptr i8) (live/live-handle-new! ROOM-RT (room-schema) (primitive/cast (ptr i8) p)))))
+
+(defn set-exit! [(from (ptr i8)) (dir i64) (to (ptr i8))] (-> i64)
+  (store! (primitive/index (field (room-of from) exits) dir) to) 0)
+
+; Link a two-way passage: dir from a->b, opposite from b->a.
+(defn opposite [(dir i64)] (-> i64) (cond (= dir 0) 1 (= dir 1) 0 (= dir 2) 3 :else 2))
+(defn link! [(a (ptr i8)) (dir i64) (b (ptr i8))] (-> i64)
+  (set-exit! a dir b) (set-exit! b (opposite dir) a) 0)
+
+(defn mk-item [(id i64) (name (slice u8)) (portable i64) (value i64) (loc (ptr i8))] (-> (ptr i8))
+  (let [p (primitive/cast (ptr ItemP) (calloc 1 (primitive/cast u64 (primitive/sizeof ItemP))))]
+    (set! (.id p) id)
+    (set! (.portable p) portable)
+    (set! (.value p) value)
+    (set! (.namelen p) (store-text! (primitive/cast (ptr u8) (field p name)) 24 name))
+    (set! (.location p) loc)
+    (primitive/cast (ptr i8) (live/live-handle-new! ITEM-RT (item-schema) (primitive/cast (ptr i8) p)))))
+
+(const NORTH 0) (const SOUTH 1) (const EAST 2) (const WEST 3)
+
+(defn build-world! [] (-> i64)
+  (register-schemas!)
+  ; A little house-and-grounds map: twelve rooms.
+  (let [hall  (mk-room 1  "Entrance Hall" "A dim hall. Dust motes drift in a shaft of light. Doors lead off in every direction.")
+        study (mk-room 2  "Study" "Bookshelves sag under mildewed volumes. A heavy desk faces the window.")
+        kitch (mk-room 3  "Kitchen" "Cold hearth, copper pots, the ghost of old bread. A cellar stair descends.")
+        cellar(mk-room 4  "Cellar" "Damp brick and the smell of earth. Something glints between the casks.")
+        parlor(mk-room 5  "Parlor" "Faded velvet chairs around a dead fireplace. A portrait watches you.")
+        gallery(mk-room 6 "Gallery" "A long room of empty frames. Your footsteps echo too many times.")
+        library(mk-room 7 "Library" "Floor to ceiling books. A ladder on a rail. A single candle, still warm.")
+        garden(mk-room 8  "Garden" "Overgrown roses and a cracked sundial under a bruised sky.")
+        well  (mk-room 9  "Old Well" "A stone well, rope frayed. Water black and far below.")
+        attic (mk-room 10 "Attic" "Steamer trunks and cobwebs. A round window looks over the moor.")
+        tower (mk-room 11 "Tower Top" "Wind and a wide grey view. The whole estate lies beneath you.")
+        crypt (mk-room 12 "Crypt" "Cold stone names worn smooth. A door of iron stands ajar.")]
+    (link! hall NORTH study)
+    (link! hall EAST kitch)
+    (link! hall SOUTH parlor)
+    (link! hall WEST gallery)
+    (link! kitch SOUTH cellar)
+    (link! study EAST library)
+    (link! parlor SOUTH garden)
+    (link! garden EAST well)
+    (link! gallery NORTH library)
+    (link! library NORTH attic)
+    (link! attic NORTH tower)
+    (link! cellar WEST crypt)
+    ; Items scattered through the world.
+    (mk-item 1 "brass key" 1 5 study)
+    (mk-item 2 "candle" 1 2 library)
+    (mk-item 3 "silver coin" 1 10 cellar)
+    (mk-item 4 "rusty sword" 1 8 crypt)
+    (mk-item 5 "portrait" 0 0 parlor)
+    (mk-item 6 "coil of rope" 1 3 well)
+    (mk-item 7 "spade" 1 4 garden)
+    (mk-item 8 "locket" 1 15 attic)
+    (mk-item 9 "telescope" 1 12 tower)
+    (mk-item 10 "loaf of bread" 1 1 kitch)
+    ; The player starts in the hall.
+    (let [pp (primitive/cast (ptr PlayerP) (calloc 1 (primitive/cast u64 (primitive/sizeof PlayerP))))]
+      (set! (.room pp) hall)
+      (live/live-register-handle-root "player"
+        (live/live-handle-new! PLAYER-RT (player-schema) (primitive/cast (ptr i8) pp)))))
+  (reindex!)
+  0)
+
+; ---- commands ---------------------------------------------------------------
+
+(defn dir-name [(d i64)] (-> (slice u8)) (cond (= d 0) "north" (= d 1) "south" (= d 2) "east" :else "west"))
+
+(defn look [] (-> i64)
+  (let [p (player) room (room-of (.room p))]
+    (printf c"\n== ")
+    (print-text (primitive/cast (ptr u8) (field room name)) (.namelen room))
+    (printf c" ==\n")
+    (print-text (primitive/cast (ptr u8) (field room desc)) (.desclen room))
+    (printf c"\n")
+    ; exits
+    (printf c"Exits:")
+    (for [d 0 4]
+      (if (!= (primitive/cast i64 (load (primitive/index (field room exits) d))) 0)
+          (printf c" %.*s" (primitive/cast i32 (slice-len (dir-name d))) (slice-data (dir-name d))) 0))
+    (printf c"\n")
+    ; items here
+    (let [(mut any) false]
+      (for [i 0 (load (all-items-n))]
+        (let [it (item-of (primitive/cast (ptr i8) (load (primitive/index (all-items) i))))]
+          (if (= (primitive/cast i64 (.location it)) (primitive/cast i64 (.room p)))
+              (do (if (load any) 0 (do (printf c"You see: ") (set! any true)))
+                  (print-text (primitive/cast (ptr u8) (field it name)) (.namelen it))
+                  (printf c"  "))
+              0)))
+      (if (load any) (printf c"\n") 0))
+    0))
+
+(defn go [(d i64)] (-> i64)
+  (let [p (player) room (room-of (.room p))
+        dest (load (primitive/index (field room exits) d))]
+    (if (= (primitive/cast i64 dest) 0)
+        (do (printf c"You can't go %.*s from here.\n"
+              (primitive/cast i32 (slice-len (dir-name d))) (slice-data (dir-name d))) 0)
+        (do (set! (.room p) dest)
+            (set! (.moves p) (+ (.moves p) 1))
+            (look)))))
+
+(defn find-item-in-room [(name (ptr u8)) (n i64)] (-> (ptr i8))
+  (let [p (player) (mut found) (primitive/cast (ptr i8) 0)]
+    (for [i 0 (load (all-items-n))]
+      (let [h (primitive/cast (ptr i8) (load (primitive/index (all-items) i)))
+            it (item-of h)]
+        (if (and (= (primitive/cast i64 (.location it)) (primitive/cast i64 (.room p)))
+                 (text=? (primitive/cast (ptr u8) (field it name)) (.namelen it) (slice-new name n)))
+            (set! found h) 0)))
+    (load found)))
+
+(defn take [(name (ptr u8)) (n i64)] (-> i64)
+  (let [p (player) h (find-item-in-room name n)]
+    (if (= (primitive/cast i64 h) 0) (do (printf c"There is no such thing here.\n") 0)
+        (let [it (item-of h)]
+          (cond
+            (= (.portable it) 0) (do (printf c"You can't take that.\n") 0)
+            (>= (.holds p) 8) (do (printf c"Your pack is full.\n") 0)
+            :else
+              (do (store! (primitive/index (field p holding) (.holds p)) h)
+                  (set! (.holds p) (+ (.holds p) 1))
+                  (set! (.location it) (primitive/cast (ptr i8) 0))
+                  (set! (.score p) (+ (.score p) (.value it)))
+                  (printf c"Taken: ")
+                  (print-text (primitive/cast (ptr u8) (field it name)) (.namelen it))
+                  (printf c" (+%ld)\n" (.value it)) 0))))))
+
+(defn drop-item [(name (ptr u8)) (n i64)] (-> i64)
+  (let [p (player) (mut slot) -1]
+    (for [i 0 (.holds p)]
+      (let [it (item-of (load (primitive/index (field p holding) i)))]
+        (if (and (< (load slot) 0) (text=? (primitive/cast (ptr u8) (field it name)) (.namelen it) (slice-new name n)))
+            (set! slot i) 0)))
+    (if (< (load slot) 0) (do (printf c"You aren't carrying that.\n") 0)
+        (let [h (load (primitive/index (field p holding) (load slot)))
+              it (item-of h)]
+          (set! (.location it) (.room p))
+          (set! (.score p) (- (.score p) (.value it)))
+          ; compact the pack
+          (for [i (load slot) (- (.holds p) 1)]
+            (store! (primitive/index (field p holding) i) (load (primitive/index (field p holding) (+ i 1)))))
+          (set! (.holds p) (- (.holds p) 1))
+          (printf c"Dropped: ")
+          (print-text (primitive/cast (ptr u8) (field it name)) (.namelen it))
+          (printf c"\n") 0))))
+
+(defn inventory [] (-> i64)
+  (let [p (player)]
+    (if (= (.holds p) 0) (do (printf c"Your pack is empty.\n") 0)
+        (do (printf c"You are carrying:\n")
+            (for [i 0 (.holds p)]
+              (let [it (item-of (load (primitive/index (field p holding) i)))]
+                (printf c"  - ")
+                (print-text (primitive/cast (ptr u8) (field it name)) (.namelen it))
+                (printf c"\n")))
+            0))))
+
+(defn score [] (-> i64)
+  (let [p (player)] (printf c"Moves: %ld   Score: %ld   Carrying: %ld\n" (.moves p) (.score p) (.holds p)) 0))
+
+(defn world-map [] (-> i64)
+  (printf c"There are %ld rooms and %ld items in this world.\n" (load (all-rooms-n)) (load (all-items-n))) 0)
+
+(defn help [] (-> i64)
+  (printf c"commands: look | n s e w | go <dir> | take <item> | drop <item> | inv | score | map | save <file> | quit\n") 0)
+
+; ---- REPL -------------------------------------------------------------------
+
+(defn line-buf [] (-> (ptr (array u8 256))) (primitive/alloc-static (array u8 256)))
+
+; Read one line from stdin into the static buffer; returns its length, or -1 at EOF.
+(defn read-line [] (-> i64)
+  (let [buf (primitive/cast (ptr u8) (line-buf)) (mut n) 0 (mut eof) false]
+    (loop
+      (if (>= (load n) 255) (break)
+          (let [c (primitive/alloc-stack u8)
+                got (read (primitive/cast i32 0) (primitive/cast (ptr i8) c) 1)]
+            (cond
+              (<= got 0) (do (if (= (load n) 0) (set! eof true) 0) (break))
+              (= (primitive/cast i64 (load c)) 10) (break)
+              :else (do (store! (primitive/index buf (load n)) (load c)) (set! n (+ (load n) 1)))))))
+    (if (load eof) -1 (load n))))
+
+; A token is [start,end) of the buffer; split off the first word and the rest.
+(defn first-word-end [(buf (ptr u8)) (n i64)] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (or (>= (load i) n) (= (primitive/cast i64 (load (primitive/index buf (load i)))) 32)) (break)
+              (set! i (+ (load i) 1))))
+    (load i)))
+
+(defn skip-spaces [(buf (ptr u8)) (from i64) (n i64)] (-> i64)
+  (let [(mut i) from]
+    (loop (if (or (>= (load i) n) (!= (primitive/cast i64 (load (primitive/index buf (load i)))) 32)) (break)
+              (set! i (+ (load i) 1))))
+    (load i)))
+
+(defn cmd=? [(buf (ptr u8)) (end i64) (s (slice u8))] (-> bool)
+  (text=? buf end s))
+
+(defn do-save [(buf (ptr u8)) (arg-start i64) (n i64)] (-> i64)
+  (if (>= arg-start n) (do (printf c"usage: save <file>\n") 0)
+      (let [path (slice-new (primitive/index buf arg-start) (- n arg-start))
+            rc (image/image-save! path IMAGE-MODE-CONTINUE)]
+        (if (!= rc 0) (do (printf c"save failed: %ld\n" rc) 0)
+            (do (printf c"world snapshotted to %.*s\n" (primitive/cast i32 (slice-len path)) (slice-data path)) 0)))))
+
+; Run the interactive loop. Returns the process exit code.
+(defn repl [] (-> i64)
+  (look)
+  (block :repl
+    (loop
+      (printf c"\n> ")
+      (let [n (read-line)]
+        (if (< n 0) (do (printf c"\n") (return-from :repl 0))
+            (let [buf (primitive/cast (ptr u8) (line-buf))
+                  end (first-word-end buf n)
+                  arg-start (skip-spaces buf end n)
+                  arg (primitive/index buf arg-start)
+                  arg-n (- n arg-start)]
+              (cond
+                (= end 0) 0
+                (cmd=? buf end "look") (look)
+                (cmd=? buf end "l") (look)
+                (cmd=? buf end "n") (go NORTH)
+                (cmd=? buf end "s") (go SOUTH)
+                (cmd=? buf end "e") (go EAST)
+                (cmd=? buf end "w") (go WEST)
+                (cmd=? buf end "go")
+                  (cond (text=? arg arg-n "north") (go NORTH) (text=? arg arg-n "n") (go NORTH)
+                        (text=? arg arg-n "south") (go SOUTH) (text=? arg arg-n "s") (go SOUTH)
+                        (text=? arg arg-n "east") (go EAST) (text=? arg arg-n "e") (go EAST)
+                        (text=? arg arg-n "west") (go WEST) (text=? arg arg-n "w") (go WEST)
+                        :else (do (printf c"go where?\n") 0))
+                (cmd=? buf end "take") (take arg arg-n)
+                (cmd=? buf end "get") (take arg arg-n)
+                (cmd=? buf end "drop") (drop-item arg arg-n)
+                (cmd=? buf end "inv") (inventory)
+                (cmd=? buf end "i") (inventory)
+                (cmd=? buf end "score") (score)
+                (cmd=? buf end "map") (world-map)
+                (cmd=? buf end "help") (help)
+                (cmd=? buf end "save") (do-save buf arg-start n)
+                (cmd=? buf end "quit") (return-from :repl 0)
+                (cmd=? buf end "q") (return-from :repl 0)
+                :else (do (printf c"I don't understand that.\n") 0))))))))
+
+; ---- main -------------------------------------------------------------------
+
+(defn cstr [(p (ptr i8))] (-> (slice u8))
+  (let [(mut n) 0]
+    (loop (if (= (primitive/cast i64 (load (primitive/index p (load n)))) 0) (break)
+              (set! n (+ (load n) 1))))
+    (slice-new (primitive/cast (ptr u8) p) (load n))))
+
+(defn micros-since [(start (ptr time/Instant))] (-> i64)
+  (match (time/monotonic-now)
+    (Err [_] -1)
+    (Ok [now]
+      (let [np (primitive/alloc-stack time/Instant)]
+        (store! np now)
+        (+ (* (- (.sec np) (.sec start)) 1000000) (/ (- (.nsec np) (.nsec start)) 1000))))))
+
+(defn self-boot! [(self-path (slice u8))] (-> i64)
+  (register-schemas!)
+  (match (time/monotonic-now)
+    (Err [_] 1)
+    (Ok [start]
+      (let [sp (primitive/alloc-stack time/Instant) _ (store! sp start)
+            rc (bake/image-boot-baked-data! self-path)
+            us (micros-since sp)]
+        (if (!= rc 0) (do (printf c"this build carries no baked world (%ld)\n" rc) 1)
+            (do (reindex!)
+                (printf c"This executable IS a saved game. Restored in %ld microseconds.\n" us)
+                (repl)))))))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (let [argv0 (cstr (load (primitive/index argv 0)))]
+   (if (< (primitive/cast i64 argc) 2)
+      (if (bake/image-baked? (alloc/malloc-allocator) argv0) (self-boot! argv0)
+          (do (printf c"usage: adventure <new|boot FILE|bake SELF IMG OUT>\n") 2))
+      (let [mode (cstr (load (primitive/index argv 1)))]
+        (cond
+          (live/live-text=? mode "bake")
+            (if (< (primitive/cast i64 argc) 5) (do (printf c"usage: adventure bake SELF IMG OUT\n") 2)
+                (let [rc (bake/image-bake! (alloc/malloc-allocator)
+                           (cstr (load (primitive/index argv 2)))
+                           (cstr (load (primitive/index argv 3)))
+                           (cstr (load (primitive/index argv 4))))]
+                  (if (!= rc 0) (do (printf c"bake failed %ld\n" rc) 1)
+                      (do (printf c"baked a self-booting game\n") 0))))
+          (live/live-text=? mode "new")
+            (do (build-world!)
+                (printf c"You awaken in an unfamiliar house. (type 'help')\n")
+                (repl))
+          (live/live-text=? mode "boot")
+            (if (< (primitive/cast i64 argc) 3) (do (printf c"usage: adventure boot FILE\n") 2)
+                (let [path (cstr (load (primitive/index argv 2)))]
+                  (register-schemas!)
+                  (match (time/monotonic-now)
+                    (Err [_] 1)
+                    (Ok [start]
+                      (let [sp (primitive/alloc-stack time/Instant) _ (store! sp start)
+                            rc (image/image-load-data! path)
+                            us (micros-since sp)]
+                        (if (!= rc 0) (do (printf c"boot failed: %ld\n" rc) 1)
+                            (do (reindex!)
+                                (printf c"World restored from %.*s in %ld microseconds. You are back.\n"
+                                  (primitive/cast i32 (slice-len path)) (slice-data path) us)
+                                (repl))))))))
+          :else (do (printf c"unknown mode\n") 2))))))

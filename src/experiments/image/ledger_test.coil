@@ -1,0 +1,62 @@
+(module experiments.image.ledger-test)
+
+; The ledger: name extraction, recording, conflict marking, and the container
+; round trip. Fast — no JIT.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.assert" :use *)
+(import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
+(import "experiments.image.format" :use *)
+(import "experiments.image.ledger" :as ledger)
+
+(deftest defined-name-extraction
+  (assert (ledger/ledger-text=? "radius" (ledger/ledger-defined-name "(defn radius [(p Particle)] (-> i64) 14)")))
+  (assert (ledger/ledger-text=? "Particle" (ledger/ledger-defined-name "(defstruct Particle [(x i64)])")))
+  (assert (ledger/ledger-text=? "cell" (ledger/ledger-defined-name "(letonce cell (Cell :a 1))")))
+  (assert (ledger/ledger-text=? "Shape" (ledger/ledger-defined-name "  (defsum Shape (Dot) (Line [(n i64)]))")))
+  (assert (= 0 (slice-len (ledger/ledger-defined-name "(println \"x\")")))))
+
+(deftest record-and-count
+  (assert-eq 1 (ledger/ledger-record! "(defstruct Cell [(a i64)])" IMAGE-LEDGER-BASE))
+  (assert-eq 2 (ledger/ledger-record! "(defn value [(c Cell)] (-> i64) (.a c))" IMAGE-LEDGER-EDIT))
+  (assert-eq 2 (ledger/ledger-count))
+  (assert-eq IMAGE-LEDGER-BASE (.kind (ledger/ledger-entry 0)))
+  (assert-eq IMAGE-LEDGER-ACCEPTED (.status (ledger/ledger-entry 1)))
+  (assert (ledger/ledger-text=? "(defstruct Cell [(a i64)])" (.source (ledger/ledger-entry 0)))))
+
+(deftest conflict-marking-overrides-matching-edits
+  (ledger/ledger-record! "(defstruct Cell [(a i64)])" IMAGE-LEDGER-BASE)
+  (ledger/ledger-record! "(defn value [(c Cell)] (-> i64) (.a c))" IMAGE-LEDGER-EDIT)
+  (ledger/ledger-record! "(defn value [(c Cell)] (-> i64) (+ (.a c) 1))" IMAGE-LEDGER-EDIT)
+  ; the booting binary redefines `value`: both prior edits of `value` are overridden
+  (assert-eq 2 (ledger/ledger-mark-conflicts! "(defn value [(c Cell)] (-> i64) 0)"))
+  (assert-eq IMAGE-LEDGER-BASE (.kind (ledger/ledger-entry 0)))
+  (assert-eq IMAGE-LEDGER-ACCEPTED (.status (ledger/ledger-entry 0)))
+  (assert-eq IMAGE-LEDGER-OVERRIDDEN (.status (ledger/ledger-entry 1)))
+  (assert-eq IMAGE-LEDGER-OVERRIDDEN (.status (ledger/ledger-entry 2)))
+  ; a base that defines an unrelated name marks nothing
+  (assert-eq 0 (ledger/ledger-mark-conflicts! "(defn other [] (-> i64) 0)")))
+
+(deftest container-round-trip-preserves-the-ledger
+  (ledger/ledger-record! "(defstruct Cell [(a i64)])" IMAGE-LEDGER-BASE)
+  (ledger/ledger-record! "(defn value [(c Cell)] (-> i64) (.a c))" IMAGE-LEDGER-EDIT)
+  (ledger/ledger-set-pending! "(defstruct Cell [(a i64) (b Kind)])" "needs transition" 1)
+  (let [a (alloc/malloc-allocator)
+        img (primitive/alloc-stack Image)]
+    (store! img (image-new a))
+    (ledger/ledger-into-image! img)
+    (assert-eq 2 (al-len (.ledger img)))
+    (assert (.present (.pending img)))
+    (assert (ledger/ledger-text=? "needs transition" (.diagnostic (.pending img))))
+    (assert-eq ledger/LEDGER-LIVE-FINGERPRINT (.live-fingerprint (field img header)))
+    (assert-eq 0 (ledger/ledger-validate-header img))
+    ; corrupt the header: validation rejects it
+    (set! (.live-fingerprint (field img header)) 1)
+    (assert-eq -1 (ledger/ledger-validate-header img))
+    (set! (.live-fingerprint (field img header)) ledger/LEDGER-LIVE-FINGERPRINT)
+    ; reload into a fresh runtime table
+    (ledger/ledger-from-image! img)
+    (assert-eq 2 (ledger/ledger-count))
+    (assert (ledger/ledger-text=? "(defn value [(c Cell)] (-> i64) (.a c))" (.source (ledger/ledger-entry 1))))))

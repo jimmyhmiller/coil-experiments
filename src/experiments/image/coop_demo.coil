@@ -1,0 +1,132 @@
+(module experiments.image.coop-demo)
+
+; Phase G: a cooperative computation captured mid-flight and resumed after a
+; process boundary. The computation's *state* is a live struct (a handle graph
+; vertex), so the image saves and restores it like any live object. The step
+; *code* is compiled into the program; the resumed process re-attaches it to the
+; restored state and runs it to completion. This is the honest shape of "a
+; parked computation survives a snapshot": data is imaged, code comes from the
+; program.
+;
+;   coil run src/experiments/image/coop_demo.coil -- save FILE   ; run partway, image
+;   coil run src/experiments/image/coop_demo.coil -- resume FILE ; reload, finish
+;
+; scripts/image-coop.sh runs both halves.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :use *)
+(import "experiments.image.format" :use *)
+(import "experiments.image.image" :as image)
+(import "experiments.heap-inspector.runtime" :as inspector)
+(import "experiments.heap-inspector.live" :as live)
+(import "experiments.coop.scheduler" :as coop)
+
+(extern calloc :cc c [u64 u64] (-> (ptr i8)))
+(extern printf :cc c [(ptr i8) ...] (-> i32))
+
+; The resumable computation: sum 0..(n-1), one addend per cooperative turn.
+(defstruct CounterState [(i i64) (acc i64) (n i64)])
+
+(const COUNTER-RUNTIME 771001)
+(const COUNTER-FP 331001)
+
+(defn counter-show [(p (ptr i8))] (-> i64) (primitive/cast i64 p) 0)
+
+(defn register-counter! [] (-> i64)
+  (let [schema (inspector/register-type "Counter" COUNTER-RUNTIME COUNTER-FP
+                 (primitive/sizeof CounterState) (primitive/alignof CounterState) 3
+                 (primitive/fnptr-of counter-show) (primitive/fnptr-of counter-show))]
+    (inspector/register-type-kind schema 1)
+    schema))
+
+; Per-process turn budget: how many turns this process runs before the task
+; parks itself. It models the process being snapshotted mid-computation; it is
+; NOT part of the saved state.
+(defn turn-budget [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn park-queue [] (-> (ptr coop/WaitQueue)) (primitive/alloc-static coop/WaitQueue))
+
+(defn counter-step [(task (ptr coop/Task))] (-> i64)
+  (let [state (primitive/cast (ptr CounterState) (.context task))]
+    (cond
+      (>= (.i state) (.n state)) (coop/task-complete! task)
+      (<= (load (turn-budget)) 0) (coop/task-park! (park-queue) task)
+      :else
+        (do
+          (set! (.acc state) (+ (.acc state) (.i state)))
+          (set! (.i state) (+ (.i state) 1))
+          (store! (turn-budget) (- (load (turn-budget)) 1))
+          0))))
+
+(defn find-root [(name (slice u8))] (-> (ptr live/LiveRoot))
+  (let [roots (live/live-roots) (mut found) (primitive/cast (ptr live/LiveRoot) 0)]
+    (for [i 0 (load (live/live-root-count))]
+      (let [r (primitive/index roots i)]
+        (if (and (.live r) (live/live-text=? (.name r) name)) (set! found r) 0)))
+    (load found)))
+
+(defn counter-state [] (-> (ptr CounterState))
+  (let [root (find-root "counter")]
+    (if (= (primitive/cast i64 root) 0) (primitive/cast (ptr CounterState) 0)
+        (let [h (.handle root)]
+          (primitive/cast (ptr CounterState) (live/live-handle-payload h (.runtime-id h) (.schema-id h)))))))
+
+(defn run-scheduler! [(state (ptr CounterState))] (-> i64)
+  (let [scheduler (primitive/alloc-stack coop/Scheduler)
+        task (primitive/alloc-stack coop/Task)]
+    (coop/scheduler-init! scheduler)
+    (coop/wait-queue-init! (park-queue))
+    (coop/task-init! task scheduler (primitive/fnptr-of counter-step)
+      (primitive/cast (ptr i8) state))
+    (coop/scheduler-run! scheduler)
+    0))
+
+(defn build-and-save! [(path (slice u8))] (-> i64)
+  (let [schema (register-counter!)
+        p (primitive/cast (ptr CounterState) (calloc 1 (primitive/cast u64 (primitive/sizeof CounterState))))]
+    (set! (.i p) 0) (set! (.acc p) 0) (set! (.n p) 10)
+    (live/live-register-handle-root "counter" (live/live-handle-new! COUNTER-RUNTIME schema (primitive/cast (ptr i8) p)))
+    ; Run only 5 turns, then the task parks: the computation is snapshotted mid-flight.
+    (store! (turn-budget) 5)
+    (run-scheduler! p)
+    (let [rc (image/image-save! path IMAGE-MODE-QUIT)]
+      (if (!= rc 0)
+          (do (printf c"SAVE-FAIL %ld\n" rc) 1)
+          (do (printf c"SAVE-OK i=%ld acc=%ld n=%ld\n" (.i p) (.acc p) (.n p)) 0)))))
+
+(defn resume-and-finish! [(path (slice u8))] (-> i64)
+  (let [status (image/image-load-data! path)]
+    (if (!= status 0)
+        (do (printf c"RESUME-FAIL load=%ld %.*s\n" status
+              (primitive/cast i32 (slice-len (image/image-error-name status)))
+              (slice-data (image/image-error-name status))) 1)
+        (let [p (counter-state)]
+          (if (= (primitive/cast i64 p) 0)
+              (do (printf c"RESUME-FAIL no-counter\n") 1)
+              (do
+                ; The restored computation was parked at i=5, acc=10.
+                (if (or (!= (.i p) 5) (!= (.acc p) 10))
+                    (do (printf c"RESUME-FAIL restored i=%ld acc=%ld\n" (.i p) (.acc p)) 1)
+                    ; Re-attach the step code and run to completion.
+                    (do
+                      (store! (turn-budget) 1000)
+                      (run-scheduler! p)
+                      (if (!= (.acc p) 45)
+                          (do (printf c"RESUME-FAIL final acc=%ld want 45\n" (.acc p)) 1)
+                          (do (printf c"COOP-OK i=%ld acc=%ld n=%ld\n" (.i p) (.acc p) (.n p)) 0))))))))))
+
+(defn cstr [(p (ptr i8))] (-> (slice u8))
+  (let [(mut n) 0]
+    (loop (if (= (primitive/cast i64 (load (primitive/index p (load n)))) 0) (break)
+              (set! n (+ (load n) 1))))
+    (slice-new (primitive/cast (ptr u8) p) (load n))))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (if (< (primitive/cast i64 argc) 3)
+      (do (printf c"usage: coop_demo <save|resume> FILE\n") 2)
+      (let [mode (cstr (load (primitive/index argv 1)))
+            path (cstr (load (primitive/index argv 2)))]
+        (cond
+          (live/live-text=? mode "save") (build-and-save! path)
+          (live/live-text=? mode "resume") (resume-and-finish! path)
+          :else (do (printf c"unknown mode\n") 2)))))
