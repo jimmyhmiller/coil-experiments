@@ -5,6 +5,8 @@
 ;; Types are resolved and the conversions C performs implicitly are inserted
 ;; here, so what comes out is a typed tree rather than a parse tree.
 (module experiments.c.parse)
+(import "experiments.c.profile" :as prof)
+(import "coil.compiler.trace" :as tr)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :as al)
@@ -421,12 +423,14 @@
           ;; by the element size.
           (and (ct/pointer-like? lt) (ct/pointer-like? rt))
             (let [diff (nd/node-binary a nd/ND-SUB l r tok)
+                  divisor (nd/node-num a (ct/ty-size (ct/ty-base lt)) tok)
                   n
                     (nd/node-binary a
                                     nd/ND-DIV
                                     diff
-                                    (nd/node-num a (ct/ty-size (ct/ty-base lt)) tok)
+                                    divisor
                                     tok)]
+              (nd/set-type! divisor (ty-long-of (mut p)))
               (nd/set-type! diff (ty-long-of (mut p)))
               (nd/set-type! n (ty-long-of (mut p)))
               n)
@@ -547,23 +551,11 @@
                           (str/sb-push-byte! (mut b) (primitive/cast u8 c))
                           (store! i (+ (load i) 1)))
                       :else
-                        (let [k
-                                (if (< (+ (load i) 1) n)
-                                    (primitive/cast i64 (slice-get text (+ (load i) 1)))
-                                    0)
-                              v
-                                (cond (= k 110) 10
-                                      (= k 116) 9
-                                      (= k 114) 13
-                                      (= k 97) 7
-                                      (= k 98) 8
-                                      (= k 102) 12
-                                      (= k 118) 11
-                                      (= k 48) 0
-                                      (= k 101) 27
-                                      :else k)]
-                          (str/sb-push-byte! (mut b) (primitive/cast u8 v))
-                          (store! i (+ (load i) 2)))))))
+                        (let [escaped (lex/decode-byte-escape text (+ (load i) 1))]
+                          (if (> (slice-len (.message escaped)) 0)
+                              (fail! (mut p) (.message escaped)) 0)
+                          (str/sb-push-byte! (mut b) (primitive/cast u8 (.value escaped)))
+                          (store! i (.next escaped)))))))
     (str/sb-str (load (mut b)))))
 
 ;;; Whether a preprocessing number spells a floating constant. A hexadecimal
@@ -949,6 +941,7 @@
    (is-typedef i64)
    (is-static i64)
    (is-extern i64)
+   (is-inline bool)
    (alignas i64)])
 
 (defn typedef-type [(p (mut Parser)) (name (slice u8))] (-> (ptr ct/Type))
@@ -1040,6 +1033,7 @@
 (defstruct Attrs
   [(packed i64)
    (aligned i64)
+   (gnu-inline bool)
    ;; nd/AT-NONE, nd/AT-CONSTRUCTOR, or nd/AT-DESTRUCTOR, with the order the
    ;; attribute asked for.
    (at-start i64)
@@ -1049,6 +1043,7 @@
   (load (Attrs
           :packed 0
           :aligned 0
+          :gnu-inline false
           :at-start nd/AT-NONE
           :at-start-priority nd/DEFAULT-PRIORITY)))
 
@@ -1073,6 +1068,9 @@
               (break)
               (cond (punct? (mut p) "(") (do (store! depth (+ (load depth) 1)) (advance! (mut p)) 0)
                     (punct? (mut p) ")") (do (store! depth (- (load depth) 1)) (advance! (mut p)) 0)
+                    (and (= (load depth) 2)
+                         (or (word? (mut p) "gnu_inline") (word? (mut p) "__gnu_inline__")))
+                      (do (advance! (mut p)) (store! (field out gnu-inline) true) 0)
                     (and (= (load depth) 2)
                          (or (word? (mut p) "packed") (word? (mut p) "__packed__")))
                       (do (advance! (mut p)) (store! (field out packed) 1) 0)
@@ -1138,6 +1136,8 @@
 ;;; place that consumes attributes therefore records what it found, and the
 ;;; function or object they describe reads it when the declarator is complete.
 (defn note-attributes! [(p (mut Parser)) (found Attrs)] (-> i64)
+  (when (.gnu-inline found)
+    (store! (field (field p pending) gnu-inline) true) 0)
   (if (!= (.at-start found) nd/AT-NONE)
       (do
         (store! (field (field p pending) at-start) (.at-start found))
@@ -1199,7 +1199,31 @@
               (fail-at! (mut p) "address is not an integer constant expression" (nd/nd-token n))
               0))))
 
+;;; Store constants as i64 bit patterns, but apply C's width at every typed
+;;; expression (including casts and unsigned wraparound), not just at the end.
+(defn constant-integer-value [(value i64) (ty (ptr ct/Type))] (-> i64)
+  (if (or (null-type? ty) (not (ct/integer? ty)))
+      value
+      (let [size (ct/ty-size ty)
+            unsigned (ct/ty-unsigned? ty)]
+        (cond (= (ct/ty-kind ty) ct/TY-BOOL) (if (= value 0) 0 1)
+              (= size 1)
+                (let [bits (primitive/iand value 255)]
+                  (if (or unsigned (< bits 128)) bits (- bits 256)))
+              (= size 2)
+                (let [bits (primitive/iand value 65535)]
+                  (if (or unsigned (< bits 32768)) bits (- bits 65536)))
+              (= size 4)
+                (let [bits (primitive/iand value 4294967295)]
+                  (if (or unsigned (< bits 2147483648)) bits (- bits 4294967296)))
+              :else value))))
+
 (defn eval-const [(p (mut Parser)) (n (ptr nd/Node))] (-> i64)
+  (if (null-node? n)
+      0
+      (constant-integer-value (eval-const-raw (mut p) n) (nd/nd-type n))))
+
+(defn eval-const-raw [(p (mut Parser)) (n (ptr nd/Node))] (-> i64)
   (if (null-node? n)
       0
       (let [k (nd/nd-kind n)
@@ -1213,10 +1237,18 @@
               (= k nd/ND-MUL) (* (eval-const (mut p) l) (eval-const (mut p) r))
               (= k nd/ND-DIV)
                 (let [d (eval-const (mut p) r)]
-                  (if (= d 0) 0 (primitive/idiv (eval-const (mut p) l) d)))
+                  (if (= d 0)
+                      0
+                      (if (ct/ty-unsigned? (nd/nd-type l))
+                          (primitive/cast i64 (primitive/udiv (primitive/cast u64 (eval-const (mut p) l)) (primitive/cast u64 d)))
+                          (primitive/idiv (eval-const (mut p) l) d))))
               (= k nd/ND-MOD)
                 (let [d (eval-const (mut p) r)]
-                  (if (= d 0) 0 (primitive/irem (eval-const (mut p) l) d)))
+                  (if (= d 0)
+                      0
+                      (if (ct/ty-unsigned? (nd/nd-type l))
+                          (primitive/cast i64 (primitive/urem (primitive/cast u64 (eval-const (mut p) l)) (primitive/cast u64 d)))
+                          (primitive/irem (eval-const (mut p) l) d))))
               (= k nd/ND-NEG) (- 0 (eval-const (mut p) l))
               (= k nd/ND-BITNOT) (primitive/inot (eval-const (mut p) l))
               (= k nd/ND-NOT) (if (= (eval-const (mut p) l) 0) 1 0)
@@ -1296,6 +1328,7 @@
         (mut is-typedef) 0
         (mut is-static) 0
         (mut is-extern) 0
+        (mut is-inline) false
         (mut requested-align) 0
         (mut done) 0]
     (loop (if (!= (load done) 0)
@@ -1307,6 +1340,10 @@
                       (word? (mut p) "typedef") (do (advance! (mut p)) (store! is-typedef 1))
                       (word? (mut p) "static") (do (advance! (mut p)) (store! is-static 1))
                       (word? (mut p) "extern") (do (advance! (mut p)) (store! is-extern 1))
+                      (or (word? (mut p) "inline")
+                          (or (word? (mut p) "__inline")
+                              (or (word? (mut p) "__inline__") (word? (mut p) "__forceinline"))))
+                        (do (advance! (mut p)) (store! is-inline true))
                       (and (word? (mut p) "_Atomic")
                            (text=? (lex/token-text (peek-at (mut p) 1)) "("))
                         (do
@@ -1396,6 +1433,7 @@
             :is-typedef (load is-typedef)
             :is-static (load is-static)
             :is-extern (load is-extern)
+            :is-inline (load is-inline)
             :alignas (load requested-align)))))
 
 (defn validate-decl-align! [(p (mut Parser)) (spec DeclSpec) (ty (ptr ct/Type))] (-> i64)
@@ -1669,7 +1707,8 @@
         (let [existing (if named (lookup-tag (mut p) tag) (nil-type))]
           (if (null-type? existing) (ty-int-of (mut p)) existing))
         (let [ty (ct/ty-new (load (field p a)) ct/TY-ENUM 4 4)
-              (mut next-value) 0]
+              (mut next-value) 0
+              (mut negative) false]
           (ct/set-name! ty tag)
           (if named (declare-tag! (mut p) tag ty) 0)
           (advance! (mut p))
@@ -1680,9 +1719,14 @@
                           (do (advance! (mut p)) (store! next-value (parse-const-expr (mut p))))
                           0)
                       (declare-enum! (mut p) (lex/token-text nt) (load next-value))
+                      (when (< (load next-value) 0) (store! negative true) 0)
                       (store! next-value (+ (load next-value) 1))
                       (if (punct? (mut p) ",") (do (advance! (mut p)) 0) 0))))
           (expect! (mut p) "}")
+          ;; The supported native C targets use unsigned storage for enums
+          ;; with no negative enumerators. In a narrow bitfield this decides
+          ;; whether its top bit is a value bit or a sign bit.
+          (store! (field ty unsigned) (if (load negative) 0 1))
           ty))))
 
 ;;; `(int)x` is a cast, `(x)` is a parenthesised expression, and only a type name
@@ -2056,9 +2100,12 @@
         tok (advance! (mut p))
         n (nd/node-new a nd/ND-ATOMIC tok)]
     (expect! (mut p) "(")
-    (let [operand (decay (mut p) (parse-assign (mut p)))]
-      (nd/push-arg! n operand)
-      (nd/set-type! n (nd/nd-type operand)))
+    (let [operand (decay (mut p) (parse-assign (mut p)))
+          type (if (text=? (lex/token-text tok) "__builtin_fabsf") (ct/ty-float a) (ct/ty-double a))]
+      (when (not (ct/numeric? (nd/nd-type operand)))
+        (fail-at! (mut p) "fabs operand must be arithmetic" tok) 0)
+      (nd/push-arg! n (convert-to (mut p) operand type))
+      (nd/set-type! n type))
     (expect! (mut p) ")")
     (nd/set-label! n (lex/token-text tok))
     n))
@@ -2185,9 +2232,9 @@
           (word? (mut p) "__builtin_va_end")
             (let [tok (advance! (mut p))]
               (expect! (mut p) "(")
-              (parse-assign (mut p))
-              (expect! (mut p) ")")
-              (let [n (nd/node-num a 0 tok)] (add-type! (mut p) n) n))
+              (let [ap (parse-assign (mut p)) n (nd/node-unary a nd/ND-VA-END ap tok)]
+                (expect! (mut p) ")")
+                (nd/set-type! n (ty-int-of (mut p))) n))
           (word? (mut p) "__builtin_va_copy")
             (let [tok (advance! (mut p))]
               (expect! (mut p) "(")
@@ -2275,11 +2322,10 @@
 
 ;; ---------------------------------------------------------- initializers
 
-;;; An initialiser mirrors the shape of the type it initialises: one child per
-;;; array element or record member, with an expression at the leaves. Building
-;;; the whole tree before generating anything is what makes `{1, 2}` and
-;;; `{{1}, {2}}` mean the same thing, and what lets the parts no initialiser
-;;; mentions be zeroed rather than left holding whatever was there.
+;;; Record members mirror their declared shape; array children exist only when
+;;; mentioned. Omitted storage is zero, not a tree of zero-valued expressions.
+;;; The index map preserves repeated/out-of-order designators without a linear
+;;; search or allocating the holes in an incomplete array.
 (defstruct Init
   [(ty (ptr ct/Type))
    (expr (ptr nd/Node))
@@ -2287,6 +2333,9 @@
    (offset i64)
    (bit-offset i64)
    (bit-width i64)
+   (index i64)
+   (extent i64)
+   (elements (ptr (hm/HashMap i64 (ptr Init))))
    (children (al/ArrayList (ptr Init)))])
 
 (defn nil-init [] (-> (ptr Init))
@@ -2296,10 +2345,19 @@
   (let [base (ct/ty-base (load (field n ty)))
         c (init-new (mut p) base)]
     (store! (field c offset) (* index (ct/ty-size base)))
+    (store! (field c index) index)
     (al/al-push! [(ptr Init)] (mut (field n children)) c)
+    (when (> (+ index 1) (load (field n extent)))
+      (store! (field n extent) (+ index 1)) 0)
+    (when (= (primitive/cast i64 (load (field n elements))) 0)
+      (store! (field n elements)
+              (alloc/box! (load (field p a)) (hm/HashMap i64 (ptr Init))
+                (hm/hm-new [i64 (ptr Init)] (load (field p a)) (hm/i64-keyops)))) 0)
+    (hm/hm-put! [i64 (ptr Init)] (mut (load (field n elements))) index c)
     c))
 
 (defn init-new [(p (mut Parser)) (ty (ptr ct/Type))] (-> (ptr Init))
+  (prof/allocation! 3 (primitive/sizeof Init))
   (let [a (load (field p a))
         n
           (alloc/box! a
@@ -2310,16 +2368,11 @@
                               :offset 0
                               :bit-offset 0
                               :bit-width -1
+                              :index 0
+                              :extent 0
+                              :elements (primitive/cast (ptr (hm/HashMap i64 (ptr Init))) 0)
                               :children (al/al-new [(ptr Init)] a))))]
-    (cond (= (ct/ty-kind ty) ct/TY-ARRAY)
-            (let [len (ct/ty-array-len ty)
-                  (mut i) 0]
-              (loop (if (>= (load i) len)
-                        (break)
-                        (do
-                          (init-push-element! (mut p) n (load i))
-                          (store! i (+ (load i) 1))))))
-          ;; A union's members all start at offset zero, so initialising one of
+    (cond ;; A union's members all start at offset zero, so initialising one of
           ;; them is the same operation as initialising a struct's first.
           (ct/record? ty)
             (let [ms (ct/ty-members ty)
@@ -2330,6 +2383,7 @@
                         (let [m (al/al-get [ct/Member] ms (load i))
                               c (init-new (mut p) (ct/member-type m))]
                           (store! (field c offset) (ct/member-offset m))
+                          (store! (field c index) (load i))
                           (store! (field c bit-offset) (ct/member-bit-offset m))
                           (store! (field c bit-width) (ct/member-bit-width m))
                           (al/al-push! [(ptr Init)] (mut (field n children)) c)
@@ -2345,17 +2399,16 @@
   (let [kids (load (field n children))
         len (al/al-len [(ptr Init)] kids)
         ty (load (field n ty))]
-    (cond (< index len) (al/al-get [(ptr Init)] kids index)
-          (and (= (ct/ty-kind ty) ct/TY-ARRAY) (< (ct/ty-array-len ty) 0))
-            (let [(mut i) len
-                  (mut last) (nil-init)]
-              (loop (if (> (load i) index)
-                        (break)
-                        (do
-                          (store! last (init-push-element! (mut p) n (load i)))
-                          (store! i (+ (load i) 1)))))
-              (load last))
-          (= (ct/ty-kind ty) ct/TY-ARRAY) (init-new (mut p) (ct/ty-base ty))
+    (cond (= (ct/ty-kind ty) ct/TY-ARRAY)
+            (if (or (< index 0) (and (>= (ct/ty-array-len ty) 0) (>= index (ct/ty-array-len ty))))
+                (init-new (mut p) (ct/ty-base ty))
+                (let [elements (load (field n elements))]
+                  (if (= (primitive/cast i64 elements) 0)
+                      (init-push-element! (mut p) n index)
+                      (match (hm/hm-get (load elements) index)
+                        (Some [c] c)
+                        (None [] (init-push-element! (mut p) n index))))))
+          (and (>= index 0) (< index len)) (al/al-get [(ptr Init)] kids index)
           :else (init-new (mut p) (ty-int-of (mut p))))))
 
 (defn at-init-end? [(p (mut Parser))] (-> bool)
@@ -2386,7 +2439,8 @@
   (let [tok (advance! (mut p))
         bytes (read-string-bytes! (mut p) tok)
         declared (ct/ty-array-len (load (field n ty)))
-        limit (if (< declared 0) (+ (slice-len bytes) 1) declared)
+        needed (+ (slice-len bytes) 1)
+        limit (if (or (< declared 0) (> declared needed)) needed declared)
         (mut i) 0]
     (loop (if (>= (load i) limit)
               (break)
@@ -2414,7 +2468,7 @@
               (break)
               (do
                 (copy-init-values! (mut p)
-                                   (init-child (mut p) dst (load i))
+                                   (init-child (mut p) dst (load (field (al/al-get [(ptr Init)] source-kids (load i)) index)))
                                    (al/al-get [(ptr Init)] source-kids (load i)))
                 (store! i (+ (load i) 1))))))
   0)
@@ -2618,7 +2672,7 @@
     (parse-initializer2! (mut p) n)
     (let [ty (nd/obj-type o)]
       (if (and (= (ct/ty-kind ty) ct/TY-ARRAY) (< (ct/ty-array-len ty) 0))
-          (ct/set-array-len! ty (al/al-len [(ptr Init)] (load (field n children))))
+          (ct/set-array-len! ty (load (field n extent)))
           0))
     (if (nd/obj-local? o)
         (let [zero (nd/node-unary a nd/ND-MEMZERO (nd/node-var a o tok) tok)]
@@ -2713,7 +2767,19 @@
     ;; In particular, calls parsed after a static prototype must point at the
     ;; object whose body is filled in by the later definition.
     (if (not (null-obj? prior))
-        prior
+        (do
+          ;; Complete an earlier extern array in place: expressions already
+          ;; parsed against that object keep the same type pointer. A shorter
+          ;; initializer must not replace the explicit bound on its definition.
+          (let [old (nd/obj-type prior)]
+            (when (and (= (ct/ty-kind old) ct/TY-ARRAY) (= (ct/ty-kind ty) ct/TY-ARRAY))
+              (let [before (ct/ty-array-len old) after (ct/ty-array-len ty)]
+                (if (and (< before 0) (>= after 0))
+                    (ct/set-array-len! old after)
+                    (when (and (>= before 0) (and (>= after 0) (!= before after)))
+                      (fail! (mut p) "conflicting array bounds in declarations of one object") 0)))
+              0))
+          prior)
         (if (not static?)
             (new-global! (mut p) name ty)
             (let [o (nd/obj-new (load (field p a)) (unit-name (mut p) name) ty false)]
@@ -2937,7 +3003,7 @@
             (let [tok (advance! (mut p))
                   n (nd/node-new a nd/ND-SWITCH tok)]
               (expect! (mut p) "(")
-              (nd/set-test! n (decay (mut p) (parse-expr (mut p))))
+              (nd/set-test! n (integer-promote (mut p) (decay (mut p) (parse-expr (mut p)))))
               (expect! (mut p) ")")
               (nd/set-then! n (parse-stmt (mut p)))
               n)
@@ -2993,12 +3059,19 @@
 (defn parse-function! [(p (mut Parser)) (spec DeclSpec) (d Declared)] (-> i64)
   (let [o (new-global-of! (mut p) (.name d) (.ty d) (!= (.is-static spec) 0))
         around (load (field p pending))]
+    (store! (field o gnu-inline) (.gnu-inline around))
+    (store! (field o inline-only)
+      (and (= (.is-static spec) 0)
+           (and (.is-inline spec)
+                (if (.gnu-inline around)
+                    (!= (.is-extern spec) 0)
+                    (and (= (.is-extern spec) 0) (not (.external-declared o)))))))
     (nd/set-obj-asm-name! o (.asm-name d))
     (if (!= (.at-start around) nd/AT-NONE)
         (nd/set-obj-at-start! o (.at-start around) (.at-start-priority around))
         0)
     (if (punct? (mut p) "{")
-        (do
+        (let [before (prof/retained-now) first (load (field p pos))]
           (store! (field p current-fn) o)
           (enter-scope! (mut p))
           ;; A prototype describes parameter types but owns no parameter
@@ -3018,7 +3091,9 @@
                         (store! i (+ (load i) 1))))))
           (nd/set-obj-body! o (parse-compound (mut p)))
           (leave-scope! (mut p))
-          (store! (field p current-fn) (nil-obj)))
+          (store! (field p current-fn) (nil-obj))
+          (tr/profile-event "c.parse.function-tokens" (nd/obj-name o) (- (load (field p pos)) first))
+          (tr/profile-event "c.parse.function-bytes" (nd/obj-name o) (- (prof/retained-now) before)))
         ;; A function declarator is either a definition followed by a body or a
         ;; declaration followed by a semicolon. Consuming an arbitrary token
         ;; here used to turn declarator/preprocessor mistakes into silently
@@ -3059,6 +3134,10 @@
                                                           (.ty d)
                                                           (!= (.is-static spec) 0))]
                                     (nd/set-obj-asm-name! f (.asm-name d))
+                                    (when (or (not (.is-inline spec)) (!= (.is-extern spec) 0))
+                                      (store! (field f external-declared) true)
+                                      (when (not (.gnu-inline f)) (store! (field f inline-only) false) 0)
+                                      0)
                                     (if (punct? (mut p) ",")
                                         (do (advance! (mut p)) 0)
                                         (do (expect! (mut p) ";") (store! more 0)))))
@@ -3097,6 +3176,7 @@
       (load (Attrs
               :packed 0
               :aligned 0
+              :gnu-inline false
               :at-start nd/AT-NONE
               :at-start-priority nd/DEFAULT-PRIORITY))
     :pack 0

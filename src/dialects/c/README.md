@@ -66,6 +66,12 @@ as an independent C translation unit and returns one in-memory Coil module.
 
 ## How C constructs are represented
 
+Integer constant expressions use the width and signedness of each typed
+expression, including casts, unsigned wraparound, division, and remainder.
+`tests/c/native/constant_unsigned.c` and the independently compiled
+`tests/c/generated-constant/` fixture compare this behavior with Clang; the
+latter includes the GMP limb-limit expression used by Emacs bootstrap.
+
 A complete, nameable C record becomes an explicit-layout Coil `defstruct`, with
 the C frontend supplying every field offset plus the record's size and alignment.
 This gives callers ordinary constructors such as `(Color :r 17 :g 34 :b 51
@@ -83,7 +89,17 @@ written at start-up. Every leaf of an initialiser that folds to a number is laid
 into the object's image and the object is emitted holding it, so the bytes are in
 the binary and the loader maps them, the same as a C compiler. Only the leaves
 whose value is an address the linker decides — a string, another object, a
-function — are left as stores that run before `main`.
+function — are left as stores that run before `main`. Numeric record images
+also currently use field stores rather than link-time struct constants.
+
+Array initializers allocate parser children only for mentioned indices; omitted
+elements and string tails stay implicit zero. Numeric static array images emit
+Coil's `alloc-static :elements` form, recursively for nested arrays. A large
+`long values[708334] = {1};` therefore produces one explicit value, not 708,334
+initializer nodes, text literals, or LLVM constants. The real object bytes and
+alignment are unchanged, and native constructors can observe them before any
+translated initialization hook. Explicit GNU range designators still retain
+one child per selected element; sparse holes do not.
 
 A function containing a label is lowered through a control-flow graph and a
 dispatch loop, because no arrangement of Coil's structured forms expresses a
@@ -125,6 +141,61 @@ rejected, as C99 and Clang reject them. Each unsupported construct reports where
 it appeared instead of quietly producing something else.
 
 ## Validation
+
+### Opt-in generated modules
+
+Set `generated-modules = true` in the manifest's `[c.<header>]` section to use
+independently compiled generated units. The default reader and CLI still lower
+one module.
+
+The partitioned reader parses sources twice. Its first pass retains copied
+linkage names, storage owners, startup order and concrete boundary type
+declarations. Its second pass lowers and submits each implementation, then frees
+that source's tokens, types, AST and output buffers. It does not first construct
+the whole program AST. A declaration-only generated type module owns shared
+record identities; other interfaces reference those fully qualified types.
+Body-private record graphs stay out of interfaces.
+
+One unit owns each mutable global, including common/tentative definitions;
+other units use its address accessor. All unit initializers run before the
+globally ordered constructors, and destructor registration retains atexit's
+reverse order. Optional ISO/GNU external inline bodies do not claim external
+symbols: reachable direct calls use a local implementation, while taking its
+address still names the externally owned C entry. Safe generated Coil bindings
+use explicit extern aliases to retain original C linker names, so separately
+compiled native libraries can call the generated definitions. The facade owns
+`main` and invokes static startup hooks through synthetic exported entries;
+static hooks have no public C symbol to preserve.
+Static identifiers include the unit index, so equal source basenames
+do not merge their private objects.
+
+This path requires the experimental generated-module Coil candidate. An owner
+unit emits each externally linked C data object as one named static allocation:
+native objects and dynamic symbol lookup therefore see the original C symbol,
+while generated-module accessors resolve to that same allocation. Public
+aggregate-value wrappers still report a diagnostic. Backend C-ABI limitations
+still apply.
+
+The development harnesses are not part of reader execution:
+
+```sh
+python3 scripts/c-generated.py --compiler /path/to/candidate
+python3 scripts/c-generated.py --compiler /path/to/candidate --backend llvm --case aggregate
+python3 scripts/c-generated.py --compiler /path/to/candidate --backend llvm --case inline
+python3 scripts/c-generated.py --compiler /path/to/candidate --backend llvm --case stack
+python3 scripts/c-generated.py --compiler /path/to/candidate --backend llvm --case constant
+python3 scripts/c-emacs-memory.py --compiler /path/to/candidate
+```
+
+The Emacs harness retains build logs and measurement JSON in the temporary
+directory it prints. Its RSS metric sums the live compiler process tree at
+100 ms intervals, rather than counting only the parent compiler.
+
+C `__builtin_alloca` uses `primitive/alloc-stack-bytes` directly in the generated
+function. Its storage lasts until that C function returns, including across
+nested calls and loop iterations. This operation currently requires LLVM on
+AArch64 or x86-64; direct backends reject it explicitly. An inline-IR helper that
+returns an alloca pointer does not provide the required lifetime.
 
 ```sh
 coil test --suite c                                              # unit tests

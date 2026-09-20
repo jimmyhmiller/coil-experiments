@@ -1,0 +1,120 @@
+(module experiments.c.partition)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as al)
+(import "coil.hashmap" :as hm)
+(import "coil.str" :as str)
+(import "coil.result" :use *)
+(import "experiments.c.node" :as nd)
+(import "experiments.c.ctype" :as ct)
+
+(export Plan Startup plan-new own-text unit-name type-module-name initializer-name data-name
+        record-unit! function-owner data-owner)
+
+;; No C AST or type pointer crosses a per-unit scratch reset. This directory
+;; owns copied names and scalar linkage/storage/startup metadata only.
+(defstruct Startup [(name (slice u8)) (unit i64) (kind i64) (priority i64)])
+(defstruct Plan
+  [(a (dyn alloc/Allocator))
+   (prefix (slice u8))
+   (units (al/ArrayList (slice u8)))
+   (functions (hm/HashMap (slice u8) i64))
+   (data (hm/HashMap (slice u8) i64))
+   (sizes (hm/HashMap (slice u8) i64))
+   (shared-types (hm/HashMap (slice u8) (slice u8)))
+   (type-names (al/ArrayList (slice u8)))
+   (type-source str/StrBuf)
+   (starts (al/ArrayList Startup))])
+
+(defn own-text [(a (dyn alloc/Allocator)) (text (slice u8))] (-> (slice u8))
+  (let [(mut b) (str/sb-new a)]
+    (str/sb-push-str! (mut b) text)
+    (str/sb-str (load (mut b)))))
+
+(defn plan-new [(a (dyn alloc/Allocator)) (path (slice u8))] (-> Plan)
+  (let [(mut prefix) (str/sb-new a)]
+    (str/sb-push-str! (mut prefix) "generated.c.p")
+    (str/sb-push-i64! (mut prefix) (str/str-hash path))
+    (Plan :a a :prefix (str/sb-str (load (mut prefix)))
+      :units (al/al-new [(slice u8)] a)
+      :functions (hm/hm-new [(slice u8) i64] a (str/str-keyops))
+      :data (hm/hm-new [(slice u8) i64] a (str/str-keyops))
+      :sizes (hm/hm-new [(slice u8) i64] a (str/str-keyops))
+      :shared-types (hm/hm-new [(slice u8) (slice u8)] a (str/str-keyops))
+      :type-names (al/al-new [(slice u8)] a)
+      :type-source (str/sb-new a)
+      :starts (al/al-new [Startup] a))))
+
+(defn type-module-name [(p (mut Plan))] (-> (slice u8))
+  (let [(mut b) (str/sb-new (.a p))]
+    (str/sb-push-str! (mut b) (.prefix p))
+    (str/sb-push-str! (mut b) ".types")
+    (str/sb-str (load (mut b)))))
+
+(defn unit-name [(p (mut Plan)) (index i64)] (-> (slice u8))
+  (let [(mut b) (str/sb-new (.a p))]
+    (str/sb-push-str! (mut b) (.prefix p))
+    (str/sb-push-str! (mut b) ".u")
+    (str/sb-push-i64! (mut b) index)
+    (str/sb-str (load (mut b)))))
+
+(defn initializer-name [(p (mut Plan)) (index i64)] (-> (slice u8))
+  (let [(mut b) (str/sb-new (.a p))]
+    (str/sb-push-str! (mut b) "__c_initialize_unit_")
+    (str/sb-push-i64! (mut b) (primitive/iand (str/str-hash (.prefix p)) 9223372036854775807))
+    (str/sb-push-str! (mut b) "_")
+    (str/sb-push-i64! (mut b) index)
+    (str/sb-str (load (mut b)))))
+
+(defn data-name [(a (dyn alloc/Allocator)) (name (slice u8))] (-> (slice u8))
+  (let [(mut b) (str/sb-new a)]
+    (str/sb-push-str! (mut b) "__c_storage_")
+    (str/sb-push-str! (mut b) name)
+    (str/sb-str (load (mut b)))))
+
+(defn function-owner [(p (mut Plan)) (name (slice u8))] (-> i64)
+  (match (hm/hm-get (.functions p) name) (Some [unit] unit) (None [] -1)))
+
+(defn data-owner [(p (mut Plan)) (name (slice u8))] (-> i64)
+  (match (hm/hm-get (.data p) name) (Some [unit] unit) (None [] -1)))
+
+(defn record-unit! [(p (mut Plan)) (unit i64) (globals (al/ArrayList (ptr nd/Obj)))] (-> i64)
+  (for [i 0 (al/al-len [(ptr nd/Obj)] globals)]
+    (let [o (al/al-get [(ptr nd/Obj)] globals i)
+          name (nd/obj-name o)]
+      (when (and (nd/obj-definition? o) (not (nd/obj-string? o)))
+        (if (nd/obj-function? o)
+            (when (and (not (.inline-only o))
+                       (or (not (nd/obj-static? o)) (!= (nd/obj-at-start o) nd/AT-NONE)))
+              (let [prior (function-owner (mut p) name)]
+                (when (and (>= prior 0) (!= prior unit))
+                  (println "C external function {s} is defined in units {d} and {d}" name prior unit)
+                  (primitive/error "C generated modules have multiple external function definitions") 0)
+                (hm/hm-put! [(slice u8) i64] (mut (.functions p)) (own-text (.a p) name) unit))
+              0)
+            (when (not (nd/obj-static? o))
+              (let [size (ct/ty-size (nd/obj-type o))
+                    prior (match (hm/hm-get (.sizes p) name) (Some [n] n) (None [] -1))]
+                ;; Preserve the existing frontend's common/tentative-definition
+                ;; policy: one owner with the most complete storage declaration.
+                (when (> size prior)
+                  (hm/hm-put! [(slice u8) i64] (mut (.data p)) (own-text (.a p) name) unit)
+                  (hm/hm-put! [(slice u8) i64] (mut (.sizes p)) (own-text (.a p) name) size)
+                  0))
+              0))
+        (when (!= (nd/obj-at-start o) nd/AT-NONE)
+          (let [entry (Startup :name (own-text (.a p) name) :unit unit
+                        :kind (nd/obj-at-start o) :priority (nd/obj-at-start-priority o))
+                (mut at) (al/al-len [Startup] (.starts p))]
+            (al/al-push! [Startup] (mut (.starts p)) entry)
+            (loop (if (and (> (load at) 0)
+                           (> (.priority (al/al-elem [Startup] (field p starts) (- (load at) 1))) (.priority entry)))
+                      (do (al/al-set! [Startup] (mut (.starts p)) (load at)
+                                      (al/al-get [Startup] (.starts p) (- (load at) 1)))
+                          (store! at (- (load at) 1)))
+                      (break)))
+            (al/al-set! [Startup] (mut (.starts p)) (load at) entry))
+          0)
+        0))
+    0)
+  0)

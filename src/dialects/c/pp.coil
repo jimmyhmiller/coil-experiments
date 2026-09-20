@@ -16,13 +16,18 @@
 (import "coil.str" :as str)
 (import "coil.fs" :as fs)
 (import "coil.result" :use *)
+(import "coil.scratch" :as scratch)
+(import "coil.compiler.trace" :as tr)
+(import "experiments.c.profile" :as prof)
 (import "experiments.c.lex" :as lex)
 
 (export Macro
         PP
         PPResult
+        own-result
         preprocess
         pp-new
+        pp-new-with-storage
         pp-define-text
         pp-read-prefix
         pp-add-include-path)
@@ -47,6 +52,14 @@
 
 (defstruct PP
   [(a (dyn alloc/Allocator))
+   ;; Lexical token vectors and per-file run buffers are owned containers,
+   ;; never spelling storage. Their allocator must support individual free.
+   ;; No container returned to the caller or retained in a macro uses it.
+   (containers (dyn alloc/Allocator))
+   ;; Allocation-policy switch for development equivalence/retention tests.
+   ;; Both modes execute the same expansion semantics; normal clients use true.
+   (bounded-expansion bool)
+   (temporary-total i64) (temporary-peak i64)
    (macros (hm/HashMap (slice u8) Macro))
    (include-paths (al/ArrayList (slice u8)))
    (once (hm/HashMap (slice u8) bool))
@@ -67,7 +80,51 @@
    (file (slice u8))
    (line i64)])
 
+;; Completed preprocessing has a single ownership boundary. Neither the parser
+;; nor a staged declaration index needs macro bodies, include lex buffers, or
+;; expansion readers. Copy the final token vector exactly once and intern its
+;; spelling/provenance bytes by content. The temporary index borrows PP strings
+;; only until this function returns; every resulting slice belongs to `a`.
+(defn own-text [(a (dyn alloc/Allocator))
+                (strings (mut (hm/HashMap (slice u8) (slice u8))))
+                (text (slice u8))] (-> (slice u8))
+  (if (= (slice-len text) 0) ""
+    (match (hm/hm-get (load strings) text)
+      (Some [owned] owned)
+      (None []
+        (let [owned (match (str/str-concat a text "")
+                (Some [bytes] bytes)
+                (None [] (alloc/oom-at c"C token ownership" (slice-len text)) ""))]
+          (hm/hm-put! (mut strings) text owned) owned)))))
+
+(defn own-result [(a (dyn alloc/Allocator)) (input PPResult)] (-> PPResult)
+  (let [temporary (primitive/alloc-stack scratch/ScratchArena)]
+    (scratch/scratch-init-with-cap temporary (alloc/malloc-allocator) 16384)
+    (let [(mut strings) (hm/hm-new [(slice u8) (slice u8)]
+            (scratch/scratch-allocator temporary) (str/str-keyops-borrowed))
+          (mut tokens) (al/al-new [lex/Token] a)
+          count (al/al-len (.tokens input))]
+      (al/al-reserve! (mut tokens) count)
+      (for [i 0 count]
+        (let [original (al/al-get (.tokens input) i)
+              text (own-text a (mut strings) (lex/token-text original))
+              file (own-text a (mut strings) (lex/token-file original))]
+          (al/al-push! (mut tokens) (lex/Token :kind (lex/token-kind original)
+            :text text :file file :line (lex/token-line original) :column (lex/token-column original)
+            :at-line-start (.at-line-start original) :preceded-by-space (.preceded-by-space original)))) 0)
+      (let [message (own-text a (mut strings) (.message input))
+            file (own-text a (mut strings) (.file input))
+            result (PPResult :tokens (load tokens) :failed (.failed input)
+              :message message :file file :line (.line input))]
+        (scratch/scratch-close! temporary) result))))
+
 (const MAX-INCLUDE-DEPTH 200)
+
+(defn container-storage [(p (mut PP))] (-> (dyn alloc/Allocator))
+  (if (load (field p bounded-expansion)) (load (field p containers)) (load (field p a))))
+
+(defn release-tokens! [(p (mut PP)) (tokens (mut (al/ArrayList lex/Token)))] (-> i64)
+  (when (load (field p bounded-expansion)) (al/al-free! (mut tokens)) 0) 0)
 
 (defn text=? [(x (slice u8)) (y (slice u8))] (-> bool)
   (str/str-eq x y))
@@ -210,9 +267,8 @@
                       (store! i (+ (load i) 1)))))))
     (load value)))
 
-;;; A character constant in `#if` is its value; only the common escapes matter
-;;; here because anything else is vanishingly rare in a conditional.
-(defn parse-char-text [(text (slice u8))] (-> i64)
+;;; The preprocessor and ordinary character constants share escape semantics.
+(defn parse-char-text [(text (slice u8))] (-> lex/ByteEscape)
   (let [n (slice-len text)
         (mut i) 0]
     (loop (if (or (>= (load i) n)
@@ -221,22 +277,11 @@
               (store! i (+ (load i) 1))))
     (store! i (+ (load i) 1))
     (if (>= (load i) n)
-        0
+        (lex/ByteEscape :value 0 :next (load i) :message "empty character constant")
         (let [c (primitive/cast i64 (slice-get text (load i)))]
           (if (!= c 92)
-              c
-              (let [k
-                      (if (< (+ (load i) 1) n)
-                          (primitive/cast i64 (slice-get text (+ (load i) 1)))
-                          0)]
-                (cond (= k 110) 10
-                      (= k 116) 9
-                      (= k 114) 13
-                      (= k 48) 0
-                      (= k 92) 92
-                      (= k 39) 39
-                      (= k 34) 34
-                      :else k)))))))
+              (lex/ByteEscape :value c :next (+ (load i) 1) :message "")
+              (lex/decode-byte-escape text (+ (load i) 1)))))))
 
 (defn e-primary [(e (mut ExprParser))] (-> i64)
   (if (e-done? (mut e))
@@ -244,7 +289,8 @@
       (let [t (e-take (mut e))]
         (cond (is-punct? t "(") (let [v (e-ternary (mut e))] (e-accept (mut e) ")") v)
               (= (lex/token-kind t) lex/TK-NUMBER) (parse-int-text (lex/token-text t))
-              (= (lex/token-kind t) lex/TK-CHARACTER) (parse-char-text (lex/token-text t))
+              (= (lex/token-kind t) lex/TK-CHARACTER)
+                (let [escaped (parse-char-text (lex/token-text t))] (.value escaped))
               ;; Every identifier that survived expansion is 0, as the standard says.
               :else 0))))
 
@@ -688,24 +734,73 @@
                           :else 0))))
         0)))
 
+(defn expand-one! [(p (mut PP)) (r (mut Reader)) (t lex/Token) (out (mut (al/ArrayList lex/Token)))] (-> i64)
+  ;; Shared by recursive rescanning and the lifetime-bounded outer stream.
+  (if (= (lex/token-kind t) lex/TK-EOF) 0
+    (if (or (is-word? t "_Pragma") (is-word? t "__pragma"))
+      (drop-pragma! (mut p) (mut r))
+      (match (builtin-value (mut p) t)
+        (Some [v] (al/al-push! [lex/Token] (mut out) v))
+        (None [] (match (expandable (mut p) (mut r) t)
+          (Some [found] (let [m found] (expand-call! (mut p) (mut r) t m (mut out))))
+          (None [] (al/al-push! [lex/Token] (mut out) t))))))) 0)
+
 (defn expand-into! [(p (mut PP)) (r (mut Reader)) (out (mut (al/ArrayList lex/Token)))] (-> i64)
   (loop (if (or (!= (load (field p failed)) 0) (r-done? (mut r)))
             (break)
             (let [t (r-next (mut r))]
-              ;; A lexer EOF belongs to the file being scanned, not to the combined
-              ;; translation unit. In particular, an included file's final ordinary
-              ;; token run may reach EOF before process-tokens! sees it directly.
-              (if (= (lex/token-kind t) lex/TK-EOF)
-                  0
-                  (if (or (is-word? t "_Pragma") (is-word? t "__pragma"))
-                      (drop-pragma! (mut p) (mut r))
-                      (match (builtin-value (mut p) t)
-                        (Some [v] (al/al-push! [lex/Token] (mut out) v))
-                        (None []
-                              (match (expandable (mut p) (mut r) t)
-                                (Some [found] (let [m found] (expand-call! (mut p) (mut r) t m (mut out))))
-                                (None [] (al/al-push! [lex/Token] (mut out) t))))))))))
+              (expand-one! (mut p) (mut r) t (mut out)))))
   0)
+
+;; Only generated spellings can point into an expansion arena. Original source,
+;; macro definitions and input token arrays remain in the translation-unit arena.
+;; Promote generated text and diagnostics before recycling; recursive rescans,
+;; argument expansion and alias-followed-by-call share the same transient scope.
+(defn promote-text [(p (mut PP)) (arena (ptr scratch/ScratchArena)) (text (slice u8))] (-> (slice u8))
+  (if (and (> (slice-len text) 0)
+    (scratch/scratch-owns-address? arena (primitive/cast (ptr i8) (slice-data text))))
+    (copy-text (mut p) text) text))
+(defn promote-token [(p (mut PP)) (arena (ptr scratch/ScratchArena)) (token lex/Token)] (-> lex/Token)
+  (let [text (promote-text (mut p) arena (lex/token-text token))
+        file (promote-text (mut p) arena (lex/token-file token))]
+    (lex/Token :kind (lex/token-kind token) :text text :file file :line (lex/token-line token)
+      :column (lex/token-column token) :at-line-start (if (lex/token-at-line-start? token) 1 0)
+      :preceded-by-space (if (lex/token-preceded-by-space? token) 1 0))))
+(defn promote-error! [(p (mut PP)) (arena (ptr scratch/ScratchArena))] (-> i64)
+  (store! (field p message) (promote-text (mut p) arena (load (field p message))))
+  (store! (field p file) (promote-text (mut p) arena (load (field p file)))) 0)
+(defn temporary-peak! [(p (mut PP)) (arena (ptr scratch/ScratchArena))] (-> i64)
+  (when (> (scratch/scratch-peak arena) (load (field p temporary-peak)))
+    (store! (field p temporary-peak) (scratch/scratch-peak arena)) 0) 0)
+
+(defn expand-stream! [(p (mut PP)) (r (mut Reader)) (out (mut (al/ArrayList lex/Token)))] (-> i64)
+  (let [arena (primitive/alloc-stack scratch/ScratchArena) permanent (load (field p a))]
+    (scratch/scratch-init-with-cap arena (alloc/malloc-allocator) 65536)
+    (loop
+      (if (or (!= (load (field p failed)) 0) (r-done? (mut r))) (break) 0)
+      (let [token (r-next (mut r)) name (lex/token-text token)]
+        (if (and (name-like? token)
+          (or (hm/hm-contains? (load (field p macros)) name)
+            (or (text=? name "__LINE__") (or (text=? name "__COUNTER__")
+              (or (text=? name "__FILE__") (or (text=? name "_Pragma") (text=? name "__pragma")))))))
+          (let [temporary (scratch/scratch-allocator arena)
+                (mut expanded) (al/al-new [lex/Token] temporary)]
+            (store! (field p a) temporary)
+            (expand-one! (mut p) (mut r) token (mut expanded))
+            (store! (field p a) permanent)
+            (for [i 0 (tok-count (load expanded))]
+              (al/al-push! [lex/Token] (mut out) (promote-token (mut p) arena (tok-at (load expanded) i))) 0)
+            ;; The current reader consumes input directly. Promote any future
+            ;; pushback implementation too, rather than relying on that detail.
+            (let [(mut pending) (al/al-new [lex/Token] permanent)]
+              (for [i (load (field r pending-pos)) (tok-count (load (field r pending)))]
+                (al/al-push! [lex/Token] (mut pending)
+                  (promote-token (mut p) arena (tok-at (load (field r pending)) i))) 0)
+              (store! (field r pending) (load pending)) (store! (field r pending-pos) 0))
+            (promote-error! (mut p) arena) (temporary-peak! (mut p) arena) (scratch/scratch-recycle! arena))
+          (if (= (lex/token-kind token) lex/TK-EOF) 0 (al/al-push! [lex/Token] (mut out) token)))))
+    (store! (field p temporary-total) (+ (load (field p temporary-total)) (scratch/scratch-total arena)))
+    (scratch/scratch-close! arena)) 0)
 
 (defn expand-run [(p (mut PP)) (in (al/ArrayList lex/Token))] (-> (al/ArrayList lex/Token))
   (let [(mut out) (al/al-new [lex/Token] (load (field p a)))
@@ -953,6 +1048,9 @@
                                           (or (text=? name "__is_identifier")
                                               (text=? name "__building_module")))))))))))))
 
+(defn definition-known? [(p (mut PP)) (name (slice u8))] (-> bool)
+  (or (hm/hm-contains? (load (field p macros)) name) (builtin-test? name)))
+
 (defn path-prefix? [(path (slice u8)) (root (slice u8))] (-> bool)
   (let [pn (slice-len path)
         rn (slice-len root)
@@ -1058,14 +1156,12 @@
                           (if (>= at n)
                               (do (fail! (mut p) "#if defined needs a name" t) (store! i n))
                               (let [word (lex/token-text (tok-at in at))
-                                    known
-                                      (or (hm/hm-contains? (load (field p macros)) word)
-                                          (builtin-test? word))]
+                                    known (definition-known? (mut p) word)]
                                 (al/al-push! [lex/Token] (mut out) (number-token t (if known 1 0) (mut p)))
                                 (store! i (+ at (if paren 2 1))))))))))
     (load (mut out))))
 
-(defn condition-value [(p (mut PP)) (tokens (al/ArrayList lex/Token)) (from i64) (until i64)] (-> bool)
+(defn condition-value-inner [(p (mut PP)) (tokens (al/ArrayList lex/Token)) (from i64) (until i64)] (-> bool)
   (let [raw (slice-tokens (mut p) tokens from until)
         resolved (resolve-defined (mut p) raw)
         expanded (expand-run (mut p) resolved)
@@ -1074,7 +1170,24 @@
         ;; expansion so the operator is answered by this frontend rather than
         ;; falling through to the integer-expression evaluator as an identifier.
         tested (resolve-defined (mut p) expanded)]
+    (for [i 0 (tok-count tested)]
+      (let [t (tok-at tested i)]
+        (if (= (lex/token-kind t) lex/TK-CHARACTER)
+            (let [escaped (parse-char-text (lex/token-text t))]
+              (if (> (slice-len (.message escaped)) 0)
+                  (fail! (mut p) (.message escaped) t) 0)) 0)))
     (!= (eval-condition tested) 0)))
+
+(defn condition-value [(p (mut PP)) (tokens (al/ArrayList lex/Token)) (from i64) (until i64)] (-> bool)
+  (if (not (load (field p bounded-expansion))) (condition-value-inner (mut p) tokens from until)
+  (let [arena (primitive/alloc-stack scratch/ScratchArena) permanent (load (field p a))]
+    (scratch/scratch-init-with-cap arena (alloc/malloc-allocator) 16384)
+    (store! (field p a) (scratch/scratch-allocator arena))
+    (let [value (condition-value-inner (mut p) tokens from until)]
+      (store! (field p a) permanent) (promote-error! (mut p) arena)
+      (temporary-peak! (mut p) arena)
+      (store! (field p temporary-total) (+ (load (field p temporary-total)) (scratch/scratch-total arena)))
+      (scratch/scratch-close! arena) value))))
 
 (defn include-file! [(p (mut PP)) (found Found) (at lex/Token)] (-> i64)
   (if (hm/hm-contains? (load (field p once)) (.path found))
@@ -1084,7 +1197,7 @@
           (match (fs/read-file (load (field p a)) (.path found))
             (Err [_] (fail! (mut p) "cannot read included file" at))
             (Ok [text]
-                (let [result (lex/lex (load (field p a)) (.path found) text)
+                (let [(mut result) (lex/lex (container-storage (mut p)) (.path found) text)
                       conditional-depth (al/al-len [Conditional] (load (field p conditionals)))]
                   (if (lex/lex-failed? result)
                       (fail! (mut p) (.message result) at)
@@ -1097,7 +1210,8 @@
                                      conditional-depth))
                             (fail! (mut p) "included file has an unbalanced conditional" at)
                             0)
-                        0))))))))
+                        0))
+                  (release-tokens! (mut p) (mut (.tokens result)))))))))
 
 (defn do-include! [(p (mut PP))
                    (tokens (al/ArrayList lex/Token))
@@ -1148,14 +1262,12 @@
                 (push-conditional! (mut p)
                                    (and live
                                         (and (< body until)
-                                             (hm/hm-contains? (load (field p macros))
-                                                              (lex/token-text (tok-at tokens body))))))
+                                             (definition-known? (mut p) (lex/token-text (tok-at tokens body))))))
               (text=? name "ifndef")
                 (push-conditional! (mut p)
                                    (and live
                                         (and (< body until)
-                                             (not (hm/hm-contains? (load (field p macros))
-                                                                   (lex/token-text (tok-at tokens body)))))))
+                                             (not (definition-known? (mut p) (lex/token-text (tok-at tokens body)))))))
               (text=? name "if") (push-conditional! (mut p) (and live (condition-value (mut p) tokens body until)))
               (text=? name "elif")
                 (if (= depth 0)
@@ -1243,12 +1355,17 @@
                         (or (text=? name "else") (text=? name "endif")))))))))
 
 (defn flush-run! [(p (mut PP)) (run (mut (al/ArrayList lex/Token)))] (-> i64)
-  (let [count (tok-count (load run))]
+  (let [count (tok-count (load run)) before (prof/retained-now)]
     (if (> count 0)
         (let [(mut r) (make-reader (load (field p a)) (load run) 0 count)]
-          (expand-into! (mut p) (mut r) (mut (field p out))))
+          (if (load (field p bounded-expansion))
+            (expand-stream! (mut p) (mut r) (mut (field p out)))
+            (expand-into! (mut p) (mut r) (mut (field p out)))))
         0)
-    (store! run (al/al-new [lex/Token] (load (field p a)))))
+    (tr/count "c.pp.expand.retained-bytes" (- (prof/retained-now) before))
+    (if (load (field p bounded-expansion))
+      (al/al-clear! (mut run))
+      (store! run (al/al-new [lex/Token] (load (field p a))))))
   0)
 
 (defn process-tokens! [(p (mut PP))
@@ -1256,8 +1373,8 @@
                        (file (slice u8))
                        (from-path i64)] (-> i64)
   (let [n (tok-count tokens)
-        (mut run) (al/al-new [lex/Token] (load (field p a)))
-        (mut i) 0]
+        (mut run) (al/al-new [lex/Token] (container-storage (mut p)))
+        (mut i) 0 (mut run-bytes) 0]
     (loop (if (or (!= (load (field p failed)) 0) (>= (load i) n))
               (break)
               (let [t (tok-at tokens (load i))]
@@ -1273,20 +1390,26 @@
                       :else
                         (let [stop (next-directive tokens (load i))]
                           (if (active? (mut p))
-                              (let [(mut j) (load i)]
+                              (let [(mut j) (load i) before (prof/retained-now)]
                                 (loop (if (>= (load j) stop)
                                           (break)
                                           (do
                                             (al/al-push! [lex/Token] (mut run) (tok-at tokens (load j)))
-                                            (store! j (+ (load j) 1))))))
+                                            (store! j (+ (load j) 1)))))
+                                (store! run-bytes (+ (load run-bytes) (- (prof/retained-now) before))))
                               0)
                           (store! i stop))))))
-    (flush-run! (mut p) (mut run))))
+    (flush-run! (mut p) (mut run))
+    (release-tokens! (mut p) (mut run))
+    (tr/profile-event "c.pp.run-retained-bytes" file (load run-bytes))))
 
 ;; ------------------------------------------------------------------- driver
-(defn pp-new [(a (dyn alloc/Allocator))] (-> PP)
+(defn pp-new-with-storage [(a (dyn alloc/Allocator)) (containers (dyn alloc/Allocator))] (-> PP)
   (PP
     :a a
+    :containers containers
+    :bounded-expansion true
+    :temporary-total 0 :temporary-peak 0
     :macros (hm/hm-new [(slice u8) Macro] a (str/str-keyops))
     :include-paths (al/al-new [(slice u8)] a)
     :once (hm/hm-new [(slice u8) bool] a (str/str-keyops))
@@ -1299,6 +1422,11 @@
     :message ""
     :file ""
     :line 0))
+
+;; Persistent source bytes, macro definitions and final output belong to `a`.
+;; Temporary lexical/run vectors have explicit frees on both success and error.
+(defn pp-new [(a (dyn alloc/Allocator))] (-> PP)
+  (pp-new-with-storage a (alloc/malloc-allocator)))
 
 (defn pp-add-include-path [(p (mut PP)) (path (slice u8))] (-> i64)
   (al/al-push! [(slice u8)] (mut (field p include-paths)) (copy-text (mut p) path))
@@ -1325,10 +1453,11 @@
           (str/sb-push-byte! (mut b) (primitive/cast u8 32))
           (str/sb-push-str! (mut b) (subslice text (+ (load cut) 1) n))))
     (let [source (str/sb-str (load (mut b)))
-          result (lex/lex (load (field p a)) "<command line>" source)]
+          (mut result) (lex/lex (container-storage (mut p)) "<command line>" source)]
       (if (lex/lex-failed? result)
           (fail! (mut p) "invalid -D definition" (tok-at (.tokens result) 0))
-          (define! (mut p) (.tokens result) 0 (- (tok-count (.tokens result)) 1)))))
+          (define! (mut p) (.tokens result) 0 (- (tok-count (.tokens result)) 1)))
+      (release-tokens! (mut p) (mut (.tokens result)))))
   0)
 
 (defn pp-result [(p (mut PP))] (-> PPResult)
@@ -1341,8 +1470,8 @@
 
 ;;; Reads one source file into the token stream, leaving the stream open.
 (defn pp-read [(p (mut PP)) (file (slice u8)) (source (slice u8))] (-> PPResult)
-  (let [result (lex/lex (load (field p a)) file source)]
-    (if (lex/lex-failed? result)
+  (let [(mut result) (lex/lex (container-storage (mut p)) file source)
+        output (if (lex/lex-failed? result)
         (PPResult
           :tokens (load (field p out))
           :failed 1
@@ -1355,7 +1484,8 @@
                    (> (al/al-len [Conditional] (load (field p conditionals))) 0))
               (fail! (mut p) "unterminated #if" (tok-at (.tokens result) 0))
               0)
-          (pp-result (mut p))))))
+          (pp-result (mut p))))]
+    (release-tokens! (mut p) (mut (.tokens result))) output))
 
 ;;; A header read ahead of the translation unit, as `-include` does. The end
 ;;; marker is deliberately not appended: the stream is not finished until the

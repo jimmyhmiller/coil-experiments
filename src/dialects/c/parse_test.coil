@@ -5,6 +5,8 @@
 (import "experiments.c.ctype" :as ct)
 (import "experiments.c.node" :as nd)
 (import "experiments.c.parse" :as ps)
+(import "experiments.c.profile" :as prof)
+(import "experiments.c.emit" :as emit)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :as al)
@@ -25,6 +27,32 @@
   (let [r (compile-source source)]
     (assert (= (.failed r) 0))
     r))
+
+(defn assert-typed-numbers [(node (ptr nd/Node))] (-> i64)
+  (when (!= (primitive/cast i64 node) 0)
+    (when (= (nd/nd-kind node) nd/ND-NUM)
+      (assert (!= (primitive/cast i64 (nd/nd-type node)) 0)) 0)
+    (assert-typed-numbers (nd/nd-lhs node)) (assert-typed-numbers (nd/nd-rhs node))
+    (for [i 0 (len (nd/nd-body node))] (assert-typed-numbers (get (nd/nd-body node) i)) 0) 0) 0)
+
+(deftest pointer-difference-divisor-is-a-typed-integer
+  (let [parsed (parse-ok "long distance(long *a, long *b) { return a - b; }")]
+    (assert-typed-numbers (nd/obj-body (find-global parsed "distance")))))
+
+(deftest fabs-builtins-use-the-declared-floating-signature
+  (let [parsed (parse-ok "_Static_assert(sizeof(__builtin_fabsf(1.0)) == 4, \"float\"); _Static_assert(sizeof(__builtin_fabs(1)) == 8, \"double\"); double f(void) { return __builtin_fabs(-42); }")
+        invalid (compile-source "double f(void *p) { return __builtin_fabs(p); }")]
+    (assert-eq (.failed parsed) 0) (assert-eq (.failed invalid) 1)
+    (assert (str/str-eq (.message invalid) "fabs operand must be arithmetic near `__builtin_fabs`"))))
+
+(deftest switch-control-undergoes-integer-promotion
+  (let [parsed (parse-ok "int f(unsigned char byte, _Bool bit) { switch(byte) { case -1:; case 255:; } switch(bit) { case 1:; } return 0; }")
+        body (nd/nd-body (nd/obj-body (find-global parsed "f")))]
+    (for [i 0 2]
+      (let [control (nd/nd-test (get body i))]
+        (assert-eq (nd/nd-kind control) nd/ND-CAST)
+        (assert-eq (ct/ty-kind (nd/nd-type control)) ct/TY-INT)
+        (assert (not (ct/ty-unsigned? (nd/nd-type control))))) 0)))
 
 (defn global-count [(r ps/ParseResult)] (-> i64)
   (al/al-len [(ptr nd/Obj)] (.globals r)))
@@ -70,6 +98,20 @@
                f (find-global r "printf")]
            (assert (ct/ty-variadic? (nd/obj-type f)))))
 
+(deftest external-inline-bodies-do-not-always-own-linker-symbols
+  (let [iso (find-global (parse-ok "inline int f(void) { return 1; }") "f")
+        iso-extern (find-global (parse-ok "extern inline int f(void) { return 1; }") "f")
+        iso-prior (find-global (parse-ok "int f(void); inline int f(void) { return 1; }") "f")
+        iso-later (find-global (parse-ok "inline int f(void) { return 1; } extern int f(void);") "f")
+        gnu (find-global (parse-ok "extern inline __attribute__((gnu_inline)) int f(void) { return 1; }") "f")
+        gnu-owned (find-global (parse-ok "inline __attribute__((gnu_inline)) int f(void) { return 1; }") "f")]
+    (assert (.inline-only iso))
+    (assert (not (.inline-only iso-extern)))
+    (assert (not (.inline-only iso-prior)))
+    (assert (not (.inline-only iso-later)))
+    (assert (.inline-only gnu))
+    (assert (not (.inline-only gnu-owned)))))
+
 (deftest apple-block-pointer-types-have-pointer-sized-representation
          (let [r (parse-ok "typedef void (^Callback)(int); extern void install(Callback callback);")
                install (find-global r "install")]
@@ -105,11 +147,30 @@
            (assert-eq (ct/ty-array-len (nd/obj-type a)) 14)
            (assert-eq (ct/ty-size (nd/obj-type a)) 56)))
 
+(deftest an-extern-array-keeps-the-definitions-explicit-bound
+  (let [r (parse-ok "extern long pure[]; long pure[1024] = {1}; extern long pure[];")
+        a (find-global r "pure")]
+    (assert-eq (ct/ty-array-len (nd/obj-type a)) 1024)
+    (assert-eq (ct/ty-size (nd/obj-type a)) 8192)))
+
+(deftest incompatible-array-bounds-are-rejected
+  (let [r (compile-source "extern int a[4]; int a[8];")]
+    (assert (!= (.failed r) 0))))
+
 (deftest unsigned-constant-right-shifts-are-logical
          (parse-ok "_Static_assert((~0ULL >> 63) == 1, \"logical shift\"); int ok;"))
 
 (deftest unsigned-constant-comparisons-use-unsigned-ordering
          (parse-ok "_Static_assert(9223372036854775807LL <= 18446744073709551615ULL, \"unsigned comparison\"); int ok;"))
+
+(deftest unsigned-constant-division-and-remainder-preserve-all-bits
+  (parse-ok "_Static_assert(~0ULL / 64 == 288230376151711743ULL, \"unsigned quotient\"); _Static_assert(~0ULL % 64 == 63, \"unsigned remainder\"); _Static_assert(~0ULL / (1ULL << 63) == 1, \"unsigned divisor\"); int ok;"))
+
+(deftest constant-integer-conversions-preserve-width-and-signedness
+  (parse-ok "_Static_assert((unsigned)-1 / 64 == 67108863, \"unsigned cast\"); _Static_assert((unsigned)-1 % 64 == 63, \"unsigned remainder\"); _Static_assert((unsigned char)511 == 255, \"narrow cast\"); _Static_assert((signed char)255 == -1, \"signed cast\"); _Static_assert((~0U + 1U) == 0, \"unsigned wrap\"); int ok;"))
+
+(deftest signed-constant-division-still-truncates-toward-zero
+  (parse-ok "_Static_assert(-65 / 64 == -1, \"signed quotient\"); _Static_assert(-65 % 64 == -1, \"signed remainder\"); _Static_assert(65 / -64 == -1, \"negative divisor\"); int ok;"))
 
 (deftest builtin-offsetof-is-an-integer-constant-expression
          (parse-ok "struct S { char c; long value; }; _Static_assert((unsigned long)&(((struct S *)0)->value) == 8, \"offset\"); int ok;"))
@@ -182,6 +243,23 @@
          (let [r (parse-ok "int values[6] = {[1 ... 4] = 7};")]
            (assert (found? (find-global r "values")))))
 
+(deftest sparse-array-initializers-do-not-allocate-the-holes
+  (let [stats (primitive/alloc-stack prof/Stats)
+        prior (load (prof/active))]
+    (store! stats (primitive/zeroed prof/Stats))
+    (store! (prof/active) stats)
+    (let [r (compile-source "long values[708334] = {[708333] = 42, [0] = 1, [708333] = 73};")]
+      (store! (prof/active) prior)
+      (assert-eq (.failed r) 0)
+      ;; Root plus two distinct scalar children; a repeated designator reuses
+      ;; its child. No allocation is charged for any of the 708,332 holes.
+      (assert-eq (.initializers stats) 3))))
+
+(deftest incomplete-sparse-array-bound-is-not-child-count
+  (let [r (parse-ok "long values[] = {[999] = 7, [0] = 4};")
+        values (find-global r "values")]
+    (assert-eq (ct/ty-array-len (nd/obj-type values)) 1000)))
+
 (deftest members-of-returned-record-values-can-decay
          (let [r (parse-ok "typedef struct { float v[4]; } V; V make(void); float *f(void) { return make().v; }")]
            (assert (found? (find-global r "f")))))
@@ -249,6 +327,11 @@
                x (find-global r "x")]
            (assert-eq (ct/ty-array-len (nd/obj-type x)) 11)))
 
+(deftest enum-storage-signedness-follows-its-enumerators
+  (let [r (parse-ok "enum U { ZERO, THREE = 3 }; enum S { MINUS = -1, PLUS = 1 }; enum U u; enum S s;")]
+    (assert (ct/ty-unsigned? (nd/obj-type (find-global r "u"))))
+    (assert (not (ct/ty-unsigned? (nd/obj-type (find-global r "s")))))))
+
 (deftest sizeof-folds-to-a-constant
          (let [r (parse-ok "int a[sizeof(int)]; int b[sizeof(char) + sizeof(double)];")
                a (find-global r "a")
@@ -271,6 +354,30 @@
                bytes (find-global r "bytes")]
            (assert (found? bytes))
            (assert-eq (ct/ty-size (nd/obj-type bytes)) 5)))
+
+(deftest numeric-string-escapes-preserve-bytes-and-boundaries
+  (let [r (parse-ok "char *s = \"\\x00\\x7F\\377\\1017\\08\\x0000ff\" \"A\";")
+        bytes (nd/obj-string-data (find-global r ".Lstr.1$test"))]
+    (assert-eq (slice-len bytes) 9)
+    (assert-eq (primitive/cast i64 (slice-get bytes 0)) 0)
+    (assert-eq (primitive/cast i64 (slice-get bytes 1)) 127)
+    (assert-eq (primitive/cast i64 (slice-get bytes 2)) 255)
+    (assert-eq (primitive/cast i64 (slice-get bytes 3)) 65)
+    (assert-eq (primitive/cast i64 (slice-get bytes 4)) 55)
+    (assert-eq (primitive/cast i64 (slice-get bytes 5)) 0)
+    (assert-eq (primitive/cast i64 (slice-get bytes 6)) 56)
+    (assert-eq (primitive/cast i64 (slice-get bytes 7)) 255)
+    (assert-eq (primitive/cast i64 (slice-get bytes 8)) 65)))
+
+(deftest invalid-numeric-string-escapes-are-diagnosed
+  (let [missing (compile-source "char *s = \"\\x\";")
+        hex (compile-source "char *s = \"\\x100\";")
+        octal (compile-source "char *s = \"\\400\";")
+        overflow (compile-source "char *s = \"\\xffffffffffffffffffffffff\";")]
+    (assert (!= (.failed missing) 0))
+    (assert (!= (.failed hex) 0))
+    (assert (!= (.failed octal) 0))
+    (assert (!= (.failed overflow) 0))))
 
 (deftest func-names-the-enclosing-function
          (let [r (parse-ok "const char *name(void) { return __func__; }")]
