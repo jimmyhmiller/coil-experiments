@@ -4,8 +4,12 @@
 ;; Clojure. Coil-specific operations and diagnostics stay explicit.
 
 (require 'cl-lib)
-(require 'lisp-mode)
 (require 'nrepl-client)
+;; The major mode itself lives in the coil repo (src/tooling/editors/emacs).
+;; coil-live only adds commands on top of it; it must never define its own
+;; `coil-mode', or it silently replaces the real one and takes font-lock,
+;; indentation and imenu with it.
+(require 'coil-mode)
 
 (defgroup coil-live nil "Live Coil development." :group 'languages)
 
@@ -17,11 +21,6 @@
 (defvar coil-live-connections (make-hash-table :test #'equal)
   "Live nREPL connection buffers keyed by project, host, and port.")
 (defvar coil-live-last-state nil)
-
-(define-derived-mode coil-mode lisp-mode "Coil"
-  "Major mode for Coil source."
-  (setq-local comment-start ";")
-  (setq-local comment-start-skip ";+ *"))
 
 (defun coil-live--project-root ()
   (or (locate-dominating-file default-directory "Coil.toml")
@@ -125,12 +124,13 @@
            (display-buffer (current-buffer))))))
    (coil-live--connection)))
 
-(define-key coil-mode-map (kbd "C-c C-c") #'coil-live-eval-defun)
-(define-key coil-mode-map (kbd "C-c C-r") #'coil-live-eval-region)
-(define-key coil-mode-map (kbd "C-c C-k") #'coil-live-load-buffer)
-(define-key coil-mode-map (kbd "C-c C-z") #'coil-live-state)
-
-(add-to-list 'auto-mode-alist '("\\.coil\\'" . coil-mode))
+;; No keys are bound here on purpose.  Every C-c prefix coil-live would want
+;; is already taken by `coil-mode' (C-c C-c eval, C-c C-r run, C-c C-k load,
+;; C-c C-z REPL), and binding into `coil-mode-map' would shadow them for every
+;; Coil buffer.  Reach these four through M-x:
+;;
+;;   coil-live-eval-defun   coil-live-eval-region
+;;   coil-live-load-buffer  coil-live-state
 
 (provide 'coil-live)
 ;;; coil-live.el ends here
