@@ -1,0 +1,406 @@
+(module experiments.live.ledger)
+
+;;; The file ledger: a source file's top-level forms as the live program last
+;;; accepted them, and the diff that turns a newly saved version of the file into
+;;; exactly the forms one live transaction must carry.
+;;;
+;;; Forms are read with Coil's own form reader -- the one behind `coil edit` -- so a
+;;; form's extent and tokens are exactly what the compiler reads. Two versions of a
+;;; form are the same when their token sequences are the same: a change of layout
+;;; or comments never makes a form "changed".
+;;;
+;;; Identity follows the live registry (experiments.heap-inspector.live-registry):
+;;; a definition is its head plus its name, an `impl` is named by the items before
+;;; its first method, and `(migrate T field old body)` is a migration of T.field.
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use [ArrayList al-new al-set! len get push! al-elem])
+(import "coil.slice" :use [slice-len slice-get subslice])
+(import "coil.str" :as str)
+(import "coil.compiler.formatter.formedit" :as fe)
+
+; What a top-level form is to the live program.
+(const KIND-DEFINITION 1)  ; defn defstruct defsum deftrait impl defclosure letonce export
+
+(const KIND-MIGRATION 2)  ; (migrate T field old body): a transition edge for T
+
+(const KIND-IMPORT 3)
+
+(const KIND-MODULE 4)  ; a file's module declaration: project metadata, never sent
+
+(const KIND-CONTEXT 5)  ; extern, const, defmacro, ...: checking context, no live identity
+
+(defstruct LedgerForm
+  [(module (slice u8))
+   (file (slice u8))
+   (kind i64)
+   (head (slice u8))  ; the form's head symbol: "defn", "defstruct", ...
+   (name (slice u8))  ; identity within its head: "radius", "Show Ball", "Ball r"
+   (target (slice u8))  ; for a migration, the type it transitions; "" otherwise
+   (canon (slice u8))  ; the form's tokens joined by single spaces
+   (text (slice u8))  ; the form's exact source bytes
+   (line i64)])  ; 1-based line of the form's first byte
+
+(defstruct Ledger
+  [(ok bool)  ; false: the file does not read (unbalanced, unterminated)
+   (source (slice u8))  ; the ledger's own copy of the file; every slice points into it
+   (forms (ArrayList LedgerForm))])
+
+;;; What a new version of a file changes against the accepted ledger.
+(defstruct LedgerPlan
+  [(submit (ArrayList LedgerForm))  ; the forms to send, in file order
+   (changed (ArrayList LedgerForm))  ; definitions whose accepted version differs
+   (added (ArrayList LedgerForm))  ; definitions the live program does not have
+   (removed (ArrayList LedgerForm))  ; accepted definitions no longer in the file
+   (migrations (ArrayList LedgerForm))  ; migrate forms sent with their type's change
+   (historical (ArrayList LedgerForm))  ; migrate forms already applied, or with nothing to apply to
+   (unsupported (ArrayList LedgerForm))])  ; changed context forms: not applicable live
+
+(defn copy-bytes [(a (dyn alloc/Allocator)) (s (slice u8))] (-> (slice u8))
+  (if (= (slice-len s) 0)
+      ""
+      (match (alloc/alloc [u8] a (slice-len s))
+        (None []
+              (do (alloc/oom-at c"live ledger source copy" (slice-len s)) ""))
+        (Some [bytes]
+              (do
+                (for [i 0 (slice-len s)]
+                  (set! (primitive/index (alloc/alloc-slice-data bytes) i)
+                        (slice-get s i)))
+                bytes)))))
+
+(defn definition-head? [(head (slice u8))] (-> bool)
+  (or (= head "defn")
+      (or (= head "defstruct")
+          (or (= head "defsum")
+              (or (= head "deftrait")
+                  (or (= head "impl")
+                      (or (= head "defclosure")
+                          (or (= head "letonce") (= head "export")))))))))
+
+; A node's tokens joined by single spaces: its identity modulo layout and comments.
+(defn node-canon [(a (dyn alloc/Allocator)) (t (ptr fe/Tree)) (node i64)] (-> (slice u8))
+  (let [p (fe/fnode t node)
+        lo (.tok-lo p)
+        hi (.tok-hi p)
+        (mut sb) (str/sb-new a)]
+    (for [j lo hi]
+      (when (> j lo) (str/sb-push-byte! (mut sb) (primitive/cast u8 32)) 0)
+      (str/sb-push-str! (mut sb) (fe/tok-text t j))
+      0)
+    (str/sb-finish! (mut sb))))
+
+(defn node-opens-with? [(t (ptr fe/Tree)) (node i64) (delim (slice u8))] (-> bool)
+  (let [p (fe/fnode t node)]
+    (and (.listp p) (= (fe/tok-text t (.tok-lo p)) delim))))
+
+; `(name [params] (-> ret) body...)`: where an impl's key ends and its methods
+; begin (live-registry registry-impl-method-form?).
+(defn method-form? [(t (ptr fe/Tree)) (node i64)] (-> bool)
+  (and (node-opens-with? t node "(")
+       (and (> (fe/count-children t node) 2)
+            (let [params (fe/child-at t node 1)
+                  ret (fe/child-at t node 2)]
+              (and (node-opens-with? t params "[")
+                   (and (node-opens-with? t ret "(")
+                        (let [arrow (fe/child-at t ret 0)]
+                          (and (>= arrow 0) (= (fe/node-text t arrow) "->")))))))))
+
+(defn form-kind [(head (slice u8)) (t (ptr fe/Tree)) (node i64)] (-> i64)
+  (cond (definition-head? head) KIND-DEFINITION
+        (and (= head "migrate") (= (fe/count-children t node) 5)) KIND-MIGRATION
+        (= head "import") KIND-IMPORT
+        (= head "module") KIND-MODULE
+        :else KIND-CONTEXT))
+
+(defn child-canon [(a (dyn alloc/Allocator))
+                   (t (ptr fe/Tree))
+                   (node i64)
+                   (k i64)] (-> (slice u8))
+  (if (> (fe/count-children t node) k)
+      (node-canon a t (fe/child-at t node k))
+      ""))
+
+(defn form-name [(a (dyn alloc/Allocator))
+                 (t (ptr fe/Tree))
+                 (node i64)
+                 (head (slice u8))
+                 (kind i64)] (-> (slice u8))
+  (cond (= kind KIND-IMPORT) (node-canon a t node)
+        (= kind KIND-MIGRATION)
+          (let [(mut sb) (str/sb-new a)]
+            (str/sb-push-str! (mut sb) (child-canon a t node 1))
+            (str/sb-push-byte! (mut sb) (primitive/cast u8 32))
+            (str/sb-push-str! (mut sb) (child-canon a t node 2))
+            (str/sb-finish! (mut sb)))
+        (= head "impl")
+          (let [n (fe/count-children t node)
+                (mut sb) (str/sb-new a)
+                (mut k) 1]
+            (loop (if (or (>= (load k) n)
+                          (method-form? t (fe/child-at t node (load k))))
+                      (break)
+                      (do
+                        (when (> (load k) 1)
+                          (str/sb-push-byte! (mut sb) (primitive/cast u8 32))
+                          0)
+                        (str/sb-push-str! (mut sb)
+                                          (node-canon a
+                                                      t
+                                                      (fe/child-at t
+                                                                   node
+                                                                   (load k))))
+                        (set! k (+ (load k) 1)))))
+            (str/sb-finish! (mut sb)))
+        :else (child-canon a t node 1)))
+
+;;; Read SRC (copied into A) into a ledger. A file that does not read yields
+;;; `ok = false` and no forms: nothing can be diffed until it reads again.
+(defn ledger-read [(a (dyn alloc/Allocator)) (src (slice u8))] (-> Ledger)
+  (let [source (copy-bytes a src)
+        t (primitive/alloc-stack fe/Tree)
+        (mut forms) (al-new [LedgerForm] a)]
+    (fe/build-tree a source t)
+    (if (not (.ok t))
+        (Ledger
+          :ok false
+          :source source
+          :forms (load forms))
+        (let [nodes (fe/all-forms a t 0)
+              (mut line) 1
+              (mut scanned) 0]
+          (for [k 0 (len nodes)]
+            (let [node (get nodes k)
+                  p (fe/fnode t node)
+                  start (.start p)
+                  end (.end p)]
+              (loop (if (>= (load scanned) start)
+                        (break)
+                        (do
+                          (when (= (slice-get source (load scanned))
+                                   (primitive/cast u8 10))
+                            (set! line (+ (load line) 1))
+                            0)
+                          (set! scanned (+ (load scanned) 1)))))
+              (let [h (fe/child-at t node 0)
+                    head
+                      (if (and (>= h 0) (not (.listp (fe/fnode t h))))
+                          (fe/node-text t h)
+                          "")
+                    kind (form-kind head t node)]
+                (push! (mut forms)
+                       (LedgerForm
+                         :module ""
+                         :file ""
+                         :kind kind
+                         :head head
+                         :name (form-name a t node head kind)
+                         :target
+                           (if (= kind KIND-MIGRATION)
+                               (child-canon a t node 1)
+                               "")
+                         :canon (node-canon a t node)
+                         :text (subslice source start end)
+                         :line (load line))))
+              0))
+          (Ledger
+            :ok true
+            :source source
+            :forms (load forms))))))
+
+;;; The ledger of a program that has accepted nothing yet.
+(defn ledger-empty [(a (dyn alloc/Allocator))] (-> Ledger)
+  (Ledger
+    :ok true
+    :source ""
+    :forms (al-new [LedgerForm] a)))
+
+;;; A source file is a complete version, so it cannot contain two definitions
+;;; of the same live identity. A submission stream may replace a definition;
+;;; silently choosing the last one inside a file would conceal invalid source.
+(defn ledger-duplicates [(a (dyn alloc/Allocator)) (l (ptr Ledger))] (-> (ArrayList LedgerForm))
+  (let [(mut duplicates) (al-new [LedgerForm] a)
+        forms (.forms l)]
+    (for [i 0 (len forms)]
+      (let [f (get forms i)
+            (mut duplicate) false]
+        (when (or (= (.kind f) KIND-DEFINITION) (= (.kind f) KIND-MIGRATION))
+          (for [j 0 i]
+            (let [prior (get forms j)]
+              (when (and (= (.module f) (.module prior))
+                         (and (= (.head f) (.head prior)) (= (.name f) (.name prior))))
+                (set! duplicate true)
+                0)))
+          0)
+        (when (load duplicate) (push! (mut duplicates) f) 0)))
+    (load duplicates)))
+
+; The index of the form of KIND with this head and name, or -1.
+(defn ledger-find-in [(l (ptr Ledger))
+                      (module (slice u8))
+                   (kind i64)
+                   (head (slice u8))
+                   (name (slice u8))] (-> i64)
+  (let [fs (field l forms)
+        (mut found) -1]
+    (for [i 0 (len (load fs))]
+      (let [f (al-elem [LedgerForm] fs i)]
+        (when (and (< (load found) 0)
+                   (and (= (.module f) module)
+                        (and (= (.kind f) kind) (and (= (.head f) head) (= (.name f) name)))))
+          (set! found i)
+          0))
+      0)
+    (load found)))
+
+; The index of a form of KIND whose tokens are exactly CANON, or -1.
+(defn ledger-find-canon-in [(l (ptr Ledger)) (module (slice u8)) (kind i64) (canon (slice u8))] (-> i64)
+  (let [fs (field l forms)
+        (mut found) -1]
+    (for [i 0 (len (load fs))]
+      (let [f (al-elem [LedgerForm] fs i)]
+        (when (and (< (load found) 0)
+                   (and (= (.module f) module) (and (= (.kind f) kind) (= (.canon f) canon))))
+          (set! found i)
+          0))
+      0)
+    (load found)))
+
+(defn type-changed-in? [(changed (ptr (ArrayList LedgerForm))) (module (slice u8)) (name (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (for [i 0 (len (load changed))]
+      (let [f (al-elem [LedgerForm] changed i)]
+        (when (and (= (.module f) module) (and (= (.name f) name)
+                   (or (= (.head f) "defstruct") (or (= (.head f) "defsum") (= (.head f) "defclosure")))))
+          (set! found true)
+          0))
+      0)
+    (load found)))
+
+;;; Diff NEXT against ACCEPTED.
+;;;  - A definition is sent when it is new or its tokens changed.
+;;;  - An import or a context form (extern, const, ...) that is new is sent as
+;;;    checking context; a CHANGED context form is unsupported -- consts, macros
+;;;    and externs are compiled into their users, which the live program cannot
+;;;    re-derive -- and the host must not apply the edit.
+;;;  - A migrate form is sent only when it is new and its type changed in this same
+;;;    version; otherwise it is historical: already applied, or waiting on nothing.
+;;;  - A definition that disappeared is reported as removed. The live program keeps
+;;;    its last accepted version; nothing is sent for it.
+(defn ledger-diff-mode [(a (dyn alloc/Allocator))
+                       (project bool) (entry-module (slice u8))
+                   (accepted (ptr Ledger))
+                   (next (ptr Ledger))] (-> LedgerPlan)
+  (let [nf (field next forms)
+        n (len (load nf))
+        (mut chosen) (al-new [bool] a)
+        (mut submit) (al-new [LedgerForm] a)
+        (mut changed) (al-new [LedgerForm] a)
+        (mut added) (al-new [LedgerForm] a)
+        (mut removed) (al-new [LedgerForm] a)
+        (mut migrations) (al-new [LedgerForm] a)
+        (mut historical) (al-new [LedgerForm] a)
+        (mut unsupported) (al-new [LedgerForm] a)]
+    (for [i 0 n] (push! (mut chosen) false) 0)
+    (for [i 0 n]
+      (let [f (al-elem [LedgerForm] nf i)
+            kind (.kind f)]
+        (cond (= kind KIND-DEFINITION)
+                (let [j (ledger-find-in accepted (.module f) kind (.head f) (.name f))]
+                  (cond (< j 0)
+                          (do
+                            (push! (mut added) (load f))
+                            (al-set! (mut chosen) i true)
+                            0)
+                        (not (= (.canon (al-elem [LedgerForm]
+                                                 (field accepted forms)
+                                                 j))
+                                (.canon f)))
+                          (if (and (= (.module f) entry-module) (and (= (.head f) "defn") (= (.name f) "main")))
+                              (do (push! (mut unsupported) (load f)) 0)
+                              (do
+                                (push! (mut changed) (load f))
+                                (al-set! (mut chosen) i true)
+                                0))
+                        :else 0))
+              (= kind KIND-IMPORT)
+                (if (< (ledger-find-canon-in accepted (.module f) kind (.canon f)) 0)
+                    (do (al-set! (mut chosen) i true) 0)
+                    0)
+              (= kind KIND-CONTEXT)
+                (let [j (ledger-find-in accepted (.module f) kind (.head f) (.name f))]
+                  (cond (< j 0) (do (al-set! (mut chosen) i true) 0)
+                        (not (= (.canon (al-elem [LedgerForm]
+                                                 (field accepted forms)
+                                                 j))
+                                (.canon f)))
+                          (if project (do (al-set! (mut chosen) i true) 0)
+                              (do (push! (mut unsupported) (load f)) 0))
+                        :else 0))
+              :else 0))
+      0)
+    (for [i 0 n]
+      (let [f (al-elem [LedgerForm] nf i)]
+        (when (= (.kind f) KIND-MIGRATION)
+          (if (and (< (ledger-find-canon-in accepted (.module f) KIND-MIGRATION (.canon f)) 0)
+                   (type-changed-in? (mut changed) (.module f) (.target f)))
+              (do
+                (push! (mut migrations) (load f))
+                (al-set! (mut chosen) i true)
+                0)
+              (do (push! (mut historical) (load f)) 0))
+          0))
+      0)
+    (let [af (field accepted forms)]
+      (for [i 0 (len (load af))]
+        (let [f (al-elem [LedgerForm] af i)]
+          (when (and (= (.kind f) KIND-DEFINITION)
+                     (< (ledger-find-in next (.module f) KIND-DEFINITION (.head f) (.name f))
+                        0))
+            (push! (mut removed) (load f))
+            0))
+        (let [f (al-elem [LedgerForm] af i)]
+          (when (and (or (= (.kind f) KIND-CONTEXT) (= (.kind f) KIND-IMPORT))
+                     (< (ledger-find-canon-in next (.module f) (.kind f) (.canon f)) 0))
+            (when (< (ledger-find-in next (.module f) (.kind f) (.head f) (.name f)) 0)
+              (if project (push! (mut submit) (load f))
+                          (push! (mut unsupported) (load f)))
+              0)
+            0))
+        0))
+    (for [i 0 n]
+      (when (get (load chosen) i)
+        (push! (mut submit) (load (al-elem [LedgerForm] nf i)))
+        0)
+      0)
+    (LedgerPlan
+      :submit (load submit)
+      :changed (load changed)
+      :added (load added)
+      :removed (load removed)
+      :migrations (load migrations)
+      :historical (load historical)
+      :unsupported (load unsupported))))
+
+;;; The candidate source for a plan: its forms' exact text, in file order.
+(defn plan-source [(a (dyn alloc/Allocator)) (plan (ptr LedgerPlan))] (-> (slice u8))
+  (let [fs (field plan submit)
+        (mut sb) (str/sb-new a)]
+    (for [i 0 (len (load fs))]
+      (when (> i 0) (str/sb-push-byte! (mut sb) (primitive/cast u8 10)) 0)
+      (str/sb-push-str! (mut sb) (.text (al-elem [LedgerForm] fs i)))
+      0)
+    (str/sb-finish! (mut sb))))
+
+
+(defn ledger-find [(l (ptr Ledger)) (kind i64) (head (slice u8)) (name (slice u8))] (-> i64)
+  (ledger-find-in l "" kind head name))
+(defn ledger-find-canon [(l (ptr Ledger)) (kind i64) (canon (slice u8))] (-> i64)
+  (ledger-find-canon-in l "" kind canon))
+(defn type-changed? [(changed (ptr (ArrayList LedgerForm))) (name (slice u8))] (-> bool)
+  (type-changed-in? changed "" name))
+(defn ledger-diff [(a (dyn alloc/Allocator)) (accepted (ptr Ledger)) (next (ptr Ledger))] (-> LedgerPlan)
+  (ledger-diff-mode a false "" accepted next))
+(defn ledger-project-diff [(a (dyn alloc/Allocator)) (entry (slice u8))
+                          (accepted (ptr Ledger)) (next (ptr Ledger))] (-> LedgerPlan)
+  (ledger-diff-mode a true entry accepted next))

@@ -8,7 +8,7 @@ connection machinery without pretending that Coil is Clojure.
 Build and start it from the project root:
 
 ```sh
-coil build src/experiments/live-repl/server.coil -o build/coil-live-nrepl
+coil build src/experiments/live-repl/main.coil -o build/coil-live-nrepl
 ./build/coil-live-nrepl
 ```
 

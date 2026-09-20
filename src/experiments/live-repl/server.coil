@@ -1,27 +1,82 @@
 (module experiments.live-repl.server)
-
 (import "coil.alloc" :as alloc)
 (import "coil.primitive" :as primitive)
 (import "coil.slice" :use [slice-new slice-len slice-data])
 (import "coil.socket" :as socket)
-(import "experiments.live-repl.bencode" :use [Request request-empty bdecode-request])
+(import "coil.thread" :as thread)
+(import "coil.scratch" :as scratch)
+(import "coil.str" :as str)
+(import "coil.fs" :as fs)
+(import "coil.atomic" :as atomic)
+(import "coil.selectors" :as selectors)
+(import "coil.time" :as time)
+(import "experiments.live-repl.bencode"
+        :use
+        [Request request-empty bdecode-request])
 (import "experiments.live-repl.protocol" :use [dispatch-request])
-(import "experiments.heap-inspector.controller" :as controller)
 
-(export serve!)
+(export serve! serve-at! prepare-listener! serve-listener!)
 
 (extern printf :cc c [(ptr i8) ...] (-> i32))
+
 (extern fopen :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
 (extern fprintf :cc c [(ptr i8) (ptr i8) ...] (-> i32))
+
 (extern fclose :cc c [(ptr i8)] (-> i32))
+
 (extern memmove :cc c [(ptr i8) (ptr i8) u64] (-> (ptr i8)))
+
+(extern malloc :cc c [u64] (-> (ptr i8)))
+
+(extern free :cc c [(ptr i8)] (-> void))
+
+(extern pthread_detach :cc c [(ptr i8)] (-> i32))
+
+(extern rename :cc c [(ptr i8) (ptr i8)] (-> i32))
 
 (const BUFFER-CAPACITY 1048576)
 
-(defn publish-port! [(port i64)] (-> i64)
-  (let [file (fopen c".nrepl-port" c"w")]
-    (if (= (primitive/cast i64 file) 0) -1
-        (do (fprintf file c"%ld\n" port) (fclose file) 0))))
+(defstruct ClientContext [(connection socket/TcpConnection)])
+
+(defn client-count [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defn claim-client! [] (-> bool)
+  (block :claimed
+         (loop (let [n (atomic/atomic-load (client-count))]
+                 (when (>= n 32) (return-from :claimed false))
+                 (when (= (atomic/atomic-cas (client-count) n (+ n 1)) n)
+                   (return-from :claimed true))))
+         false))
+
+(defn release-client! [] (-> i64)
+  (loop (let [n (atomic/atomic-load (client-count))]
+          (when (= (atomic/atomic-cas (client-count) n (- n 1)) n) (break))))
+  0)
+
+(defn request-deadline [] (-> time/Instant)
+  (match (time/duration-millis 30000)
+    (Err [_] (primitive/zeroed time/Instant))
+    (Ok [d]
+        (match (time/deadline-after d)
+          (Err [_] (primitive/zeroed time/Instant))
+          (Ok [deadline] deadline)))))
+
+(defn publish-port! [(path (ptr i8)) (port i64)] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        (mut sb) (str/sb-new a)]
+    (str/sb-push-str! (mut sb) (str/cstr->str path))
+    (str/sb-push-str! (mut sb) ".tmp")
+    (let [tmp (str/str->cstr a (str/sb-finish! (mut sb)))
+          file (fopen tmp c"w")]
+      (if (= (primitive/cast i64 file) 0)
+          -1
+          (let [written (fprintf file c"%ld\n" port)
+                closed (fclose file)]
+            (if (or (< written 0) (!= closed 0))
+                -1
+                (primitive/cast i64 (rename tmp path))))))))
 
 (defn request-buffer [(a (dyn alloc/Allocator))] (-> (slice u8))
   (match (alloc/alloc-bytes a BUFFER-CAPACITY 1)
@@ -31,79 +86,165 @@
 (defn write-all! [(connection (ptr socket/TcpConnection)) (bytes (slice u8))] (-> i64)
   (let [(mut sent) 0]
     (block :done
-      (loop
-        (if (>= (load sent) (slice-len bytes)) (return-from :done 0)
-            (match (socket/tcp-write connection
-                     (primitive/cast (ptr i8) (primitive/index (slice-data bytes) (load sent)))
-                     (- (slice-len bytes) (load sent)))
-              (Err [_] (return-from :done -1))
-              (Ok [n] (if (<= n 0) (return-from :done -1)
-                          (set! sent (+ (load sent) n)))))))
-      0)))
+           (loop (if (>= (load sent) (slice-len bytes))
+                     (return-from :done 0)
+                     (match (socket/tcp-write connection
+                                              (primitive/cast (ptr i8)
+                                                              (primitive/index (slice-data bytes)
+                                                                               (load sent)))
+                                              (- (slice-len bytes) (load sent)))
+                       (Err [_] (return-from :done -1))
+                       (Ok [n]
+                           (if (<= n 0)
+                               (return-from :done -1)
+                               (set! sent (+ (load sent) n)))))))
+           0)))
 
 (defn serve-connection! [(connection (ptr socket/TcpConnection))] (-> i64)
   (let [a (alloc/malloc-allocator)
         storage (request-buffer a)
         buffer (slice-data [u8] storage)
         request (primitive/alloc-stack Request)
+        (mut arena) (primitive/zeroed scratch/ScratchArena)
+        (mut deadline) (request-deadline)
         (mut used) 0
         (mut result) 0]
     (store! request (request-empty))
+    (scratch/scratch-init (mut arena) a)
     (block :client
-      (loop
-        (match (socket/tcp-read connection
-                 (primitive/cast (ptr i8) (primitive/index buffer (load used)))
-                 (- BUFFER-CAPACITY (load used)))
-          (Err [_] (return-from :client -1))
-          (Ok [n]
-            (if (= n 0) (return-from :client 0)
-                (do
-                  (set! used (+ (load used) n))
-                  (block :requests
-                    (loop
-                      (let [consumed (bdecode-request (slice-new buffer (load used)) request)]
-                        (cond
-                          (= consumed 0) (return-from :requests 0)
-                          (< consumed 0) (do (set! result -2) (return-from :client -2))
-                          :else
-                            (let [response (dispatch-request a request)
-                                  remaining (- (load used) consumed)]
-                              (if (!= (write-all! connection response) 0)
-                                  (return-from :client -1) 0)
-                              (if (> remaining 0)
-                                  (do (memmove (primitive/cast (ptr i8) buffer)
-                                               (primitive/cast (ptr i8) (primitive/index buffer consumed))
-                                               (primitive/cast u64 remaining))
-                                      0) 0)
-                              (set! used remaining)))))))))))
-      0)
+           (loop (when (>= (load used) BUFFER-CAPACITY)
+                   (return-from :client -2))
+             (match (selectors/wait-fd-until (.fd connection)
+                                             (selectors/interest-readable)
+                                             (load deadline))
+               (Err [_] (return-from :client -1))
+               (Ok [_] 0))
+             (match (socket/tcp-read connection
+                                     (primitive/cast (ptr i8)
+                                                     (primitive/index buffer
+                                                                      (load used)))
+                                     (- BUFFER-CAPACITY (load used)))
+               (Err [_] (return-from :client -1))
+               (Ok [n]
+                   (if (= n 0)
+                       (return-from :client 0)
+                       (do
+                         (set! used (+ (load used) n))
+                         (block :requests
+                                  (loop (let [consumed
+                                                (bdecode-request (slice-new buffer
+                                                                            (load used))
+                                                                 request)]
+                                          (cond (= consumed 0)
+                                                  (return-from :requests 0)
+                                                (< consumed 0)
+                                                  (do
+                                                    (set! result -2)
+                                                    (return-from :client -2))
+                                                :else
+                                                  (let [response
+                                                          (dispatch-request (scratch/scratch-allocator (mut arena))
+                                                                            request)
+                                                        remaining
+                                                          (- (load used)
+                                                             consumed)]
+                                                    (if (!= (write-all! connection
+                                                                        response)
+                                                            0)
+                                                        (return-from :client -1)
+                                                        0)
+                                                    (scratch/scratch-reset! (mut arena))
+                                                    (set! deadline
+                                                          (request-deadline))
+                                                    (if (> remaining 0)
+                                                        (do
+                                                          (memmove (primitive/cast (ptr i8)
+                                                                                   buffer)
+                                                                   (primitive/cast (ptr i8)
+                                                                                   (primitive/index buffer
+                                                                                                    consumed))
+                                                                   (primitive/cast u64
+                                                                                   remaining))
+                                                          0)
+                                                        0)
+                                                    (set! used remaining)))))))))))
+           0)
     (alloc/free-bytes a storage 1)
+    (scratch/scratch-close! (mut arena))
     (load result)))
 
+(defn client-thread [(argument (ptr i8))] (-> (ptr i8))
+  (let [context (primitive/cast (ptr ClientContext) argument)]
+    (serve-connection! (field context connection))
+    (socket/tcp-connection-close! (field context connection))
+    (free argument)
+    (release-client!)
+    (primitive/cast (ptr i8) 0)))
+
+(defn start-client! [(connection (ptr socket/TcpConnection))] (-> i64)
+  (if (not (claim-client!))
+      -1
+      (let [memory
+              (malloc (primitive/cast u64 (primitive/sizeof ClientContext)))]
+        (if (= (primitive/cast i64 memory) 0)
+            (do (release-client!) -1)
+            (let [context (primitive/cast (ptr ClientContext) memory)
+                  worker (primitive/alloc-stack thread/Thread)]
+              (store! (field context connection) (load connection))
+              (let [status
+                      (thread/thread-spawn-configured worker
+                                                      (primitive/fnptr-of client-thread)
+                                                      memory
+                                                      (thread/thread-config 33554432
+                                                                            16384))]
+                (if (!= (primitive/cast i64 status) 0)
+                    (do
+                      (free memory)
+                      (release-client!)
+                      (primitive/cast i64 status))
+                    (do (pthread_detach (load (field worker handle))) 0))))))))
+
+;;; Serve nREPL on an ephemeral loopback port, writing the port to `.nrepl-port`
+;;; in the working directory (the standalone server's convention).
 (defn serve! [] (-> i64)
-  (let [a (alloc/malloc-allocator)
-        listener (primitive/alloc-stack socket/TcpListener)]
+  (serve-at! c".nrepl-port"))
+
+;;; Serve nREPL on an ephemeral loopback port, writing the port to PORT-FILE: a
+;;; host embedded in a program publishes it in its project root, wherever the
+;;; program itself was started from.
+(defn serve-at! [(port-file (ptr i8))] (-> i64)
+  (let [listener (primitive/alloc-stack socket/TcpListener)
+        status (prepare-listener! listener port-file)]
+    (if (= status 0) (serve-listener! listener) status)))
+
+;;; Bind and publish discovery synchronously, so hosts can fail startup before
+;;; entering an application that would otherwise be unreachable by its editor.
+(defn prepare-listener! [(listener (ptr socket/TcpListener))
+                         (port-file (ptr i8))] (-> i64)
+  (let [a (alloc/malloc-allocator)]
     (match (socket/tcp-listen a listener "127.0.0.1" 0 true 16)
       (Err [e] (socket/socket-error-code e))
       (Ok [_]
-        (match (socket/tcp-listener-port listener)
-          (Err [e] (socket/socket-error-code e))
-          (Ok [port]
-            (do
-              ; Standard nREPL discovery file consumed by editor clients.
-              (printf c"nREPL server started on 127.0.0.1:%ld\n" port)
-              (printf c"PORT=%ld\n" port)
-              (publish-port! port)
-              (loop
-                (let [connection (primitive/alloc-stack socket/TcpConnection)]
-                  (match (socket/tcp-accept listener connection)
-                    (Err [_] (break))
-                    (Ok [_]
-                      (do (serve-connection! connection)
-                          (socket/tcp-connection-close! connection))))))
-              (socket/tcp-listener-close! listener)
-              0)))))))
+          (match (socket/tcp-listener-port listener)
+            (Err [e]
+                 (do
+                   (socket/tcp-listener-close! listener)
+                   (socket/socket-error-code e)))
+            (Ok [port]
+                (do
+                  ; Standard nREPL discovery file consumed by editor clients.
+                  (printf c"nREPL server started on 127.0.0.1:%ld\n" port)
+                  (printf c"PORT=%ld\n" port)
+                  (let [status (publish-port! port-file port)]
+                    (when (!= status 0) (socket/tcp-listener-close! listener) 0)
+                    status))))))))
 
-(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
-  (controller/live-controller-init!)
-  (serve!))
+(defn serve-listener! [(listener (ptr socket/TcpListener))] (-> i64)
+  (let [connection (primitive/alloc-stack socket/TcpConnection)]
+    (loop (match (socket/tcp-accept listener connection)
+            (Err [_] (break))
+            (Ok [_]
+                (when (!= (start-client! connection) 0)
+                  (socket/tcp-connection-close! connection)))))
+    (socket/tcp-listener-close! listener)
+    0))

@@ -1,0 +1,315 @@
+(module experiments.heap-inspector.live-project-test)
+(import "coil.alloc" :as alloc)
+(import "coil.str" :as str)
+(import "coil.slice" :use [slice-len slice-get])
+(import "coil.assert" :use *)
+(import "coil.primitive" :as primitive)
+(import "experiments.heap-inspector.controller" :as controller)
+(import "experiments.heap-inspector.live-app-api" :as app)
+
+(defn quoted! [(out (mut str/StrBuf)) (source (slice u8))] (-> i64)
+  (str/sb-push-str! (mut out) "\"")
+  (for [i 0 (slice-len source)]
+    (let [c (slice-get source i)]
+      (when (or (= c (primitive/cast u8 34)) (= c (primitive/cast u8 92)))
+        (str/sb-push-str! (mut out) "\\")
+        0)
+      (str/sb-push-byte! (mut out) c)))
+  (str/sb-push-str! (mut out) "\"")
+  0)
+
+(defn project-entry [(entry (slice u8)) (left (slice u8)) (right (slice u8))] (-> (slice u8))
+  (let [(mut out) (str/sb-new (alloc/malloc-allocator))]
+    (str/sb-push-str! (mut out)
+                      "(live-project \"experiments.heap-inspector.live-project-fixture\" (file \"experiments.heap-inspector.live-project-fixture\" \"fixture.coil\" ")
+    (quoted! (mut out) entry)
+    (str/sb-push-str! (mut out)
+                      ") (file \"experiments.heap-inspector.live-project-left\" \"left.coil\" ")
+    (quoted! (mut out) left)
+    (str/sb-push-str! (mut out)
+                      ") (file \"experiments.heap-inspector.live-project-right\" \"right.coil\" ")
+    (quoted! (mut out) right)
+    (str/sb-push-str! (mut out) "))")
+    (str/sb-finish! (mut out))))
+
+(defn project [(left (slice u8)) (right (slice u8))] (-> (slice u8))
+  (project-entry "(module experiments.heap-inspector.live-project-fixture)
+       (import \"experiments.heap-inspector.live-project-left\" :as left)
+       (import \"experiments.heap-inspector.live-project-right\" :use [value] :rename [[value right-value]])
+       (defn redraw [] (-> i64) (+ (left/value) (right-value)))
+       (defn main [] (-> i64) (redraw))"
+                 left
+                 right))
+
+(defn submit [(source (slice u8))] (-> i64)
+  (controller/live-controller-submit! source
+                                      controller/LIVE-POLICY-STRICT
+                                      true
+                                      false))
+
+(deftest imported-functions-preserve-module-identities
+         (assert-eq 0 (controller/live-controller-enable-app!))
+         (assert-eq 0
+                    (submit (project "(module experiments.heap-inspector.live-project-left) (export value) (defn value [] (-> i64) 7)"
+                                     "(module experiments.heap-inspector.live-project-right) (export value) (defn value [] (-> i64) 11)")))
+         (assert-eq 18 (app/live-app-run!))
+         (assert-eq 0
+                    (submit (project "(module experiments.heap-inspector.live-project-left) (export value) (defn value [] (-> i64) 20)"
+                                     "(module experiments.heap-inspector.live-project-right) (export value) (defn value [] (-> i64) 11)")))
+         (assert-eq 31 (app/live-app-request-redraw!)))
+
+(defn shared-entry [(floating bool)] (-> (slice u8))
+  (if floating
+      "(module experiments.heap-inspector.live-project-fixture)
+       (import \"coil.primitive\" :as primitive)
+       (import \"experiments.heap-inspector.live-project-left\" :as left)
+       (import \"experiments.heap-inspector.live-project-right\" :as right)
+       (defn redraw [] (-> i64)
+         (let [a (left/value) b (right/value)]
+           (+ (primitive/cast i64 (.x a)) (.x b))))
+       (defn main [] (-> i64) (redraw))"
+      "(module experiments.heap-inspector.live-project-fixture)
+       (import \"coil.primitive\" :as primitive)
+       (import \"experiments.heap-inspector.live-project-left\" :as left)
+       (import \"experiments.heap-inspector.live-project-right\" :as right)
+       (defn redraw [] (-> i64)
+         (let [a (left/value) b (right/value)] (+ (.x a) (.x b))))
+       (defn main [] (-> i64) (redraw))"))
+
+(defn right-state [] (-> (slice u8))
+  "(module experiments.heap-inspector.live-project-right)
+   (export State value)
+   (defstruct State [(x i64)])
+   (letonce state (State :x 10))
+   (defn value [] (-> State) (clone state))")
+
+(deftest shared-types-migrate-atomically-across-modules
+         (assert-eq 0 (controller/live-controller-enable-app!))
+         (assert-eq 0
+                    (submit (project-entry (shared-entry false)
+                                           "(module experiments.heap-inspector.live-project-left)
+     (export State value)
+     (defstruct State [(x i64)])
+     (letonce state (State :x 7))
+     (defn value [] (-> State) (clone state))"
+                                           (right-state))))
+         (assert-eq 17 (app/live-app-run!))
+         (let [epoch (controller/live-controller-epoch)]
+           (assert-eq 1
+                      (submit (project-entry (shared-entry true)
+                                             "(module experiments.heap-inspector.live-project-left)
+       (export State value)
+       (defstruct State [(x f64)])
+       (letonce state (State :x 99.0))
+       (defn value [] (-> State) (clone state))"
+                                             (right-state))))
+           (assert-eq epoch (controller/live-controller-epoch))
+           (assert-eq 17 (app/live-app-request-redraw!)))
+         (assert-eq 0
+                    (submit (project-entry (shared-entry true)
+                                           "(module experiments.heap-inspector.live-project-left)
+     (import \"coil.primitive\" :as primitive)
+     (export State value)
+     (defstruct State [(x f64)])
+     (migrate State x old (primitive/cast f64 old))
+     (letonce state (State :x 99.0))
+     (defn value [] (-> State) (clone state))"
+                                           (right-state))))
+         (assert-eq 17 (app/live-app-request-redraw!)))
+
+(defn sum-entry [(changed bool) (migrate bool)] (-> (slice u8))
+  (let [(mut sb) (str/sb-new (alloc/malloc-allocator))]
+    (str/sb-push-str! (mut sb)
+                      "(module experiments.heap-inspector.live-project-fixture)\n")
+    (str/sb-push-str! (mut sb)
+                      (if changed
+                          "(defsum Flag (Off) (On)) (defstruct State [(flag Flag)])\n"
+                          "(defstruct State [(flag bool)])\n"))
+    (when migrate
+      (str/sb-push-str! (mut sb)
+                        "(migrate State flag old (if old (On) (Off)))\n")
+      0)
+    (str/sb-push-str! (mut sb)
+                      (if changed
+                          "(letonce state (State :flag (Off))) (defn redraw [] (-> i64) (match (.flag state) (On [] 1) (Off [] 0)))\n"
+                          "(letonce state (State :flag true)) (defn redraw [] (-> i64) (if (.flag state) 1 0))\n"))
+    (str/sb-push-str! (mut sb) "(defn main [] (-> i64) (redraw))")
+    (str/sb-finish! (mut sb))))
+
+(deftest project-sum-field-transition
+         (assert-eq 0 (controller/live-controller-enable-app!))
+         (let [left
+                 "(module experiments.heap-inspector.live-project-left) (defn value [] (-> i64) 0)"
+               right
+                 "(module experiments.heap-inspector.live-project-right) (defn value [] (-> i64) 0)"]
+           (assert-eq 0
+                      (submit (project-entry (sum-entry false false) left right)))
+           (assert-eq 1 (app/live-app-run!))
+           (assert-eq 1
+                      (submit (project-entry (sum-entry true false) left right)))
+           (assert-eq 9 (controller/live-controller-phase))
+           (assert-eq 0
+                      (submit (project-entry (sum-entry true true) left right)))
+           (assert-eq 1 (app/live-app-request-redraw!))))
+
+(import "experiments.heap-inspector.live" :as live)
+(import "experiments.heap-inspector.runtime" :as runtime)
+
+(defn migrating-state [(module (slice u8)) (floating bool) (initial (slice u8))] (-> (slice u8))
+  (let [(mut sb) (str/sb-new (alloc/malloc-allocator))]
+    (str/sb-push-str! (mut sb) "(module ")
+    (str/sb-push-str! (mut sb) module)
+    (str/sb-push-str! (mut sb)
+                      ") (import \"coil.primitive\" :as primitive) (export State value)")
+    (str/sb-push-str! (mut sb)
+                      (if floating
+                          "(defstruct State [(x f64)]) (migrate State x old (primitive/cast f64 old))"
+                          "(defstruct State [(x i64)])"))
+    (str/sb-push-str! (mut sb) "(letonce state (State :x ")
+    (str/sb-push-str! (mut sb) initial)
+    (str/sb-push-str! (mut sb) ")) (defn value [] (-> State) (clone state))")
+    (str/sb-finish! (mut sb))))
+
+(defn root-handle [(name (slice u8))] (-> (ptr live/LiveHandle))
+  (let [(mut found) (primitive/cast (ptr live/LiveHandle) 0)]
+    (for [i 1 (+ (load (live/live-root-count)) 1)]
+      (let [root (live/live-root-by-id i)]
+        (when (and (!= (primitive/cast i64 root) 0) (= (.name root) name))
+          (set! found (.handle root))
+          0)))
+    (load found)))
+
+(deftest native-failure-in-second-module-rolls-back-the-whole-project
+         (assert-eq 0 (controller/live-controller-enable-app!))
+         (let [entry
+                 "(module experiments.heap-inspector.live-project-fixture)
+       (import \"coil.primitive\" :as primitive)
+       (import \"experiments.heap-inspector.live-project-left\" :as left)
+       (import \"experiments.heap-inspector.live-project-right\" :as right)
+       (defn redraw [] (-> i64)
+         (let [a (left/value) b (right/value)]
+           (+ (primitive/cast i64 (.x a)) (primitive/cast i64 (.x b)))))
+       (defn main [] (-> i64) (redraw))"
+               left "experiments.heap-inspector.live-project-left"
+               right "experiments.heap-inspector.live-project-right"]
+           (assert-eq 0
+                      (submit (project-entry entry
+                                             (migrating-state left false "7")
+                                             (migrating-state right false "10"))))
+           (assert-eq 17 (app/live-app-run!))
+           (let [handle
+                   (root-handle "experiments.heap-inspector.live-project-right/state")
+                 epoch (controller/live-controller-epoch)
+                 types (load (runtime/type-n))
+                 handles (load (live/live-handle-count))
+                 transitions (load (live/live-transition-count))
+                 candidate
+                   (project-entry entry
+                                  (let [(mut source)
+                                          (str/sb-new (alloc/malloc-allocator))]
+                                    (str/sb-push-str! (mut source)
+                                                      (migrating-state left
+                                                                       true
+                                                                       "99.0"))
+                                    (str/sb-push-str! (mut source)
+                                                      " (letonce added (State :x 33.0))")
+                                    (str/sb-finish! (mut source)))
+                                  (migrating-state right true "99.0"))]
+             (assert (!= (primitive/cast i64 handle) 0))
+             (assert-eq 1 (live/live-handle-pin! handle))
+             (for [i 0 3]
+               (assert (!= 0 (submit candidate)))
+               (assert-eq epoch (controller/live-controller-epoch))
+               (assert-eq types (load (runtime/type-n)))
+               (assert-eq handles (load (live/live-handle-count)))
+               (assert-eq transitions (load (live/live-transition-count)))
+               (assert-eq 0
+                          (primitive/cast i64
+                                          (root-handle "experiments.heap-inspector.live-project-left/added")))
+               (assert-eq 17 (app/live-app-request-redraw!)))
+             (live/live-handle-unpin! handle)
+             (assert-eq 0 (submit candidate))
+             (assert (!= 0
+                         (primitive/cast i64
+                                         (root-handle "experiments.heap-inspector.live-project-left/added"))))
+             (assert-eq 17 (app/live-app-request-redraw!)))))
+
+(deftest imported-native-types-follow-project-allocation-sites
+         (assert-eq 0 (controller/live-controller-enable-app!))
+         (let [entry
+                 "(module experiments.heap-inspector.live-project-fixture)
+       (import \"coil.primitive\" :as primitive)
+       (import \"experiments.heap-inspector.live-project-left\" :as left)
+       (defn redraw [] (-> i64)
+         (let [storage (primitive/alloc-stack (array left/Native 2))
+               p (primitive/index storage 0)]
+           (set! (.x p) 9) (left/value p)))
+       (defn main [] (-> i64) (redraw))"
+               right "(module experiments.heap-inspector.live-project-right)"]
+           (assert-eq 0
+                      (submit (project-entry entry
+                                             "(module experiments.heap-inspector.live-project-left)
+       (export Native value) (defstruct Native [(x i64)])
+       (defn value [(p (ptr Native))] (-> i64) (+ (.x p) 10))"
+                                             right)))
+           (assert-eq 19 (app/live-app-run!))
+           (assert-eq 0
+                      (submit (project-entry entry
+                                             "(module experiments.heap-inspector.live-project-left)
+       (export Native value) (defstruct Native [(x i64)])
+       (defn value [(p (ptr Native))] (-> i64) (+ (.x p) 20))"
+                                             right)))
+           (assert-eq 29 (app/live-app-request-redraw!))
+           (assert-eq 1
+                      (submit (project-entry entry
+                                             "(module experiments.heap-inspector.live-project-left)
+       (export Native value) (defstruct Native [(x i64) (y i64)])
+       (defn value [(p (ptr Native))] (-> i64) (+ (.x p) 20))"
+                                             right)))
+           (assert-eq 29 (app/live-app-request-redraw!))))
+
+(deftest multiple-import-aliases-share-one-managed-type
+         (assert-eq 0 (controller/live-controller-enable-app!))
+         (let [entry
+                 "(module experiments.heap-inspector.live-project-fixture)
+       (import \"coil.primitive\" :as primitive)
+       (import \"experiments.heap-inspector.live-project-left\" :as one)
+       (import \"experiments.heap-inspector.live-project-left\" :as two)
+       (defn redraw [] (-> i64)
+         (let [a (one/value) b (two/value)]
+           (+ (primitive/cast i64 (.x a)) (primitive/cast i64 (.x b)))))
+       (defn main [] (-> i64) (redraw))"
+               left "experiments.heap-inspector.live-project-left"
+               right "(module experiments.heap-inspector.live-project-right)"]
+           (assert-eq 0
+                      (submit (project-entry entry
+                                             (migrating-state left false "7")
+                                             right)))
+           (assert-eq 14 (app/live-app-run!))
+           (assert-eq 0
+                      (submit (project-entry entry
+                                             (migrating-state left true "99.0")
+                                             right)))
+           (assert-eq 14 (app/live-app-request-redraw!))))
+
+(deftest imported-function-edits-preserve-native-static-storage
+         (assert-eq 0 (controller/live-controller-enable-app!))
+         (controller/live-controller-set-auto-redraw! false)
+         (let [right
+                 "(module experiments.heap-inspector.live-project-right) (defn value [] (-> i64) 0)"]
+           (assert-eq 0
+                      (submit (project "(module experiments.heap-inspector.live-project-left)
+       (import \"coil.primitive\" :as primitive)
+       (defn value [] (-> i64)
+         (let [p (primitive/alloc-static i64)]
+           (store! p (+ (load p) 1)) (load p)))"
+                                       right)))
+           (assert-eq 1 (app/live-app-run!))
+           (assert-eq 0
+                      (submit (project "(module experiments.heap-inspector.live-project-left)
+       (import \"coil.primitive\" :as primitive)
+       (defn value [] (-> i64)
+         (let [p (primitive/alloc-static i64)]
+           (store! p (+ (load p) 10)) (load p)))"
+                                       right)))
+           (assert-eq 11 (app/live-app-request-redraw!))))

@@ -1,0 +1,134 @@
+(module experiments.heap-inspector.live-submit-test)
+
+;; The controller's submission policies, as the file adapter and the editor use
+;; them. Every test runs in its own process, so each owns a fresh controller.
+(import "coil.alloc" :as alloc)
+(import "coil.assert" :use *)
+(import "coil.slice" :use [slice-len])
+(import "experiments.heap-inspector.controller" :as controller)
+(import "experiments.heap-inspector.live" :as live)
+
+(defn base-program [] (-> (slice u8))
+  "(defstruct Ball [(x i64) (r i64)])
+   (letonce ball (Ball :x 1 :r 5))
+   (defn radius [] (-> i64) (.r ball))
+   (defn other [] (-> i64) 7)")
+
+(defn strict [(source (slice u8))] (-> i64)
+  (controller/live-controller-submit! source
+                                      controller/LIVE-POLICY-STRICT
+                                      true
+                                      false))
+
+(defn check [(source (slice u8))] (-> i64)
+  (controller/live-controller-submit! source
+                                      controller/LIVE-POLICY-STRICT
+                                      true
+                                      true))
+
+(deftest an-app-without-redraw-commits
+         (assert-eq 0 (controller/live-controller-enable-app!))
+         (assert-eq 0
+                    (controller/live-controller-edit-source! "(defn draw [] (-> i64) 1)
+       (defn main [] (-> i64) (draw))"))
+         (assert-eq 7 (controller/live-controller-phase)))
+
+(deftest a-strict-rejection-publishes-nothing
+         (assert-eq 0 (controller/live-controller-init!))
+         (assert-eq 0 (strict (base-program)))
+         (let [epoch (controller/live-controller-epoch)]
+           (assert-eq 1 (strict "(defn radius [] (-> i64) true)"))
+           ; TypeErrors: rejected, and unlike the deferred policy no Broken entry is
+           ; published and no condition pauses the running program.
+           (assert-eq 3 (controller/live-controller-phase))
+           (assert-eq epoch (controller/live-controller-epoch))
+           (assert (not (live/live-condition-active?)))
+           (assert (> (slice-len (controller/live-controller-diagnostic)) 0))))
+
+(deftest an-existing-root-initializer-is-checked-without-recreating-its-slot
+         (assert-eq 0 (controller/live-controller-init!))
+         (assert-eq 0 (strict (base-program)))
+         (assert-eq 0 (strict "(letonce ball (Ball :x 99 :r 88))"))
+         (let [epoch (controller/live-controller-epoch)]
+           (assert-eq 1 (strict "(letonce ball (Ball :x true :r 88))"))
+           (assert-eq epoch (controller/live-controller-epoch))))
+
+(deftest root-initializer-edits-can-travel-with-a-field-migration
+         (assert-eq 0 (controller/live-controller-init!))
+         (assert-eq 0 (strict (base-program)))
+         (assert-eq 0
+                    (strict "(defstruct Ball [(x i64) (r f64)])
+             (migrate Ball r old (primitive/cast f64 old))
+             (letonce ball (Ball :x 99 :r 88.0))
+             (defn radius [] (-> i64) (primitive/cast i64 (.r ball)))")))
+
+(deftest a-new-struct-and-root-can-be-added-to-a-running-program
+         (assert-eq 0 (controller/live-controller-init!))
+         (assert-eq 0 (strict (base-program)))
+         (assert-eq 0
+                    (strict "(defstruct Settings [(scale i64)])
+             (letonce settings (Settings :scale 2))
+             (defn radius [] (-> i64) (* (.scale settings) (.r ball)))")))
+
+(deftest replacing-pending-drops-a-rejected-schema-change
+         (assert-eq 0 (controller/live-controller-init!))
+         (assert-eq 0 (strict (base-program)))
+         ; A field type change with no migrate: NeedsTransition, and the candidate is
+         ; kept as the pending branch.
+         (assert-eq 1
+                    (strict "(defstruct Ball [(x i64) (r f64)])
+             (defn radius [] (-> i64) (primitive/cast i64 (.r ball)))"))
+         (assert-eq 9 (controller/live-controller-phase))
+         ; The file adapter always submits its complete changeset against the accepted
+         ; program. With the schema change reverted, only `other` differs, and the
+         ; stale rejected branch must not come back with it.
+         (assert-eq 0 (strict "(defn other [] (-> i64) 8)"))
+         (assert-eq 7 (controller/live-controller-phase)))
+
+(deftest an-edit-can-use-an-accepted-const
+         (assert-eq 0 (controller/live-controller-init!))
+         (assert-eq 0
+                    (strict "(const LIMIT 5)
+             (defn uses-limit [] (-> i64) LIMIT)
+             (defn other [] (-> i64) 7)"))
+         ; A const lives only at compile time: a later edit that sends just the
+         ; function must still see it (multi-form and one-definition paths alike).
+         (assert-eq 0 (strict "(defn uses-limit [] (-> i64) (+ 1 LIMIT))"))
+         (assert-eq 0
+                    (strict "(defn uses-limit [] (-> i64) (+ 2 LIMIT))
+                        (defn other [] (-> i64) 8)")))
+
+(deftest resending-a-const-does-not-duplicate-it
+         (assert-eq 0 (controller/live-controller-init!))
+         (assert-eq 0
+                    (controller/live-controller-edit-source! "(const LIMIT 5)
+                  (defn uses-limit [] (-> i64) LIMIT)"))
+         ; An editor that publishes a whole buffer sends the same const again.
+         (assert-eq 0
+                    (controller/live-controller-edit-source! "(const LIMIT 5)
+                  (defn uses-limit [] (-> i64) (+ 1 LIMIT))"))
+         (assert-eq 0
+                    (controller/live-controller-edit-source! "(defn uses-limit [] (-> i64) (+ 2 LIMIT))")))
+
+(deftest a-dry-run-check-changes-nothing
+         (assert-eq 0 (controller/live-controller-init!))
+         (assert-eq 0 (strict (base-program)))
+         (let [epoch (controller/live-controller-epoch)]
+           (assert-eq 0 (check "(defn other [] (-> i64) 9)"))
+           (assert-eq epoch (controller/live-controller-epoch))
+           (assert-eq 7 (controller/live-controller-phase))
+           (assert-eq 0
+                      (slice-len (controller/live-controller-check-diagnostic)))
+           (assert-eq 1 (check "(defn other [] (-> i64) true)"))
+           (assert (> (slice-len (controller/live-controller-check-diagnostic))
+                      0))
+           ; The running world, its reported state and its pending branch are as
+           ; they were before either check.
+           (assert-eq epoch (controller/live-controller-epoch))
+           (assert-eq 7 (controller/live-controller-phase))
+           (assert-eq 0
+                      (slice-len (controller/live-controller-pending-copy (alloc/malloc-allocator))))
+           (assert (not (live/live-condition-active?)))
+           ; And the checked edit still publishes for real.
+           (assert-eq 0 (strict "(defn other [] (-> i64) 9)"))
+           (assert (> (controller/live-controller-epoch) epoch))))

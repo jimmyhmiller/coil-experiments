@@ -3,18 +3,40 @@
 #   save    build a live world, mutate it at runtime, save
 #   boot    fresh process: replay the ledger (code) + overlay heap state
 #   upgrade fresh process: boot, then a schema upgrade migrates state forward
+#
+# The JIT host (which embeds Coil's in-process compiler) is built ONCE into a
+# static archive and linked; rebuilding it on every app build cost ~37 s, while
+# linking the prebuilt archive costs under a second.
 # Not Python; a test harness only.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 coil="${COIL:-coil}"
+lib="build/libcoilimage.a"
 bin="build/image-boot-demo"
 img="$(mktemp -t coil-boot.XXXXXX).coilimage"
 trap 'rm -f "$img"' EXIT
 
-echo "building $bin"
-"$coil" build src/experiments/image/boot_demo.coil -o "$bin"
+# Rebuild the JIT host only when the image/live layer it wraps has changed.
+stale=0
+if [ ! -f "$lib" ]; then
+  stale=1
+else
+  while IFS= read -r src; do
+    [ "$src" -nt "$lib" ] && stale=1 && break
+  done < <(ls src/experiments/image/*.coil src/experiments/heap-inspector/*.coil 2>/dev/null)
+fi
+
+if [ "$stale" = "1" ]; then
+  echo "building the JIT host archive (once; it embeds the compiler)"
+  "$coil" build src/experiments/image/jit_host.coil --lib -o "$lib"
+else
+  echo "reusing $lib"
+fi
+
+echo "building $bin (links the prebuilt archive)"
+"$coil" build src/experiments/image/boot_demo.coil -o "$bin" --link-flag "$root/$lib"
 
 check() { # label expected actual
   echo "  $3"
