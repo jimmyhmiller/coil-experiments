@@ -24,10 +24,14 @@
 (import "experiments.c.lex" :as lex)
 (import "experiments.c.ctype" :as ct)
 (import "experiments.c.node" :as nd)
+(import "experiments.c.partition" :as part)
+(import "coil.compiler.trace" :as tr)
 
 (extern snprintf :cc c [(ptr i8) i64 (ptr i8) ...] (-> i32))
 
-(export Emitter EmitResult emit-program emit-module)
+(export Emitter EmitResult emit-program emit-module emit-partition function-name partition-function-name emit-public-wrapper
+        record-partition-types! emit-type-interface Value eval-value
+        no-value int-value convert-value eval-int-binop)
 
 ;; ------------------------------------------ static initialisers, laid down
 
@@ -50,6 +54,8 @@
 
 (defstruct Emitter
   [(a (dyn alloc/Allocator))
+   (partition (ptr part/Plan))
+   (unit i64)
    (out str/StrBuf)
    (slots (hm/HashMap (slice u8) (slice u8)))
    (defined (hm/HashMap (slice u8) bool))
@@ -158,7 +164,10 @@
 ;;; C identifiers are a subset of what Coil accepts, except that a leading dot
 ;;; appears in the names generated for string literals.
 (defn ident [(e (mut Emitter)) (prefix (slice u8)) (name (slice u8))] (-> (slice u8))
-  (let [(mut b) (str/sb-new (load (field e a)))
+  (ident-with (.a e) prefix name))
+
+(defn ident-with [(a (dyn alloc/Allocator)) (prefix (slice u8)) (name (slice u8))] (-> (slice u8))
+  (let [(mut b) (str/sb-new a)
         n (slice-len name)
         (mut i) 0]
     (str/sb-push-str! (mut b) prefix)
@@ -191,7 +200,10 @@
 ;;; ordinary functions. Only those actual collisions receive a readable suffix;
 ;;; the common case stays exactly as authored in C.
 (defn coil-form-name? [(e (mut Emitter)) (name (slice u8))] (-> bool)
-  (let [(mut needle) (str/sb-new (load (field e a)))]
+  (coil-form-name-with? (.a e) name))
+
+(defn coil-form-name-with? [(a (dyn alloc/Allocator)) (name (slice u8))] (-> bool)
+  (let [(mut needle) (str/sb-new a)]
     (str/sb-push-str! (mut needle) "|")
     (str/sb-push-str! (mut needle) name)
     (str/sb-push-str! (mut needle) "|")
@@ -201,24 +213,45 @@
       (None [] false))))
 
 (defn source-name [(e (mut Emitter)) (name (slice u8))] (-> (slice u8))
-  (let [plain (ident (mut e) "" name)]
-    (if (coil-form-name? (mut e) plain)
-        (let [(mut b) (str/sb-new (load (field e a)))]
+  (source-name-with (.a e) name))
+
+(defn source-name-with [(a (dyn alloc/Allocator)) (name (slice u8))] (-> (slice u8))
+  (let [plain (ident-with a "" name)]
+    (if (coil-form-name-with? a plain)
+        (let [(mut b) (str/sb-new a)]
           (str/sb-push-str! (mut b) plain)
           (str/sb-push-str! (mut b) "-from-c")
           (str/sb-str (load (mut b))))
         plain)))
 
+(defn function-name [(a (dyn alloc/Allocator)) (name (slice u8))] (-> (slice u8))
+  (if (str/str-eq name "main") "c-main" (source-name-with a name)))
+
+;; Boundary names are concrete C identifiers, even when the normal Coil spelling
+;; is c-main or a reserved-form escape such as report-from-c.
+(defn partition-function-name [(a (dyn alloc/Allocator)) (name (slice u8))] (-> (slice u8))
+  (ident-with a "__coil_c_fn_" name))
+
+(defn partition-link-name [(a (dyn alloc/Allocator)) (o (ptr nd/Obj))] (-> (slice u8))
+  ;; The facade owns main and invokes static startup hooks through synthetic
+  ;; entries. Static functions have no external C symbol to preserve. All other
+  ;; externally owned functions keep their original C linker name.
+  (if (or (nd/obj-static? o) (str/str-eq (nd/obj-name o) "main"))
+      (partition-function-name a (nd/obj-name o))
+      (link-name o)))
+
 ;; --------------------------------------------------------------- types
 (defn scalar-name [(t (ptr ct/Type))] (-> (slice u8))
   (let [k (ct/ty-kind t)
         u (ct/ty-unsigned? t)]
-    (cond (= k ct/TY-VOID) "i8"
+    ;; A void expression is represented by the unit-like integer every emitted
+    ;; statement returns. `void *` remains byte-addressed in emit-pointee!.
+    (cond (= k ct/TY-VOID) "i64"
           (= k ct/TY-BOOL) "u8"
           (= k ct/TY-CHAR) (if u "u8" "i8")
           (= k ct/TY-SHORT) (if u "u16" "i16")
           (= k ct/TY-INT) (if u "u32" "i32")
-          (= k ct/TY-ENUM) "i32"
+          (= k ct/TY-ENUM) (if u "u32" "i32")
           (= k ct/TY-LONG) (if u "u64" "i64")
           (= k ct/TY-FLOAT) "f32"
           (= k ct/TY-DOUBLE) "f64"
@@ -269,12 +302,12 @@
               ;; An array of no stated length is only ever reached through a
               ;; pointer, so one element stands for its storage. Coil has no
               ;; zero-length array type to spell the alternative with.
-              (= k ct/TY-ARRAY)
+              (or (= k ct/TY-ARRAY) (= k ct/TY-VLA))
                 (do
                   (put! (mut e) "(array ")
                   (emit-type! (mut e) (ct/ty-base t))
                   (put! (mut e) " ")
-                  (put-int! (mut e) (if (< (ct/ty-array-len t) 1) 1 (ct/ty-array-len t)))
+                  (put-int! (mut e) (if (= k ct/TY-VLA) 1 (if (< (ct/ty-array-len t) 1) 1 (ct/ty-array-len t))))
                   (put! (mut e) ")"))
               (= k ct/TY-FUNC) (emit-fnptr! (mut e) t)
               :else (put! (mut e) (scalar-name t))))))
@@ -319,7 +352,8 @@
   (if (= (primitive/cast i64 t) 0)
       (put! (mut e) "i64")
       (let [k (ct/ty-kind t)]
-        (cond (= k ct/TY-ARRAY) (do (put! (mut e) "(ptr ") (emit-pointee! (mut e) (ct/ty-base t)) (put! (mut e) ")"))
+        (cond (or (= k ct/TY-ARRAY) (= k ct/TY-VLA))
+                (do (put! (mut e) "(ptr ") (emit-pointee! (mut e) (ct/ty-base t)) (put! (mut e) ")"))
               (= k ct/TY-FUNC) (emit-fnptr! (mut e) t)
               :else (emit-type! (mut e) t)))))
 
@@ -327,7 +361,7 @@
   (if (= (primitive/cast i64 t) 0)
       (put! (mut e) "i64")
       (if (= (ct/ty-kind t) ct/TY-VOID)
-          (put! (mut e) "i64")
+          (put! (mut e) "void")
           (emit-param-type! (mut e) t))))
 
 ;; ------------------------------------------------------------ operations
@@ -439,18 +473,85 @@
           (= k ct/TY-ARRAY) (+ (+ 2000 (* 16 (ct/ty-array-len t))) (ct/ty-kind (ct/ty-base t)))
           :else 0)))
 
+;; Partition identity includes nested value layouts and callback signatures,
+;; not just the shallow size/kind fingerprint used by the legacy emitter.
+(defn partition-type-shape! [(b (mut str/StrBuf)) (t (ptr ct/Type))
+                             (stack (mut (al/ArrayList (ptr ct/Type))))] (-> i64)
+  (let [k (ct/ty-kind t)]
+    (str/sb-push-str! (mut b) "(")
+    (str/sb-push-i64! (mut b) k)
+    (str/sb-push-str! (mut b) ":")
+    (str/sb-push-i64! (mut b) (ct/ty-size t))
+    (str/sb-push-str! (mut b) ":")
+    (str/sb-push-i64! (mut b) (ct/ty-align t))
+    (str/sb-push-str! (mut b) (if (ct/ty-unsigned? t) "u" "s"))
+    (cond (ct/record? t)
+            (let [(mut prior) -1]
+              (for [i 0 (al/al-len [(ptr ct/Type)] (load stack))]
+                (when (= (primitive/cast i64 t)
+                         (primitive/cast i64 (al/al-get [(ptr ct/Type)] (load stack) i)))
+                  (store! prior i) 0) 0)
+              (if (>= (load prior) 0)
+                  (do (str/sb-push-str! (mut b) "back") (str/sb-push-i64! (mut b) (load prior)))
+                  (do
+                    (str/sb-push-str! (mut b) (ct/ty-name t))
+                    (al/al-push! [(ptr ct/Type)] (mut stack) t)
+                    (let [members (ct/ty-members t)]
+                      (for [i 0 (al/al-len [ct/Member] members)]
+                        (let [m (al/al-get [ct/Member] members i)]
+                          (str/sb-push-str! (mut b) "|")
+                          (str/sb-push-str! (mut b) (ct/member-name m))
+                          (str/sb-push-str! (mut b) ":")
+                          (str/sb-push-i64! (mut b) (ct/member-offset m))
+                          (str/sb-push-str! (mut b) ":")
+                          (str/sb-push-i64! (mut b) (ct/member-bit-offset m))
+                          (str/sb-push-str! (mut b) ":")
+                          (str/sb-push-i64! (mut b) (ct/member-bit-width m))
+                          (partition-type-shape! (mut b) (ct/member-type m) (mut stack))) 0))
+                    (al/al-pop! [(ptr ct/Type)] (mut stack)) 0)) 0)
+          (= k ct/TY-PTR)
+            (let [base (ct/ty-base t)]
+              (if (or (ct/record? base) (= (ct/ty-kind base) ct/TY-VOID))
+                  (str/sb-push-str! (mut b) "byte-pointer")
+                  (partition-type-shape! (mut b) base (mut stack))))
+          (or (= k ct/TY-ARRAY) (= k ct/TY-VLA))
+            (do (str/sb-push-str! (mut b) "[")
+                (str/sb-push-i64! (mut b) (ct/ty-array-len t))
+                (partition-type-shape! (mut b) (ct/ty-base t) (mut stack)))
+          (= k ct/TY-FUNC)
+            (do (str/sb-push-str! (mut b) (if (ct/ty-variadic? t) "variadic" "fixed"))
+                (partition-type-shape! (mut b) (ct/ty-base t) (mut stack))
+                (let [params (ct/ty-params t)]
+                  (for [i 0 (al/al-len [(ptr ct/Type)] params)]
+                    (partition-type-shape! (mut b) (al/al-get [(ptr ct/Type)] params i) (mut stack)) 0)) 0)
+          :else 0)
+    (str/sb-push-str! (mut b) ")"))
+  0)
+
+(defn partition-record-key [(a (dyn alloc/Allocator)) (t (ptr ct/Type))] (-> (slice u8))
+  (let [(mut b) (str/sb-new a) (mut stack) (al/al-new [(ptr ct/Type)] a)]
+    (partition-type-shape! (mut b) t (mut stack))
+    (str/sb-str (load (mut b)))))
+
 ;;; The `defstruct` for a record, declared once and remembered by the shape it
 ;;; was declared with.
 (defn record-struct [(e (mut Emitter)) (t (ptr ct/Type))] (-> (slice u8))
   (if (not (declarable-record? t))
       ""
       (let [a (load (field e a))
-            key (record-key a t)]
-        (match (hm/hm-get (load (field e record-names)) key)
+            plan (.partition e)
+            key (if (= (primitive/cast i64 plan) 0) (record-key a t) (partition-record-key a t))
+            shared (if (= (primitive/cast i64 plan) 0)
+                       (None [(slice u8)]) (hm/hm-get (.shared-types plan) key))]
+        (match (match shared (Some [name] (Some name))
+                            (None [] (hm/hm-get (load (field e record-names)) key)))
           (Some [name] name)
           (None []
                 (let [tag (if (> (slice-len (ct/ty-name t)) 0) (ct/ty-name t) "AnonymousRecord")
-                      name (numbered (mut e) (source-name (mut e) tag))
+                      ;; Keep type names in their own namespace. C tags may begin
+                      ;; with an underscore or collide with a value/form name;
+                      ;; both are legal C and poor generated Coil type names.
+                      name (numbered (mut e) (ident (mut e) "CRecord_" tag))
                       members (ct/ty-members t)
                       count (al/al-len [ct/Member] members)
                       (mut i) 0]
@@ -544,7 +645,8 @@
 (defn field-access? [(e (mut Emitter)) (n (ptr nd/Node))] (-> bool)
   (and (< (nd/nd-member-bit-width n) 0)
        (and (> (slice-len (nd/nd-member-name n)) 0)
-            (> (slice-len (record-struct (mut e) (nd/nd-type (nd/nd-lhs n)))) 0))))
+            (and (> (ct/ty-size (nd/nd-type n)) 0)
+                 (> (slice-len (record-struct (mut e) (nd/nd-type (nd/nd-lhs n)))) 0)))))
 
 ;;; Every record the program reaches a member of gets a declaration. Collected
 ;;; before anything is written, because the declarations come first.
@@ -764,19 +866,36 @@
 
 ;;; The address of an lvalue. Only the constructs C calls lvalues have one, and
 ;;; every read of an lvalue is a load from here.
+(defn emit-function-address! [(e (mut Emitter)) (o (ptr nd/Obj))] (-> i64)
+  (let [plan (.partition e)]
+    (if (and (!= (primitive/cast i64 plan) 0)
+             (or (.inline-only o) (>= (part/function-owner (mut plan) (nd/obj-name o)) 0)))
+        (do
+          ;; C function identity always names the C entry point, including in
+          ;; its owner. The Coil implementation may use an implicit-reference
+          ;; aggregate ABI behind a distinct C marshaling thunk.
+          (put! (mut e) "(cast ") (emit-fnptr! (mut e) (nd/obj-type o))
+          (put! (mut e) " (linker-address ")
+          (put-text-string! (mut e) (partition-link-name (.a e) o))
+          (put! (mut e) "))"))
+        (do (put! (mut e) "(fnptr-of ")
+            (put! (mut e) (callee-name (mut e) o))
+            (put! (mut e) ")")))))
+
 (defn emit-addr! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
   (let [k (nd/nd-kind n)]
     (cond ;; A function has no storage to take the address of: its name already
           ;; denotes its address.
           (and (= k nd/ND-VAR) (= (ct/ty-kind (nd/obj-type (nd/nd-obj n))) ct/TY-FUNC))
-            (do
-              (put! (mut e) "(fnptr-of ")
-              (put! (mut e) (callee-name (mut e) (nd/nd-obj n)))
-              (put! (mut e) ")"))
+            (emit-function-address! (mut e) (nd/nd-obj n))
           (= k nd/ND-VAR)
             (let [o (nd/nd-obj n)]
               (if (nd/obj-local? o)
-                  (put! (mut e) (slot-of (mut e) o))
+                  (if (= (ct/ty-kind (nd/obj-type o)) ct/TY-VLA)
+                      (do (put! (mut e) "(load ")
+                          (put! (mut e) (slot-of (mut e) o))
+                          (put! (mut e) ")"))
+                      (put! (mut e) (slot-of (mut e) o)))
                   (do (put! (mut e) "(") (put! (mut e) (slot-of (mut e) o)) (put! (mut e) ")"))))
           (= k nd/ND-STMT-EXPR) (emit-compound-literal! (mut e) n true)
           ;; The pointer's own type says nothing about what it points at, so the
@@ -1151,7 +1270,7 @@
   (let [from (nd/nd-type operand)]
     (cond ;; Array-to-pointer conversion uses the array object's address. This is
           ;; especially important for array compound literals, which are lvalues.
-          (= (ct/ty-kind from) ct/TY-ARRAY) (emit-addr! (mut e) operand)
+          (or (= (ct/ty-kind from) ct/TY-ARRAY) (= (ct/ty-kind from) ct/TY-VLA)) (emit-addr! (mut e) operand)
           (and (fnptr-type? target) (not (fnptr-type? from)))
             (do
               (put! (mut e) "(cast (ptr i8) (cast i64 ")
@@ -1248,38 +1367,88 @@
   (let [name (nd/nd-label n)
         args (nd/nd-args n)
         count (al/al-len [(ptr nd/Node)] args)]
-    (if (str/str-eq name "__asm_aarch64_yield")
-        (put! (mut e) "(llvm-ir i32 [] \"call void asm sideeffect \\\"yield\\\", \\\"~{memory}\\\"()\\nret i32 0\")")
-        (if (or (str/str-eq name "__builtin_popcount")
-                (or (str/str-eq name "__builtin_popcountl")
-                    (str/str-eq name "__builtin_popcountll")))
-            (do
-              (put! (mut e) "(cast i32 (popcount ")
-              (emit-expr! (mut e) (al/al-get [(ptr nd/Node)] args 0))
-              (put! (mut e) "))"))
-        (if (or (str/str-eq name "__builtin_ctz")
-                (or (str/str-eq name "__builtin_ctzl")
-                    (str/str-eq name "__builtin_ctzll")))
-            (let [arg (al/al-get [(ptr nd/Node)] args 0)
-                  bits (* (ct/ty-size (nd/nd-type arg)) 8)]
-              (put! (mut e) "(llvm-ir i32 [")
-              (emit-expr! (mut e) arg)
-              (if (= bits 64)
-                  (put! (mut e) "] \"%n = call i64 @llvm.cttz.i64(i64 $0, i1 false)\\n%r = trunc i64 %n to i32\\nret i32 %r\")")
-                  (put! (mut e) "] \"%n = call i32 @llvm.cttz.i32(i32 $0, i1 false)\\nret i32 %n\")")))
-        (if (or (str/str-eq name "__builtin_bswap16")
-                (or (str/str-eq name "__builtin_bswap32")
-                    (str/str-eq name "__builtin_bswap64")))
-            (do
-              (put! (mut e) "(bswap ")
-              (emit-expr! (mut e) (al/al-get [(ptr nd/Node)] args 0))
-              (put! (mut e) ")"))
-        (if (str/str-eq name "__builtin_alloca")
-        (do
-          (put! (mut e) "(llvm-ir (ptr i8) [")
-          (emit-expr! (mut e) (al/al-get [(ptr nd/Node)] args 0))
-          (put! (mut e) "] \"%p = alloca i8, i64 $0, align 16\\nret ptr %p\")"))
-        (emit-sync-atomic! (mut e) n name args count)))))))
+    (if (or (str/str-eq name "__builtin_trap")
+            (str/str-eq name "__builtin_unreachable"))
+        ;; A terminating expression inhabits whatever value context contains
+        ;; it. Give it an integer result type so Coil can type the surrounding
+        ;; branch; LLVM's `unreachable` ensures no value is ever demanded.
+        (put! (mut e) "(llvm-ir i64 [] \"call void @llvm.trap()\\nunreachable\")")
+        (if (str/str-eq name "__asm_aarch64_yield")
+            (put! (mut e)
+                  "(llvm-ir i32 [] \"call void asm sideeffect \\\"yield\\\", \\\"~{memory}\\\"()\\nret i32 0\")")
+            (if (or (str/str-eq name "__builtin_popcount")
+                    (or (str/str-eq name "__builtin_popcountl")
+                        (str/str-eq name "__builtin_popcountll")))
+                (do
+                  (put! (mut e) "(cast i32 (popcount ")
+                  (emit-expr! (mut e) (al/al-get [(ptr nd/Node)] args 0))
+                  (put! (mut e) "))"))
+                (if (or (str/str-eq name "__builtin_clz")
+                        (or (str/str-eq name "__builtin_clzl")
+                            (str/str-eq name "__builtin_clzll")))
+                    (do
+                      (put! (mut e) "(cast i32 (clz ")
+                      (emit-expr! (mut e) (al/al-get [(ptr nd/Node)] args 0))
+                      (put! (mut e) "))"))
+                    (if (or (str/str-eq name "__builtin_fabsf")
+                            (or (str/str-eq name "__builtin_fabs")
+                                (str/str-eq name "__builtin_fabsl")))
+                        (let [arg (al/al-get [(ptr nd/Node)] args 0)
+                              single (= (ct/ty-kind (nd/nd-type arg)) ct/TY-FLOAT)]
+                          (put! (mut e) "(llvm-ir ")
+                          (put! (mut e) (if single "f32" "f64"))
+                          (put! (mut e) " [")
+                          (emit-expr! (mut e) arg)
+                          (put! (mut e) "] \"%r = call ")
+                          (put! (mut e) (if single "float @llvm.fabs.f32(float $0)" "double @llvm.fabs.f64(double $0)"))
+                          (put! (mut e) "\\nret ")
+                          (put! (mut e) (if single "float" "double"))
+                          (put! (mut e) " %r\")"))
+                        (if (or (str/str-eq name "__builtin_inff")
+                                (or (str/str-eq name "__builtin_inf")
+                                    (or (str/str-eq name "__builtin_infl")
+                                        (or (str/str-eq name "__builtin_huge_valf")
+                                            (or (str/str-eq name "__builtin_huge_val")
+                                                (or (str/str-eq name "__builtin_huge_vall")
+                                                    (or (str/str-eq name "__builtin_nanf")
+                                                        (str/str-eq name "__builtin_nan"))))))))
+                            (let [single (= (ct/ty-kind (nd/nd-type n)) ct/TY-FLOAT)
+                                  nan (or (str/str-eq name "__builtin_nanf") (str/str-eq name "__builtin_nan"))]
+                              (put! (mut e) "(llvm-ir ")
+                              (put! (mut e) (if single "f32" "f64"))
+                              (put! (mut e) " [] \"%r = fdiv ")
+                              (put! (mut e) (if single "float " "double "))
+                              (put! (mut e) (if nan "0.0, 0.0" "1.0, 0.0"))
+                              (put! (mut e) "\\nret ")
+                              (put! (mut e) (if single "float" "double"))
+                              (put! (mut e) " %r\")"))
+                            (if (or (str/str-eq name "__builtin_ctz")
+                                    (or (str/str-eq name "__builtin_ctzl")
+                                        (str/str-eq name "__builtin_ctzll")))
+                                (let [arg (al/al-get [(ptr nd/Node)] args 0)
+                                      bits (* (ct/ty-size (nd/nd-type arg)) 8)]
+                                  (put! (mut e) "(llvm-ir i32 [")
+                                  (emit-expr! (mut e) arg)
+                                  (if (= bits 64)
+                                      (put! (mut e)
+                                            "] \"%n = call i64 @llvm.cttz.i64(i64 $0, i1 false)\\n%r = trunc i64 %n to i32\\nret i32 %r\")")
+                                      (put! (mut e)
+                                            "] \"%n = call i32 @llvm.cttz.i32(i32 $0, i1 false)\\nret i32 %n\")")))
+                                (if (or (str/str-eq name "__builtin_bswap16")
+                                        (or (str/str-eq name "__builtin_bswap32")
+                                            (str/str-eq name "__builtin_bswap64")))
+                                    (do
+                                      (put! (mut e) "(bswap ")
+                                      (emit-expr! (mut e) (al/al-get [(ptr nd/Node)] args 0))
+                                      (put! (mut e) ")"))
+                                    (if (str/str-eq name "__builtin_alloca")
+                                        (do
+                                          ;; C alloca belongs to this function,
+                                          ;; not to a transient inline-IR helper.
+                                          (put! (mut e) "(cast (ptr i8) (primitive/alloc-stack-bytes ")
+                                          (emit-expr! (mut e) (al/al-get [(ptr nd/Node)] args 0))
+                                          (put! (mut e) "))"))
+                                        (emit-sync-atomic! (mut e) n name args count)))))))))))
   0)
 
 ;;; LLVM integer types are signless. Coil distinguishes i32 from u32, but
@@ -1595,11 +1764,13 @@
           :else (do (put! (mut e) "(do ") (emit-expr! (mut e) n) (put! (mut e) " 0)")))))
 
 (defn callee-name [(e (mut Emitter)) (o (ptr nd/Obj))] (-> (slice u8))
+  (let [plan (.partition e)]
   (if (hm/hm-contains? (load (field e defined)) (nd/obj-name o))
-      (if (str/str-eq (nd/obj-name o) "main")
-          "c-main"
-          (source-name (mut e) (nd/obj-name o)))
-      (link-name o)))
+      (if (and (!= (primitive/cast i64 plan) 0)
+               (and (not (.inline-only o)) (>= (part/function-owner (mut plan) (nd/obj-name o)) 0)))
+          (partition-function-name (.a e) (nd/obj-name o))
+          (function-name (.a e) (nd/obj-name o)))
+      (function-name (.a e) (nd/obj-name o)))))
 
 (defn allocation-call? [(n (ptr nd/Node))] (-> bool)
   (if (!= (nd/nd-kind n) nd/ND-CALL)
@@ -1662,11 +1833,8 @@
               (= k nd/ND-VAR)
                 (let [vt (nd/nd-type n)]
                   (cond (= (ct/ty-kind vt) ct/TY-FUNC)
-                          (do
-                            (put! (mut e) "(fnptr-of ")
-                            (put! (mut e) (callee-name (mut e) (nd/nd-obj n)))
-                            (put! (mut e) ")"))
-                        (= (ct/ty-kind vt) ct/TY-ARRAY) (emit-addr! (mut e) n)
+                          (emit-function-address! (mut e) (nd/nd-obj n))
+                        (or (= (ct/ty-kind vt) ct/TY-ARRAY) (= (ct/ty-kind vt) ct/TY-VLA)) (emit-addr! (mut e) n)
                         (direct-value? (mut e) (nd/nd-obj n)) (put! (mut e) (slot-of (mut e) (nd/nd-obj n)))
                         :else (do (put! (mut e) "(load ") (emit-addr! (mut e) n) (put! (mut e) ")"))))
               (= k nd/ND-STMT-EXPR) (emit-compound-literal! (mut e) n false)
@@ -1677,7 +1845,7 @@
                         (emit-addr! (mut e) n)
                         (do (put! (mut e) "(load ") (emit-addr! (mut e) n) (put! (mut e) ")"))))
               (= k nd/ND-DEREF)
-                (if (or (= (ct/ty-kind t) ct/TY-ARRAY) (= (ct/ty-kind t) ct/TY-FUNC))
+                (if (or (= (ct/ty-kind t) ct/TY-ARRAY) (or (= (ct/ty-kind t) ct/TY-VLA) (= (ct/ty-kind t) ct/TY-FUNC)))
                     (emit-expr! (mut e) (nd/nd-lhs n))
                     (do (put! (mut e) "(load ") (emit-addr! (mut e) n) (put! (mut e) ")")))
               (= k nd/ND-ADDR) (emit-addr! (mut e) (nd/nd-lhs n))
@@ -1685,6 +1853,9 @@
               (= k nd/ND-COMPOUND) (emit-compound! (mut e) n)
               (= k nd/ND-TARGET) (emit-target-load! (mut e) n (top-label (load (field e target-addrs))))
               (= k nd/ND-ATOMIC) (emit-atomic! (mut e) n)
+              (= k nd/ND-GNU-STMT-EXPR)
+                (emit-gnu-stmt-expr! (mut e) (nd/nd-lhs n))
+              (= k nd/ND-VLA-ALLOC) (emit-vla-allocation! (mut e) (nd/nd-obj n))
               ;; A record has no cast: the value already has the storage type the
               ;; target wants, and Coil has no conversion between aggregates.
               (and (= k nd/ND-CAST) (ct/record? t)) (emit-expr! (mut e) (nd/nd-lhs n))
@@ -1732,7 +1903,12 @@
                   (put! (mut e) " (zeroed ")
                   (emit-type! (mut e) t)
                   (put! (mut e) "))"))
-              (= k nd/ND-CALL) (emit-call! (mut e) n)
+              (= k nd/ND-CALL)
+                (if (= (ct/ty-kind t) ct/TY-VOID)
+                    (do (put! (mut e) "(do ")
+                        (emit-call! (mut e) n)
+                        (put! (mut e) " 0)"))
+                    (emit-call! (mut e) n))
               ;; `va_start` points the list at the area the caller filled, which
               ;; arrived as the function's last parameter.
               (= k nd/ND-VA-START)
@@ -1740,6 +1916,11 @@
                   (put! (mut e) "(do (set! ")
                   (emit-addr! (mut e) (nd/nd-lhs n))
                   (put! (mut e) " c_va) 0)"))
+              ;; The legacy pointer-cursor ABI needs no resource release, but
+              ;; evaluating a side-effecting va_list designator is observable.
+              (= k nd/ND-VA-END)
+                (do (put! (mut e) "(do ")
+                  (emit-addr! (mut e) (nd/nd-lhs n)) (put! (mut e) " 0)"))
               ;; `va_arg` reads the slot the list points at and steps past it.
               (= k nd/ND-VA-ARG)
                 (let [slot (fresh (mut e) "va")]
@@ -1805,9 +1986,21 @@
                   (put! (mut e) "(if ")
                   (emit-truth! (mut e) (nd/nd-test n))
                   (put! (mut e) " ")
-                  (emit-expr! (mut e) (nd/nd-then n))
+                  (if (ct/pointer-like? t)
+                      (do (put! (mut e) "(cast ")
+                          (emit-type! (mut e) t)
+                          (put! (mut e) " ")
+                          (emit-expr! (mut e) (nd/nd-then n))
+                          (put! (mut e) ")"))
+                      (emit-expr! (mut e) (nd/nd-then n)))
                   (put! (mut e) " ")
-                  (emit-expr! (mut e) (nd/nd-else n))
+                  (if (ct/pointer-like? t)
+                      (do (put! (mut e) "(cast ")
+                          (emit-type! (mut e) t)
+                          (put! (mut e) " ")
+                          (emit-expr! (mut e) (nd/nd-else n))
+                          (put! (mut e) ")"))
+                      (emit-expr! (mut e) (nd/nd-else n)))
                   (put! (mut e) ")"))
               (= k nd/ND-COMMA)
                 (do
@@ -2139,6 +2332,24 @@
     (emit-block-range! (mut e) body 0 (al/al-len [(ptr nd/Node)] body)))
   0)
 
+;;; A GNU statement expression has the value of its final expression statement.
+;;; Ordinary block lowering deliberately discards every expression statement, so
+;;; emit the prefix as statements and preserve the last expression here.
+(defn emit-gnu-stmt-expr! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
+  (let [body (nd/nd-body n)
+        count (al/al-len [(ptr nd/Node)] body)]
+    (put! (mut e) "(do")
+    (if (= count 0)
+        (put! (mut e) " 0")
+        (let [last (al/al-get [(ptr nd/Node)] body (- count 1))]
+          (if (> count 1) (emit-block-range! (mut e) body 0 (- count 1)) 0)
+          (put! (mut e) " ")
+          (if (= (nd/nd-kind last) nd/ND-EXPR-STMT)
+              (emit-value! (mut e) (nd/nd-lhs last))
+              (do (emit-stmt! (mut e) last) (put! (mut e) " 0")))))
+    (put! (mut e) ")"))
+  0)
+
 (defn emit-stmt! [(e (mut Emitter)) (n (ptr nd/Node))] (-> i64)
   (if (= (primitive/cast i64 n) 0)
       (put! (mut e) "0")
@@ -2150,14 +2361,21 @@
                   (emit-block-body! (mut e) n)
                   (put! (mut e) " 0)"))
               ;; The value is discarded, so it is never produced.
-              (= k nd/ND-EXPR-STMT) (emit-discarded! (mut e) (nd/nd-lhs n))
+              (= k nd/ND-EXPR-STMT)
+                (do
+                  (put! (mut e) "(do ")
+                  (emit-discarded! (mut e) (nd/nd-lhs n))
+                  (put! (mut e) " 0)"))
               (= k nd/ND-RETURN)
                 (do
-                  (put! (mut e) "(control/return-from :c-return ")
+                  ;; A statement has no C value. The trailing zero keeps a
+                  ;; return used as one arm of a Coil `if` the same width as
+                  ;; the other statement arm; control has already left first.
+                  (put! (mut e) "(do (control/return-from :c-return ")
                   (if (= (primitive/cast i64 (nd/nd-lhs n)) 0)
-                      (put! (mut e) "0")
+                      (put! (mut e) "(do)")
                       (emit-value! (mut e) (nd/nd-lhs n)))
-                  (put! (mut e) ")"))
+                  (put! (mut e) ") 0)"))
               (= k nd/ND-IF)
                 (do
                   (put! (mut e) "(if ")
@@ -2634,10 +2852,12 @@
             (do
               (put! (mut e) "(control/return-from :c-return ")
               (if (= (primitive/cast i64 (load (field b value))) 0)
-                  (do
-                    (put! (mut e) "(zeroed ")
-                    (emit-return-type! (mut e) result)
-                    (put! (mut e) ")"))
+                  (if (= (ct/ty-kind result) ct/TY-VOID)
+                      (put! (mut e) "(do)")
+                      (do
+                        (put! (mut e) "(zeroed ")
+                        (emit-return-type! (mut e) result)
+                        (put! (mut e) ")")))
                   (emit-value! (mut e) (load (field b value))))
               (put! (mut e) ")"))
           (= term TERM-SWITCH) (emit-switch-terminator! (mut e) b state)
@@ -2780,20 +3000,56 @@
 (defn emit-local! [(e (mut Emitter)) (o (ptr nd/Obj))] (-> i64)
   (let [slot (local-name! (mut e) o)]
     (bind-slot! (mut e) o slot)
-    (if (bound-local? (mut e) o)
+    (if (= (ct/ty-kind (nd/obj-type o)) ct/TY-VLA)
         (do
           (put! (mut e) " (mut ")
           (put! (mut e) slot)
-          (put! (mut e) ") (zeroed ")
-          (emit-type! (mut e) (nd/obj-type o))
-          (put! (mut e) ")"))
-        (do
-          (put! (mut e) " ")
-          (put! (mut e) slot)
-          (put! (mut e) " (alloc-stack ")
-          (emit-type! (mut e) (nd/obj-type o))
-          (put! (mut e) ")"))))
+          (put! (mut e) ") (cast (ptr ")
+          (emit-pointee! (mut e) (ct/ty-base (nd/obj-type o)))
+          (put! (mut e) ") 0)"))
+        (if (bound-local? (mut e) o)
+            (do
+              (put! (mut e) " (mut ")
+              (put! (mut e) slot)
+              (put! (mut e) ") (zeroed ")
+              (emit-type! (mut e) (nd/obj-type o))
+              (put! (mut e) ")"))
+            (do
+              (put! (mut e) " ")
+              (put! (mut e) slot)
+              (put! (mut e) " (alloc-stack ")
+              (emit-type! (mut e) (nd/obj-type o))
+              (put! (mut e) ")")))))
   0)
+
+;;; Evaluate every variably modified bound exactly once at its declaration and
+;;; allocate the resulting byte count on the current function's stack.
+(defn emit-vla-allocation! [(e (mut Emitter)) (o (ptr nd/Obj))] (-> i64)
+  (let [bounds (nd/obj-vla-bounds o)
+        count (al/al-len [(ptr nd/Node)] bounds)
+        element (ct/ty-base (nd/obj-type o))
+        slot (slot-of (mut e) o)
+        (mut i) 0]
+    (put! (mut e) "(set! ")
+    (put! (mut e) slot)
+    (put! (mut e) " (cast (ptr ")
+    (emit-pointee! (mut e) element)
+    (put! (mut e) ") (primitive/alloc-stack-bytes (cast u64 ")
+    (loop (if (>= (load i) count)
+              (break)
+              (do (put! (mut e) "(* ") (store! i (+ (load i) 1)))))
+    (put-int! (mut e) (ct/ty-size element))
+    (store! i 0)
+    (loop (if (>= (load i) count)
+              (break)
+              (do
+                (put! (mut e) " ")
+                (put! (mut e) "(cast i64 ")
+                (emit-expr! (mut e) (al/al-get [(ptr nd/Node)] bounds (load i)))
+                (put! (mut e) "))")
+                (store! i (+ (load i) 1)))))
+    (put! (mut e) "))))")
+    0))
 
 ;;; Parameters arrive as values and are copied into their slots, so the body can
 ;;; treat them exactly like any other local.
@@ -2898,6 +3154,12 @@
   0)
 
 (defn emit-function! [(e (mut Emitter)) (f (ptr nd/Obj))] (-> i64)
+  (let [span (tr/span-begin (nd/obj-name f))
+        result (emit-function-body! (mut e) f)]
+    (tr/span-end span)
+    result))
+
+(defn emit-function-body! [(e (mut Emitter)) (f (ptr nd/Obj))] (-> i64)
   (store! (field e names-taken)
           (hm/hm-new [(slice u8) bool] (load (field e a)) (str/str-keyops)))
   (store! (field e addressed)
@@ -2914,10 +3176,7 @@
         state (fresh (mut e) "st")
         (mut i) 0]
     (put! (mut e) "(defn ")
-    (put! (mut e)
-          (if (str/str-eq (nd/obj-name f) "main")
-              "c-main"
-              (source-name (mut e) (nd/obj-name f))))
+    (put! (mut e) (callee-name (mut e) f))
     (put! (mut e) " [")
     (loop (if (>= (load i) count)
               (break)
@@ -2950,10 +3209,13 @@
         ;; The body's own statements go straight into the block the parameter
         ;; copies are already in, rather than into one of their own.
         (emit-block-body! (mut e) (nd/obj-body f)))
-    (put! (mut e) " (zeroed ")
-    (emit-return-type! (mut e) (ct/ty-base ty))
-    ;; closes: zeroed, do, scope, let, defn
-    (put! (mut e) ")))))\n"))
+    (if (= (ct/ty-kind (ct/ty-base ty)) ct/TY-VOID)
+        (put! (mut e) " (do)))))\n")
+        (do
+          (put! (mut e) " (zeroed ")
+          (emit-return-type! (mut e) (ct/ty-base ty))
+          ;; closes: zeroed, do, scope, let, defn
+          (put! (mut e) ")))))\n"))))
   0)
 
 ;;; A global is a static cell reached through a zero-argument accessor, which
@@ -2989,6 +3251,13 @@
                 (store! i (+ (load i) 1)))))
     (put! (mut e) "\""))
   0)
+
+;; Metadata contains a Coil string, not a null-terminated C literal.
+(defn put-text-string! [(e (mut Emitter)) (bytes (slice u8))] (-> i64)
+  (put! (mut e) "\"")
+  (for [i 0 (slice-len bytes)]
+    (put-string-byte! (mut e) (primitive/cast i64 (slice-get bytes i))) 0)
+  (put! (mut e) "\""))
 
 (defn put-hex! [(e (mut Emitter)) (v i64)] (-> i64)
   (let [digits "0123456789abcdef"]
@@ -3038,18 +3307,6 @@
             (if (or unsigned (< m 2147483648)) m (- m 4294967296)))
         :else x))
 
-;;; An unsigned operand as the i64 whose ordering and division agree with C's.
-;;; A 64-bit one above the signed range has no such i64, and folds no further.
-(defn as-operand [(v Value) (t (ptr ct/Type))] (-> Value)
-  (if (or (= (primitive/cast i64 t) 0) (not (ct/ty-unsigned? t)))
-      (int-value (.i v))
-      (let [size (ct/ty-size t)]
-        (cond (= size 1) (int-value (primitive/iand (.i v) 255))
-              (= size 2) (int-value (primitive/iand (.i v) 65535))
-              (= size 4) (int-value (primitive/iand (.i v) 4294967295))
-              (< (.i v) 0) (no-value)
-              :else (int-value (.i v))))))
-
 (defn convert-value [(v Value) (t (ptr ct/Type))] (-> Value)
   (cond (= (primitive/cast i64 t) 0) (no-value)
         (= (ct/ty-kind t) ct/TY-BOOL)
@@ -3067,10 +3324,28 @@
         (= (ct/ty-kind t) ct/TY-PTR) (if (= (.flo v) 0) (int-value (.i v)) (no-value))
         :else (no-value)))
 
-;;; Folds the expressions C allows in a static initialiser and this compiler can
-;;; write down. An address is not one of them: `&x` and a function's name mean a
-;;; number only the linker knows, so they fold to nothing and stay statements.
+;;; Integer-address lvalues (including the target's offsetof form) can be
+;;; evaluated without dereferencing memory. Symbolic &global addresses remain
+;;; unfurled and belong to the link-time relocation path, never numeric zero.
+(defn eval-numeric-address [(n (ptr nd/Node))] (-> Value)
+  (if (= (primitive/cast i64 n) 0) (no-value)
+    (cond (= (nd/nd-kind n) nd/ND-DEREF) (eval-value (nd/nd-lhs n))
+      (and (= (nd/nd-kind n) nd/ND-MEMBER) (< (nd/nd-member-bit-width n) 0))
+        (let [base (eval-numeric-address (nd/nd-lhs n))]
+          (if (or (= (.ok base) 0) (!= (.flo base) 0)) (no-value)
+            (int-value (+ (.i base) (nd/nd-member-offset n)))))
+      :else (no-value))))
+
+;;; Folds numeric static expressions. Symbolic addresses fold to nothing and
+;;; are preserved for relocation emission.
 (defn eval-value [(n (ptr nd/Node))] (-> Value)
+  (let [value (eval-value-raw n)]
+    ;; Every typed intermediate narrows, not only explicit casts. In particular
+    ;; ~0U and unsigned wraparound must remain 32-bit before later comparisons.
+    (if (or (= (.ok value) 0) (= (primitive/cast i64 n) 0)) value
+      (convert-value value (nd/nd-type n)))))
+
+(defn eval-value-raw [(n (ptr nd/Node))] (-> Value)
   (if (= (primitive/cast i64 n) 0)
       (no-value)
       (let [k (nd/nd-kind n)
@@ -3079,6 +3354,7 @@
                 (if (and (!= (primitive/cast i64 ty) 0) (ct/floating? ty))
                     (float-value (nd/nd-fvalue n))
                     (int-value (nd/nd-value n)))
+              (= k nd/ND-ADDR) (eval-numeric-address (nd/nd-lhs n))
               (= k nd/ND-CAST)
                 (let [v (eval-value (nd/nd-lhs n))]
                   (if (= (.ok v) 0) (no-value) (convert-value v ty)))
@@ -3144,8 +3420,8 @@
 ;;; numbers depending on the signedness C gave them, so each is read back through
 ;;; its own type before the operation runs.
 (defn eval-int-binop [(k i64) (n (ptr nd/Node)) (x i64) (y i64)] (-> Value)
-  (let [u (as-operand (int-value x) (nd/nd-type (nd/nd-lhs n)))
-        w (as-operand (int-value y) (nd/nd-type (nd/nd-rhs n)))]
+  (let [unsigned (ct/ty-unsigned? (nd/nd-type (nd/nd-lhs n)))
+        ux (primitive/cast u64 x) uy (primitive/cast u64 y)]
     (cond (= k nd/ND-ADD) (int-value (+ x y))
           (= k nd/ND-SUB) (int-value (- x y))
           (= k nd/ND-MUL) (int-value (* x y))
@@ -3154,21 +3430,21 @@
           (= k nd/ND-BITXOR) (int-value (primitive/ixor x y))
           (= k nd/ND-SHL) (if (or (< y 0) (>= y 64)) (no-value) (int-value (primitive/ishl x y)))
           (= k nd/ND-SHR)
-            (if (or (or (< y 0) (>= y 64)) (= (.ok u) 0))
+            (if (or (< y 0) (>= y 64))
                 (no-value)
-                (int-value (primitive/ishr (.i u) y)))
+                (int-value (if unsigned (primitive/cast i64 (>> ux uy)) (primitive/ishr x y))))
           (= k nd/ND-DIV)
-            (if (or (or (= (.ok u) 0) (= (.ok w) 0)) (= (.i w) 0))
+            (if (or (= y 0) (and (not unsigned) (and (= x -9223372036854775808) (= y -1))))
                 (no-value)
-                (int-value (primitive/idiv (.i u) (.i w))))
+                (int-value (if unsigned (primitive/cast i64 (primitive/udiv ux uy)) (primitive/idiv x y))))
           (= k nd/ND-MOD)
-            (if (or (or (= (.ok u) 0) (= (.ok w) 0)) (= (.i w) 0))
+            (if (or (= y 0) (and (not unsigned) (and (= x -9223372036854775808) (= y -1))))
                 (no-value)
-                (int-value (primitive/irem (.i u) (.i w))))
+                (int-value (if unsigned (primitive/cast i64 (primitive/urem ux uy)) (primitive/irem x y))))
           (= k nd/ND-EQ) (int-value (if (= x y) 1 0))
           (= k nd/ND-NE) (int-value (if (!= x y) 1 0))
-          (= k nd/ND-LT) (if (or (= (.ok u) 0) (= (.ok w) 0)) (no-value) (int-value (if (< (.i u) (.i w)) 1 0)))
-          (= k nd/ND-LE) (if (or (= (.ok u) 0) (= (.ok w) 0)) (no-value) (int-value (if (<= (.i u) (.i w)) 1 0)))
+          (= k nd/ND-LT) (int-value (if (if unsigned (< ux uy) (< x y)) 1 0))
+          (= k nd/ND-LE) (int-value (if (if unsigned (<= ux uy) (<= x y)) 1 0))
           (= k nd/ND-LOGAND) (int-value (if (and (!= x 0) (!= y 0)) 1 0))
           (= k nd/ND-LOGOR) (int-value (if (or (!= x 0) (!= y 0)) 1 0))
           :else (no-value))))
@@ -3449,6 +3725,32 @@
                 (store! j (+ (load j) 1)))))
     (put! (mut e) "]")))
 
+;;; Test object bytes, not a converted numeric value: floating negative zero
+;;; and other bit patterns must remain explicit in link-time storage.
+(defn image-nonzero? [(im (ptr Image)) (offset i64) (size i64)] (-> bool)
+  (block :found
+  (let [bytes (load (field im bytes))]
+    (for [i offset (+ offset size)]
+      (when (!= (slice-get bytes i) (primitive/cast u8 0)) (break :found true) 0) 0)
+    false)))
+
+;;; Array holes remain implicit all the way to object emission. Nested arrays
+;;; use the same compact literal; scanning the actual image costs object bytes,
+;;; but does not allocate one initializer/expression/string per zero element.
+(defn put-image-elements! [(e (mut Emitter)) (im (ptr Image))
+                           (t (ptr ct/Type)) (offset i64)] (-> i64)
+  (let [base (ct/ty-base t) size (ct/ty-size base)]
+    (put! (mut e) "[")
+    (for [i 0 (ct/ty-array-len t)]
+      (let [at (+ offset (* i size))]
+        (when (image-nonzero? im at size)
+          (put! (mut e) "(") (put-int! (mut e) i) (put! (mut e) " ")
+          (if (= (ct/ty-kind base) ct/TY-ARRAY)
+              (do (put! (mut e) "(:elements ") (put-image-elements! (mut e) im base at) (put! (mut e) ")"))
+              (put-image! (mut e) im base at))
+          (put! (mut e) ")") 0)) 0)
+    (put! (mut e) "]")))
+
 (defn emit-global! [(e (mut Emitter)) (o (ptr nd/Obj))] (-> i64)
   (if (hm/hm-contains? (load (field e emitted)) (nd/obj-name o))
       0
@@ -3469,11 +3771,22 @@
             (let [im (image-of (mut e) (nd/obj-name o))]
               (put! (mut e) "(alloc-static ")
               (emit-type! (mut e) (nd/obj-type o))
+              ;; A generated-module owner is also the native ABI owner. Give
+              ;; externally linked C data its real linker symbol on the one
+              ;; canonical allocation; accessors in other Coil modules point
+              ;; at this cell rather than introducing proxy storage.
+              (when (and (!= (primitive/cast i64 (.partition e)) 0)
+                         (not (nd/obj-static? o)))
+                (put! (mut e) " :as ")
+                (put-text-string! (mut e) (link-name o))
+                0)
               (if (= (primitive/cast i64 im) 0)
                   0
-                  (do
-                    (put! (mut e) " ")
-                    (put-image! (mut e) im (nd/obj-type o) 0)))
+                  (if (= (ct/ty-kind (nd/obj-type o)) ct/TY-ARRAY)
+                      (do (put! (mut e) " :elements ")
+                          (put-image-elements! (mut e) im (nd/obj-type o) 0))
+                      (do (put! (mut e) " ")
+                          (put-image! (mut e) im (nd/obj-type o) 0))))
               (put! (mut e) ")")))
         (put! (mut e) ")\n")
         0)))
@@ -3497,7 +3810,9 @@
         count (al/al-len [(ptr ct/Type)] params)
         (mut i) 0]
     (put! (mut e) "(extern ")
-    (put! (mut e) (link-name o))
+    (put! (mut e) (callee-name (mut e) o))
+    (unless (str/str-eq (callee-name (mut e) o) (link-name o))
+      (put! (mut e) " :as ") (put-text-string! (mut e) (link-name o)) 0)
     (put! (mut e) " :cc c [")
     (loop (if (>= (load i) count)
               (break)
@@ -3751,15 +4066,207 @@
     (put! (mut e) ")\n")
     0))
 
+(defn emit-partition-function-decl! [(e (mut Emitter)) (o (ptr nd/Obj))] (-> i64)
+  (let [ty (nd/obj-type o) params (ct/ty-params ty)
+        n (al/al-len [(ptr ct/Type)] params)]
+    (put! (mut e) "(extern ")
+    (put! (mut e) (callee-name (mut e) o))
+    (put! (mut e) " :as ")
+    (put-text-string! (mut e) (partition-link-name (.a e) o))
+    (put! (mut e) " :cc c [")
+    (for [i 0 n]
+      (if (> i 0) (put! (mut e) " ") 0)
+      (emit-param-type! (mut e) (al/al-get [(ptr ct/Type)] params i))
+      0)
+    (when (ct/ty-variadic? ty)
+      (if (> n 0) (put! (mut e) " ") 0)
+      (put! (mut e) "(ptr i8)") 0)
+    (put! (mut e) "] (-> ")
+    (emit-return-type! (mut e) (ct/ty-base ty))
+    (put! (mut e) "))\n")))
+
+;; Only value types that occur in a boundary signature belong in an interface.
+;; A pointer to a C record is already byte-erased by emit-pointee!, so traversing
+;; it would retain the entire Emacs header graph in every importing compiler.
+(defn mark-boundary-types! [(e (mut Emitter)) (t (ptr ct/Type))
+                            (names (mut (hm/HashMap (slice u8) bool)))] (-> i64)
+  (when (!= (primitive/cast i64 t) 0)
+    (let [kind (ct/ty-kind t)]
+      (cond (ct/record? t)
+              (let [name (record-struct (mut e) t)]
+                (when (and (> (slice-len name) 0) (not (hm/hm-contains? (load names) name)))
+                  (hm/hm-put! [(slice u8) bool] (mut names) name true)
+                  (let [members (ct/ty-members t)]
+                    (for [i 0 (al/al-len [ct/Member] members)]
+                      (let [member (al/al-get [ct/Member] members i)]
+                        (when (declarable-member? member)
+                          (mark-boundary-types! (mut e) (ct/member-type member) (mut names)) 0)) 0))
+                  0) 0)
+            (= kind ct/TY-ARRAY) (mark-boundary-types! (mut e) (ct/ty-base t) (mut names))
+            (= kind ct/TY-PTR)
+              (if (= (ct/ty-kind (ct/ty-base t)) ct/TY-FUNC)
+                  (mark-boundary-types! (mut e) (ct/ty-base t) (mut names)) 0)
+            (= kind ct/TY-FUNC)
+              (do (mark-boundary-types! (mut e) (ct/ty-base t) (mut names))
+                  (let [params (ct/ty-params t)]
+                    (for [i 0 (al/al-len [(ptr ct/Type)] params)]
+                      (mark-boundary-types! (mut e) (al/al-get [(ptr ct/Type)] params i) (mut names)) 0)) 0)
+            :else 0)) 0)
+  0)
+
+(defn emit-selected-records! [(e (mut Emitter)) (names (hm/HashMap (slice u8) bool))
+                              (selected bool)] (-> i64)
+  (for [i 0 (al/al-len [(ptr ct/Type)] (.records e))]
+    (let [name (al/al-get [(slice u8)] (.record-decls e) i)]
+      (when (= (hm/hm-contains? names name) selected)
+        (emit-record-decl! (mut e) (al/al-get [(ptr ct/Type)] (.records e) i) name) 0)) 0)
+  0)
+
+(defn record-partition-types! [(a (dyn alloc/Allocator)) (globals (al/ArrayList (ptr nd/Obj)))
+                               (plan (ptr part/Plan)) (unit i64)] (-> i64)
+  (let [(mut e) (emitter-new a plan unit)
+        (mut boundary) (hm/hm-new [(slice u8) bool] a (str/str-keyops))
+        (mut added) (hm/hm-new [(slice u8) (slice u8)] a (str/str-keyops))]
+    (for [i 0 (al/al-len [(ptr nd/Obj)] globals)]
+      (let [o (al/al-get [(ptr nd/Obj)] globals i)]
+        (when (and (nd/obj-definition? o)
+                   (= (part/function-owner (mut plan) (nd/obj-name o)) unit))
+          (mark-boundary-types! (mut e) (nd/obj-type o) (mut boundary)) 0)) 0)
+    ;; Reserve every newly selected identity before spelling any declaration,
+    ;; so nested members refer to their canonical owner regardless of order.
+    (for [i 0 (al/al-len [(ptr ct/Type)] (.records e))]
+      (when (hm/hm-contains? (load (mut boundary)) (al/al-get [(slice u8)] (.record-decls e) i))
+        (let [t (al/al-get [(ptr ct/Type)] (.records e) i) key (partition-record-key a t)]
+          (when (not (hm/hm-contains? (.shared-types plan) key))
+            (let [(mut local) (str/sb-new (.a plan)) (mut full) (str/sb-new (.a plan))]
+              (str/sb-push-str! (mut local) "CShared_")
+              (str/sb-push-i64! (mut local) (al/al-len [(slice u8)] (.type-names plan)))
+              (str/sb-push-str! (mut full) (part/type-module-name (mut plan)))
+              (str/sb-push-str! (mut full) ".")
+              (str/sb-push-str! (mut full) (str/sb-str (load (mut local))))
+              (hm/hm-put! [(slice u8) (slice u8)] (mut (.shared-types plan))
+                (part/own-text (.a plan) key) (str/sb-str (load (mut full))))
+              (al/al-push! [(slice u8)] (mut (.type-names plan)) (str/sb-str (load (mut local))))
+              (hm/hm-put! [(slice u8) (slice u8)] (mut added) key (str/sb-str (load (mut local))))) 0)) 0) 0)
+    (for [i 0 (al/al-len [(ptr ct/Type)] (.records e))]
+      (let [t (al/al-get [(ptr ct/Type)] (.records e) i)]
+        (match (hm/hm-get (load (mut added)) (partition-record-key a t))
+          (Some [name] (emit-record-decl! (mut e) t name))
+          (None [] 0))) 0)
+    (str/sb-push-str! (mut (.type-source plan)) (str/sb-str (.out e)))
+    0))
+
+(defn emit-type-interface [(a (dyn alloc/Allocator)) (plan (ptr part/Plan))] (-> (slice u8))
+  (let [(mut b) (str/sb-new a)]
+    (str/sb-push-str! (mut b) "(module ")
+    (str/sb-push-str! (mut b) (part/type-module-name (mut plan)))
+    (str/sb-push-str! (mut b) ")\n")
+    (str/sb-push-str! (mut b) (str/sb-str (.type-source plan)))
+    (str/sb-push-str! (mut b) "(export")
+    (for [i 0 (al/al-len [(slice u8)] (.type-names plan))]
+      (str/sb-push-str! (mut b) " ")
+      (str/sb-push-str! (mut b) (al/al-get [(slice u8)] (.type-names plan) i)) 0)
+    (str/sb-push-str! (mut b) ")\n")
+    (str/sb-str (load (mut b)))))
+
+(defn emit-partition-boundary! [(e (mut Emitter)) (globals (al/ArrayList (ptr nd/Obj)))
+                                (module-name (slice u8)) (interface (ptr str/StrBuf))] (-> i64)
+  (let [a (.a e) plan (.partition e) unit (.unit e) saved (.out e)
+        init-name (part/initializer-name (mut plan) unit)
+        (mut names) (al/al-new [(slice u8)] a)
+        (mut boundary-types) (hm/hm-new [(slice u8) bool] a (str/str-keyops))
+        (mut seen) (hm/hm-new [(slice u8) bool] a (str/str-keyops))
+        n (al/al-len [(ptr nd/Obj)] globals)]
+    (for [i 0 n]
+      (let [o (al/al-get [(ptr nd/Obj)] globals i)]
+        (when (and (nd/obj-definition? o)
+                   (= (part/function-owner (mut plan) (nd/obj-name o)) unit))
+          (mark-boundary-types! (mut e) (nd/obj-type o) (mut boundary-types)) 0)) 0)
+    (set! (.out e) (str/sb-new a))
+    (put! (mut e) "(module ") (put! (mut e) module-name) (put! (mut e) ")\n")
+    (put! (mut e) "(import \"") (put! (mut e) (part/type-module-name (mut plan)))
+    (put! (mut e) "\")\n")
+    (emit-selected-records! (mut e) (load (mut boundary-types)) true)
+    (put! (mut e) "(extern ") (put! (mut e) init-name) (put! (mut e) " :cc c [] (-> i64))\n")
+    (al/al-push! [(slice u8)] (mut names) init-name)
+    (for [i 0 n]
+      (let [o (al/al-get [(ptr nd/Obj)] globals i) name (nd/obj-name o)]
+        (when (and (nd/obj-definition? o) (not (hm/hm-contains? (load (mut seen)) name)))
+          (when (and (nd/obj-function? o) (= (part/function-owner (mut plan) name) unit))
+            (emit-partition-function-decl! (mut e) o)
+            (al/al-push! [(slice u8)] (mut names) (callee-name (mut e) o))
+            (hm/hm-put! [(slice u8) bool] (mut seen) name true)
+            0)
+          (when (and (not (nd/obj-function? o))
+                     (and (not (nd/obj-static? o)) (= (part/data-owner (mut plan) name) unit)))
+            (let [symbol (part/data-name a (ident-with a "" name))]
+              (put! (mut e) "(extern ") (put! (mut e) symbol) (put! (mut e) " :cc c [] (-> (ptr i8)))\n")
+              (al/al-push! [(slice u8)] (mut names) symbol))
+            (hm/hm-put! [(slice u8) bool] (mut seen) name true)
+            0)
+          0))
+      0)
+    (put! (mut e) "(export")
+    (for [i 0 (al/al-len [(slice u8)] (load (mut names)))]
+      (put! (mut e) " ") (put! (mut e) (al/al-get [(slice u8)] (load (mut names)) i)) 0)
+    (put! (mut e) ")\n")
+    (store! interface (.out e))
+    (set! (.out e) saved)
+    (put! (mut e) "(import \"") (put! (mut e) (part/type-module-name (mut plan)))
+    (put! (mut e) "\")\n")
+    (emit-selected-records! (mut e) (load (mut boundary-types)) false)
+    (set! seen (hm/hm-new [(slice u8) bool] a (str/str-keyops)))
+    (for [i 0 n]
+      (let [o (al/al-get [(ptr nd/Obj)] globals i) name (nd/obj-name o)
+            function-unit (part/function-owner (mut plan) name)
+            data-unit (part/data-owner (mut plan) name)]
+        (when (not (hm/hm-contains? (load (mut seen)) name))
+          (when (and (not (.inline-only o))
+                     (and (>= function-unit 0) (and (!= function-unit unit) (used? (mut e) o))))
+            (put! (mut e) "(import \"") (put! (mut e) (part/unit-name (mut plan) function-unit))
+            (put! (mut e) "\" :use [") (put! (mut e) (callee-name (mut e) o)) (put! (mut e) "])\n")
+            (hm/hm-put! [(slice u8) bool] (mut seen) name true)
+            0)
+          (when (and (>= data-unit 0)
+                     (and (not (nd/obj-function? o)) (or (= data-unit unit) (used? (mut e) o))))
+            (let [symbol (part/data-name a (ident-with a "" name))]
+              (if (= data-unit unit)
+                  (do (put! (mut e) "(defn ") (put! (mut e) symbol)
+                      (put! (mut e) " [] (-> (ptr i8)) (cast (ptr i8) (")
+                      (put! (mut e) (source-name (mut e) name)) (put! (mut e) ")))\n"))
+                  (do
+                    (put! (mut e) "(import \"") (put! (mut e) (part/unit-name (mut plan) data-unit))
+                    (put! (mut e) "\" :use [") (put! (mut e) symbol) (put! (mut e) "])\n(defn ")
+                    (put! (mut e) (source-name (mut e) name)) (put! (mut e) " [] (-> (ptr ")
+                    (emit-type! (mut e) (nd/obj-type o)) (put! (mut e) ")) (cast (ptr ")
+                    (emit-type! (mut e) (nd/obj-type o)) (put! (mut e) ") (")
+                    (put! (mut e) symbol) (put! (mut e) ")))\n"))))
+            (hm/hm-put! [(slice u8) bool] (mut seen) name true)
+            0)
+          0))
+      0)
+    0))
+
 (defn emit-module [(a (dyn alloc/Allocator))
                    (globals (al/ArrayList (ptr nd/Obj)))
                    (init (ptr nd/Node))
                    (module-name (slice u8))
                    (executable bool)
                    (public-names (al/ArrayList (slice u8)))] (-> EmitResult)
-  (let [(mut e)
+  (emit-module-impl a globals init module-name executable public-names
+                    (primitive/cast (ptr part/Plan) 0) -1 (primitive/cast (ptr str/StrBuf) 0)))
+
+(defn emit-partition [(a (dyn alloc/Allocator)) (globals (al/ArrayList (ptr nd/Obj)))
+                      (init (ptr nd/Node)) (plan (ptr part/Plan)) (unit i64)
+                      (interface (mut str/StrBuf))] (-> EmitResult)
+  (emit-module-impl a globals init (part/unit-name (mut plan) unit) false
+                    (al/al-new [(slice u8)] a) plan unit (mut interface)))
+
+(defn emitter-new [(a (dyn alloc/Allocator)) (plan (ptr part/Plan)) (unit i64)] (-> Emitter)
           (load (Emitter
                   :a a
+                  :partition plan
+                  :unit unit
                   :out (str/sb-new a)
                   :slots (hm/hm-new [(slice u8) (slice u8)] a (str/str-keyops))
                   :defined (hm/hm-new [(slice u8) bool] a (str/str-keyops))
@@ -3787,10 +4294,54 @@
                   :failed 0
                   :message ""
                   :file ""
-                  :line 0))
+                  :line 0)))
+
+(defn emit-public-wrapper [(a (dyn alloc/Allocator)) (o (ptr nd/Obj)) (owner i64)] (-> (slice u8))
+  (let [(mut e) (emitter-new a (primitive/cast (ptr part/Plan) 0) -1)
+        name (function-name a (nd/obj-name o)) ty (nd/obj-type o)
+        params (ct/ty-params ty) n (al/al-len [(ptr ct/Type)] params)]
+    (when (ct/record? (ct/ty-base ty))
+      (primitive/error "C partition public aggregate returns require a pointer-based wrapper") 0)
+    (put! (mut e) "(export ") (put! (mut e) name) (put! (mut e) ")\n(defn ")
+    (put! (mut e) name) (put! (mut e) " [")
+    (for [i 0 n]
+      (when (ct/record? (al/al-get [(ptr ct/Type)] params i))
+        (primitive/error "C partition public aggregate arguments require a pointer-based wrapper") 0)
+      (put! (mut e) "(a") (put-int! (mut e) i) (put! (mut e) " ")
+      (emit-param-type! (mut e) (al/al-get [(ptr ct/Type)] params i))
+      (put! (mut e) ")") 0)
+    (when (ct/ty-variadic? ty) (put! (mut e) "(va (ptr i8))") 0)
+    (put! (mut e) "] (-> ") (emit-return-type! (mut e) (ct/ty-base ty))
+    (put! (mut e) ") (u") (put-int! (mut e) owner) (put! (mut e) "/")
+    (put! (mut e) (partition-function-name a (nd/obj-name o)))
+    (for [i 0 n] (put! (mut e) " a") (put-int! (mut e) i) 0)
+    (when (ct/ty-variadic? ty) (put! (mut e) " va") 0)
+    (put! (mut e) "))\n")
+    (str/sb-str (.out e))))
+
+(defn emit-module-impl [(a (dyn alloc/Allocator))
+                        (globals (al/ArrayList (ptr nd/Obj)))
+                        (init (ptr nd/Node)) (module-name (slice u8))
+                        (executable bool) (public-names (al/ArrayList (slice u8)))
+                        (plan (ptr part/Plan)) (unit i64)
+                        (interface (ptr str/StrBuf))] (-> EmitResult)
+  (let [(mut e) (emitter-new a plan unit)
         count (al/al-len [(ptr nd/Obj)] globals)
         (mut start-up) init
+        (mut phase) (tr/span-begin "c.emit.prepare")
         (mut i) 0]
+    (when (!= (primitive/cast i64 plan) 0)
+      ;; All owned function/data names retain their translated calling/storage
+      ;; convention even when their definition belongs to another worker.
+      (for [pi 0 count]
+        (let [o (al/al-get [(ptr nd/Obj)] globals pi)
+              name (nd/obj-name o)]
+          (when (>= (part/function-owner (mut plan) name) 0)
+            (hm/hm-put! [(slice u8) bool] (mut (.defined (mut e))) name true) 0)
+          (when (>= (part/data-owner (mut plan) name) 0)
+            (hm/hm-put! [(slice u8) bool] (mut (.defined-data (mut e))) name true) 0))
+        0)
+      0)
     ;; What has a definition, and under which of the two kinds.
     (loop (if (>= (load i) count)
               (break)
@@ -3808,7 +4359,10 @@
                                       (mut (field e defined-data))
                                       (nd/obj-name o)
                                       true)
-                          (choose-storage! (mut e) o (load i))
+                          (when (or (= (primitive/cast i64 plan) 0)
+                                    (or (or (nd/obj-static? o) (nd/obj-string? o))
+                                        (= (part/data-owner (mut plan) (nd/obj-name o)) unit)))
+                            (choose-storage! (mut e) o (load i)) 0)
                           0))
                     0)
                 ;; A string literal has no reference to find it by; its bytes
@@ -3825,7 +4379,9 @@
             (do
               (for [pi 0 count]
                 (let [po (al/al-get [(ptr nd/Obj)] globals pi)]
-                  (if (and (nd/obj-definition? po) (not (nd/obj-static? po)))
+                  (if (and (nd/obj-definition? po)
+                           (and (not (nd/obj-static? po))
+                                (or (= (primitive/cast i64 plan) 0) (not (.inline-only po)))))
                       (mark-used-name! (mut e) (nd/obj-name po))
                       0))
                 0)
@@ -3862,19 +4418,29 @@
                           0))
                     0))))
       0)
+    (tr/span-end (load phase))
+    (set! phase (tr/span-begin "c.emit.records"))
     (store! i 0)
     (loop (if (>= (load i) count)
               (break)
               (let [o (al/al-get [(ptr nd/Obj)] globals (load i))]
-                (if (and (nd/obj-definition? o) (used? (mut e) o))
+                ;; Defined data is emitted below even when no translated
+                ;; function reads it (its initializer may still have observable
+                ;; startup effects), so its record type must be declared too.
+                (if (and (nd/obj-definition? o)
+                         (or (used? (mut e) o) (not (nd/obj-function? o))))
                     (do
                       (collect-type-records! (mut e) (nd/obj-type o))
                       (collect-records! (mut e) (nd/obj-body o)))
                     0)
                 (store! i (+ (load i) 1)))))
     (collect-records! (mut e) init)
+    (tr/span-end (load phase))
+    (set! phase (tr/span-begin "c.emit.fold-statics"))
     ;; Everything a static initialiser can say now, said now.
     (store! start-up (fold-statics! (mut e) globals init))
+    (tr/span-end (load phase))
+    (set! phase (tr/span-begin "c.emit.declarations"))
 
     ;; A source-reader result may omit the module form so Coil's loader can
     ;; insert the namespace selected by normal import resolution.
@@ -3885,17 +4451,18 @@
           (put! (mut e) ")\n"))
         0)
     (put! (mut e) "(import \"coil.primitive\" :use *)\n")
-    (put! (mut e) "(import \"coil.alloc\" :as alloc)\n")
     (put! (mut e) "(import \"coil.control\" :as control)\n")
     (put! (mut e) "(import \"coil.slice\" :use *)\n")
-    (if executable 0 (emit-library-exports! (mut e) globals public-names))
-    (emit-record-decls! (mut e))
+    (if (= (primitive/cast i64 plan) 0)
+        (do (if executable 0 (emit-library-exports! (mut e) globals public-names))
+            (emit-record-decls! (mut e)))
+        (emit-partition-boundary! (mut e) globals module-name interface))
     (put! (mut e) ";; Allocation type evidence retained for opt-in metaprograms.\n")
     (put! (mut e)
           "(defn c-type-hint [(name (slice u8)) (size i64) (align i64) (value (ptr i8))] (-> (ptr i8)) value)\n\n")
     ;; `destructor` functions are registered here rather than called from the
     ;; end of `main`, so that they still run when the program calls `exit`.
-    (put! (mut e) "(extern atexit :cc c [(fnptr c [] i64)] (-> i32))\n")
+    (put! (mut e) "(extern atexit :cc c [(fnptr c [] void)] (-> i32))\n")
     ;; Declarations first, so a call can precede the definition it names.
     (store! i 0)
     (loop (if (>= (load i) count)
@@ -3926,6 +4493,7 @@
                               (emit-extern-global! (mut e) o)))
                       :else 0)
                 (store! i (+ (load i) 1)))))
+    (tr/span-end (load phase))
     (store! i 0)
     (loop (if (>= (load i) count)
               (break)
@@ -3937,12 +4505,15 @@
                 (store! i (+ (load i) 1)))))
     ;; Everything with static storage is initialised once, in source order,
     ;; before the program's own `main` runs.
-    (put! (mut e)
-          (if executable
-              "(defn c-init-statics [] (-> i64) (do "
-              "(defn initialize-c-library [] (-> i64) (do "))
+    (if (= (primitive/cast i64 plan) 0)
+        (put! (mut e) (if executable
+                         "(defn c-init-statics [] (-> i64) (do "
+                         "(defn initialize-c-library [] (-> i64) (do "))
+        (do (put! (mut e) "(defn ")
+            (put! (mut e) (part/initializer-name (mut plan) unit))
+            (put! (mut e) " [] (-> i64) (do ")))
     (emit-stmt! (mut e) (load start-up))
-    (emit-at-start! (mut e) globals)
+    (if (= (primitive/cast i64 plan) 0) (emit-at-start! (mut e) globals) 0)
     (put! (mut e) " 0))\n")
     ;; Coil's entry point calls the program's, with the arguments it asked for.
     (if executable (emit-entry! (mut e) globals) 0)

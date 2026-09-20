@@ -7,6 +7,8 @@
 ;; carries a file, line, and column, which is what makes real diagnostics
 ;; possible.
 (module experiments.c.lex)
+(import "coil.compiler.trace" :as tr)
+(import "experiments.c.profile" :as prof)
 
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
@@ -34,6 +36,50 @@
         token-preceded-by-space?
         keyword?
         lex-failed?)
+
+(export ByteEscape decode-byte-escape)
+
+;; Shared by ordinary literals and preprocessor character constants. `next` is
+;; the first unconsumed source byte; numeric escapes must not consume a quote or
+;; a following non-digit. The token itself keeps its spelling for stringification.
+(defstruct ByteEscape [(value i64) (next i64) (message (slice u8))])
+
+(defn escape-digit [(c i64)] (-> i64)
+  (cond (and (>= c 48) (<= c 57)) (- c 48)
+        (and (>= c 97) (<= c 102)) (+ 10 (- c 97))
+        (and (>= c 65) (<= c 70)) (+ 10 (- c 65))
+        :else -1))
+
+;; `start` names the byte after the backslash. This frontend's ordinary string
+;; representation is bytes, so an out-of-range numeric escape is a diagnostic,
+;; not a wrapping integer operation. Leading zeroes do not limit hex length.
+(defn decode-byte-escape [(text (slice u8)) (start i64)] (-> ByteEscape)
+  (let [n (slice-len text)
+        k (if (< start n) (primitive/cast i64 (slice-get text start)) 0)
+        octal (and (>= k 48) (<= k 55))]
+    (if (or octal (= k 120))
+        (let [(mut i) (+ start (if octal 0 1))
+              (mut count) 0
+              (mut value) 0
+              (mut overflow) false
+              base (if octal 8 16)]
+          (loop
+            (if (or (>= (load i) n) (and octal (>= (load count) 3))) (break) 0)
+            (let [d (escape-digit (primitive/cast i64 (slice-get text (load i))))]
+              (if (or (< d 0) (>= d base)) (break) 0)
+              (if (not (load overflow))
+                  (do (store! value (+ (* (load value) base) d))
+                      (if (> (load value) 255) (store! overflow true) 0)) 0)
+              (store! count (+ (load count) 1))
+              (store! i (+ (load i) 1))))
+          (ByteEscape :value (load value) :next (load i)
+            :message (cond (= (load count) 0) "hexadecimal escape requires a digit"
+                           (load overflow) "numeric escape is outside the byte range"
+                           :else "")))
+        (ByteEscape :next (+ start 1) :message ""
+          :value (cond (= k 110) 10 (= k 116) 9 (= k 114) 13
+                       (= k 97) 7 (= k 98) 8 (= k 102) 12
+                       (= k 118) 11 (= k 101) 27 :else k)))))
 
 (const TK-EOF 0)
 (const TK-IDENT 1)
@@ -392,7 +438,8 @@
 (defn lex [(a (dyn alloc/Allocator))
            (file (slice u8))
            (src (slice u8))] (-> LexResult)
-  (let [(mut x) (load (Lexer :a a
+  (let [before (prof/retained-now)
+        (mut x) (load (Lexer :a a
                   :src src
                   :file file
                   :pos 0
@@ -411,6 +458,10 @@
                 (break)
                 (lex-one! (mut x)))))
     (push! (mut x) TK-EOF (.pos x) (.line x) (.column x))
+    (tr/profile-event "c.lex.bytes" file (slice-len src))
+    (tr/profile-event "c.lex.tokens" file (al/al-len [Token] (.tokens x)))
+    (tr/profile-event "c.lex.retained-bytes" file (- (prof/retained-now) before))
+    (tr/profile-event "c.lex.capacity-bytes" file (* (.cap (field x tokens)) (primitive/sizeof Token)))
     (LexResult :tokens (.tokens x)
       :failed (.failed x)
       :message (.message x)

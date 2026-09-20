@@ -18,6 +18,8 @@
 ;; Clang is not involved at any point. The result is ordinary Coil, which
 ;; `coil build` turns into an executable.
 (module experiments.c.cc)
+(import "coil.compiler.trace" :as tr)
+(import "experiments.c.profile" :as prof)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :as al)
@@ -27,13 +29,18 @@
 (import "coil.io" :as io)
 (import "coil.os" :as os)
 (import "coil.result" :use *)
+(import "coil.scratch" :as scratch)
+(import "coil.meta" :as meta)
 (import "experiments.c.lex" :as lex)
 (import "experiments.c.node" :as nd)
+(import "experiments.c.ctype" :as ct)
 (import "experiments.c.pp" :as pp)
 (import "experiments.c.parse" :as ps)
 (import "experiments.c.emit" :as em)
+(import "experiments.c.partition" :as part)
 
-(export Options setup-pp! compile-unit! lower-text lower-text-with-header-defines run-cli)
+(export Options setup-pp! compile-unit! lower-text lower-text-with-header-defines
+        lower-partitioned-with-header-defines run-cli)
 
 (defstruct Options
   [(inputs (al/ArrayList (slice u8)))
@@ -132,17 +139,31 @@
                      (path (slice u8))
                      (globals (mut (al/ArrayList (ptr nd/Obj))))
                      (init (ptr nd/Node))] (-> i64)
+  (compile-unit-tag! a opts defines path (unit-tag path) (mut globals) init))
+
+(defn compile-unit-tag! [(a (dyn alloc/Allocator)) (opts Options)
+                         (defines (al/ArrayList (slice u8))) (path (slice u8))
+                         (tag (slice u8)) (globals (mut (al/ArrayList (ptr nd/Obj))))
+                         (init (ptr nd/Node))] (-> i64)
   (match (fs/read-file a path)
     (Err [_] (do (println "cannot read {s}" path) 1))
     (Ok [source]
-        (let [(mut p) (pp/pp-new a)]
-          (if (!= (setup-pp-with-defines! (mut p) a opts defines) 0)
+        (let [(mut p) (pp/pp-new a)
+              setup-span (tr/span-begin "c.prefix")
+              setup-result (setup-pp-with-defines! (mut p) a opts defines)
+              _setup-end (tr/span-end setup-span)]
+          (if (!= setup-result 0)
               1
-              (let [pre (pp/preprocess (mut p) path source)]
+              (let [pp-span (tr/span-begin "c.preprocess")
+                    pre (pp/preprocess (mut p) path source)
+                    _pp-end (tr/span-end pp-span)
+                    _token-count (tr/count "c.preprocessed-tokens" (al/al-len [lex/Token] (.tokens pre)))]
                 (if (!= (.failed pre) 0)
                     (do (report "preprocessor" (.message pre) (.file pre) (.line pre)) 1)
-                    (let [(mut parser) (ps/parser-new a (.tokens pre) (unit-tag path))
-                          parsed (ps/parse (mut parser))]
+                    (let [parse-span (tr/span-begin "c.parse")
+                          (mut parser) (ps/parser-new a (.tokens pre) tag)
+                          parsed (ps/parse (mut parser))
+                          _parse-end (tr/span-end parse-span)]
                       (if (!= (.failed parsed) 0)
                           (do (report "error" (.message parsed) (.file parsed) (.line parsed)) 1)
                           (let [own (.globals parsed)
@@ -248,6 +269,117 @@
 
 (defn lower-text [(a (dyn alloc/Allocator)) (opts Options)] (-> (slice u8))
   (lower-text-with-header-defines a opts (.defines opts) false))
+
+;; Only this opt-in path partitions a C program. Pass one retains copied linkage
+;; names and scalar ownership metadata; pass two submits each source immediately.
+;; Every token, C type, AST node and generated body lives in one resettable arena.
+(defn lower-partitioned-with-header-defines [(a (dyn alloc/Allocator)) (opts Options)
+                                            (header-defines (al/ArrayList (slice u8)))
+                                            (has-header-defines bool)] (-> (slice u8))
+  (let [(mut plan) (part/plan-new a (.public-header opts))
+        inputs (.inputs opts) n (al/al-len [(slice u8)] inputs)
+        arena (primitive/alloc-stack scratch/ScratchArena)
+        ignored (scratch/scratch-init-with-cap arena (alloc/malloc-allocator) 65536)
+        sa (scratch/scratch-allocator arena)
+        stats (primitive/alloc-stack prof/Stats)
+        (mut facade) (str/sb-new a)]
+    (tr/count "c.sizeof.Node" (primitive/sizeof nd/Node))
+    (tr/count "c.sizeof.Type" (primitive/sizeof ct/Type))
+    (tr/count "c.sizeof.Obj" (primitive/sizeof nd/Obj))
+    (tr/count "c.sizeof.Token" (primitive/sizeof lex/Token))
+    (for [i 0 n]
+      (al/al-push! [(slice u8)] (mut (.units (mut plan))) (part/unit-name (mut plan) i)) 0)
+    (for [i 0 n]
+      (prof/open! stats (al/al-get [(slice u8)] inputs i) "ownership" arena)
+      (let [(mut globals) (al/al-new [(ptr nd/Obj)] sa)
+            init (nd/node-new sa nd/ND-BLOCK (lex/token-none))]
+        (when (!= (compile-unit-tag! sa opts (.defines opts)
+                    (al/al-get [(slice u8)] inputs i)
+                    (al/al-get [(slice u8)] (.units plan) i) (mut globals) init) 0)
+          (scratch/scratch-close! arena)
+          (primitive/error "C partition ownership pass failed") 0)
+        (let [span (tr/span-begin "c.ownership")]
+          (part/record-unit! (mut plan) i (load (mut globals)))
+          (em/record-partition-types! sa (load (mut globals)) (mut plan) i)
+          (tr/span-end span)))
+      (prof/close! stats)
+      (scratch/scratch-reset! arena) 0)
+    (let [(mut body) (str/sb-new sa)]
+      (str/sb-push-str! (mut body) "(module ")
+      (str/sb-push-str! (mut body) (part/type-module-name (mut plan)))
+      (str/sb-push-str! (mut body) ")\n")
+      (meta/generated-unit! (part/type-module-name (mut plan))
+        (em/emit-type-interface sa (mut plan)) (str/sb-str (load (mut body)))))
+    (scratch/scratch-reset! arena)
+    (for [i 0 n]
+      (prof/open! stats (al/al-get [(slice u8)] inputs i) "implementation" arena)
+      (let [(mut globals) (al/al-new [(ptr nd/Obj)] sa)
+            init (nd/node-new sa nd/ND-BLOCK (lex/token-none))
+            (mut interface) (str/sb-new sa)]
+        (when (!= (compile-unit-tag! sa opts (.defines opts)
+                    (al/al-get [(slice u8)] inputs i)
+                    (al/al-get [(slice u8)] (.units plan) i) (mut globals) init) 0)
+          (scratch/scratch-close! arena)
+          (primitive/error "C partition implementation pass failed") 0)
+        (let [emit-span (tr/span-begin "c.emit-coil")
+              emitted (em/emit-partition sa (load (mut globals)) init (mut plan) i (mut interface))
+              _emit-end (tr/span-end emit-span)]
+          (when (!= (.failed emitted) 0)
+            (report "error" (.message emitted) (.file emitted) (.line emitted))
+            (scratch/scratch-close! arena)
+            (primitive/error "C partition lowering failed") 0)
+          (tr/count "c.interface-bytes" (slice-len (str/sb-str (load (mut interface)))))
+          (tr/count "c.body-bytes" (slice-len (.text emitted)))
+          (let [registration-span (tr/span-begin "c.register-interface")]
+            (meta/generated-unit! (al/al-get [(slice u8)] (.units plan) i)
+                                  (str/sb-str (load (mut interface))) (.text emitted))
+            (tr/span-end registration-span))))
+      (prof/close! stats)
+      (scratch/scratch-reset! arena) 0)
+    (str/sb-push-str! (mut facade) "(import \"coil.primitive\" :use *)\n")
+    (for [i 0 n]
+      (str/sb-push-str! (mut facade) "(import \"")
+      (str/sb-push-str! (mut facade) (al/al-get [(slice u8)] (.units plan) i))
+      (str/sb-push-str! (mut facade) "\" :as u") (str/sb-push-i64! (mut facade) i)
+      (str/sb-push-str! (mut facade) ")\n") 0)
+    (let [(mut declarations) (al/al-new [(ptr nd/Obj)] sa)
+          init (nd/node-new sa nd/ND-BLOCK (lex/token-none))]
+      (when (!= (compile-unit! sa opts
+                  (if has-header-defines header-defines (.defines opts))
+                  (.public-header opts) (mut declarations) init) 0)
+        (scratch/scratch-close! arena)
+        (primitive/error "C partition public header compilation failed") 0)
+      (for [i 0 (al/al-len [(ptr nd/Obj)] (load (mut declarations)))]
+        (let [o (al/al-get [(ptr nd/Obj)] (load (mut declarations)) i)
+              owner (part/function-owner (mut plan) (nd/obj-name o))]
+          (when (and (not (nd/obj-static? o)) (not (nd/obj-string? o)))
+            (when (!= (ct/ty-kind (nd/obj-type o)) ct/TY-FUNC)
+              (println "C partition public data: {s}" (nd/obj-name o))
+              (primitive/error "C partition public data requires an explicit accessor function") 0)
+            (when (< owner 0)
+              (primitive/error "C partition public function has no implementation owner") 0)
+            (str/sb-push-str! (mut facade) (em/emit-public-wrapper sa o owner)) 0)) 0))
+    (scratch/scratch-close! arena)
+    (str/sb-push-str! (mut facade) "(export initialize-c-library)\n(extern atexit :cc c [(fnptr c [] void)] (-> i32))\n(defn initialize-c-library [] (-> i64) (do")
+    (for [i 0 n]
+      (str/sb-push-str! (mut facade) " (u") (str/sb-push-i64! (mut facade) i)
+      (str/sb-push-str! (mut facade) "/")
+      (str/sb-push-str! (mut facade) (part/initializer-name (mut plan) i))
+      (str/sb-push-str! (mut facade) ")") 0)
+    ;; All static initialization precedes any constructor. Destructors register
+    ;; in priority order, matching the existing frontend's reverse atexit order.
+    (for [kind nd/AT-CONSTRUCTOR (+ nd/AT-DESTRUCTOR 1)]
+      (let [wanted (if (= kind nd/AT-CONSTRUCTOR) nd/AT-DESTRUCTOR nd/AT-CONSTRUCTOR)]
+        (for [i 0 (al/al-len [part/Startup] (.starts plan))]
+          (let [entry (al/al-elem [part/Startup] (field (mut plan) starts) i)]
+            (when (= (.kind entry) wanted)
+              (str/sb-push-str! (mut facade) (if (= wanted nd/AT-DESTRUCTOR) " (atexit (fnptr-of u" " (u"))
+              (str/sb-push-i64! (mut facade) (.unit entry))
+              (str/sb-push-str! (mut facade) "/")
+              (str/sb-push-str! (mut facade) (em/partition-function-name a (.name entry)))
+              (str/sb-push-str! (mut facade) (if (= wanted nd/AT-DESTRUCTOR) "))" ")")) 0)) 0)) 0)
+    (str/sb-push-str! (mut facade) " 0))\n")
+    (str/sb-str (load (mut facade)))))
 
 ;;; True when `arg` begins with the one-letter flag `letter`, which is how the C
 ;;; compiler flags that take an attached value are spelled.
