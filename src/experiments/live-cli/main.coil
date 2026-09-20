@@ -1,0 +1,788 @@
+(module experiments.coil-live.main)
+
+;;; coil-live: ask a program that runs a file live (experiments.live) what it
+;;; did with the file, from a shell or from an agent.
+;;;
+;;;     coil-live status [--json] [--dir DIR]
+;;;     coil-live check  [--json] [--dir DIR]
+;;;     coil-live apply  [--json] [--deferred] [--dir DIR]
+;;;     coil-live mcp    [--dir DIR]
+;;;
+;;; `status` reports what the running program did with the file's latest saved
+;;; version. `check` checks the file as it is on disk now without changing the
+;;; program. `apply` applies it now, as a save would. `mcp` serves the same three
+;;; as tools over stdio (the Model Context Protocol). DIR is the program's project
+;;; root, where its `.nrepl-port` is; it defaults to the working directory.
+;;;
+;;; Exit status: 0 when the program runs the file as it is (for `check`: would),
+;;; 1 when it does not, 2 when no program answers or the request fails.
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.fs" :as fs)
+(import "coil.io" :as io)
+(import "coil.json" :as json)
+(import "coil.result" :use *)
+(import "coil.scratch" :as scratch)
+(import "coil.slice" :use [slice-len slice-get slice-data subslice slice-new])
+(import "coil.socket" :as socket)
+(import "coil.str" :as str)
+(import "coil.os" :as os)
+(import "coil.time" :as time)
+(import "coil.selectors" :as selectors)
+
+(const EXIT-GOOD 0)
+
+(const EXIT-NOT-LIVE 1)
+
+(const EXIT-UNREACHABLE 2)
+
+(const MAX-REPLY 4194304)
+
+(extern realpath :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+(extern free :cc c [(ptr i8)] (-> void))
+
+(defn timeout-cell [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defn request-timeout [] (-> i64)
+  (let [n (load (timeout-cell))] (if (> n 0) n 30000)))
+
+; ---- text ------------------------------------------------------------------------
+(defn out! [(s (slice u8))] (-> i64)
+  (match (io/print-str (io/stdout) s) (_ 0)))
+
+(defn err! [(s (slice u8))] (-> i64)
+  (match (io/print-str (io/stderr) s) (_ 0)))
+
+(defn cat [(a (dyn alloc/Allocator)) (x (slice u8)) (y (slice u8))] (-> (slice u8))
+  (let [(mut sb) (str/sb-new a)]
+    (str/sb-push-str! (mut sb) x)
+    (str/sb-push-str! (mut sb) y)
+    (str/sb-finish! (mut sb))))
+
+(defn push-decimal! [(sb (mut str/StrBuf)) (n i64)] (-> i64)
+  (when (>= n 10) (push-decimal! (mut sb) (/ n 10)) 0)
+  (str/sb-push-byte! (mut sb) (primitive/cast u8 (+ 48 (% n 10))))
+  0)
+
+; The index of byte C in S at or after FROM, or -1.
+(defn find-byte [(s (slice u8)) (c i64) (from i64)] (-> i64)
+  (let [(mut found) -1]
+    (for [i from (slice-len s)]
+      (when (and (< (load found) 0) (= (primitive/cast i64 (slice-get s i)) c))
+        (set! found i)
+        0)
+      0)
+    (load found)))
+
+; S as a non-negative decimal, or -1 when it is empty or holds anything else.
+(defn parse-decimal [(s (slice u8))] (-> i64)
+  (let [(mut n) 0
+        (mut bad) (= (slice-len s) 0)]
+    (for [i 0 (slice-len s)]
+      (let [c (primitive/cast i64 (slice-get s i))]
+        (if (and (and (>= c 48) (<= c 57))
+                 (<= (load n) (/ (- 9223372036854775807 (- c 48)) 10)))
+            (do (set! n (+ (* (load n) 10) (- c 48))) 0)
+            (do (set! bad true) 0))))
+    (if (load bad) -1 (load n))))
+
+(defn trim [(s (slice u8))] (-> (slice u8))
+  (let [(mut lo) 0
+        (mut hi) (slice-len s)]
+    (loop (when (or (>= (load lo) (load hi))
+                    (> (primitive/cast i64 (slice-get s (load lo))) 32))
+            (break))
+      (set! lo (+ (load lo) 1))
+      0)
+    (loop (when (or (<= (load hi) (load lo))
+                    (> (primitive/cast i64 (slice-get s (- (load hi) 1))) 32))
+            (break))
+      (set! hi (- (load hi) 1))
+      0)
+    (subslice s (load lo) (load hi))))
+
+; ---- scratch regions --------------------------------------------------------------
+; Everything one MCP message produces lives in one arena, freed after the reply.
+(defstruct Region [(arena (ptr scratch/ScratchArena))])
+
+(defn region-new [] (-> Region)
+  (let [arena
+          (alloc/unwrap-ptr [scratch/ScratchArena]
+                            (alloc/create [scratch/ScratchArena]
+                                          (alloc/malloc-allocator)))]
+    (scratch/scratch-init-with-cap arena (alloc/malloc-allocator) 65536)
+    (Region :arena arena)))
+
+(defn region-allocator [(r Region)] (-> (dyn alloc/Allocator))
+  (scratch/scratch-allocator (.arena r)))
+
+(defn region-free! [(r Region)] (-> i64)
+  (scratch/scratch-close! (.arena r))
+  (alloc/destroy [scratch/ScratchArena] (alloc/malloc-allocator) (.arena r))
+  0)
+
+; ---- bencode ------------------------------------------------------------------
+(defn push-bstring! [(sb (mut str/StrBuf)) (s (slice u8))] (-> i64)
+  (push-decimal! (mut sb) (slice-len s))
+  (str/sb-push-byte! (mut sb) (primitive/cast u8 58))
+  (str/sb-push-str! (mut sb) s)
+  0)
+
+(defn encode-request [(a (dyn alloc/Allocator))
+                      (op (slice u8))
+                      (policy (slice u8))
+                      (format (slice u8))
+                      (project (slice u8))] (-> (slice u8))
+  (let [(mut sb) (str/sb-new a)]
+    (str/sb-push-str! (mut sb) "d")
+    (push-bstring! (mut sb) "id")
+    (push-bstring! (mut sb) "1")
+    (push-bstring! (mut sb) "op")
+    (push-bstring! (mut sb) op)
+    (push-bstring! (mut sb) "policy")
+    (push-bstring! (mut sb) policy)
+    (push-bstring! (mut sb) "format")
+    (push-bstring! (mut sb) format)
+    (push-bstring! (mut sb) "project")
+    (push-bstring! (mut sb) project)
+    (str/sb-push-str! (mut sb) "e")
+    (str/sb-finish! (mut sb))))
+
+; The end of the bencode value at I in B: -1 when B ends before it does, -2 when
+; it is malformed.
+(defn bvalue-end [(b (slice u8)) (i i64)] (-> i64)
+  (bvalue-end-depth b i 0))
+
+(defn bvalue-end-depth [(b (slice u8)) (i i64) (depth i64)] (-> i64)
+  (if (or (< i 0) (> depth 64))
+      -2
+      (if (>= i (slice-len b))
+          -1
+          (let [c (primitive/cast i64 (slice-get b i))]
+            (cond (= c 105)
+                    (let [e (find-byte b 101 (+ i 1))] (if (< e 0) -1 (+ e 1)))
+                  (or (= c 108) (= c 100))
+                    (let [(mut j) (+ i 1)
+                          (mut result) -1]
+                      (loop (cond (>= (load j) (slice-len b))
+                                    (do (set! result -1) (break))
+                                  (= (primitive/cast i64 (slice-get b (load j)))
+                                     101)
+                                    (do (set! result (+ (load j) 1)) (break))
+                                  :else
+                                    (let [k
+                                            (bvalue-end-depth b
+                                                              (load j)
+                                                              (+ depth 1))]
+                                      (if (< k 0)
+                                          (do (set! result k) (break))
+                                          (do (set! j k) 0))))
+                        0)
+                      (load result))
+                  (and (>= c 48) (<= c 57))
+                    (let [colon (find-byte b 58 i)]
+                      (if (< colon 0)
+                          -1
+                          (let [n (parse-decimal (subslice b i colon))
+                                end (+ (+ colon 1) n)]
+                            (cond (or (< n 0) (> n MAX-REPLY)) -2
+                                  (> end (slice-len b)) -1
+                                  :else end))))
+                  :else -2)))))
+
+; The bencode string at I in B (complete: B was checked with bvalue-end).
+(defn bstring-at [(b (slice u8)) (i i64)] (-> (slice u8))
+  (let [colon (find-byte b 58 i)
+        n (parse-decimal (subslice b i colon))]
+    (subslice b (+ colon 1) (+ (+ colon 1) n))))
+
+(defn bstring? [(b (slice u8)) (i i64)] (-> bool)
+  (and (and (>= i 0) (< i (slice-len b)))
+       (let [c (primitive/cast i64 (slice-get b i))]
+         (and (>= c 48) (<= c 57)))))
+
+; ---- asking the program -----------------------------------------------------------
+(defstruct Reply
+  [(reached bool)  ; the program answered
+   (not-live bool)  ; ... and does not run the file as it is
+   (text (slice u8))])  ; its report, or why there was none
+
+(defn unreachable [(text (slice u8))] (-> Reply)
+  (Reply
+    :reached false
+    :not-live false
+    :text text))
+
+(defn write-all! [(connection (ptr socket/TcpConnection)) (bytes (slice u8))] (-> bool)
+  (let [(mut at) 0
+        (mut ok) true]
+    (loop (when (or (not (load ok)) (>= (load at) (slice-len bytes))) (break))
+      (match (socket/tcp-write connection
+                               (primitive/cast (ptr i8)
+                                               (primitive/index (slice-data bytes)
+                                                                (load at)))
+                               (- (slice-len bytes) (load at)))
+        (Err [_] (do (set! ok false) 0))
+        (Ok [n] (do (if (<= n 0) (set! ok false) (set! at (+ (load at) n))) 0)))
+      0)
+    (load ok)))
+
+; Read one complete bencode reply; "" when the connection ends first or the
+; reply is malformed.
+(defn read-reply [(a (dyn alloc/Allocator))
+                  (connection (ptr socket/TcpConnection))
+                  (deadline time/Instant)] (-> (slice u8))
+  (let [buffer (primitive/alloc-stack (array u8 4096))
+        (mut collected) (str/sb-new a)
+        (mut got) ""
+        (mut result) ""
+        (mut done) false]
+    (loop (when (load done) (break))
+      (match (selectors/wait-fd-until (.fd connection)
+                                      (selectors/interest-readable)
+                                      deadline)
+        (Err [_] (break))
+        (Ok [_] 0))
+      (match (socket/tcp-read connection (primitive/cast (ptr i8) buffer) 4096)
+        (Err [_] (do (set! done true) 0))
+        (Ok [n]
+            (if (<= n 0)
+                (do (set! done true) 0)
+                (do
+                  (when (> (+ (slice-len (load got)) n) MAX-REPLY) (break))
+                  (str/sb-push-str! (mut collected)
+                                    (slice-new (primitive/cast (ptr u8) buffer)
+                                               n))
+                  (set! got (str/sb-str (load collected)))
+                  (let [end (bvalue-end (load got) 0)]
+                    (cond (>= end 0)
+                            (do
+                              (set! result (subslice (load got) 0 end))
+                              (set! done true)
+                              0)
+                          (= end -2) (do (set! done true) 0)
+                          :else 0))))))
+      0)
+    (load result)))
+
+; Send OP to the program whose project root is DIR.
+(defn project-dir [(a (dyn alloc/Allocator)) (dir (slice u8))] (-> (slice u8))
+  (let [absolute
+          (if (and (> (slice-len dir) 0)
+                   (= (slice-get dir 0) (primitive/cast u8 47)))
+              dir
+              (match (os/current-dir a)
+                (Ok [cwd] (cat a (cat a (os/owned-string-slice cwd) "/") dir))
+                (Err [_] dir)))
+        (mut here) absolute]
+    (block :found
+           (loop (match (fs/read-file a (cat a (load here) "/Coil.toml"))
+                   (Ok [_] (return-from :found (canonical-dir a (load here))))
+                   (Err [_] 0))
+             (let [(mut slash) -1]
+               (for [i 0 (slice-len (load here))]
+                 (when (= (slice-get (load here) i) (primitive/cast u8 47))
+                   (set! slash i)
+                   0))
+               (when (<= (load slash) 0) (return-from :found absolute))
+               (set! here (subslice (load here) 0 (load slash)))))
+           absolute)))
+
+(defn canonical-dir [(a (dyn alloc/Allocator)) (dir (slice u8))] (-> (slice u8))
+  (let [resolved (realpath (str/str->cstr a dir) (primitive/cast (ptr i8) 0))]
+    (if (= (primitive/cast i64 resolved) 0)
+        dir
+        (let [copy (cat a "" (str/cstr->str resolved))]
+          (free resolved)
+          copy))))
+
+(defn ask [(a (dyn alloc/Allocator))
+           (dir (slice u8))
+           (op (slice u8))
+           (policy (slice u8))
+           (format (slice u8))] (-> Reply)
+  (let [project (project-dir a dir)
+        port-path (cat a project "/.nrepl-port")]
+    (match (fs/read-file a port-path)
+      (Err [_]
+           (unreachable (cat a
+                             (cat a
+                                  "no live program here: there is no "
+                                  port-path)
+                             ". Build and start the program (it must use experiments.live.enable in its Coil.toml)")))
+      (Ok [text]
+          (let [port (parse-decimal (trim text))
+                connection (primitive/alloc-stack socket/TcpConnection)]
+            (if (or (<= port 0) (> port 65535))
+                (unreachable (cat a port-path " does not hold a port number"))
+                (match (socket/tcp-connect a connection "127.0.0.1" port)
+                  (Err [_]
+                       (unreachable (cat a
+                                         (cat a
+                                              "no live program answers on the port in "
+                                              port-path)
+                                         "; it has probably stopped. Start it again")))
+                  (Ok [_]
+                      (let [sent
+                              (write-all! connection
+                                          (encode-request a
+                                                          op
+                                                          policy
+                                                          format
+                                                          project))
+                            reply
+                              (if sent
+                                  (match (time/duration-millis (request-timeout))
+                                    (Err [_] "")
+                                    (Ok [duration]
+                                        (match (time/deadline-after duration)
+                                          (Err [_] "")
+                                          (Ok [deadline]
+                                              (read-reply a connection deadline)))))
+                                  "")]
+                        (socket/tcp-connection-close! connection)
+                        (if (= (slice-len reply) 0)
+                            (unreachable "the live program did not return a complete reply before the deadline, closed the connection, or sent an invalid/oversized reply; check status before retrying an apply")
+                            (decode-reply reply)))))))))))
+
+(defn decode-reply [(b (slice u8))] (-> Reply)
+  (block :reply
+         (when (or (< (slice-len b) 2)
+                   (!= (slice-get b 0) (primitive/cast u8 100)))
+           (return-from :reply
+                          (unreachable "the live server reply is not a dictionary")))
+         (let [(mut i) 1
+               (mut text) ""
+               (mut failure) ""
+               (mut not-live) false]
+           (loop (when (or (>= (load i) (slice-len b))
+                           (= (primitive/cast i64 (slice-get b (load i))) 101))
+                   (break))
+             (unless (bstring? b (load i))
+               (return-from :reply
+                              (unreachable "the live server reply has a non-string key")))
+             (let [key (bstring-at b (load i))
+                   vstart (bvalue-end b (load i))
+                   vend (bvalue-end b vstart)]
+               (when (or (< vend 0) (>= vstart (- (slice-len b) 1)))
+                 (return-from :reply
+                                (unreachable "the live server reply has a missing value")))
+               (cond (and (= key "value") (bstring? b vstart))
+                       (do (set! text (bstring-at b vstart)) 0)
+                     (and (= key "err") (bstring? b vstart))
+                       (do (set! failure (bstring-at b vstart)) 0)
+                     (= key "status")
+                       (let [(mut j) (+ vstart 1)]
+                         (unless (= (slice-get b vstart)
+                                    (primitive/cast u8 108))
+                           (return-from :reply
+                                          (unreachable "the live server status is not a list")))
+                         (loop (when (>= (load j) (- vend 1)) (break))
+                           (unless (bstring? b (load j))
+                             (return-from :reply
+                                            (unreachable "the live server status contains a non-string")))
+                           (when (= (bstring-at b (load j)) "coil/not-live")
+                             (set! not-live true)
+                             0)
+                           (set! j (bvalue-end b (load j)))
+                           0)
+                         0)
+                     :else 0)
+               (set! i vend))
+             0)
+           (if (> (slice-len (load failure)) 0)
+               (unreachable (load failure))
+               (if (= (slice-len (load text)) 0)
+                   (unreachable "the live server reply has no verdict")
+                   (Reply
+                     :reached true
+                     :not-live (load not-live)
+                     :text (load text)))))))
+
+(defn reply-exit [(r Reply)] (-> i64)
+  (cond (not (.reached r)) EXIT-UNREACHABLE
+        (.not-live r) EXIT-NOT-LIVE
+        :else EXIT-GOOD))
+
+; ---- JSON text ------------------------------------------------------------------
+(defn hex-digit [(n i64)] (-> u8)
+  (primitive/cast u8 (if (< n 10) (+ n 48) (+ n 87))))
+
+(defn push-json-string! [(sb (mut str/StrBuf)) (s (slice u8))] (-> i64)
+  (str/sb-push-byte! (mut sb) (primitive/cast u8 34))
+  (for [i 0 (slice-len s)]
+    (let [c (primitive/cast i64 (slice-get s i))]
+      (cond (= c 34) (str/sb-push-str! (mut sb) "\\\"")
+            (= c 92) (str/sb-push-str! (mut sb) "\\\\")
+            (= c 10) (str/sb-push-str! (mut sb) "\\n")
+            (= c 13) (str/sb-push-str! (mut sb) "\\r")
+            (= c 9) (str/sb-push-str! (mut sb) "\\t")
+            (< c 32)
+              (do
+                (str/sb-push-str! (mut sb) "\\u00")
+                (str/sb-push-byte! (mut sb) (hex-digit (/ c 16)))
+                (str/sb-push-byte! (mut sb) (hex-digit (% c 16)))
+                0)
+            :else (str/sb-push-byte! (mut sb) (slice-get s i)))
+      0))
+  (str/sb-push-byte! (mut sb) (primitive/cast u8 34))
+  0)
+
+(defn hex-value [(c i64)] (-> i64)
+  (cond (and (>= c 48) (<= c 57)) (- c 48)
+        (and (>= c 97) (<= c 102)) (- c 87)
+        (and (>= c 65) (<= c 70)) (- c 55)
+        :else 0))
+
+(defn hex4 [(s (slice u8)) (i i64)] (-> i64)
+  (let [(mut v) 0]
+    (for [k 0 4]
+      (set! v
+            (+ (* (load v) 16)
+               (hex-value (primitive/cast i64 (slice-get s (+ i k))))))
+      0)
+    (load v)))
+
+(defn push-utf8! [(sb (mut str/StrBuf)) (cp i64)] (-> i64)
+  (cond (< cp 128) (str/sb-push-byte! (mut sb) (primitive/cast u8 cp))
+        (< cp 2048)
+          (do
+            (str/sb-push-byte! (mut sb) (primitive/cast u8 (+ 192 (/ cp 64))))
+            (str/sb-push-byte! (mut sb) (primitive/cast u8 (+ 128 (% cp 64))))
+            0)
+        (< cp 65536)
+          (do
+            (str/sb-push-byte! (mut sb) (primitive/cast u8 (+ 224 (/ cp 4096))))
+            (str/sb-push-byte! (mut sb)
+                               (primitive/cast u8 (+ 128 (% (/ cp 64) 64))))
+            (str/sb-push-byte! (mut sb) (primitive/cast u8 (+ 128 (% cp 64))))
+            0)
+        :else
+          (do
+            (str/sb-push-byte! (mut sb)
+                               (primitive/cast u8 (+ 240 (/ cp 262144))))
+            (str/sb-push-byte! (mut sb)
+                               (primitive/cast u8 (+ 128 (% (/ cp 4096) 64))))
+            (str/sb-push-byte! (mut sb)
+                               (primitive/cast u8 (+ 128 (% (/ cp 64) 64))))
+            (str/sb-push-byte! (mut sb) (primitive/cast u8 (+ 128 (% cp 64))))
+            0))
+  0)
+
+; A JSON string's encoded contents (as coil.json keeps them), decoded. The
+; parser has already validated every escape.
+(defn json-unescape [(a (dyn alloc/Allocator)) (raw (slice u8))] (-> (slice u8))
+  (let [n (slice-len raw)
+        (mut sb) (str/sb-new a)
+        (mut i) 0]
+    (loop (when (>= (load i) n) (break))
+      (let [c (primitive/cast i64 (slice-get raw (load i)))]
+        (if (and (= c 92) (< (+ (load i) 1) n))
+            (let [e (primitive/cast i64 (slice-get raw (+ (load i) 1)))]
+              (cond (= e 110)
+                      (do
+                        (str/sb-push-byte! (mut sb) (primitive/cast u8 10))
+                        (set! i (+ (load i) 2))
+                        0)
+                    (= e 116)
+                      (do
+                        (str/sb-push-byte! (mut sb) (primitive/cast u8 9))
+                        (set! i (+ (load i) 2))
+                        0)
+                    (= e 114)
+                      (do
+                        (str/sb-push-byte! (mut sb) (primitive/cast u8 13))
+                        (set! i (+ (load i) 2))
+                        0)
+                    (= e 98)
+                      (do
+                        (str/sb-push-byte! (mut sb) (primitive/cast u8 8))
+                        (set! i (+ (load i) 2))
+                        0)
+                    (= e 102)
+                      (do
+                        (str/sb-push-byte! (mut sb) (primitive/cast u8 12))
+                        (set! i (+ (load i) 2))
+                        0)
+                    (= e 117)
+                      (let [hi (hex4 raw (+ (load i) 2))
+                            pair
+                              (and (and (>= hi 55296) (<= hi 56319))
+                                   (and (<= (+ (load i) 12) n)
+                                        (and (= (primitive/cast i64
+                                                                (slice-get raw
+                                                                           (+ (load i)
+                                                                              6)))
+                                                92)
+                                             (= (primitive/cast i64
+                                                                (slice-get raw
+                                                                           (+ (load i)
+                                                                              7)))
+                                                117))))]
+                        (if pair
+                            (let [lo (hex4 raw (+ (load i) 8))]
+                              (push-utf8! (mut sb)
+                                          (+ 65536
+                                             (+ (* (- hi 55296) 1024)
+                                                (- lo 56320))))
+                              (set! i (+ (load i) 12))
+                              0)
+                            (do
+                              (push-utf8! (mut sb) hi)
+                              (set! i (+ (load i) 6))
+                              0)))
+                    :else
+                      (do
+                        (str/sb-push-byte! (mut sb) (primitive/cast u8 e))
+                        (set! i (+ (load i) 2))
+                        0)))
+            (do
+              (str/sb-push-byte! (mut sb) (slice-get raw (load i)))
+              (set! i (+ (load i) 1))
+              0)))
+      0)
+    (str/sb-finish! (mut sb))))
+
+; The string member KEY of the object at OBJECT in D, decoded; FALLBACK when it
+; is absent or not a string.
+(defn member-string [(a (dyn alloc/Allocator))
+                     (d json/Doc)
+                     (object i64)
+                     (key (slice u8))
+                     (fallback (slice u8))] (-> (slice u8))
+  (if (or (< object 0) (not (json/is-object? (json/token d object))))
+      fallback
+      (let [at (json/object-get d object key)]
+        (if (or (< at 0) (not (json/is-string? (json/token d at))))
+            fallback
+            (json-unescape a (json/string-text d (json/token d at)))))))
+
+; ---- the MCP server -------------------------------------------------------------
+(defn mcp-instructions [] (-> (slice u8))
+  "A Coil program is running its project source graph live. Edit its participating project files with your ordinary file tools. Every save is diffed against what the program runs, and exactly the changed definitions are applied as one transaction, or rejected with the program left running its previous version. After each save, call live_status: it says whether the program took the edit and, if not, why, at the definitions concerned (compiler errors, a struct change that needs a `(migrate Type field old EXPR)` form, or an edit that needs a restart). `coil check` in the project reports the same while the program runs.")
+
+(defn tool-json [(sb (mut str/StrBuf))
+                 (name (slice u8))
+                 (description (slice u8))
+                 (with-policy bool)] (-> i64)
+  (str/sb-push-str! (mut sb) "{\"name\":")
+  (push-json-string! (mut sb) name)
+  (str/sb-push-str! (mut sb) ",\"description\":")
+  (push-json-string! (mut sb) description)
+  (str/sb-push-str! (mut sb)
+                    ",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"dir\":{\"type\":\"string\",\"description\":\"The live program's project root, where its .nrepl-port is. Defaults to the directory the server was started for.\"}")
+  (when with-policy
+    (str/sb-push-str! (mut sb)
+                      ",\"policy\":{\"type\":\"string\",\"enum\":[\"strict\",\"deferred\"],\"description\":\"strict (the default): an edit that does not check changes nothing. deferred: publish what checks and mark the broken callers for repair.\"}")
+    0)
+  (str/sb-push-str! (mut sb) "}}}")
+  0)
+
+(defn tools-list [(a (dyn alloc/Allocator))] (-> (slice u8))
+  (let [(mut sb) (str/sb-new a)]
+    (str/sb-push-str! (mut sb) "{\"tools\":[")
+    (tool-json (mut sb)
+               "live_status"
+               "What the running program did with its project source graph's latest saved version: running it (live); rejected it, with the compiler's errors at the definitions concerned, the program still running its previous version; needs a migration for a changed struct, with the migrate form to add; or needs a restart. Lists the participating files and their versions; imported module changes are included in the same transaction. Call it after each save."
+               false)
+    (str/sb-push-str! (mut sb) ",")
+    (tool-json (mut sb)
+               "live_check"
+               "Check the live source file as it is on disk now against the running program, changing nothing: a dry run of what saving it does."
+               false)
+    (str/sb-push-str! (mut sb) ",")
+    (tool-json (mut sb)
+               "live_apply"
+               "Apply the live source file as it is on disk now, as a save would. Saves already apply by themselves; use this when the program has not picked up an edit, or with policy deferred."
+               true)
+    (str/sb-push-str! (mut sb) "]}")
+    (str/sb-finish! (mut sb))))
+
+(defn tool-result [(a (dyn alloc/Allocator)) (r Reply)] (-> (slice u8))
+  (let [(mut sb) (str/sb-new a)]
+    (str/sb-push-str! (mut sb) "{\"content\":[{\"type\":\"text\",\"text\":")
+    (push-json-string! (mut sb) (.text r))
+    (str/sb-push-str! (mut sb) "}],\"isError\":")
+    (str/sb-push-str! (mut sb) (if (.reached r) "false" "true"))
+    (str/sb-push-str! (mut sb) "}")
+    (str/sb-finish! (mut sb))))
+
+(defn respond! [(a (dyn alloc/Allocator)) (id (slice u8)) (result (slice u8))] (-> i64)
+  (out! (cat a
+             (cat a
+                  (cat a
+                       (cat a "{\"jsonrpc\":\"2.0\",\"id\":" id)
+                       ",\"result\":")
+                  result)
+             "}\n")))
+
+(defn respond-error! [(a (dyn alloc/Allocator))
+                      (id (slice u8))
+                      (code (slice u8))
+                      (message (slice u8))] (-> i64)
+  (let [(mut sb) (str/sb-new a)]
+    (str/sb-push-str! (mut sb) "{\"jsonrpc\":\"2.0\",\"id\":")
+    (str/sb-push-str! (mut sb) id)
+    (str/sb-push-str! (mut sb) ",\"error\":{\"code\":")
+    (str/sb-push-str! (mut sb) code)
+    (str/sb-push-str! (mut sb) ",\"message\":")
+    (push-json-string! (mut sb) message)
+    (str/sb-push-str! (mut sb) "}}\n")
+    (out! (str/sb-finish! (mut sb)))))
+
+; A request's id as JSON text, to echo back; "" for a notification.
+(defn request-id [(a (dyn alloc/Allocator)) (d json/Doc)] (-> (slice u8))
+  (let [at (json/object-get d 0 "id")]
+    (if (< at 0)
+        ""
+        (let [t (json/token d at)]
+          (if (json/is-string? t)
+              (cat a (cat a "\"" (json/string-text d t)) "\"")
+              (json/span d t))))))
+
+(defn call-tool [(a (dyn alloc/Allocator))
+                 (d json/Doc)
+                 (params i64)
+                 (dir (slice u8))] (-> (slice u8))
+  (let [name (member-string a d params "name" "")
+        args (if (< params 0) -1 (json/object-get d params "arguments"))
+        where (member-string a d args "dir" dir)
+        policy (member-string a d args "policy" "strict")
+        op
+          (cond (= name "live_status") "coil/file-status"
+                (= name "live_check") "coil/file-check"
+                (= name "live_apply") "coil/file-apply"
+                :else "")]
+    (if (= (slice-len op) 0)
+        ""
+        (tool-result a (ask a where op policy "markdown")))))
+
+(defn mcp-message! [(a (dyn alloc/Allocator))
+                    (line (slice u8))
+                    (dir (slice u8))] (-> i64)
+  (match (json/parse a line)
+    (Err [_] (respond-error! a "null" "-32700" "parse error"))
+    (Ok [d]
+        (if (not (json/is-object? (json/root d)))
+            (respond-error! a "null" "-32600" "invalid request")
+            (let [id (request-id a d)
+                  method (member-string a d 0 "method" "")
+                  params (json/object-get d 0 "params")]
+              (cond (= (slice-len id) 0) 0  ; a notification: nothing to answer
+                    (= method "initialize")
+                      (let [(mut sb) (str/sb-new a)]
+                        (str/sb-push-str! (mut sb) "{\"protocolVersion\":")
+                        (push-json-string! (mut sb)
+                                           (member-string a
+                                                          d
+                                                          params
+                                                          "protocolVersion"
+                                                          "2025-06-18"))
+                        (str/sb-push-str! (mut sb)
+                                          ",\"capabilities\":{\"tools\":{\"listChanged\":false}},\"serverInfo\":{\"name\":\"coil-live\",\"version\":\"0.1.0\"},\"instructions\":")
+                        (push-json-string! (mut sb) (mcp-instructions))
+                        (str/sb-push-str! (mut sb) "}")
+                        (respond! a id (str/sb-finish! (mut sb))))
+                    (= method "ping") (respond! a id "{}")
+                    (= method "tools/list") (respond! a id (tools-list a))
+                    (= method "tools/call")
+                      (let [result (call-tool a d params dir)]
+                        (if (= (slice-len result) 0)
+                            (respond-error! a id "-32602" "unknown tool")
+                            (respond! a id result)))
+                    :else (respond-error! a id "-32601" "method not found")))))))
+
+(defn mcp-serve! [(dir (slice u8))] (-> i64)
+  (let [line-cell (primitive/alloc-stack io/OwnedBytes)
+        (mut running) true]
+    (loop (when (not (load running)) (break))
+      (match (io/read-line-alloc (alloc/malloc-allocator) (io/stdin) 67108864)
+        (Err [_] (do (set! running false) 0))
+        (Ok [line]
+            (let [region (region-new)]
+              (store! line-cell line)
+              (when (> (slice-len (trim (io/owned-bytes-slice line))) 0)
+                (mcp-message! (region-allocator region)
+                              (io/owned-bytes-slice line)
+                              dir)
+                0)
+              (io/owned-bytes-free (alloc/malloc-allocator) line-cell)
+              (region-free! region)
+              0)))
+      0)
+    EXIT-GOOD))
+
+; ---- main -----------------------------------------------------------------------
+(defn usage! [] (-> i64)
+  (err! "usage: coil-live status|check|apply [--json] [--deferred] [--dir DIR] [--timeout-ms N]\n       coil-live mcp [--dir DIR] [--timeout-ms N]\n")
+  EXIT-UNREACHABLE)
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        n (primitive/cast i64 argc)
+        (mut command) ""
+        (mut dir) "."
+        (mut json?) false
+        (mut policy) "strict"
+        (mut bad) false
+        (mut i) 1]
+    (loop (when (>= (load i) n) (break))
+      (let [arg (str/cstr->str (load (primitive/index argv (load i))))]
+        (cond (= arg "--json") (do (set! json? true) 0)
+              (= arg "--deferred") (do (set! policy "deferred") 0)
+              (= arg "--dir")
+                (if (>= (+ (load i) 1) n)
+                    (do (set! bad true) 0)
+                    (do
+                      (set! i (+ (load i) 1))
+                      (set! dir
+                            (str/cstr->str (load (primitive/index argv (load i)))))
+                      0))
+              (= arg "--timeout-ms")
+                (if (>= (+ (load i) 1) n)
+                    (do (set! bad true) 0)
+                    (do
+                      (set! i (+ (load i) 1))
+                      (let [ms
+                              (parse-decimal (str/cstr->str (load (primitive/index argv
+                                                                                   (load i)))))]
+                        (if (and (> ms 0) (<= ms 3600000))
+                            (store! (timeout-cell) ms)
+                            (set! bad true)))
+                      0))
+              (= (slice-len (load command)) 0) (do (set! command arg) 0)
+              :else (do (set! bad true) 0))
+        (set! i (+ (load i) 1)))
+      0)
+    (let [op
+            (cond (= (load command) "status") "coil/file-status"
+                  (= (load command) "check") "coil/file-check"
+                  (= (load command) "apply") "coil/file-apply"
+                  :else "")]
+      (cond (load bad) (usage!)
+            (= (load command) "mcp") (mcp-serve! (load dir))
+            (= (slice-len op) 0) (usage!)
+            :else
+              (let [r
+                      (ask a
+                           (load dir)
+                           op
+                           (load policy)
+                           (if (load json?) "json" "markdown"))
+                    text (.text r)]
+                (if (.reached r)
+                    (do
+                      (out! text)
+                      (when (or (= (slice-len text) 0)
+                                (!= (primitive/cast i64
+                                                    (slice-get text
+                                                               (- (slice-len text)
+                                                                  1)))
+                                    10))
+                        (out! "\n")
+                        0)
+                      0)
+                    (do (err! "coil-live: ") (err! text) (err! "\n") 0))
+                (reply-exit r))))))

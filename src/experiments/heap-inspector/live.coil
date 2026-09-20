@@ -192,6 +192,35 @@
 (defn live-roots [] (-> (ptr (array LiveRoot 512)))
   (primitive/alloc-static (array LiveRoot 512)))
 (defn live-root-count [] (-> (ptr i64)) (primitive/alloc-static i64))
+
+; A candidate may introduce persistent roots before another module fails.
+; Keep their storage and initialization flags in the publication transaction.
+(defstruct LiveNewRoot
+  [(id i64) (handle (ptr LiveHandle)) (slot (ptr (ptr i8)))
+   (initialized (ptr bool))])
+(defn live-new-roots [] (-> (ptr (array LiveNewRoot 512)))
+  (primitive/alloc-static (array LiveNewRoot 512)))
+(defn live-new-root-count [] (-> (ptr i64)) (primitive/alloc-static i64))
+
+(defn live-stage-new-root-c [(name (ptr u8)) (name-len i64) (raw (ptr i8))
+                            (slot (ptr (ptr i8))) (initialized (ptr bool))] (-> i64)
+  (let [handle (primitive/cast (ptr LiveHandle) raw)
+        n (load (live-new-root-count))
+        id (if (>= n 512) -20
+               (live-register-handle-root (slice-new name name-len) handle))]
+    (if (< id 0)
+        (do (live-handle-release! handle)
+            (free (load slot))
+            (store! slot (primitive/cast (ptr i8) 0))
+            (store! initialized false)
+            id)
+        (let [root (primitive/index (live-new-roots) n)]
+          (set! (.id root) id)
+          (set! (.handle root) handle)
+          (set! (.slot root) slot)
+          (set! (.initialized root) initialized)
+          (set! (live-new-root-count) (+ n 1))
+          id))))
 (defn live-handle-head [] (-> (ptr (ptr LiveHandle)))
   (primitive/alloc-static (ptr LiveHandle)))
 (defn live-handle-count [] (-> (ptr i64)) (primitive/alloc-static i64))
@@ -210,6 +239,28 @@
 (defn live-schema-destructors [] (-> (ptr (array LiveSchemaDestructor 4096)))
   (primitive/alloc-static (array LiveSchemaDestructor 4096)))
 (defn live-schema-destructor-count [] (-> (ptr i64)) (primitive/alloc-static i64))
+
+(defstruct LiveMetadataCheckpoint
+  [(active bool) (transitions i64) (references i64) (destructors i64)])
+(defn live-metadata-checkpoint [] (-> (ptr LiveMetadataCheckpoint))
+  (primitive/alloc-static LiveMetadataCheckpoint))
+(defn live-metadata-begin! [] (-> i64)
+  (let [s (live-metadata-checkpoint)]
+    (set! (.transitions s) (load (live-transition-count)))
+    (set! (.references s) (load (live-reference-field-count)))
+    (set! (.destructors s) (load (live-schema-destructor-count)))
+    (set! (.active s) true)
+    (inspector/registry-begin-candidate!)))
+(defn live-metadata-end! [(commit bool)] (-> i64)
+  (let [s (live-metadata-checkpoint)]
+    (when (.active s)
+      (unless commit
+        (set! (live-transition-count) (.transitions s))
+        (set! (live-reference-field-count) (.references s))
+        (set! (live-schema-destructor-count) (.destructors s)) 0)
+      (set! (.active s) false)
+      (inspector/registry-end-candidate! commit) 0)
+    0))
 (defn live-managed-objects [] (-> (ptr (array LiveManagedObject 4096)))
   (primitive/alloc-static (array LiveManagedObject 4096)))
 (defn live-managed-object-count [] (-> (ptr i64)) (primitive/alloc-static i64))
@@ -528,6 +579,20 @@
       (field (primitive/index (live-source-gates) i) broken) 0))
   (live-source-gate-unlock!))
 
+; An activation already holding a closed gate must be allowed to finish its
+; nested calls. Publication waits for that ancestor, so admitting the child
+; cannot cross a publication boundary. Without this rule, closing both caller
+; and callee deadlocks the caller against the publisher waiting for it.
+; Called with the source-gate lock held; the stack belongs to this thread.
+(defn live-thread-holds-closed-source? [(thread (ptr LiveThreadState))] (-> bool)
+  (let [(mut found) false]
+    (for [i 0 (.depth thread)]
+      (let [index (load (primitive/index (field thread gates) i))]
+        (when (!= (atomic/atomic-load
+                    (field (primitive/index (live-source-gates) index) closed)) 0)
+          (set! found true) 0)))
+    (load found)))
+
 (defn live-enter-source! [(identity i64)] (-> i64)
   (let [thread (live-thread-state) (mut entered) false (mut failure) 0]
     (if (= (primitive/cast i64 thread) 0) (set! failure -1)
@@ -542,6 +607,9 @@
                         (break))
                     (let [gate (primitive/index (live-source-gates) gate-index)]
                       (if (or (!= (.publishing thread) 0)
+                              (and (> (.depth thread) 0)
+                                   (or (!= (atomic/atomic-load (live-writer-cell)) 0)
+                                       (live-thread-holds-closed-source? thread)))
                               (and (= (atomic/atomic-load (live-writer-cell)) 0)
                                    (= (atomic/atomic-load (field gate closed)) 0)))
                           (do
@@ -639,11 +707,12 @@
                                             (field (primitive/index
                                               (live-source-gates) i) active)) 0))
                                   (set! pending true) 0))))))
-                  0)))))))
+                  (live-metadata-begin!))))))))
 
 (defn live-end-affected-publication! [] (-> i64)
   (if (= (atomic/atomic-load (live-affected-publication-active)) 0) 0
       (do
+        (live-metadata-end! false)
         (live-source-gate-lock!)
         (for [i 0 (load (live-source-gate-count))]
           (atomic/atomic-store
@@ -1257,6 +1326,15 @@
       (primitive/call-ptr (.release staged) (.new-value staged)
                           (.new-bytes staged) (.align staged))))
   (set! (live-staged-managed-count) 0)
+  ; Unregister explicitly even when the root aliases an accepted handle.
+  (for [i 0 (load (live-new-root-count))]
+    (let [root (primitive/index (live-new-roots) (- (load (live-new-root-count)) (+ i 1)))]
+      (live-unregister-root! (.id root))
+      (live-handle-release! (.handle root))
+      (free (load (.slot root)))
+      (store! (.slot root) (primitive/cast (ptr i8) 0))
+      (store! (.initialized root) false)))
+  (set! (live-new-root-count) 0)
   (set! (live-forward-count) 0)
   (live-managed-lock!)
   (for [i 0 (load (live-managed-object-count))]
@@ -1580,6 +1658,7 @@
 ; Migrate every registered root of one nominal type as one transaction.
 (defn live-begin-staging-locked! [] (-> i64)
   (live-abort-staged!)
+  (set! (live-staged-validated) false)
   (live-clear-staged-code-owners!)
   (set! (live-last-status) 0)
   (live-record-blocker! 0 -1 -1 (primitive/cast (ptr i8) 0))
@@ -1830,8 +1909,16 @@
 
 ; After successful staging, publication and retirement are bounded and cannot
 ; fail. The caller must still hold the writer gate.
+(defn live-staged-validated [] (-> (ptr bool)) (primitive/alloc-static bool))
+
+(defn live-validate-staged! [] (-> i64)
+  (if (load (live-staged-validated)) 0
+      (let [status (live-rewrite-staged-references!)]
+        (when (= status 0) (set! (live-staged-validated) true) 0)
+        status)))
+
 (defn live-publish-staged-locked! [] (-> i64)
-  (let [reference-status (live-rewrite-staged-references!)]
+  (let [reference-status (live-validate-staged!)]
   (if (!= reference-status 0)
       (do (live-abort-staged!)
           (set! (live-last-status) reference-status)
@@ -1893,6 +1980,8 @@
   (store! (live-staged-affected-head) (primitive/cast (ptr LiveAffected) 0))
   (store! (live-staged-affected-count) 0)
   (set! (live-epoch-cell) (+ (load (live-epoch-cell)) 1))
+  (set! (live-new-root-count) 0)
+  (live-metadata-end! true)
   0))))
 
 (defn live-cancel-staged-locked! [] (-> i64)
@@ -1921,6 +2010,7 @@
 ; Candidate generations declare these as externs. They must share this host
 ; registry rather than importing a second copy of its alloc-static cells.
 (export-c [live-register-transition-c :as "coil_live_register_transition"]
+          [live-validate-staged! :as "coil_live_validate_staged"]
           [live-handle-new-c :as "coil_live_handle_new"]
           [live-handle-payload-c :as "coil_live_handle_payload"]
           [live-handle-borrow-payload-c :as "coil_live_handle_borrow_payload"]
@@ -1934,6 +2024,7 @@
           [live-register-schema-destructor-c :as "coil_live_register_schema_destructor"]
           [live-register-root-c :as "coil_live_register_root"]
           [live-register-handle-root-c :as "coil_live_register_handle_root"]
+          [live-stage-new-root-c :as "coil_live_stage_new_root"]
           [live-register-reference-field :as "coil_live_register_reference_field"]
           [live-begin-staging-locked! :as "coil_live_begin_staging_locked"]
           [live-stage-type-roots-locked! :as "coil_live_stage_type_roots_locked"]
