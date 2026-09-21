@@ -1,0 +1,2318 @@
+(module experiments.probe.engine)
+
+; The probe engine: a whole-program semantic transform driven by a SPEC.
+;
+; A `.probe` file's reader (experiments.probe.reader) turns the DSL into this
+; s-expression contract, and the generated module calls `run` from its transform:
+;
+;   (spec "MODULE" CLAUSE...)
+;   (defs "MODULE" (point "name" POINT (fields ("f" EXPR)...))
+;                  (span  "name" "CELL" POINT)
+;                  (span  "name" "CELL" (range POINT POINT KEY|(nokey))) ...)
+;   CLAUSE := (clause "label" POINT (during "span")|(always) PRED|(true) ACTION...)
+;   POINT  := (call (targets "pat"...)) | (enter (targets ...)) | (mark "name") | (ref "name")
+;   ACTION := (agg KIND "CELL" EXPR|(none) (by EXPR...))
+;           | (print DEST (text "lit")|(hole EXPR) ...)
+;           | (record DEST ("name" EXPR)...)
+;   DEST   := "CELL" | (stderr)
+;   EXPR   := (var "n") | (path EXPR "f") | (int N) | (dur NS) | (str "s") | (bool 0|1)
+;           | (cmp "op" A B) | (and A B) | (or A B) | (not A)
+;           | (strop "op" A B) | (in A "pattern") | (clip EXPR N) | (coil FORM)
+;
+; What the engine must respect about the compiler:
+;   * A semantic transform's output is NOT macro-expanded, so every template here
+;     uses primitive forms only: let*, if, do, loop, match, (.f x), (: e T).
+;   * Transforms run to a fixpoint. A rewritten site is recognized by its first
+;     binder (`probe-site-<module>`), and never rewritten twice.
+;   * Types of synthesized expressions are not known when they are built. Values
+;     that must be rendered by type go through `show-marker`, a generic no-op; the
+;     NEXT round asks the type checker (`type-of`) what each one is and replaces it.
+;   * Nodes are rebuilt with `code-list-like`, and only on the path to a rewrite, so
+;     untouched code keeps its identity, spans and hygiene.
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.meta" :use [expansion-allocator])
+
+(extern engine-write :as "write" :cc c [i32 (ptr u8) isize] (-> isize))
+
+; ---- small utilities -----------------------------------------------------------
+(defn say [(s (slice u8))] (-> i64)
+  (primitive/cast i64
+                  (engine-write 2
+                                (slice-data s)
+                                (primitive/cast isize (slice-len s)))))
+
+(extern engine-getenv :as "getenv" :cc c [(ptr i8)] (-> (ptr i8)))
+
+;;; `PROBE_DUMP=1 coil build …` prints every rewritten site: what the engine turned
+;;; each matched call into, as the compiler will see it.
+(defn dumping? [] (-> bool)
+  (!= (primitive/cast i64 (engine-getenv c"PROBE_DUMP")) 0))
+
+(defn dump [(f Code)] (-> i64)
+  (cond (or (primitive/code-list? f) (primitive/code-vector? f))
+          (let [n (cnt f)
+                (mut i) 0]
+            (say (if (primitive/code-vector? f) "[" "("))
+            (while (< (load i) n)
+              (if (> (load i) 0) (say " ") 0)
+              (dump (nth f (load i)))
+              (set! i (+ (load i) 1)))
+            (say (if (primitive/code-vector? f) "]" ")")))
+        (primitive/code-sym? f) (say (primitive/code-str f))
+        (primitive/code-int? f)
+          (say (primitive/int->str (primitive/code-int f)))
+        (primitive/code-string? f)
+          (do (say "\"") (say (primitive/code-str f)) (say "\""))
+        (primitive/code-keyword? f)
+          (do (say ":") (say (primitive/code-keyword-name f)))
+        :else (say "#")))
+
+;;; A located compile error. Errors collect; the build fails after all are shown.
+(defn complain [(node Code) (msg (slice u8))] (-> i64)
+  (do (primitive/report node msg) 0))
+
+;;; `proto` with its children replaced. `code-list-like` keeps the prototype's
+;;; source and hygiene identity but takes list-vs-vector from the ITEMS, so a
+;;; vector's replacement children are handed over as a vector.
+(defn like [(proto Code) (items Code)] (-> Code)
+  (if (primitive/code-vector? proto)
+      (primitive/code-list-like proto `[~@items])
+      (primitive/code-list-like proto items)))
+
+(defn cat [(a (slice u8)) (b (slice u8))] (-> (slice u8))
+  (let [(mut sb) (sb-new (expansion-allocator))]
+    (sb-push-str! (mut sb) a)
+    (sb-push-str! (mut sb) b)
+    (sb-str (load sb))))
+
+(defn cat3 [(a (slice u8)) (b (slice u8)) (c (slice u8))] (-> (slice u8))
+  (cat (cat a b) c))
+
+(defn cnt [(f Code)] (-> i64)
+  (if (or (primitive/code-list? f) (primitive/code-vector? f))
+      (primitive/code-count f)
+      0))
+
+(defn nth [(f Code) (i i64)] (-> Code)
+  (primitive/code-nth f i))
+
+(defn text-of [(f Code)] (-> (slice u8))
+  (if (or (primitive/code-sym? f) (primitive/code-string? f))
+      (primitive/code-str f)
+      ""))
+
+;;; Is `f` a list whose head is a symbol spelled `name`? The spec is read from text,
+;;; so its heads are compared by spelling, never by identity.
+(defn tag? [(f Code) (name (slice u8))] (-> bool)
+  (if (and (primitive/code-list? f) (> (primitive/code-count f) 0))
+      (let [h (nth f 0)]
+        (if (primitive/code-sym? h) (str-eq (primitive/code-str h) name) false))
+      false))
+
+(defn sym-named? [(f Code) (name (slice u8))] (-> bool)
+  (if (primitive/code-sym? f) (str-eq (primitive/code-str f) name) false))
+
+(defn starts-with? [(s (slice u8)) (p (slice u8))] (-> bool)
+  (if (< (slice-len s) (slice-len p))
+      false
+      (str-eq (substr s 0 (slice-len p)) p)))
+
+(defn ends-with? [(s (slice u8)) (p (slice u8))] (-> bool)
+  (if (< (slice-len s) (slice-len p))
+      false
+      (str-eq (substr s (- (slice-len s) (slice-len p)) (slice-len s)) p)))
+
+(defn index-of [(s (slice u8)) (c i64)] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (while (and (< (load found) 0) (< (load i) (slice-len s)))
+      (if (= (primitive/cast i64 (char-at s (load i))) c)
+          (set! found (load i))
+          0)
+      (set! i (+ (load i) 1)))
+    (load found)))
+
+(defn last-index-of [(s (slice u8)) (c i64)] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (while (< (load i) (slice-len s))
+      (if (= (primitive/cast i64 (char-at s (load i))) c)
+          (set! found (load i))
+          0)
+      (set! i (+ (load i) 1)))
+    (load found)))
+
+(defn base-name [(path (slice u8))] (-> (slice u8))
+  (substr path (+ (last-index-of path 47) 1) (slice-len path)))
+
+;;; A symbol spelled `name`, resolved as if written at `proto`. Fully dotted names
+;;; (`experiments.probe.rt.enter!`) resolve from any module without an import.
+(defn sym [(proto Code) (name (slice u8))] (-> Code)
+  (primitive/datum->syntax proto name))
+
+(defn rt [(proto Code) (name (slice u8))] (-> Code)
+  (sym proto (cat "experiments.probe.rt." name)))
+
+;;; A call to a generated storage cell's accessor: `(MODULE.probe-agg-0)`.
+(defn cell [(proto Code) (name Code)] (-> Code)
+  `(~(sym proto (text-of name))))
+
+; ---- engine state --------------------------------------------------------------
+;;; One normalized rule: a clause (or a span's bookkeeping) resolved down to the
+;;; calls it attaches to.
+;;;   mode     0 call, 1 enter, 2 mark, 3 span-open/close bookkeeping only
+;;;   kind     0 clause, 1 call-span bookkeeping, 2 range-open, 3 range-close
+(defstruct Rule
+  [(index i64)
+   (kind i64)
+   (mode i64)
+   (label (slice u8))
+   (targets Code)
+   (mark (slice u8))
+   (fields Code)
+   (during Code)
+   (pred Code)
+   (actions Code)
+   (span-cell Code)
+   (span-key Code)
+   (range-span (slice u8))
+   (sites i64)
+   (skipped i64)])
+
+(defstruct Engine
+  [(module (slice u8))
+   (defs Code)
+   (rules (ArrayList Rule))
+   (mods Code)
+   (marker (slice u8))
+   (boot-marker (slice u8))
+   (fresh i64)
+   (callers (ArrayList (slice u8)))
+   (ambiguous (ArrayList (slice u8)))
+   (cur-module (slice u8))
+   (cur-fn (slice u8))
+   (wildcard i64)
+   (thunks Code)
+   (thunk-names (ArrayList (slice u8)))
+   (changed i64)])
+
+; ---- declarations ---------------------------------------------------------------
+(defstruct Callee
+  [(ok i64) (module (slice u8)) (name (slice u8)) (kind (slice u8))])
+
+;;; What a reference resolves to. `ref` is the REFERENCE NODE — the whole call, or
+;;; the whole `(fnptr-of F)` — because that is what `code-decl` resolves exactly,
+;;; by node identity: through aliases and renames, for generic functions, and for a
+;;; call whose head a macro in another module introduced (a name the call site
+;;; could never look up by spelling). The head symbol alone gets only a name-based
+;;; lookup, which misses all of those.
+(defn callee-of [(ref Code)] (-> Callee)
+  (let [(mut c) (primitive/zeroed Callee)
+        d (primitive/code-decl ref)]
+    (if (and (primitive/code-list? d) (>= (primitive/code-count d) 4))
+        (let [module (text-of (nth d 1))
+              qname (text-of (nth d 3))]
+          (set! (.ok c) 1)
+          (set! (.module c) module)
+          (set! (.kind c) (text-of (nth d 2)))
+          (set! (.name c)
+                (if (and (starts-with? qname module)
+                         (> (slice-len qname) (+ (slice-len module) 1)))
+                    (substr qname (+ (slice-len module) 1) (slice-len qname))
+                    qname))
+          0)
+        0)
+    (load c)))
+
+(defn internal-module? [(name (slice u8))] (-> bool)
+  (or (str-eq name "experiments.probe.rt")
+      (or (str-eq name "experiments.probe.engine")
+          (or (str-eq name "experiments.probe.reader")
+              (or (str-eq name "experiments.probe.lang")
+                  (str-eq name "experiments.probe.marks"))))))
+
+(defn defn-form? [(f Code)] (-> bool)
+  (or (tag? f "defn*") (tag? f "defn")))
+
+;;; A probe module carries a `probe-module-marker`; its generated code is never
+;;; instrumented, by this probe or another.
+(defn probe-module? [(m Code)] (-> bool)
+  (let [n (cnt m)
+        (mut i) 1
+        (mut found) false]
+    (while (and (not (load found)) (< (load i) n))
+      (let [f (nth m (load i))]
+        (if (and (defn-form? f) (> (cnt f) 1))
+            (if (sym-named? (nth f 1) "probe-module-marker")
+                (set! found true)
+                0)
+            0))
+      (set! i (+ (load i) 1)))
+    (load found)))
+
+(defn user-module? [(mods Code) (name (slice u8))] (-> bool)
+  (let [n (cnt mods)
+        (mut i) 0
+        (mut answer) false
+        (mut done) false]
+    (while (and (not (load done)) (< (load i) n))
+      (let [m (nth mods (load i))]
+        (if (and (> (cnt m) 1) (str-eq (text-of (nth m 0)) name))
+            (do
+              (set! done true)
+              (set! answer
+                    (and (primitive/code-from-user? (nth m 1))
+                         (and (not (internal-module? name))
+                              (not (probe-module? m)))))
+              0)
+            0))
+      (set! i (+ (load i) 1)))
+    (load answer)))
+
+;;; Index of the `(-> R)` form in a defn, or -1. The parameter vector is the form
+;;; before it (annotations and a generic list may come between name and params).
+(defn arrow-index [(f Code)] (-> i64)
+  (let [n (cnt f)
+        (mut i) 2
+        (mut found) -1]
+    (while (and (< (load found) 0) (< (load i) n))
+      (if (tag? (nth f (load i)) "->") (set! found (load i)) 0)
+      (set! i (+ (load i) 1)))
+    (load found)))
+
+;;; The parameter vector of `module.name`, or an empty list when the callee has no
+;;; body in the program (an extern) — its arguments are then arg0, arg1, ….
+(defn params-of [(e (ptr Engine)) (module (slice u8)) (name (slice u8))] (-> Code)
+  (let [n (cnt (.mods e))
+        (mut i) 0
+        (mut result) `()
+        (mut done) false]
+    (while (and (not (load done)) (< (load i) n))
+      (let [m (nth (.mods e) (load i))]
+        (if (and (> (cnt m) 1) (str-eq (text-of (nth m 0)) module))
+            (let [k (cnt m)
+                  (mut j) 1]
+              (set! done true)
+              (while (< (load j) k)
+                (let [f (nth m (load j))]
+                  (if (and (defn-form? f) (> (cnt f) 3))
+                      (if (sym-named? (nth f 1) name)
+                          (let [a (arrow-index f)]
+                            (if (> a 2) (set! result (nth f (- a 1))) 0)
+                            0)
+                          0)
+                      0))
+                (set! j (+ (load j) 1)))
+              0)
+            0))
+      (set! i (+ (load i) 1)))
+    (load result)))
+
+(defn param-name [(params Code) (i i64)] (-> (slice u8))
+  (if (< i (cnt params))
+      (let [p (nth params i)]
+        (if (and (primitive/code-list? p) (> (cnt p) 0))
+            (text-of (nth p 0))
+            ""))
+      ""))
+
+; ---- patterns -------------------------------------------------------------------
+(defn pattern-matches? [(mods Code)
+                        (pat (slice u8))
+                        (module (slice u8))
+                        (name (slice u8))] (-> bool)
+  (let [slash (index-of pat 47)]
+    (cond ; A forwarding thunk the engine generated is not a function of the program.
+          (ends-with? name "--probe-thunk") false
+          (str-eq pat "*") (user-module? mods module)
+          (>= slash 0)
+            (let [mod-pat (substr pat 0 slash)
+                  name-pat (substr pat (+ slash 1) (slice-len pat))]
+              (and (or (str-eq mod-pat module)
+                       (ends-with? module (cat "." mod-pat)))
+                   (or (str-eq name-pat "*") (str-eq name-pat name))))
+          :else (str-eq pat name))))
+
+(defn targets-match? [(e (ptr Engine)) (targets Code) (c (ptr Callee))] (-> bool)
+  (let [n (cnt targets)
+        (mut i) 1
+        (mut hit) false]
+    (while (and (not (load hit)) (< (load i) n))
+      (let [pat (text-of (nth targets (load i)))]
+        (if (pattern-matches? (.mods e) pat (.module c) (.name c))
+            (do
+              (set! hit true)
+              ; A bare name that lands in more than one module is ambiguous; note
+              ; each (pattern, module) pair so the report can say so.
+              (if (and (< (index-of pat 47) 0) (not (str-eq pat "*")))
+                  (note-unique! (primitive/field e ambiguous)
+                                (cat3 pat "|" (.module c)))
+                  0)
+              0)
+            0))
+      (set! i (+ (load i) 1)))
+    (load hit)))
+
+(defn note-unique! [(list (ptr (ArrayList (slice u8)))) (s (slice u8))] (-> i64)
+  (let [n (len list)
+        (mut i) 0
+        (mut seen) false]
+    (while (and (not (load seen)) (< (load i) n))
+      (if (str-eq (get list (load i)) s) (set! seen true) 0)
+      (set! i (+ (load i) 1)))
+    (if (load seen) 0 (do (push! list s) 1))))
+
+(defn wildcard-targets? [(targets Code)] (-> bool)
+  (let [n (cnt targets)
+        (mut i) 1
+        (mut wild) false]
+    (while (< (load i) n)
+      (let [pat (text-of (nth targets (load i)))]
+        (if (or (str-eq pat "*") (ends-with? pat "/*")) (set! wild true) 0))
+      (set! i (+ (load i) 1)))
+    (load wild)))
+
+; ---- spec lookup ----------------------------------------------------------------
+;;; Find `(KIND "name" …)` among the definitions this module and its `use`s give.
+(defn find-def [(e (ptr Engine)) (kind (slice u8)) (name (slice u8))] (-> Code)
+  (let [n (cnt (.defs e))
+        (mut i) 0
+        (mut found) `()]
+    (while (and (= (cnt (load found)) 0) (< (load i) n))
+      (let [d (nth (.defs e) (load i))]
+        (if (and (tag? d kind) (str-eq (text-of (nth d 1)) name))
+            (set! found d)
+            0))
+      (set! i (+ (load i) 1)))
+    (load found)))
+
+(defn no-fields [] (-> Code)
+  `(fields))
+
+;;; Reduce a POINT to the underlying call/enter/mark, following named points.
+;;; Returns `(MODE TARGETS MARK FIELDS)`; MODE -1 when the name is unknown.
+(defn resolve-point [(e (ptr Engine)) (point Code) (depth i64)] (-> Code)
+  (cond (> depth 8) `(-1 (targets) "" (fields))
+        (tag? point "call") `(0 ~(nth point 1) "" (fields))
+        (tag? point "enter") `(1 ~(nth point 1) "" (fields))
+        (tag? point "mark") `(2 (targets) ~(nth point 1) (fields))
+        (tag? point "ref")
+          (let [name (text-of (nth point 1))
+                p (find-def e "point" name)]
+            (if (> (cnt p) 0)
+                (let [inner (resolve-point e (nth p 2) (+ depth 1))]
+                  ; The outermost point's fields win; inner fields stay reachable
+                  ; because fields are looked up in order.
+                  `(~(nth inner 0) ~(nth inner 1)
+                      ~(nth inner 2)
+                      (fields ~@(primitive/code-rest (nth p 3))
+                              ~@(primitive/code-rest (nth inner 3)))))
+                `(-1 (targets) "" (fields))))
+        :else `(-1 (targets) "" (fields))))
+
+;;; Note: every function here that touches Engine, Rule or Site has `Code` somewhere
+;;; in its signature. That is load-bearing, not style: a function with no Code in
+;;; its signature is compiled for run time too, and codegen aborts on a struct that
+;;; holds a Code field ("unknown struct"). See the coil-bugs pad.
+(defn add-rule! [(e (ptr Engine)) (r Rule) (targets Code)] (-> i64)
+  (do
+    (if (wildcard-targets? targets) (set! (.wildcard e) 1) 0)
+    (push! (primitive/field e rules) r)
+    0))
+
+(defn blank-rule [(index i64) (empty Code)] (-> Rule)
+  (let [(mut r) (primitive/zeroed Rule)]
+    (set! (.index r) index)
+    (set! (.targets r) `(targets))
+    (set! (.fields r) `(fields))
+    (set! (.during r) `(always))
+    (set! (.pred r) `(true))
+    (set! (.actions r) empty)
+    (set! (.span-cell r) `"")
+    (set! (.span-key r) `(nokey))
+    (load r)))
+
+;;; A clause becomes one rule. A clause on a span name attaches where the span
+;;; ends: the span's own call for a call span, the closing point for a range span.
+(defn add-clause! [(e (ptr Engine)) (clause Code)] (-> i64)
+  (let [(mut r) (blank-rule (len (.rules e)) `())
+        point (nth clause 2)
+        span
+          (if (tag? point "ref")
+              (find-def e "span" (text-of (nth point 1)))
+              `())]
+    (set! (.label r) (text-of (nth clause 1)))
+    (set! (.during r) (nth clause 3))
+    (set! (.pred r) (nth clause 4))
+    (set! (.actions r) (primitive/code-slice clause 5 (cnt clause)))
+    (if (> (cnt span) 0)
+        (let [body (nth span 3)]
+          (if (tag? body "range")
+              (let [closing (resolve-point e (nth body 2) 0)]
+                (set! (.mode r) (primitive/code-int (nth closing 0)))
+                (set! (.targets r) (nth closing 1))
+                (set! (.mark r) (text-of (nth closing 2)))
+                (set! (.fields r) (nth closing 3))
+                (set! (.range-span r) (text-of (nth span 1)))
+                0)
+              (let [p (resolve-point e body 0)]
+                (set! (.mode r) (primitive/code-int (nth p 0)))
+                (set! (.targets r) (nth p 1))
+                (set! (.mark r) (text-of (nth p 2)))
+                (set! (.fields r) (nth p 3))
+                0)))
+        (let [p (resolve-point e point 0)]
+          (set! (.mode r) (primitive/code-int (nth p 0)))
+          (set! (.targets r) (nth p 1))
+          (set! (.mark r) (text-of (nth p 2)))
+          (set! (.fields r) (nth p 3))
+          0))
+    (if (< (.mode r) 0)
+        (complain clause
+                  (cat3 "probe: `"
+                        (.label r)
+                        "` names a point or span that is not defined"))
+        0)
+    (add-rule! e (load r) (.targets r))))
+
+;;; This module's own spans need bookkeeping at their sites whether or not a clause
+;;; mentions them, because `during` reads it.
+(defn add-span-rules! [(e (ptr Engine)) (span Code)] (-> i64)
+  (let [body (nth span 3)]
+    (if (tag? body "range")
+        (let [(mut open) (blank-rule (len (.rules e)) `())
+              opening (resolve-point e (nth body 1) 0)]
+          (set! (.kind open) 2)
+          (set! (.label open) (cat "span " (text-of (nth span 1))))
+          (set! (.mode open) (primitive/code-int (nth opening 0)))
+          (set! (.targets open) (nth opening 1))
+          (set! (.mark open) (text-of (nth opening 2)))
+          (set! (.fields open) (nth opening 3))
+          (set! (.span-cell open) (nth span 2))
+          (set! (.span-key open) (nth body 3))
+          (if (= (.mode open) 2)
+              (complain span
+                        "probe: a range span opens and closes on calls (`enter F` or `call F`), not on a mark")
+              0)
+          (add-rule! e (load open) (.targets open))
+          (let [(mut close) (blank-rule (len (.rules e)) `())
+                closing (resolve-point e (nth body 2) 0)]
+            (set! (.kind close) 3)
+            (set! (.label close) (cat "span " (text-of (nth span 1))))
+            (set! (.mode close) (primitive/code-int (nth closing 0)))
+            (set! (.targets close) (nth closing 1))
+            (set! (.mark close) (text-of (nth closing 2)))
+            (set! (.fields close) (nth closing 3))
+            (set! (.span-cell close) (nth span 2))
+            (set! (.span-key close) (nth body 3))
+            (set! (.range-span close) (text-of (nth span 1)))
+            ; A span's clauses read the closing call's result and elapsed time, so
+            ; it closes when that call RETURNS.
+            (if (!= (.mode close) 0)
+                (complain span
+                          "probe: a range span must close on `call F`: `span s = enter A .. call B`")
+                0)
+            (add-rule! e (load close) (.targets close))))
+        (let [(mut r) (blank-rule (len (.rules e)) `())
+              p (resolve-point e body 0)]
+          (set! (.kind r) 1)
+          (set! (.label r) (cat "span " (text-of (nth span 1))))
+          (set! (.mode r) (primitive/code-int (nth p 0)))
+          (set! (.targets r) (nth p 1))
+          (set! (.mark r) (text-of (nth p 2)))
+          (set! (.fields r) (nth p 3))
+          (set! (.span-cell r) (nth span 2))
+          (if (!= (.mode r) 0)
+              (complain span
+                        "probe: a span over one function is written `span s = call F`; for a stretch between two points use `span s = enter A .. call B`")
+              0)
+          (add-rule! e (load r) (.targets r))))))
+
+; ---- a site under construction -----------------------------------------------------
+;;; Everything known at one call being instrumented. `env` maps a DSL name to the
+;;; Code that reads it: `(("path" BINDER) ("site" "main.coil:12:3") …)`.
+(defstruct Site
+  [(node Code)
+   (env Code)
+   (has-result i64)
+   (result-is-result i64)
+   (module (slice u8))
+   (caller (slice u8))
+   (callee-module (slice u8))
+   (callee (slice u8))
+   (range-elapsed Code)])
+
+(defn env-lookup [(env Code) (name (slice u8))] (-> Code)
+  (let [n (cnt env)
+        (mut i) 0
+        (mut found) `()]
+    (while (and (= (cnt (load found)) 0) (< (load i) n))
+      (let [pair (nth env (load i))]
+        (if (str-eq (text-of (nth pair 0)) name) (set! found pair) 0))
+      (set! i (+ (load i) 1)))
+    (load found)))
+
+(defn field-lookup [(fields Code) (name (slice u8))] (-> Code)
+  (let [n (cnt fields)
+        (mut i) 1
+        (mut found) `()]
+    (while (and (= (cnt (load found)) 0) (< (load i) n))
+      (let [pair (nth fields (load i))]
+        (if (str-eq (text-of (nth pair 0)) name) (set! found pair) 0))
+      (set! i (+ (load i) 1)))
+    (load found)))
+
+; ---- expressions: value + wrapper with holes ----------------------------------------
+; Coil has no capturing closures, so an expression compiles to a PAIR:
+;   (WRAPPER VALUE)
+; WRAPPER is code with one `probe-hole` where the value is used and `probe-missing`
+; wherever the value turns out not to exist (the `Err` arm of `result.ok…`). The
+; consumer fills both. A value with no wrapper has WRAPPER = `probe-hole` itself.
+(defn hole [] (-> Code)
+  `probe-hole)
+
+(defn missing [] (-> Code)
+  `probe-missing)
+
+(defn fill [(wrapper Code) (use Code) (absent Code)] (-> Code)
+  (cond (sym-named? wrapper "probe-hole") use
+        (sym-named? wrapper "probe-missing") absent
+        (or (primitive/code-list? wrapper) (primitive/code-vector? wrapper))
+          (let [n (cnt wrapper)
+                out (primitive/code-list-new)
+                (mut i) 0]
+            (while (< (load i) n)
+              (primitive/code-list-push! out
+                                         (fill (nth wrapper (load i))
+                                               use
+                                               absent))
+              (set! i (+ (load i) 1)))
+            (like wrapper (primitive/code-list-done out)))
+        :else wrapper))
+
+(defn pair [(wrapper Code) (value Code)] (-> Code)
+  `(~wrapper ~value))
+
+(defn plain [(value Code)] (-> Code)
+  `(~(hole) ~value))
+
+;;; Nest wrapper `inner` inside wrapper `outer`'s hole, keeping `inner`'s own hole.
+(defn nest [(outer Code) (inner Code)] (-> Code)
+  (fill outer inner (missing)))
+
+(defn fresh [(e (ptr Engine)) (name (slice u8))] (-> Code)
+  (do
+    (set! (.fresh e) (+ (.fresh e) 1))
+    (primitive/fresh-identifier name)))
+
+(defn compile-var [(e (ptr Engine))
+                   (r (ptr Rule))
+                   (s (ptr Site))
+                   (name (slice u8))
+                   (depth i64)] (-> Code)
+  (let [field (field-lookup (.fields r) name)
+        bound (env-lookup (.env s) name)]
+    (cond (> depth 16)
+            (do
+              (complain (.node s)
+                        (cat3 "probe: point field `"
+                              name
+                              "` is defined in terms of itself"))
+              (plain `0))
+          (> (cnt field) 0) (compile-expr e r s (nth field 1) (+ depth 1))
+          (> (cnt bound) 0) (plain (nth bound 1))
+          (str-eq name "failed")
+            (if (= (.has-result s) 0)
+                (do
+                  (complain (.node s)
+                            "probe: `failed` needs a result; it is not available in `enter`")
+                  (plain `false))
+                (let [res (nth (env-lookup (.env s) "result") 1)]
+                  (plain `(match ~res (Ok [_] false) (Err [_] true)))))
+          :else
+            (do
+              (complain (.node s)
+                        (cat3 "probe: `"
+                              name
+                              (cat3 "` is not available in `"
+                                    (.label r)
+                                    (cat "` at this site. Available here:"
+                                         (available-names (.env s) (.fields r))))))
+              (plain `0)))))
+
+;;; The names a clause can read at a site, for the error that says one is unknown.
+(defn available-names [(env Code) (fields Code)] (-> (slice u8))
+  (let [(mut sb) (sb-new (expansion-allocator))
+        (mut i) 1]
+    (while (< (load i) (cnt fields))
+      (sb-push-str! (mut sb) " ")
+      (sb-push-str! (mut sb) (text-of (nth (nth fields (load i)) 0)))
+      (set! i (+ (load i) 1)))
+    (set! i 0)
+    (while (< (load i) (cnt env))
+      (sb-push-str! (mut sb) " ")
+      (sb-push-str! (mut sb) (text-of (nth (nth env (load i)) 0)))
+      (set! i (+ (load i) 1)))
+    (sb-push-str! (mut sb) " failed")
+    (sb-str (load sb))))
+
+(defn compile-path [(e (ptr Engine))
+                    (r (ptr Rule))
+                    (s (ptr Site))
+                    (expr Code)
+                    (depth i64)] (-> Code)
+  (let [base (compile-expr e r s (nth expr 1) depth)
+        name (text-of (nth expr 2))
+        w (nth base 0)
+        v (nth base 1)]
+    (cond (str-eq name "ok")
+            (let [b (fresh e "probe-ok")]
+              (pair (nest w `(match ~v (Ok [~b] ~(hole)) (Err [_] ~(missing))))
+                    b))
+          (str-eq name "err")
+            (let [b (fresh e "probe-err")]
+              (pair (nest w `(match ~v (Ok [_] ~(missing)) (Err [~b] ~(hole))))
+                    b))
+          (str-eq name "some")
+            (let [b (fresh e "probe-some")]
+              (pair (nest w
+                          `(match ~v (Some [~b] ~(hole)) (None [] ~(missing))))
+                    b))
+          (str-eq name "len") (pair w `(len ~v))
+          :else
+          ; A field read needs a place, so the base is bound first.
+          (let [b (fresh e "probe-base")]
+            (pair (nest w `(let* [~b ~v] ~(hole)))
+                  `(~(sym (.node s) (cat "." name)) ~b))))))
+
+(defn cmp-head [(op (slice u8))] (-> Code)
+  (cond (str-eq op ">") `>
+        (str-eq op "<") `<
+        (str-eq op ">=") `>=
+        (str-eq op "<=") `<=
+        (str-eq op "!=") `!=
+        :else `=))
+
+(defn string-literal? [(expr Code)] (-> bool)
+  (tag? expr "str"))
+
+;;; Replace DSL names inside a `{ coil }` escape. A symbol whose first dotted
+;;; segment is a probe variable is a DSL path (`req.url`); any other symbol that
+;;; names a function somewhere in the program is rewritten to its qualified name,
+;;; so the escape means the same thing at every site it is compiled into.
+(defn compile-escape [(e (ptr Engine))
+                      (r (ptr Rule))
+                      (s (ptr Site))
+                      (form Code)
+                      (depth i64)] (-> Code)
+  (cond (primitive/code-sym? form)
+          (let [spelling (primitive/code-str form)
+                dot (index-of spelling 46)
+                first (if (> dot 0) (substr spelling 0 dot) spelling)
+                known
+                  (or (> (cnt (env-lookup (.env s) first)) 0)
+                      (or (> (cnt (field-lookup (.fields r) first)) 0)
+                          (str-eq first "failed")))]
+            (if (and known (not (starts-with? spelling ".")))
+                (compile-expr e r s (path-spec spelling) depth)
+                (let [d (primitive/code-decl form)]
+                  (if (and (primitive/code-list? d)
+                           (>= (primitive/code-count d) 4))
+                      (plain (sym (.node s) (text-of (nth d 3))))
+                      (plain (sym (.node s) spelling))))))
+        (or (primitive/code-list? form) (primitive/code-vector? form))
+          (let [n (cnt form)
+                out (primitive/code-list-new)
+                (mut wrapper) (hole)
+                (mut i) 0]
+            (while (< (load i) n)
+              (let [part (compile-escape e r s (nth form (load i)) depth)]
+                (set! wrapper (nest (load wrapper) (nth part 0)))
+                (primitive/code-list-push! out (nth part 1)))
+              (set! i (+ (load i) 1)))
+            (pair (load wrapper) (like form (primitive/code-list-done out))))
+        :else (plain form)))
+
+;;; `a.b.c` as the spec's nested `(path …)` form.
+(defn path-spec [(spelling (slice u8))] (-> Code)
+  (let [(mut acc) `()
+        (mut start) 0
+        (mut i) 0
+        n (slice-len spelling)]
+    (while (<= (load i) n)
+      (if (or (= (load i) n)
+              (= (primitive/cast i64 (char-at spelling (load i))) 46))
+          (let [seg (substr spelling (load start) (load i))]
+            (set! acc
+                  (if (= (cnt (load acc)) 0)
+                      `(var ~seg)
+                      `(path ~(load acc) ~seg)))
+            (set! start (+ (load i) 1))
+            0)
+          0)
+      (set! i (+ (load i) 1)))
+    (load acc)))
+
+(defn compile-expr [(e (ptr Engine))
+                    (r (ptr Rule))
+                    (s (ptr Site))
+                    (expr Code)
+                    (depth i64)] (-> Code)
+  (cond (tag? expr "var") (compile-var e r s (text-of (nth expr 1)) depth)
+        (tag? expr "path") (compile-path e r s expr depth)
+        (tag? expr "int") (plain (nth expr 1))
+        (tag? expr "dur") (plain (nth expr 1))
+        (tag? expr "str") (plain (nth expr 1))
+        (tag? expr "bool")
+          (plain (if (= (primitive/code-int (nth expr 1)) 1) `true `false))
+        (tag? expr "true") (plain `true)
+        (tag? expr "clip")
+          (let [base (compile-expr e r s (nth expr 1) depth)]
+            (pair (nth base 0)
+                  `(~(rt (.node s) "clip") ~(nth base 1) ~(nth expr 2))))
+        (tag? expr "coil") (compile-escape e r s (nth expr 1) depth)
+        (tag? expr "cmp")
+          (let [a (compile-expr e r s (nth expr 2) depth)
+                b (compile-expr e r s (nth expr 3) depth)
+                op (text-of (nth expr 1))
+                strings
+                  (or (string-literal? (nth expr 2))
+                      (string-literal? (nth expr 3)))
+                test
+                  (if strings
+                      `(~(rt (.node s) "str-equals?") ~(nth a 1) ~(nth b 1))
+                      `(~(cmp-head op) ~(nth a 1) ~(nth b 1)))]
+            (pair (nest (nth a 0) (nth b 0))
+                  (if (and strings (str-eq op "!="))
+                      `(if ~test false true)
+                      test)))
+        (tag? expr "strop")
+          (let [a (compile-expr e r s (nth expr 2) depth)
+                b (compile-expr e r s (nth expr 3) depth)
+                op (text-of (nth expr 1))
+                f
+                  (cond (str-eq op "starts-with") "str-starts-with?"
+                        (str-eq op "ends-with") "str-ends-with?"
+                        :else "str-contains?")]
+            (pair (nest (nth a 0) (nth b 0))
+                  `(~(rt (.node s) f) ~(nth a 1) ~(nth b 1))))
+        (tag? expr "in")
+          (do
+            (complain (.node s)
+                      "probe: `in` tests a compile-time fact; its left side must be `caller`, `module` or `fn`")
+            (plain `false))
+        ; Boolean connectives evaluate their operands to complete booleans first, so a
+        ; missing value inside one operand makes THAT operand false, not the whole test.
+        (tag? expr "and")
+          (plain `(if ~(compile-bool e r s (nth expr 1) depth)
+                      ~(compile-bool e r s (nth expr 2) depth)
+                      false))
+        (tag? expr "or")
+          (plain `(if ~(compile-bool e r s (nth expr 1) depth)
+                      true
+                      ~(compile-bool e r s (nth expr 2) depth)))
+        (tag? expr "not")
+          (plain `(if ~(compile-bool e r s (nth expr 1) depth) false true))
+        :else
+          (do
+            (complain (.node s)
+                      "probe: internal error: unknown expression form in the spec")
+            (plain `0))))
+
+;;; An expression as a self-contained boolean: a missing value reads as false.
+(defn compile-bool [(e (ptr Engine))
+                    (r (ptr Rule))
+                    (s (ptr Site))
+                    (expr Code)
+                    (depth i64)] (-> Code)
+  (let [c (compile-expr e r s expr depth)]
+    (fill (nth c 0) (nth c 1) `false)))
+
+; ---- static predicates --------------------------------------------------------------
+; 0 = false, 1 = true, 2 = decided at run time. A clause whose predicate is false at
+; a site is not compiled into it at all.
+(defn static-string [(s (ptr Site)) (expr Code) (known (mut bool))] (-> (slice u8))
+  (if (tag? expr "var")
+      (let [name (text-of (nth expr 1))]
+        (cond (str-eq name "caller") (do (set! known true) (.caller s))
+              (str-eq name "module") (do (set! known true) (.module s))
+              (str-eq name "fn") (do (set! known true) (.callee s))
+              :else ""))
+      (if (tag? expr "str") (do (set! known true) (text-of (nth expr 1))) "")))
+
+(defn static-pred [(e (ptr Engine)) (s (ptr Site)) (expr Code)] (-> i64)
+  (cond (tag? expr "true") 1
+        (tag? expr "bool") (primitive/code-int (nth expr 1))
+        (tag? expr "and")
+          (let [a (static-pred e s (nth expr 1))
+                b (static-pred e s (nth expr 2))]
+            (if (or (= a 0) (= b 0)) 0 (if (and (= a 1) (= b 1)) 1 2)))
+        (tag? expr "or")
+          (let [a (static-pred e s (nth expr 1))
+                b (static-pred e s (nth expr 2))]
+            (if (or (= a 1) (= b 1)) 1 (if (and (= a 0) (= b 0)) 0 2)))
+        (tag? expr "not")
+          (let [a (static-pred e s (nth expr 1))]
+            (if (= a 2) 2 (- 1 a)))
+        (tag? expr "in")
+          (let [subject (nth expr 1)
+                pat (text-of (nth expr 2))]
+            (if (tag? subject "var")
+                (let [name (text-of (nth subject 1))]
+                  (cond (str-eq name "caller")
+                          (if (pattern-matches? (.mods e)
+                                                pat
+                                                (.module s)
+                                                (.caller s))
+                              1
+                              0)
+                        (str-eq name "fn")
+                          (if (pattern-matches? (.mods e)
+                                                pat
+                                                (.callee-module s)
+                                                (.callee s))
+                              1
+                              0)
+                        (str-eq name "module")
+                          (if (pattern-matches? (.mods e)
+                                                (cat pat "/*")
+                                                (.module s)
+                                                "")
+                              1
+                              0)
+                        :else 2))
+                2))
+        (or (tag? expr "cmp") (tag? expr "strop"))
+          (let [(mut ka) false
+                (mut kb) false
+                a (static-string s (nth expr 2) (mut ka))
+                b (static-string s (nth expr 3) (mut kb))
+                op (text-of (nth expr 1))]
+            (if (and (load ka) (load kb))
+                (cond (str-eq op "=") (if (str-eq a b) 1 0)
+                      (str-eq op "!=") (if (str-eq a b) 0 1)
+                      (str-eq op "starts-with") (if (starts-with? a b) 1 0)
+                      (str-eq op "ends-with") (if (ends-with? a b) 1 0)
+                      (str-eq op "contains") (if (contains? a b) 1 0)
+                      :else 2)
+                2))
+        :else 2))
+
+(defn contains? [(s (slice u8)) (p (slice u8))] (-> bool)
+  (let [(mut i) 0
+        (mut hit) false]
+    (while (and (not (load hit)) (<= (+ (load i) (slice-len p)) (slice-len s)))
+      (if (str-eq (substr s (load i) (+ (load i) (slice-len p))) p)
+          (set! hit true)
+          0)
+      (set! i (+ (load i) 1)))
+    (load hit)))
+
+;;; A static subexpression, once decided, must not be compiled (`in` has no runtime
+;;; form). Rewrite decided parts to literals and leave the rest.
+(defn fold-static [(e (ptr Engine)) (s (ptr Site)) (expr Code)] (-> Code)
+  (let [v (static-pred e s expr)]
+    (cond (= v 1) `(bool 1)
+          (= v 0) `(bool 0)
+          (or (tag? expr "and") (tag? expr "or"))
+            `(~(nth expr 0) ~(fold-static e s (nth expr 1))
+                ~(fold-static e s (nth expr 2)))
+          (tag? expr "not") `(~(nth expr 0) ~(fold-static e s (nth expr 1)))
+          :else expr)))
+
+; ---- what a rule reads ----------------------------------------------------------------
+(defn mentions? [(e (ptr Engine))
+                 (r (ptr Rule))
+                 (expr Code)
+                 (name (slice u8))
+                 (depth i64)] (-> bool)
+  (cond (> depth 16) false
+        (tag? expr "var")
+          (let [v (text-of (nth expr 1))
+                field (field-lookup (.fields r) v)]
+            (if (> (cnt field) 0)
+                (mentions? e r (nth field 1) name (+ depth 1))
+                (str-eq v name)))
+        (tag? expr "coil") (escape-mentions? e r (nth expr 1) name depth)
+        (or (primitive/code-list? expr) (primitive/code-vector? expr))
+          (let [n (cnt expr)
+                (mut i) 0
+                (mut hit) false]
+            (while (and (not (load hit)) (< (load i) n))
+              (if (mentions? e r (nth expr (load i)) name depth)
+                  (set! hit true)
+                  0)
+              (set! i (+ (load i) 1)))
+            (load hit))
+        :else false))
+
+(defn escape-mentions? [(e (ptr Engine))
+                        (r (ptr Rule))
+                        (form Code)
+                        (name (slice u8))
+                        (depth i64)] (-> bool)
+  (cond (primitive/code-sym? form)
+          (let [spelling (primitive/code-str form)
+                dot (index-of spelling 46)
+                first (if (> dot 0) (substr spelling 0 dot) spelling)
+                field (field-lookup (.fields r) first)]
+            (if (> (cnt field) 0)
+                (mentions? e r (nth field 1) name (+ depth 1))
+                (str-eq first name)))
+        (or (primitive/code-list? form) (primitive/code-vector? form))
+          (let [n (cnt form)
+                (mut i) 0
+                (mut hit) false]
+            (while (and (not (load hit)) (< (load i) n))
+              (if (escape-mentions? e r (nth form (load i)) name depth)
+                  (set! hit true)
+                  0)
+              (set! i (+ (load i) 1)))
+            (load hit))
+        :else false))
+
+(defn rule-mentions? [(e (ptr Engine))
+                      (r (ptr Rule))
+                      (pred Code)
+                      (name (slice u8))] (-> bool)
+  (or (mentions? e r pred name 0)
+      (or (mentions? e r (.actions r) name 0)
+          (mentions? e r (.span-key r) name 0))))
+
+;;; Does the rule read `result` AS a Result (`result.ok`, `result.err`, `failed`)?
+(defn reads-result-shape? [(e (ptr Engine))
+                           (r (ptr Rule))
+                           (expr Code)
+                           (depth i64)] (-> bool)
+  (cond (> depth 16) false
+        (tag? expr "var")
+          (let [v (text-of (nth expr 1))
+                field (field-lookup (.fields r) v)]
+            (if (> (cnt field) 0)
+                (reads-result-shape? e r (nth field 1) (+ depth 1))
+                (str-eq v "failed")))
+        (tag? expr "path")
+          (let [name (text-of (nth expr 2))
+                base (nth expr 1)]
+            (if (and (or (str-eq name "ok") (str-eq name "err"))
+                     (and (tag? base "var")
+                          (str-eq (text-of (nth base 1)) "result")))
+                true
+                (reads-result-shape? e r base depth)))
+        (tag? expr "coil") (escape-mentions? e r (nth expr 1) "failed" depth)
+        (or (primitive/code-list? expr) (primitive/code-vector? expr))
+          (let [n (cnt expr)
+                (mut i) 0
+                (mut hit) false]
+            (while (and (not (load hit)) (< (load i) n))
+              (if (reads-result-shape? e r (nth expr (load i)) depth)
+                  (set! hit true)
+                  0)
+              (set! i (+ (load i) 1)))
+            (load hit))
+        :else false))
+
+; ---- actions ---------------------------------------------------------------------------
+;;; Render a value into the thread's output buffer. `elapsed` and duration literals
+;;; are durations; everything else is rendered by type in the next round.
+(defn show [(e (ptr Engine)) (r (ptr Rule)) (s (ptr Site)) (expr Code)] (-> Code)
+  (let [c (compile-expr e r s expr 0)
+        is-dur
+          (or (tag? expr "dur")
+              (and (tag? expr "var") (str-eq (text-of (nth expr 1)) "elapsed")))
+        use
+          (cond is-dur `(~(rt (.node s) "out-dur!") ~(nth c 1))
+                (tag? expr "str") `(~(rt (.node s) "out-str!") ~(nth c 1))
+                :else `(~(rt (.node s) "show-marker") ~(nth c 1)))]
+    (fill (nth c 0) use `(~(rt (.node s) "out-null!")))))
+
+(defn dest-code [(s (ptr Site)) (dest Code)] (-> Code)
+  (if (primitive/code-string? dest)
+      (cell (.node s) dest)
+      `(~(rt (.node s) "dest-stderr"))))
+
+(defn compile-agg [(e (ptr Engine))
+                   (r (ptr Rule))
+                   (s (ptr Site))
+                   (action Code)
+                   (elapsed Code)] (-> Code)
+  (let [kind (primitive/code-int (nth action 1))
+        agg (cell (.node s) (nth action 2))
+        by (nth action 4)
+        out (primitive/code-list-new)
+        (mut i) 1]
+    (primitive/code-list-push! out `(~(rt (.node s) "key-begin!")))
+    (while (< (load i) (cnt by))
+      (if (> (load i) 1)
+          (do (primitive/code-list-push! out `(~(rt (.node s) "key-sep!"))) 0)
+          0)
+      (primitive/code-list-push! out (show e r s (nth by (load i))))
+      (set! i (+ (load i) 1)))
+    (primitive/code-list-push! out
+                               (cond (= kind 0)
+                                       `(~(rt (.node s) "agg-count!") ~agg)
+                                     (= kind 1)
+                                       (if (> (slice-len (.range-span r)) 0)
+                                           `(~(rt (.node s) "agg-span-time!") ~agg
+                                               ~elapsed)
+                                           `(~(rt (.node s) "agg-time!") ~agg
+                                               ~elapsed))
+                                     :else
+                                       (let [c
+                                               (compile-expr e
+                                                             r
+                                                             s
+                                                             (nth action 3)
+                                                             0)]
+                                         (fill (nth c 0)
+                                               `(~(rt (.node s) "agg-add!") ~agg
+                                                   (cast i64 ~(nth c 1)))
+                                               `0))))
+    `(do ~@(primitive/code-list-done out))))
+
+(defn compile-print [(e (ptr Engine))
+                     (r (ptr Rule))
+                     (s (ptr Site))
+                     (action Code)] (-> Code)
+  (let [out (primitive/code-list-new)
+        (mut i) 2]
+    (primitive/code-list-push! out `(~(rt (.node s) "print-begin!")))
+    (while (< (load i) (cnt action))
+      (let [part (nth action (load i))]
+        (primitive/code-list-push! out
+                                   (if (tag? part "text")
+                                       `(~(rt (.node s) "out-text!") ~(nth part
+                                                                           1))
+                                       (show e r s (nth part 1)))))
+      (set! i (+ (load i) 1)))
+    (primitive/code-list-push! out
+                               `(~(rt (.node s) "print-end!") ~(dest-code s
+                                                                          (nth action
+                                                                               1))))
+    `(do ~@(primitive/code-list-done out))))
+
+(defn compile-record [(e (ptr Engine))
+                      (r (ptr Rule))
+                      (s (ptr Site))
+                      (action Code)] (-> Code)
+  (let [out (primitive/code-list-new)
+        (mut i) 2]
+    (primitive/code-list-push! out `(~(rt (.node s) "rec-begin!")))
+    (while (< (load i) (cnt action))
+      (let [field (nth action (load i))]
+        (primitive/code-list-push! out
+                                   `(~(rt (.node s) "rec-key!") ~(nth field 0)))
+        (primitive/code-list-push! out (show e r s (nth field 1))))
+      (set! i (+ (load i) 1)))
+    (primitive/code-list-push! out
+                               `(~(rt (.node s) "rec-end!") ~(dest-code s
+                                                                        (nth action
+                                                                             1))))
+    `(do ~@(primitive/code-list-done out))))
+
+;;; One rule's contribution at one site: `(if DURING (if PRED (do ACTIONS…) 0) 0)`.
+(defn compile-rule-body [(e (ptr Engine))
+                         (r (ptr Rule))
+                         (s (ptr Site))
+                         (elapsed Code)] (-> Code)
+  (let [out (primitive/code-list-new)
+        n (cnt (.actions r))
+        (mut i) 0]
+    (while (< (load i) n)
+      (let [action (nth (.actions r) (load i))]
+        (primitive/code-list-push! out
+                                   (cond (tag? action "agg")
+                                           (compile-agg e r s action elapsed)
+                                         (tag? action "print")
+                                           (compile-print e r s action)
+                                         (tag? action "record")
+                                           (compile-record e r s action)
+                                         :else
+                                           (do
+                                             (complain (.node s)
+                                                       "probe: internal error: unknown action in the spec")
+                                             `0))))
+      (set! i (+ (load i) 1)))
+    (primitive/code-list-push! out `0)
+    (let [actions `(do ~@(primitive/code-list-done out))
+          pred (fold-static e s (.pred r))
+          guarded
+            (if (tag? pred "bool")
+                actions
+                `(if ~(compile-bool e r s pred 0) ~actions 0))]
+      (if (tag? (.during r) "during")
+          (let [span (find-def e "span" (text-of (nth (.during r) 1)))]
+            (if (= (cnt span) 0)
+                (do
+                  (complain (.node s)
+                            (cat3 "probe: `during "
+                                  (text-of (nth (.during r) 1))
+                                  "` names a span that is not defined"))
+                  `0)
+                `(if (~(rt (.node s) "span-active?") ~(cell (.node s)
+                                                            (nth span 2)))
+                     ~guarded
+                     0)))
+          guarded))))
+
+; ---- building a site ---------------------------------------------------------------------
+(defn site-literal [(f Code)] (-> (slice u8))
+  (cat3 (base-name (primitive/code-file f))
+        ":"
+        (cat3 (primitive/int->str (primitive/code-line f))
+              ":"
+              (primitive/int->str (primitive/code-col f)))))
+
+(defn mut-arg? [(a Code)] (-> bool)
+  (tag? a "mut"))
+
+(defn result-type? [(t Code)] (-> bool)
+  (if (and (primitive/code-list? t) (> (cnt t) 0))
+      (let [h (text-of (nth t 0))]
+        (or (str-eq h "Result") (ends-with? h ".Result")))
+      false))
+
+(defn void-type? [(t Code)] (-> bool)
+  (sym-named? t "void"))
+
+;;; Wrap a probe body in the re-entrancy guard.
+(defn guarded [(s (ptr Site)) (bodies Code)] (-> Code)
+  `(if (~(rt (.node s) "enter!"))
+       (do ~@bodies (~(rt (.node s) "leave!")))
+       0))
+
+(defn note-site! [(e (ptr Engine)) (r (ptr Rule)) (site Code)] (-> i64)
+  (do
+    (set! (.sites r) (+ (.sites r) 1))
+    (note-unique! (primitive/field e callers)
+                  (cat3 (primitive/int->str (.index r))
+                        "|"
+                        (cat3 (.cur-module e) "." (.cur-fn e))))
+    0))
+
+;;; The rules attached at a site, as the marker binding's value: "0,3". The final
+;;; round reads these back to produce the match report from what is really there.
+(defn rule-list [(rules (ptr (ArrayList i64))) (anchor Code)] (-> Code)
+  (let [(mut sb) (sb-new (expansion-allocator))
+        (mut i) 0]
+    (while (< (load i) (len rules))
+      (if (> (load i) 0) (sb-push-str! (mut sb) ",") 0)
+      (sb-push-i64! (mut sb) (get rules (load i)))
+      (set! i (+ (load i) 1)))
+    (let [text (sb-str (load sb))]
+      `~text)))
+
+;;; Credit the rules named in a site's marker.
+(defn credit-site! [(e (ptr Engine)) (f Code)] (-> i64)
+  (let [text (text-of (nth (nth f 1) 1))
+        n (slice-len text)
+        (mut i) 0
+        (mut value) 0
+        (mut any) false]
+    (while (<= (load i) n)
+      (let [c
+              (if (< (load i) n)
+                  (primitive/cast i64 (char-at text (load i)))
+                  44)]
+        (if (= c 44)
+            (do
+              (if (and (load any) (< (load value) (len (.rules e))))
+                  (note-site! e
+                              (al-elem (primitive/field e rules) (load value))
+                              f)
+                  0)
+              (set! value 0)
+              (set! any false)
+              0)
+            (do (set! value (+ (* (load value) 10) (- c 48))) (set! any true) 0)))
+      (set! i (+ (load i) 1)))
+    0))
+
+;;; Instrument one call. `applicable` holds the indices of the rules that attach.
+(defn build-site [(e (ptr Engine))
+                  (f Code)
+                  (callee (ptr Callee))
+                  (applicable (ptr (ArrayList i64)))] (-> Code)
+  (let [(mut s) (primitive/zeroed Site)
+        head (nth f 0)
+        nargs (- (cnt f) 1)
+        named (and (> nargs 0) (primitive/code-keyword? (nth f 1)))
+        params (params-of e (.module callee) (.name callee))
+        ret (primitive/type-of f)
+        is-void (void-type? ret)
+        env (primitive/code-list-new)
+        binds (primitive/code-list-new)
+        call-args (primitive/code-list-new)
+        nrules (len applicable)
+        (mut needs-post) false
+        (mut last-needed) -1]
+    (set! (.node s) f)
+    (set! (.module s) (.cur-module e))
+    (set! (.caller s) (if (= (slice-len (.cur-fn e)) 0) "<top>" (.cur-fn e)))
+    (set! (.callee-module s) (.module callee))
+    (set! (.callee s) (.name callee))
+    (set! (.range-elapsed s) `())
+    (set! (.result-is-result s) (if (result-type? ret) 1 0))
+    ; The marker binder: how a later fixpoint round knows this site is done.
+    (set! (.changed e) 1)
+    (primitive/code-list-push! binds (sym f (.marker e)))
+    (primitive/code-list-push! binds (rule-list applicable f))
+    ; Which positional arguments do the rules read? Bind through the last one, so
+    ; evaluation order is preserved; leave the rest exactly where they were.
+    (let [(mut a) 0]
+      (while (< (load a) nargs)
+        (let [pname
+                (if named
+                    (if (= (% (load a) 2) 0)
+                        ""
+                        (primitive/code-keyword-name (nth f (load a))))
+                    (param-name params (load a)))
+              positional (cat "arg" (primitive/int->str (load a)))
+              (mut k) 0]
+          (while (< (load k) nrules)
+            (let [r
+                    (al-elem (primitive/field e rules)
+                             (get applicable (load k)))]
+              (if (or (and (> (slice-len pname) 0)
+                           (rule-mentions? e r (.pred r) pname))
+                      (and (not named)
+                           (rule-mentions? e r (.pred r) positional)))
+                  (set! last-needed (load a))
+                  0))
+            (set! k (+ (load k) 1))))
+        (set! a (+ (load a) 1))))
+    (let [(mut a) 0]
+      (while (< (load a) nargs)
+        (let [arg (rewrite e (nth f (+ (load a) 1)))
+              is-key (and named (= (% (load a) 2) 0))
+              pname
+                (if named
+                    (if is-key
+                        ""
+                        (primitive/code-keyword-name (nth f (load a))))
+                    (param-name params (load a)))
+              t (primitive/type-of (nth f (+ (load a) 1)))
+              ; A symbol or literal can simply be read again: no binding, and so no
+              ; chance of disturbing how a by-reference value is passed.
+              atomic
+                (not (or (primitive/code-list? arg)
+                         (primitive/code-vector? arg)))
+              by-ref (or (tag? t "ref") (tag? t "mut"))
+              typed
+                (and (or (primitive/code-sym? t) (primitive/code-list? t))
+                     (not by-ref))
+              bindable
+                (and (not is-key)
+                     (and (not atomic)
+                          (and (<= (load a) (load last-needed))
+                               (and typed (not (mut-arg? arg))))))
+              reader (if bindable (fresh e "probe-arg") arg)]
+          (if bindable
+              (do
+                (primitive/code-list-push! binds reader)
+                (primitive/code-list-push! binds `(: ~arg ~t))
+                0)
+              0)
+          (if is-key 0 (do (primitive/code-list-push! call-args reader) 0))
+          (if is-key (do (primitive/code-list-push! call-args arg) 0) 0)
+          ; An argument the probe can read: bound above, or atomic. Anything else
+          ; (a `(mut place)`, a by-reference expression) is left out of the
+          ; environment, so a probe that names it gets a located error.
+          (if (and (not is-key) (or bindable atomic))
+              (do
+                (if (> (slice-len pname) 0)
+                    (do (primitive/code-list-push! env `(~pname ~reader)) 0)
+                    0)
+                (if (not named)
+                    (do
+                      (primitive/code-list-push! env
+                                                 `(~(cat "arg"
+                                                         (primitive/int->str (load a))) ~reader))
+                      0)
+                    0)
+                0)
+              0))
+        (set! a (+ (load a) 1))))
+    (primitive/code-list-push! env `("site" ~(site-literal f)))
+    (primitive/code-list-push! env `("caller" ~(.caller s)))
+    (primitive/code-list-push! env `("module" ~(.module s)))
+    (primitive/code-list-push! env `("fn" ~(.callee s)))
+    (primitive/code-list-push! env `("thread" (~(rt f "thread-id"))))
+    (primitive/code-list-push! env `("depth" (~(rt f "depth"))))
+    (primitive/code-list-push! env `("wall" (~(rt f "wall-ms"))))
+    (let [pre-env (primitive/code-list-done env)
+          pre (primitive/code-list-new)
+          post (primitive/code-list-new)
+          (mut any-pre) false
+          (mut k) 0]
+      ; -- before the call: `enter` clauses and span opens.
+      (set! (.env s) pre-env)
+      (set! (.has-result s) 0)
+      (while (< (load k) nrules)
+        (let [r (al-elem (primitive/field e rules) (get applicable (load k)))]
+          (if (= (.mode r) 1)
+              (do
+                (cond (= (.kind r) 0)
+                        (do
+                          (primitive/code-list-push! pre
+                                                     (compile-rule-body e
+                                                                        r
+                                                                        (mut s)
+                                                                        `0))
+                          (set! any-pre true)
+                          0)
+                      (= (.kind r) 2)
+                        (do
+                          (primitive/code-list-push! pre
+                                                     (range-open e r (mut s)))
+                          (set! any-pre true)
+                          0)
+                      :else 0)
+                0)
+              0))
+        (set! k (+ (load k) 1)))
+      (if (load any-pre)
+          (do
+            (primitive/code-list-push! binds (fresh e "probe-pre"))
+            (primitive/code-list-push! binds
+                                       (guarded (mut s)
+                                                (primitive/code-list-done pre)))
+            0)
+          0)
+      ; Call spans open outside the guard: they are bookkeeping, not probe bodies.
+      (set! k 0)
+      (while (< (load k) nrules)
+        (let [r (al-elem (primitive/field e rules) (get applicable (load k)))]
+          (if (and (= (.kind r) 1) (= (.mode r) 0))
+              (do
+                (primitive/code-list-push! binds (fresh e "probe-span-open"))
+                (primitive/code-list-push! binds
+                                           `(~(rt f "span-enter!") ~(cell f
+                                                                          (.span-cell r))))
+                0)
+              0))
+        (set! k (+ (load k) 1)))
+      ; -- the call itself.
+      (let [t0 (fresh e "probe-t0")
+            result (fresh e "probe-call")
+            elapsed (fresh e "probe-elapsed")
+            the-call (like f `(~head ~@(primitive/code-list-done call-args)))
+            post-env (primitive/code-list-new)]
+        (primitive/code-list-push! binds t0)
+        (primitive/code-list-push! binds `(~(rt f "call-begin!")))
+        (if is-void
+            (do
+              ; A void call has no value to bind; it runs as the binding of a unit.
+              (primitive/code-list-push! binds result)
+              (primitive/code-list-push! binds `(do ~the-call 0))
+              0)
+            (do
+              (primitive/code-list-push! binds result)
+              (primitive/code-list-push! binds the-call)
+              0))
+        (primitive/code-list-push! binds elapsed)
+        (primitive/code-list-push! binds `(~(rt f "call-end!") ~t0))
+        (set! k 0)
+        (while (< (load k) nrules)
+          (let [r (al-elem (primitive/field e rules) (get applicable (load k)))]
+            (if (and (= (.kind r) 1) (= (.mode r) 0))
+                (do
+                  (primitive/code-list-push! binds (fresh e "probe-span-close"))
+                  (primitive/code-list-push! binds
+                                             `(~(rt f "span-exit!") ~(cell f
+                                                                           (.span-cell r))))
+                  0)
+                0))
+          (set! k (+ (load k) 1)))
+        ; -- after the call: `call` clauses, range opens and closes.
+        (let [(mut j) 0]
+          (while (< (load j) (cnt pre-env))
+            (primitive/code-list-push! post-env (nth pre-env (load j)))
+            (set! j (+ (load j) 1))))
+        (primitive/code-list-push! post-env `("elapsed" ~elapsed))
+        (if is-void
+            0
+            (do (primitive/code-list-push! post-env `("result" ~result)) 0))
+        (set! (.env s) (primitive/code-list-done post-env))
+        (set! (.has-result s) (if is-void 0 1))
+        ; A range span closes once per site, before the clauses that read it.
+        (set! k 0)
+        (while (< (load k) nrules)
+          (let [r (al-elem (primitive/field e rules) (get applicable (load k)))]
+            (if (and (= (.kind r) 3) (= (.mode r) 0))
+                (let [b (fresh e "probe-range")]
+                  (primitive/code-list-push! binds b)
+                  (primitive/code-list-push! binds (range-close e r (mut s)))
+                  (set! (.range-elapsed s)
+                        `(~@(.range-elapsed s) (~(.range-span r) ~b)))
+                  0)
+                0))
+          (set! k (+ (load k) 1)))
+        (set! k 0)
+        (while (< (load k) nrules)
+          (let [r (al-elem (primitive/field e rules) (get applicable (load k)))]
+            (if (= (.mode r) 0)
+                (cond (= (.kind r) 0)
+                        (do
+                          (if (> (slice-len (.range-span r)) 0)
+                              ; A clause on a range span: its `elapsed` is the span's,
+                              ; and it fires only when the span really closed here.
+                              (let [found
+                                      (env-lookup (.range-elapsed s)
+                                                  (.range-span r))]
+                                (if (> (cnt found) 0)
+                                    (let [span-elapsed (nth found 1)
+                                          saved (.env s)]
+                                      (set! (.env s)
+                                            `(("elapsed" ~span-elapsed) ~@saved))
+                                      (primitive/code-list-push! post
+                                                                 `(if (>= ~span-elapsed
+                                                                          0)
+                                                                      ~(compile-rule-body e
+                                                                                          r
+                                                                                          (mut s)
+                                                                                          span-elapsed)
+                                                                      0))
+                                      (set! (.env s) saved)
+                                      0)
+                                    (do
+                                      (complain f
+                                                (cat3 "probe: `"
+                                                      (.label r)
+                                                      "` is on a range span defined in another module; put the clause in the module that defines the span"))
+                                      0)))
+                              (do
+                                (primitive/code-list-push! post
+                                                           (compile-rule-body e
+                                                                              r
+                                                                              (mut s)
+                                                                              elapsed))
+                                0))
+                          (set! needs-post true)
+                          0)
+                      (= (.kind r) 2)
+                        (do
+                          (primitive/code-list-push! post
+                                                     (range-open e r (mut s)))
+                          (set! needs-post true)
+                          0)
+                      :else 0)
+                0))
+          (set! k (+ (load k) 1)))
+        (if (load needs-post)
+            (do
+              (primitive/code-list-push! binds (fresh e "probe-post"))
+              (primitive/code-list-push! binds
+                                         (guarded (mut s)
+                                                  (primitive/code-list-done post)))
+              0)
+            0)
+        (if is-void
+            `(let* [~@(primitive/code-list-done binds)] (~(rt f "nothing")))
+            `(let* [~@(primitive/code-list-done binds)] (~(rt f "ret") ~result)))))))
+
+(defn range-key [(e (ptr Engine)) (r (ptr Rule)) (s (ptr Site))] (-> Code)
+  (if (tag? (.span-key r) "nokey")
+      `(~(rt (.node s) "key-begin!"))
+      `(do (~(rt (.node s) "key-begin!")) ~(show e r s (.span-key r)))))
+
+(defn range-open [(e (ptr Engine)) (r (ptr Rule)) (s (ptr Site))] (-> Code)
+  `(do
+     ~(range-key e r s)
+     (~(rt (.node s) "range-open!") ~(cell (.node s) (.span-cell r)))))
+
+;;; Close a range span at this site: evaluates to its elapsed ns, or -1 when no
+;;; span was open for the key (or when a probe is already running on this thread).
+(defn range-close [(e (ptr Engine)) (r (ptr Rule)) (s (ptr Site))] (-> Code)
+  (let [b (fresh e "probe-range-elapsed")]
+    `(if (~(rt (.node s) "enter!"))
+         (let* [~b
+                  (do
+                    ~(range-key e r s)
+                    (~(rt (.node s) "range-close!") ~(cell (.node s)
+                                                           (.span-cell r))))]
+           (do (~(rt (.node s) "leave!")) ~b))
+         -1)))
+
+; ---- marks ------------------------------------------------------------------------------------
+;;; `(marks/mark-point "name" VALUE)` and `(marks/span-region "name" BODY)`.
+(defn build-mark-site [(e (ptr Engine))
+                       (f Code)
+                       (region bool)
+                       (applicable (ptr (ArrayList i64)))] (-> Code)
+  (let [(mut s) (primitive/zeroed Site)
+        inner (rewrite e (nth f 2))
+        t (primitive/type-of (nth f 2))
+        typed (or (primitive/code-sym? t) (primitive/code-list? t))
+        value (fresh e "probe-value")
+        t0 (fresh e "probe-t0")
+        elapsed (fresh e "probe-elapsed")
+        binds (primitive/code-list-new)
+        post (primitive/code-list-new)
+        nrules (len applicable)
+        (mut k) 0]
+    (set! (.node s) f)
+    (set! (.module s) (.cur-module e))
+    (set! (.caller s) (if (= (slice-len (.cur-fn e)) 0) "<top>" (.cur-fn e)))
+    (set! (.callee s) "")
+    (set! (.callee-module s) "")
+    (set! (.range-elapsed s) `())
+    (set! (.has-result s) 1)
+    (set! (.changed e) 1)
+    (primitive/code-list-push! binds (sym f (.marker e)))
+    (primitive/code-list-push! binds (rule-list applicable f))
+    (primitive/code-list-push! binds t0)
+    (primitive/code-list-push! binds `(~(rt f "call-begin!")))
+    (primitive/code-list-push! binds value)
+    (primitive/code-list-push! binds (if typed `(: ~inner ~t) inner))
+    (primitive/code-list-push! binds elapsed)
+    (primitive/code-list-push! binds `(~(rt f "call-end!") ~t0))
+    (set! (.env s)
+          `(("value" ~value) ("result" ~value)
+              ("elapsed" ~elapsed)
+              ("site" ~(site-literal f))
+              ("caller" ~(.caller s))
+              ("module" ~(.module s))
+              ("fn" "")
+              ("thread" (~(rt f "thread-id")))
+              ("depth" (~(rt f "depth")))
+              ("wall" (~(rt f "wall-ms")))))
+    (while (< (load k) nrules)
+      (let [r (al-elem (primitive/field e rules) (get applicable (load k)))]
+        (primitive/code-list-push! post (compile-rule-body e r (mut s) elapsed)))
+      (set! k (+ (load k) 1)))
+    (primitive/code-list-push! binds (fresh e "probe-post"))
+    (primitive/code-list-push! binds
+                               (guarded (mut s) (primitive/code-list-done post)))
+    (if region
+        `(let* [~@(primitive/code-list-done binds)] (~(rt f "ret") ~value))
+        `(let* [~@(primitive/code-list-done binds)] 0))))
+
+; ---- rendering values by type (the second round) -------------------------------------------------
+(defn int-type? [(name (slice u8))] (-> bool)
+  (or (str-eq name "i64")
+      (str-eq name "i32")
+      (str-eq name "i16")
+      (str-eq name "i8")
+      (str-eq name "u64")
+      (str-eq name "u32")
+      (str-eq name "u16")
+      (str-eq name "u8")
+      (str-eq name "isize")
+      (str-eq name "usize")))
+
+(defn show-struct [(e (ptr Engine)) (f Code) (x Code) (t Code)] (-> Code)
+  (let [n (primitive/code-field-count t)
+        b (fresh e "probe-struct")
+        out (primitive/code-list-new)
+        (mut i) 0]
+    (primitive/code-list-push! out `(~(rt f "out-open!") "{"))
+    (while (< (load i) n)
+      (let [fname (primitive/code-str (primitive/code-field-name t (load i)))]
+        (primitive/code-list-push! out `(~(rt f "out-field!") ~fname ~(load i)))
+        (primitive/code-list-push! out
+                                   `(~(rt f "show-marker") (~(sym f
+                                                                  (cat "."
+                                                                       fname)) ~b))))
+      (set! i (+ (load i) 1)))
+    (primitive/code-list-push! out `(~(rt f "out-close!") "}"))
+    `(let* [~b ~x] (do ~@(primitive/code-list-done out)))))
+
+(defn show-sum [(e (ptr Engine)) (f Code) (x Code) (t Code)] (-> Code)
+  (let [nv (primitive/code-variant-count t)
+        arms (primitive/code-list-new)
+        (mut v) 0]
+    (while (< (load v) nv)
+      (let [nf (primitive/code-variant-fields t (load v))
+            vname (primitive/code-str (primitive/code-variant-name t (load v)))
+            binders (primitive/code-list-new)
+            body (primitive/code-list-new)
+            (mut k) 0]
+        (primitive/code-list-push! body
+                                   `(~(rt f "out-variant-begin!") ~vname ~nf))
+        (while (< (load k) nf)
+          (let [b (fresh e "probe-payload")]
+            (primitive/code-list-push! binders b)
+            (if (> (load k) 0)
+                (do (primitive/code-list-push! body `(~(rt f "out-sep!"))) 0)
+                0)
+            (primitive/code-list-push! body `(~(rt f "show-marker") ~b)))
+          (set! k (+ (load k) 1)))
+        (primitive/code-list-push! body `(~(rt f "out-variant-end!") ~nf))
+        (primitive/code-list-push! arms
+                                   `(~(primitive/code-variant-qname t (load v)) [~@(primitive/code-list-done binders)]
+                                       (do ~@(primitive/code-list-done body)))))
+      (set! v (+ (load v) 1)))
+    `(match ~x ~@(primitive/code-list-done arms))))
+
+(defn show-slice [(e (ptr Engine)) (f Code) (x Code)] (-> Code)
+  (let [s (fresh e "probe-slice")
+        i (fresh e "probe-i")]
+    `(let* [~s ~x
+            (mut ~i) 0]
+       (do
+         (~(rt f "out-open!") "[")
+         (loop (if (>= (load ~i) (len ~s))
+                   (break)
+                   (do
+                     (if (> (load ~i) 0) (~(rt f "out-sep!")) 0)
+                     (~(rt f "show-marker") (get ~s (load ~i)))
+                     (store! ~i (+ (load ~i) 1)))))
+         (~(rt f "out-close!") "]")))))
+
+;;; Replace one `(show-marker X)` now that the checker knows X's type. Returns the
+;;; marker unchanged while the type is still unknown; a later round will have it.
+(defn expand-marker [(e (ptr Engine)) (f Code)] (-> Code)
+  (let [x (nth f 1)
+        t (primitive/type-of x)]
+    (cond (primitive/code-sym? t)
+            (let [name (primitive/code-str t)]
+              (cond (int-type? name) `(~(rt f "out-int!") (cast i64 ~x))
+                    (str-eq name "bool") `(~(rt f "out-bool!") ~x)
+                    (or (str-eq name "f64") (str-eq name "f32"))
+                      `(~(rt f "out-f64!") (cast f64 ~x))
+                    (str-eq name "Code") `(~(rt f "out-text!") "<code>")
+                    :else
+                      (let [shape (primitive/code-type-shape t)]
+                        (cond (sym-named? shape "struct") (show-struct e f x t)
+                              (sym-named? shape "sum") (show-sum e f x t)
+                              :else `(~(rt f "out-text!") ~(cat3 "<" name ">"))))))
+          (primitive/code-list? t)
+            (let [h (text-of (nth t 0))]
+              (cond (str-eq h "slice")
+                      (if (sym-named? (nth t 1) "u8")
+                          `(~(rt f "out-str!") ~x)
+                          (show-slice e f x))
+                    (str-eq h "ptr")
+                      (if (sym-named? (nth t 1) "i8")
+                          `(~(rt f "out-cstr!") ~x)
+                          `(~(rt f "out-ptr!") (cast i64 ~x)))
+                    (str-eq h "fnptr") `(~(rt f "out-text!") "<fn>")
+                    (or (str-eq h "array")
+                        (or (str-eq h "vec")
+                            (or (str-eq h "dyn") (str-eq h "mut"))))
+                      `(~(rt f "out-text!") ~(cat3 "<" h ">"))
+                    :else
+                      (let [shape (primitive/code-type-shape t)]
+                        (cond (sym-named? shape "struct") (show-struct e f x t)
+                              (sym-named? shape "sum") (show-sum e f x t)
+                              :else `(~(rt f "out-text!") ~(cat3 "<" h ">"))))))
+          :else f)))
+
+(defn marker-call? [(f Code)] (-> bool)
+  (if (and (primitive/code-list? f) (= (cnt f) 2))
+      (let [h (nth f 0)]
+        (if (primitive/code-sym? h)
+            (str-eq (primitive/code-str h) "experiments.probe.rt.show-marker")
+            false))
+      false))
+
+(defn has-marker? [(f Code)] (-> bool)
+  (cond (marker-call? f) true
+        (or (primitive/code-list? f) (primitive/code-vector? f))
+          (let [n (cnt f)
+                (mut i) 0
+                (mut hit) false]
+            (while (and (not (load hit)) (< (load i) n))
+              (if (has-marker? (nth f (load i))) (set! hit true) 0)
+              (set! i (+ (load i) 1)))
+            (load hit))
+        :else false))
+
+(defn expand-markers [(e (ptr Engine)) (f Code)] (-> Code)
+  (cond (marker-call? f) (expand-marker e f)
+        (and (or (primitive/code-list? f) (primitive/code-vector? f))
+             (has-marker? f))
+          (let [n (cnt f)
+                out (primitive/code-list-new)
+                (mut i) 0]
+            (while (< (load i) n)
+              (primitive/code-list-push! out
+                                         (expand-markers e (nth f (load i))))
+              (set! i (+ (load i) 1)))
+            (like f (primitive/code-list-done out)))
+        :else f))
+
+; ---- the walk --------------------------------------------------------------------------------------
+(defn site-marker [(f Code)] (-> (slice u8))
+  (if (and (tag? f "let*") (> (cnt f) 1))
+      (let [b (nth f 1)]
+        (if (and (primitive/code-vector? b) (> (cnt b) 0))
+            (text-of (nth b 0))
+            ""))
+      ""))
+
+;;; A site this probe module built in an earlier round.
+(defn done-site? [(e (ptr Engine)) (f Code)] (-> bool)
+  (str-eq (site-marker f) (.marker e)))
+
+;;; A site ANY probe module built.
+(defn probe-site? [(f Code)] (-> bool)
+  (starts-with? (site-marker f) "probe-site-"))
+
+;;; The binding that holds a site's original call. It may hold the call itself, a
+;;; void call wrapped as `(do CALL 0)`, or — when several probe modules attach to
+;;; the same call — another probe's whole site with the call further in. `owned`
+;;; says this probe has already instrumented that call, so whatever else happens
+;;; it must not be wrapped again; that is what lets two probes reach a fixpoint
+;;; instead of re-wrapping each other's sites forever.
+(defn rewrite-call-slot [(e (ptr Engine)) (init Code) (owned bool)] (-> Code)
+  (cond (done-site? e init) (rewrite-site e init true)
+        (probe-site? init) (rewrite-site e init owned)
+        (and (tag? init "do") (= (cnt init) 3))
+          (let [inner (rewrite-call-slot e (nth init 1) owned)]
+            (if (primitive/code-eq inner (nth init 1))
+                init
+                (like init `(~(nth init 0) ~inner ~(nth init 2)))))
+        owned (rewrite-args e init)
+        :else (rewrite e init)))
+
+;;; Walk a site from an earlier round (this probe's or another's). Argument
+;;; bindings are ordinary program code and are walked again; the call slot is
+;;; handled above; probe bodies are never instrumented, only checked (when they are
+;;; this probe's) for values whose type the checker has now worked out.
+(defn rewrite-site [(e (ptr Engine)) (f Code) (owned bool)] (-> Code)
+  (let [b (nth f 1)
+        n (cnt b)
+        mine (done-site? e f)
+        out (primitive/code-list-new)
+        (mut changed) false
+        (mut i) 0]
+    (if mine (credit-site! e f) 0)
+    (while (< (load i) n)
+      (let [name (nth b (load i))
+            init (nth b (+ (load i) 1))
+            spelling (text-of name)
+            fresh-init
+              (cond (or (str-eq spelling "probe-arg")
+                        (str-eq spelling "probe-value"))
+                      (rewrite e init)
+                    (str-eq spelling "probe-call")
+                      (rewrite-call-slot e init owned)
+                    mine (expand-markers e init)
+                    :else init)]
+        (if (not (primitive/code-eq init fresh-init)) (set! changed true) 0)
+        (primitive/code-list-push! out name)
+        (primitive/code-list-push! out fresh-init))
+      (set! i (+ (load i) 2)))
+    ; Untouched when nothing beneath it changed: that is what lets the fixpoint end.
+    (if (load changed) (set! (.changed e) 1) 0)
+    (if (load changed)
+        (like f
+              `(~(nth f 0) ~(like b (primitive/code-list-done out))
+                  ~@(primitive/code-slice f 2 (cnt f))))
+        f)))
+
+(defn rewrite-args [(e (ptr Engine)) (f Code)] (-> Code)
+  (if (or (primitive/code-list? f) (primitive/code-vector? f))
+      (let [n (cnt f)
+            out (primitive/code-list-new)
+            (mut changed) false
+            (mut i) 1]
+        (if (> n 0) (do (primitive/code-list-push! out (nth f 0)) 0) 0)
+        (while (< (load i) n)
+          (let [child (nth f (load i))
+                fresh-child (rewrite e child)]
+            (if (not (primitive/code-eq child fresh-child))
+                (set! changed true)
+                0)
+            (primitive/code-list-push! out fresh-child))
+          (set! i (+ (load i) 1)))
+        (if (load changed) (like f (primitive/code-list-done out)) f))
+      f))
+
+(defn mark-name? [(f Code) (name (slice u8))] (-> bool)
+  (if (> (cnt f) 1)
+      (let [a (nth f 1)]
+        (if (primitive/code-string? a)
+            (str-eq (primitive/code-str a) name)
+            false))
+      false))
+
+;;; Which rules attach to this call? Fills `out`; returns 1 for a mark-point, 2 for
+;;; a span-region, 0 for an ordinary call.
+(defn applicable-rules! [(e (ptr Engine))
+                         (f Code)
+                         (c (ptr Callee))
+                         (out (ptr (ArrayList i64)))] (-> i64)
+  (let [n (len (.rules e))
+        is-mark
+          (and (str-eq (.module c) "experiments.probe.marks")
+               (str-eq (.name c) "mark-point"))
+        is-region
+          (and (str-eq (.module c) "experiments.probe.marks")
+               (str-eq (.name c) "span-region"))
+        ret (primitive/type-of f)
+        (mut i) 0]
+    (while (< (load i) n)
+      (let [r (al-elem (primitive/field e rules) (load i))]
+        (if (= (.mode r) 2)
+            (if (and (or is-mark is-region) (mark-name? f (.mark r)))
+                (do (push! out (load i)) 0)
+                0)
+            (if (and (not (or is-mark is-region))
+                     (targets-match? e (.targets r) c))
+                ; A rule that reads `result.ok`/`failed` only fits a function that
+                ; returns a Result. Under a wildcard the others are skipped (and
+                ; counted); a named target that does not fit is the author's error.
+                (if (and (= (.mode r) 0)
+                         (and (rule-reads-result-shape? e r (.pred r))
+                              (not (result-type? ret))))
+                    (if (wildcard-targets? (.targets r))
+                        (do (set! (.skipped r) (+ (.skipped r) 1)) 0)
+                        (do
+                          (complain f
+                                    (cat3 "probe: `"
+                                          (.label r)
+                                          "` reads result.ok / result.err / failed, but this function does not return a Result"))
+                          0))
+                    (do (push! out (load i)) 0))
+                0)))
+      (set! i (+ (load i) 1)))
+    (if is-mark 1 (if is-region 2 0))))
+
+(defn rule-reads-result-shape? [(e (ptr Engine)) (r (ptr Rule)) (pred Code)] (-> bool)
+  (or (reads-result-shape? e r pred 0) (reads-result-shape? e r (.actions r) 0)))
+
+;;; Drop rules whose predicate is already false here.
+(defn filter-static! [(e (ptr Engine))
+                      (f Code)
+                      (c (ptr Callee))
+                      (rules (ptr (ArrayList i64)))] (-> i64)
+  (let [(mut s) (primitive/zeroed Site)
+        (mut kept) (al-new [i64] (expansion-allocator))
+        n (len rules)
+        (mut i) 0]
+    (set! (.node s) f)
+    (set! (.module s) (.cur-module e))
+    (set! (.caller s) (if (= (slice-len (.cur-fn e)) 0) "<top>" (.cur-fn e)))
+    (set! (.callee-module s) (.module c))
+    (set! (.callee s) (.name c))
+    (while (< (load i) n)
+      (let [r (al-elem (primitive/field e rules) (get rules (load i)))]
+        (if (= (static-pred e (mut s) (.pred r)) 0)
+            ; Matched, and deliberately left out: still a match for the report.
+            (do (note-site! e r f) 0)
+            (do (push! (mut kept) (get rules (load i))) 0)))
+      (set! i (+ (load i) 1)))
+    (al-clear! rules)
+    (set! i 0)
+    (while (< (load i) (len kept))
+      (push! rules (get kept (load i)))
+      (set! i (+ (load i) 1)))
+    (len rules)))
+
+(defn fnptr-form? [(f Code)] (-> bool)
+  (and (= (cnt f) 2) (or (tag? f "fnptr-of") (tag? f "primitive/fnptr-of"))))
+
+;;; Does any rule attach to calls of this function?
+(defn probed-callee? [(e (ptr Engine)) (c (ptr Callee)) (anchor Code)] (-> bool)
+  (let [n (len (.rules e))
+        (mut i) 0
+        (mut hit) false]
+    (while (and (not (load hit)) (< (load i) n))
+      (let [r (al-elem (primitive/field e rules) (load i))]
+        (if (and (!= (.mode r) 2) (targets-match? e (.targets r) c))
+            (set! hit true)
+            0))
+      (set! i (+ (load i) 1)))
+    (load hit)))
+
+;;; `(fnptr-of F)` for a probed F. A call through the pointer has no call site to
+;;; rewrite, so the pointer is redirected to a forwarding function generated beside
+;;; the reference:
+;;;
+;;;   (defn* F--probe-thunk [(p0 T0) …] (-> R) (F p0 …))
+;;;
+;;; Its one call IS a call site, and the ordinary path instruments it on the next
+;;; round (with `caller` = the thunk, which says the call came through a pointer).
+;;; Returns the original form when F has no usable declaration.
+(defn redirect-fnptr [(e (ptr Engine)) (f Code) (c (ptr Callee))] (-> Code)
+  (let [d (primitive/code-decl f)
+        thunk-name (cat (.name c) "--probe-thunk")]
+    (if (and (primitive/code-list? d) (>= (cnt d) 6))
+        (let [types (nth d 4)
+              ret (nth d 5)
+              params (params-of e (.module c) (.name c))
+              target (sym f (text-of (nth d 3)))
+              thunk (sym f thunk-name)
+              formals (primitive/code-list-new)
+              actuals (primitive/code-list-new)
+              (mut i) 0]
+          (if (= (note-unique! (primitive/field e thunk-names)
+                               (cat3 (.cur-module e) "|" thunk-name))
+                 1)
+              (do
+                (while (< (load i) (cnt types))
+                  (let [pname (param-name params (load i))
+                        formal
+                          (sym f
+                               (if (> (slice-len pname) 0)
+                                   pname
+                                   (cat "arg" (primitive/int->str (load i)))))]
+                    (primitive/code-list-push! formals
+                                               `(~formal ~(nth types (load i))))
+                    (primitive/code-list-push! actuals formal))
+                  (set! i (+ (load i) 1)))
+                (set! (.thunks e)
+                      `(~@(.thunks e) (defn* ~thunk [~@(primitive/code-list-done formals)] (-> ~ret)
+                                        (~target ~@(primitive/code-list-done actuals)))))
+                0)
+              0)
+          (set! (.changed e) 1)
+          (like f `(~(nth f 0) ~thunk)))
+        f)))
+
+(defn rewrite [(e (ptr Engine)) (f Code)] (-> Code)
+  (cond (done-site? e f) (rewrite-site e f true)
+        (probe-site? f) (rewrite-site e f false)
+        (fnptr-form? f)
+          (let [(mut target) (callee-of f)]
+            (if (and (= (.ok target) 1)
+                     (and (str-eq (.kind target) "fn")
+                          (probed-callee? e (mut target) f)))
+                (redirect-fnptr e f (mut target))
+                f))
+        (primitive/code-list? f)
+          (if (= (cnt f) 0)
+              f
+              (let [(mut c)
+                      (if (primitive/code-sym? (nth f 0))
+                          (callee-of f)
+                          (primitive/zeroed Callee))]
+                (if (and (= (.ok c) 1)
+                         (or (str-eq (.kind c) "fn")
+                             (str-eq (.kind c) "extern")))
+                    (let [(mut rules) (al-new [i64] (expansion-allocator))
+                          shape (applicable-rules! e f (mut c) (mut rules))]
+                      (if (> (len rules) 0)
+                          (if (> shape 0)
+                              (build-mark-site e f (= shape 2) (mut rules))
+                              (if (> (filter-static! e f (mut c) (mut rules)) 0)
+                                  (let [site
+                                          (build-site e f (mut c) (mut rules))]
+                                    (if (dumping?)
+                                        (do
+                                          (say "probe site: ")
+                                          (dump site)
+                                          (say "\n")
+                                          0)
+                                        0)
+                                    site)
+                                  (rewrite-children e f)))
+                          (rewrite-children e f)))
+                    (rewrite-children e f))))
+        (primitive/code-vector? f) (rewrite-children e f)
+        :else f))
+
+;;; Rebuild a node only if something beneath it changed, so untouched code keeps
+;;; its original nodes.
+(defn rewrite-children [(e (ptr Engine)) (f Code)] (-> Code)
+  (let [n (cnt f)
+        out (primitive/code-list-new)
+        (mut changed) false
+        (mut i) 0]
+    (while (< (load i) n)
+      (let [child (nth f (load i))
+            fresh-child (rewrite e child)]
+        (if (not (primitive/code-eq child fresh-child)) (set! changed true) 0)
+        (primitive/code-list-push! out fresh-child))
+      (set! i (+ (load i) 1)))
+    (if (load changed)
+        (like f (primitive/code-list-done out))
+        f)))
+
+; ---- booting the runtime from main --------------------------------------------------------------------
+(defn imports-module? [(m Code) (name (slice u8))] (-> bool)
+  (let [n (cnt m)
+        (mut i) 1
+        (mut hit) false]
+    (while (and (not (load hit)) (< (load i) n))
+      (let [f (nth m (load i))]
+        (if (and (tag? f "import") (> (cnt f) 1))
+            (if (str-eq (text-of (nth f 1)) name) (set! hit true) 0)
+            0))
+      (set! i (+ (load i) 1)))
+    (load hit)))
+
+;;; Has this probe module already put its `probe-init` at the top of `main`? Each
+;;; probe module wraps main's body in its own `(let* [probe-boot-<module> (init)]
+;;; (do BODY…))`, so with several modules the wrappers nest; look through them all.
+(defn boot-inside? [(e (ptr Engine)) (form Code)] (-> bool)
+  (if (and (tag? form "let*") (> (cnt form) 2))
+      (let [b (nth form 1)]
+        (if (and (primitive/code-vector? b) (> (cnt b) 0))
+            (let [name (text-of (nth b 0))]
+              (cond (str-eq name (.boot-marker e)) true
+                    (starts-with? name "probe-boot-")
+                      (let [body (nth form 2)]
+                        (if (and (tag? body "do") (> (cnt body) 1))
+                            (boot-inside? e (nth body 1))
+                            false))
+                    :else false))
+            false))
+      false))
+
+(defn booted? [(e (ptr Engine)) (f Code) (arrow i64)] (-> bool)
+  (if (> (cnt f) (+ arrow 1)) (boot-inside? e (nth f (+ arrow 1))) false))
+
+(defn boot-main [(e (ptr Engine)) (f Code) (arrow i64)] (-> Code)
+  (let [init (sym f (cat (.module e) ".probe-init"))
+        marker (sym f (.boot-marker e))
+        body (primitive/code-slice f (+ arrow 1) (cnt f))]
+    (primitive/code-list-like f
+                              `(~@(primitive/code-slice f 0 (+ arrow 1)) (let* [~marker
+                                                                                  (~init)]
+                                                                           (do
+                                                                             ~@body))))))
+
+; ---- the transform ----------------------------------------------------------------------------------------
+(defn xf-form [(e (ptr Engine)) (f Code) (entry bool) (state (ptr i64))] (-> Code)
+  (if (defn-form? f)
+      (let [arrow (arrow-index f)
+            name (if (> (cnt f) 1) (text-of (nth f 1)) "")]
+        (set! (.cur-fn e) name)
+        (let [walked (rewrite e f)]
+          (if (and entry (and (str-eq name "main") (> arrow 0)))
+              (if (booted? e walked arrow)
+                  (do (primitive/store! state 2) walked)
+                  (do
+                    (primitive/store! state 1)
+                    (set! (.changed e) 1)
+                    (boot-main e walked arrow)))
+              walked)))
+      (do
+        (set! (.cur-fn e) "")
+        (rewrite e f))))
+
+(defn xf-module [(e (ptr Engine)) (m Code) (state (ptr i64))] (-> Code)
+  (let [name (text-of (nth m 0))]
+    (if (or (<= (cnt m) 1) (or (internal-module? name) (probe-module? m)))
+        m
+        (let [entry (imports-module? m (.module e))
+              n (cnt m)
+              out (primitive/code-list-new)
+              (mut changed) false
+              (mut i) 1]
+          (set! (.cur-module e) name)
+          (set! (.thunks e) `())
+          (primitive/code-list-push! out (nth m 0))
+          (while (< (load i) n)
+            (let [f (nth m (load i))
+                  g (xf-form e f entry state)]
+              (if (not (primitive/code-eq f g)) (set! changed true) 0)
+              (primitive/code-list-push! out g))
+            (set! i (+ (load i) 1)))
+          ; Forwarding thunks made for `fnptr-of` references in this module.
+          (let [(mut k) 0]
+            (while (< (load k) (cnt (.thunks e)))
+              (primitive/code-list-push! out (nth (.thunks e) (load k)))
+              (set! changed true)
+              (set! k (+ (load k) 1))))
+          (set! (.thunks e) `())
+          (if (load changed) (like m (primitive/code-list-done out)) m)))))
+
+(defn pad-right [(s (slice u8)) (width i64)] (-> (slice u8))
+  (let [(mut sb) (sb-new (expansion-allocator))
+        (mut i) (slice-len s)]
+    (sb-push-str! (mut sb) s)
+    (while (< (load i) width)
+      (sb-push-byte! (mut sb) (primitive/cast u8 32))
+      (set! i (+ (load i) 1)))
+    (sb-str (load sb))))
+
+(defn functions-for [(callers (ptr (ArrayList (slice u8)))) (index i64)] (-> i64)
+  (let [prefix (cat (primitive/int->str index) "|")
+        n (len callers)
+        (mut i) 0
+        (mut count) 0]
+    (while (< (load i) n)
+      (if (starts-with? (get callers (load i)) prefix)
+          (set! count (+ (load count) 1))
+          0)
+      (set! i (+ (load i) 1)))
+    (load count)))
+
+;;; The match report, printed by the round that instrumented the program. A clause
+;;; that attached nowhere is an error: a probe that silently matches nothing answers
+;;; "it never happened" when the truth is "I never looked".
+(defn report-matches! [(e (ptr Engine)) (anchor Code)] (-> i64)
+  (let [n (len (.rules e))
+        (mut i) 0
+        (mut width) 0]
+    (while (< (load i) n)
+      (let [r (al-elem (primitive/field e rules) (load i))]
+        (if (> (slice-len (.label r)) (load width))
+            (set! width (slice-len (.label r)))
+            0))
+      (set! i (+ (load i) 1)))
+    (say (cat3 "probe " (.module e) "\n"))
+    (set! i 0)
+    (while (< (load i) n)
+      (let [r (al-elem (primitive/field e rules) (load i))]
+        ; A range span contributes two bookkeeping rules; report its opening only.
+        (if (= (.kind r) 3)
+            0
+            (do
+              (say (cat "  " (pad-right (.label r) (+ (load width) 2))))
+              (say (primitive/int->str (.sites r)))
+              (say (if (= (.sites r) 1) " site in " " sites in "))
+              (say (primitive/int->str (functions-for (primitive/field e
+                                                                       callers)
+                                                      (.index r))))
+              (say (if (= (functions-for (primitive/field e callers) (.index r))
+                          1)
+                       " function"
+                       " functions"))
+              (if (> (.skipped r) 0)
+                  (say (cat3 "  ("
+                             (primitive/int->str (.skipped r))
+                             " skipped: not a Result)"))
+                  0)
+              (say "\n")
+              (if (= (.sites r) 0)
+                  (complain anchor
+                            (cat3 "probe: `"
+                                  (.label r)
+                                  "` matches nothing in this program"))
+                  0)
+              0)))
+      (set! i (+ (load i) 1)))
+    0))
+
+(defn report-ambiguity! [(e (ptr Engine)) (anchor Code)] (-> i64)
+  (let [n (len (.ambiguous e))
+        (mut i) 0]
+    (while (< (load i) n)
+      (let [entry (get (.ambiguous e) (load i))
+            bar (index-of entry 124)
+            pat (substr entry 0 bar)
+            (mut j) 0
+            (mut others) 0
+            (mut list) (sb-new (expansion-allocator))]
+        (while (< (load j) n)
+          (let [other (get (.ambiguous e) (load j))
+                obar (index-of other 124)]
+            (if (str-eq (substr other 0 obar) pat)
+                (do
+                  (set! others (+ (load others) 1))
+                  (sb-push-str! (mut list) " ")
+                  (sb-push-str! (mut list)
+                                (substr other (+ obar 1) (slice-len other)))
+                  (sb-push-str! (mut list) "/")
+                  (sb-push-str! (mut list) pat)
+                  0)
+                0))
+          (set! j (+ (load j) 1)))
+        ; Reported once per pattern: at its first entry.
+        (if (and (> (load others) 1)
+                 (first-for-pattern? (primitive/field e ambiguous) (load i) pat))
+            (complain anchor
+                      (cat3 "probe: `"
+                            pat
+                            (cat "` is ambiguous; name one of:"
+                                 (sb-str (load list)))))
+            0))
+      (set! i (+ (load i) 1)))
+    0))
+
+(defn first-for-pattern? [(entries (ptr (ArrayList (slice u8))))
+                          (index i64)
+                          (pat (slice u8))] (-> bool)
+  (let [(mut i) 0
+        (mut earlier) false]
+    (while (< (load i) index)
+      (let [entry (get entries (load i))]
+        (if (str-eq (substr entry 0 (index-of entry 124)) pat)
+            (set! earlier true)
+            0))
+      (set! i (+ (load i) 1)))
+    (not (load earlier))))
+
+;;; The built-in reader returns its forms wrapped in `(do …)`; a spec is one form.
+(defn read-spec [(text (slice u8))] (-> Code)
+  (let [c (primitive/code-read text `(reader-config))]
+    (if (and (tag? c "do") (= (cnt c) 2)) (nth c 1) c)))
+
+;;; A probe module's point and span definitions, parsed. Generated `probe-defs`
+;;; functions call this; it exists so they have Code in their signature.
+(defn defs-text [(text (slice u8))] (-> Code)
+  (read-spec text))
+
+(defn defs-none [] (-> Code)
+  `())
+
+(defn defs-cons [(head Code) (tail Code)] (-> Code)
+  `(~head ~@tail))
+
+;;; The transform body. `spec-text` is this module's clauses, `own-text` its point
+;;; and span definitions, and `libs` the parsed definitions of every module it `use`s.
+(defn run [(mods Code) (spec-text (slice u8)) (own-text (slice u8)) (libs Code)] (-> Code)
+  (let [a (expansion-allocator)
+        spec (read-spec spec-text)
+        own (read-spec own-text)
+        (mut e) (primitive/zeroed Engine)
+        defs (primitive/code-list-new)
+        (mut state) 0
+        (mut i) 0]
+    (set! (.module e) (text-of (nth spec 1)))
+    (set! (.mods e) mods)
+    (set! (.marker e) (cat "probe-site-" (.module e)))
+    (set! (.boot-marker e) (cat "probe-boot-" (.module e)))
+    (set! (.rules e) (al-new [Rule] a))
+    (set! (.callers e) (al-new [(slice u8)] a))
+    (set! (.ambiguous e) (al-new [(slice u8)] a))
+    (set! (.thunk-names e) (al-new [(slice u8)] a))
+    (set! (.thunks e) `())
+    ; Own definitions first, so a local name shadows a used one.
+    (let [(mut j) 2]
+      (while (< (load j) (cnt own))
+        (primitive/code-list-push! defs (nth own (load j)))
+        (set! j (+ (load j) 1))))
+    (while (< (load i) (cnt libs))
+      (let [lib (nth libs (load i))
+            (mut j) 2]
+        (while (< (load j) (cnt lib))
+          (primitive/code-list-push! defs (nth lib (load j)))
+          (set! j (+ (load j) 1))))
+      (set! i (+ (load i) 1)))
+    (set! (.defs e) (primitive/code-list-done defs))
+    ; Own spans first (their bookkeeping must wrap the clauses'), then clauses.
+    (let [(mut j) 2]
+      (while (< (load j) (cnt own))
+        (if (tag? (nth own (load j)) "span")
+            (add-span-rules! (mut e) (nth own (load j)))
+            0)
+        (set! j (+ (load j) 1))))
+    (set! i 2)
+    (while (< (load i) (cnt spec))
+      (if (tag? (nth spec (load i)) "clause")
+          (add-clause! (mut e) (nth spec (load i)))
+          0)
+      (set! i (+ (load i) 1)))
+    (let [n (cnt mods)
+          out (primitive/code-list-new)
+          (mut k) 0]
+      (while (< (load k) n)
+        (primitive/code-list-push! out
+                                   (xf-module (mut e)
+                                              (nth mods (load k))
+                                              (mut state)))
+        (set! k (+ (load k) 1)))
+      ; state: 0 = no main found, 1 = booted main this round, 2 = already booted.
+      ; The match report belongs to the round that changed nothing: only then is
+      ; every site (including ones reached through a generated thunk) in place.
+      (cond (= (load state) 0)
+              (complain (nth mods 0)
+                        (cat3 "probe: "
+                              (.module e)
+                              " found no `main` in the entry module to start the probe runtime from"))
+            (= (.changed e) 0) (report-matches! (mut e) (nth mods 0))
+            :else 0)
+      ; Ambiguity is seen while matching, which happens in the round that builds the
+      ; sites; a later round finds them already built and has nothing to compare.
+      (report-ambiguity! (mut e) (nth mods 0))
+      `(do ~@(primitive/code-list-done out)))))

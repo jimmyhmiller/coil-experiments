@@ -1,0 +1,1137 @@
+(module experiments.probe.reader)
+
+; The probe reader: `.probe` text in, an ordinary Coil module out.
+;
+; It is a text-to-text compiler. The DSL is parsed into an s-expression SPEC (the
+; contract with `experiments.probe.engine`, documented there), and the module that
+; carries it is generated as Coil source and handed to the built-in reader. The
+; generated module holds the storage cells the clauses need (aggregations,
+; destinations, spans), a `probe-init` that registers them at start-up, and a
+; transform registration — so a probe file IS a dialect, switched on with `--use`.
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.meta" :use [expansion-allocator])
+
+(const T_EOF 0)
+
+(const T_IDENT 1)
+
+(const T_NUMBER 2)
+
+(const T_STRING 3)
+
+(const T_PUNCT 4)
+
+;;; Lexer + current token. `text` is the token's meaning: an identifier's spelling,
+;;; a string's decoded bytes, a punctuation mark. A number is `num`, already scaled
+;;; to its unit (ns for durations, bytes for sizes); `unit` says which.
+(defstruct P
+  [(src (slice u8))
+   (pos i64)
+   (kind i64)
+   (start i64)
+   (text (slice u8))
+   (num i64)
+   (unit i64)])
+
+(const U_NONE 0)
+
+(const U_DUR 1)
+
+(const U_BYTES 2)
+
+;;; Everything the parse produces, plus the first error (parsing stops at it).
+(defstruct Out
+  [(spec StrBuf)
+   (defs StrBuf)
+   (cells StrBuf)
+   (init StrBuf)
+   (imports StrBuf)
+   (uses StrBuf)
+   (module (slice u8))
+   (naggs i64)
+   (nspans i64)
+   (nuses i64)
+   (nclauses i64)
+   (dests (ArrayList (slice u8)))
+   (failed i64)
+   (err StrBuf)])
+
+; ---- errors -------------------------------------------------------------------
+(defn line-of [(src (slice u8)) (pos i64)] (-> i64)
+  (let [(mut line) 1
+        (mut i) 0]
+    (while (and (< (load i) pos) (< (load i) (slice-len src)))
+      (if (= (primitive/cast i64 (char-at src (load i))) 10)
+          (set! line (+ (load line) 1))
+          0)
+      (set! i (+ (load i) 1)))
+    (load line)))
+
+(defn fail! [(p (ptr P)) (o (ptr Out)) (msg (slice u8))] (-> i64)
+  (if (= (.failed o) 1)
+      0
+      (do
+        (set! (.failed o) 1)
+        (sb-push-str! (primitive/field o err) "line ")
+        (sb-push-i64! (primitive/field o err) (line-of (.src p) (.start p)))
+        (sb-push-str! (primitive/field o err) ": ")
+        (sb-push-str! (primitive/field o err) msg)
+        (if (= (.kind p) T_EOF)
+            (sb-push-str! (primitive/field o err) " (at end of file)")
+            (do
+              (sb-push-str! (primitive/field o err) " (at `")
+              (sb-push-str! (primitive/field o err) (.text p))
+              (sb-push-str! (primitive/field o err) "`)")))
+        0)))
+
+; ---- lexer --------------------------------------------------------------------
+(defn byte-at [(p (ptr P)) (i i64)] (-> i64)
+  (if (< i (slice-len (.src p))) (primitive/cast i64 (char-at (.src p) i)) 0))
+
+(defn ident-start? [(c i64)] (-> bool)
+  (or (and (>= c 97) (<= c 122))
+      (or (and (>= c 65) (<= c 90)) (or (= c 95) (= c 42)))))
+
+(defn digit? [(c i64)] (-> bool)
+  (and (>= c 48) (<= c 57)))
+
+(defn ident-char? [(c i64)] (-> bool)
+  (or (ident-start? c)
+      (or (digit? c) (or (= c 45) (or (= c 33) (or (= c 63) (= c 36)))))))
+
+(defn skip-space! [(p (ptr P))] (-> i64)
+  (let [(mut going) true]
+    (while (load going)
+      (let [c (byte-at p (.pos p))]
+        (cond (>= (.pos p) (slice-len (.src p))) (set! going false)
+              (or (= c 32) (or (= c 9) (or (= c 10) (= c 13))))
+                (set! (.pos p) (+ (.pos p) 1))
+              (= c 35)
+                (while (and (< (.pos p) (slice-len (.src p)))
+                            (!= (byte-at p (.pos p)) 10))
+                  (set! (.pos p) (+ (.pos p) 1)))
+              :else (set! going false))))
+    0))
+
+;;; An identifier keeps going through `.` and `/` only when what follows can
+;;; continue a name, so `result.ok.status` and `coil.fs/read-file` are one token
+;;; while `[..64kb]` and the `/` closing a predicate are not swallowed.
+(defn lex-ident! [(p (ptr P))] (-> i64)
+  (let [begin (.pos p)
+        (mut going) true]
+    (while (load going)
+      (let [c (byte-at p (.pos p))
+            d (byte-at p (+ (.pos p) 1))]
+        (cond (ident-char? c) (set! (.pos p) (+ (.pos p) 1))
+              (and (= c 46) (or (ident-start? d) (digit? d)))
+                (set! (.pos p) (+ (.pos p) 1))
+              (and (= c 47) (ident-start? d)) (set! (.pos p) (+ (.pos p) 1))
+              :else (set! going false))))
+    (set! (.kind p) T_IDENT)
+    (set! (.text p) (substr (.src p) begin (.pos p)))
+    0))
+
+(defn unit-scale [(p (ptr P)) (o (ptr Out)) (unit (slice u8))] (-> i64)
+  (cond (str-eq unit "") (do (set! (.unit p) U_NONE) 1)
+        (str-eq unit "ns") (do (set! (.unit p) U_DUR) 1)
+        (or (str-eq unit "us") (str-eq unit "µs"))
+          (do (set! (.unit p) U_DUR) 1000)
+        (str-eq unit "ms") (do (set! (.unit p) U_DUR) 1000000)
+        (str-eq unit "s") (do (set! (.unit p) U_DUR) 1000000000)
+        (str-eq unit "b") (do (set! (.unit p) U_BYTES) 1)
+        (str-eq unit "kb") (do (set! (.unit p) U_BYTES) 1024)
+        (str-eq unit "mb") (do (set! (.unit p) U_BYTES) 1048576)
+        :else
+          (do (fail! p o "unknown unit; use ns, us/µs, ms, s, b, kb or mb") 1)))
+
+(defn lex-number! [(p (ptr P)) (o (ptr Out))] (-> i64)
+  (let [(mut whole) 0
+        (mut frac) 0
+        (mut frac-div) 1]
+    (while (digit? (byte-at p (.pos p)))
+      (set! whole (+ (* (load whole) 10) (- (byte-at p (.pos p)) 48)))
+      (set! (.pos p) (+ (.pos p) 1)))
+    (if (and (= (byte-at p (.pos p)) 46) (digit? (byte-at p (+ (.pos p) 1))))
+        (do
+          (set! (.pos p) (+ (.pos p) 1))
+          (while (digit? (byte-at p (.pos p)))
+            (set! frac (+ (* (load frac) 10) (- (byte-at p (.pos p)) 48)))
+            (set! frac-div (* (load frac-div) 10))
+            (set! (.pos p) (+ (.pos p) 1)))
+          0)
+        0)
+    (let [unit-begin (.pos p)]
+      ; A unit is letters, or the two UTF-8 bytes of µ followed by letters.
+      (while (let [c (byte-at p (.pos p))]
+               (or (and (>= c 97) (<= c 122)) (or (= c 194) (= c 181))))
+        (set! (.pos p) (+ (.pos p) 1)))
+      (let [scale (unit-scale p o (substr (.src p) unit-begin (.pos p)))]
+        (set! (.kind p) T_NUMBER)
+        (set! (.text p) (substr (.src p) (.start p) (.pos p)))
+        (set! (.num p)
+              (+ (* (load whole) scale)
+                 (/ (* (load frac) scale) (load frac-div))))
+        0))))
+
+(defn lex-string! [(p (ptr P)) (o (ptr Out))] (-> i64)
+  (let [(mut sb) (sb-new (expansion-allocator))
+        (mut going) true]
+    (set! (.pos p) (+ (.pos p) 1))
+    (while (load going)
+      (let [c (byte-at p (.pos p))]
+        (cond (>= (.pos p) (slice-len (.src p)))
+                (do (fail! p o "unterminated string") (set! going false))
+              (= c 34) (do (set! (.pos p) (+ (.pos p) 1)) (set! going false))
+              (= c 92)
+                (let [e (byte-at p (+ (.pos p) 1))]
+                  (sb-push-byte! (mut sb)
+                                 (primitive/cast u8
+                                                 (cond (= e 110) 10
+                                                       (= e 116) 9
+                                                       (= e 114) 13
+                                                       :else e)))
+                  (set! (.pos p) (+ (.pos p) 2)))
+              :else
+                (do
+                  (sb-push-byte! (mut sb) (primitive/cast u8 c))
+                  (set! (.pos p) (+ (.pos p) 1))))))
+    (set! (.kind p) T_STRING)
+    (set! (.text p) (sb-str (load sb)))
+    0))
+
+(defn two-char-punct? [(c i64) (d i64)] (-> bool)
+  (or (and (= c 46) (= d 46))  ; ..
+      (or (and (= d 61)
+               (or (= c 62) (or (= c 60) (or (= c 33) (or (= c 61) (= c 43))))))  ; >= <= != == +=
+          false)))
+
+(defn advance! [(p (ptr P)) (o (ptr Out))] (-> i64)
+  (do
+    (skip-space! p)
+    (set! (.start p) (.pos p))
+    (set! (.unit p) U_NONE)
+    (let [c (byte-at p (.pos p))
+          d (byte-at p (+ (.pos p) 1))]
+      (cond (>= (.pos p) (slice-len (.src p)))
+              (do (set! (.kind p) T_EOF) (set! (.text p) "") 0)
+            (ident-start? c) (lex-ident! p)
+            (digit? c) (lex-number! p o)
+            (= c 34) (lex-string! p o)
+            :else
+              (let [n (if (two-char-punct? c d) 2 1)]
+                (set! (.kind p) T_PUNCT)
+                (set! (.text p) (substr (.src p) (.pos p) (+ (.pos p) n)))
+                (set! (.pos p) (+ (.pos p) n))
+                0)))))
+
+(defn is? [(p (ptr P)) (kind i64) (text (slice u8))] (-> bool)
+  (and (= (.kind p) kind) (str-eq (.text p) text)))
+
+(defn punct? [(p (ptr P)) (text (slice u8))] (-> bool)
+  (is? p T_PUNCT text))
+
+(defn word? [(p (ptr P)) (text (slice u8))] (-> bool)
+  (is? p T_IDENT text))
+
+(defn expect-punct! [(p (ptr P))
+                     (o (ptr Out))
+                     (text (slice u8))
+                     (msg (slice u8))] (-> i64)
+  (if (punct? p text) (advance! p o) (fail! p o msg)))
+
+(defn index-of-byte [(s (slice u8)) (c i64)] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (while (and (< (load found) 0) (< (load i) (slice-len s)))
+      (if (= (primitive/cast i64 (char-at s (load i))) c)
+          (set! found (load i))
+          0)
+      (set! i (+ (load i) 1)))
+    (load found)))
+
+; ---- emitting the spec ---------------------------------------------------------
+(defn emit! [(sb (ptr StrBuf)) (s (slice u8))] (-> i64)
+  (sb-push-str! sb s))
+
+;;; A Coil string literal holding exactly these bytes.
+(defn emit-quoted! [(sb (ptr StrBuf)) (s (slice u8))] (-> i64)
+  (let [(mut i) 0]
+    (sb-push-byte! sb (primitive/cast u8 34))
+    (while (< (load i) (slice-len s))
+      (let [c (primitive/cast i64 (char-at s (load i)))]
+        (cond (= c 34) (sb-push-str! sb "\\\"")
+              (= c 92) (sb-push-str! sb "\\\\")
+              (= c 10) (sb-push-str! sb "\\n")
+              (= c 9) (sb-push-str! sb "\\t")
+              (= c 13) (sb-push-str! sb "\\r")
+              :else (sb-push-byte! sb (primitive/cast u8 c))))
+      (set! i (+ (load i) 1)))
+    (sb-push-byte! sb (primitive/cast u8 34))))
+
+;;; `s` with whitespace runs collapsed and the ends trimmed: the clause as the
+;;; author wrote it, for report labels.
+(defn emit-collapsed! [(sb (ptr StrBuf)) (s (slice u8))] (-> i64)
+  (let [(mut i) 0
+        (mut pending) false
+        (mut any) false]
+    (while (< (load i) (slice-len s))
+      (let [c (primitive/cast i64 (char-at s (load i)))]
+        (if (or (= c 32) (or (= c 9) (or (= c 10) (= c 13))))
+            (set! pending (load any))
+            (do
+              (if (load pending) (sb-push-byte! sb (primitive/cast u8 32)) 0)
+              (set! pending false)
+              (set! any true)
+              (sb-push-byte! sb (primitive/cast u8 c))
+              0)))
+      (set! i (+ (load i) 1)))
+    0))
+
+(defn cell-name! [(sb (ptr StrBuf)) (o (ptr Out)) (kind (slice u8)) (n i64)] (-> i64)
+  (do
+    (emit! sb (.module o))
+    (emit! sb ".probe-")
+    (emit! sb kind)
+    (emit! sb "-")
+    (sb-push-i64! sb n)))
+
+; ---- expressions ----------------------------------------------------------------
+(defn emit-path! [(sb (ptr StrBuf)) (name (slice u8))] (-> i64)
+  ; `a.b.c` -> (path (path (var "a") "b") "c"), built inside-out.
+  (let [(mut dots) 0
+        (mut i) 0]
+    (while (< (load i) (slice-len name))
+      (if (= (primitive/cast i64 (char-at name (load i))) 46)
+          (set! dots (+ (load dots) 1))
+          0)
+      (set! i (+ (load i) 1)))
+    (set! i 0)
+    (while (< (load i) (load dots))
+      (emit! sb "(path ")
+      (set! i (+ (load i) 1)))
+    (let [(mut seg-start) 0
+          (mut first) true
+          (mut j) 0]
+      (while (<= (load j) (slice-len name))
+        (if (or (= (load j) (slice-len name))
+                (= (primitive/cast i64 (char-at name (load j))) 46))
+            (let [seg (substr name (load seg-start) (load j))]
+              (if (load first)
+                  (do
+                    (emit! sb "(var ")
+                    (emit-quoted! sb seg)
+                    (emit! sb ")")
+                    (set! first false)
+                    0)
+                  (do (emit! sb " ") (emit-quoted! sb seg) (emit! sb ")") 0))
+              (set! seg-start (+ (load j) 1))
+              0)
+            0)
+        (set! j (+ (load j) 1)))
+      0)))
+
+;;; The raw text of a `{ coil }` escape. The lexer has just produced `{`; scan to
+;;; its matching `}` (strings respected) and hand the inside over verbatim.
+(defn raw-escape! [(p (ptr P)) (o (ptr Out))] (-> (slice u8))
+  (let [begin (.pos p)
+        (mut depth) 1
+        (mut in-str) false]
+    (while (and (> (load depth) 0) (< (.pos p) (slice-len (.src p))))
+      (let [c (byte-at p (.pos p))]
+        (cond (load in-str)
+                (cond (= c 92) (set! (.pos p) (+ (.pos p) 1))
+                      (= c 34) (set! in-str false)
+                      :else 0)
+              (= c 34) (set! in-str true)
+              (= c 123) (set! depth (+ (load depth) 1))
+              (= c 125) (set! depth (- (load depth) 1))
+              :else 0)
+        (set! (.pos p) (+ (.pos p) 1))))
+    (if (> (load depth) 0)
+        (do (fail! p o "unterminated `{ coil }` escape") "")
+        (substr (.src p) begin (- (.pos p) 1)))))
+
+(defn parse-primary! [(p (ptr P)) (o (ptr Out)) (sb (ptr StrBuf))] (-> i64)
+  (cond (= (.kind p) T_NUMBER)
+          (do
+            (emit! sb (if (= (.unit p) U_DUR) "(dur " "(int "))
+            (sb-push-i64! sb (.num p))
+            (emit! sb ")")
+            (advance! p o))
+        (= (.kind p) T_STRING)
+          (do
+            (emit! sb "(str ")
+            (emit-quoted! sb (.text p))
+            (emit! sb ")")
+            (advance! p o))
+        (word? p "true") (do (emit! sb "(bool 1)") (advance! p o))
+        (word? p "false") (do (emit! sb "(bool 0)") (advance! p o))
+        (punct? p "(")
+          (do
+            (advance! p o)
+            (parse-expr! p o sb)
+            (expect-punct! p o ")" "expected `)`"))
+        (punct? p "{")
+          (let [raw (raw-escape! p o)]
+            (emit! sb "(coil ")
+            (emit! sb raw)
+            (emit! sb ")")
+            (advance! p o))
+        (= (.kind p) T_IDENT)
+          (let [name (.text p)]
+            (advance! p o)
+            (if (punct? p "[")
+                ; body[..64kb]
+                (do
+                  (advance! p o)
+                  (expect-punct! p o ".." "a slice is written `[..N]`")
+                  (if (= (.kind p) T_NUMBER)
+                      (do
+                        (emit! sb "(clip ")
+                        (emit-path! sb name)
+                        (emit! sb " ")
+                        (sb-push-i64! sb (.num p))
+                        (emit! sb ")")
+                        (advance! p o)
+                        (expect-punct! p o "]" "expected `]`"))
+                      (fail! p o "expected a size after `[..`")))
+                (emit-path! sb name)))
+        :else (fail! p o "expected an expression")))
+
+(defn cmp-op? [(p (ptr P))] (-> bool)
+  (and (= (.kind p) T_PUNCT)
+       (or (str-eq (.text p) ">")
+           (or (str-eq (.text p) "<")
+               (or (str-eq (.text p) ">=")
+                   (or (str-eq (.text p) "<=")
+                       (or (str-eq (.text p) "=")
+                           (or (str-eq (.text p) "==") (str-eq (.text p) "!=")))))))))
+
+(defn str-op? [(p (ptr P))] (-> bool)
+  (and (= (.kind p) T_IDENT)
+       (or (str-eq (.text p) "starts-with")
+           (or (str-eq (.text p) "ends-with")
+               (or (str-eq (.text p) "contains") (str-eq (.text p) "matches"))))))
+
+(defn parse-cmp! [(p (ptr P)) (o (ptr Out)) (sb (ptr StrBuf))] (-> i64)
+  ; The left operand is parsed into a scratch buffer because the operator that
+  ; decides the node's head comes after it.
+  (let [(mut left) (sb-new (expansion-allocator))]
+    (parse-primary! p o (mut left))
+    (cond (cmp-op? p)
+            (let [op (if (str-eq (.text p) "==") "=" (.text p))]
+              (advance! p o)
+              (emit! sb "(cmp ")
+              (emit-quoted! sb op)
+              (emit! sb " ")
+              (emit! sb (sb-str (load left)))
+              (emit! sb " ")
+              (parse-primary! p o sb)
+              (emit! sb ")"))
+          (str-op? p)
+            (let [op (.text p)]
+              (if (str-eq op "matches")
+                  (fail! p
+                         o
+                         "`matches` (regex) is not implemented; use starts-with, ends-with or contains")
+                  (do
+                    (advance! p o)
+                    (emit! sb "(strop ")
+                    (emit-quoted! sb op)
+                    (emit! sb " ")
+                    (emit! sb (sb-str (load left)))
+                    (emit! sb " ")
+                    (parse-primary! p o sb)
+                    (emit! sb ")"))))
+          (word? p "in")
+            (do
+              (advance! p o)
+              (if (= (.kind p) T_IDENT)
+                  (do
+                    (emit! sb "(in ")
+                    (emit! sb (sb-str (load left)))
+                    (emit! sb " ")
+                    (emit-quoted! sb (.text p))
+                    (emit! sb ")")
+                    (advance! p o))
+                  (fail! p
+                         o
+                         "expected a pattern such as `myapp.db/*` after `in`")))
+          :else (emit! sb (sb-str (load left))))))
+
+(defn parse-not! [(p (ptr P)) (o (ptr Out)) (sb (ptr StrBuf))] (-> i64)
+  (if (word? p "not")
+      (do
+        (advance! p o)
+        (emit! sb "(not ")
+        (parse-not! p o sb)
+        (emit! sb ")"))
+      (parse-cmp! p o sb)))
+
+;;; `and`/`or` chains. Left-nested s-expressions need their opening parens before
+;;; the first operand, so operands are collected first.
+(defn parse-chain! [(p (ptr P)) (o (ptr Out)) (sb (ptr StrBuf)) (level i64)] (-> i64)
+  (let [word (if (= level 0) "or" "and")
+        (mut acc) (sb-new (expansion-allocator))]
+    (if (= level 0) (parse-chain! p o (mut acc) 1) (parse-not! p o (mut acc)))
+    (while (and (= (.failed o) 0) (word? p word))
+      (advance! p o)
+      (let [(mut next) (sb-new (expansion-allocator))]
+        (if (= level 0)
+            (parse-chain! p o (mut next) 1)
+            (parse-not! p o (mut next)))
+        (let [(mut joined) (sb-new (expansion-allocator))]
+          (emit! (mut joined) (if (= level 0) "(or " "(and "))
+          (emit! (mut joined) (sb-str (load acc)))
+          (emit! (mut joined) " ")
+          (emit! (mut joined) (sb-str (load next)))
+          (emit! (mut joined) ")")
+          (set! acc (load joined)))))
+    (emit! sb (sb-str (load acc)))))
+
+(defn parse-expr! [(p (ptr P)) (o (ptr Out)) (sb (ptr StrBuf))] (-> i64)
+  (parse-chain! p o sb 0))
+
+; ---- points ---------------------------------------------------------------------
+(defn parse-targets! [(p (ptr P)) (o (ptr Out)) (sb (ptr StrBuf))] (-> i64)
+  (do
+    (emit! sb "(targets")
+    (let [(mut going) true]
+      (while (and (load going) (= (.failed o) 0))
+        (if (= (.kind p) T_IDENT)
+            (do
+              (emit! sb " ")
+              (emit-quoted! sb (.text p))
+              (advance! p o)
+              (if (punct? p "|") (advance! p o) (set! going false)))
+            (do
+              (fail! p
+                     o
+                     "expected a function pattern such as `parse-expr`, `myapp.db/*` or `*`")
+              (set! going false)))))
+    (emit! sb ")")))
+
+(defn parse-point! [(p (ptr P)) (o (ptr Out)) (sb (ptr StrBuf))] (-> i64)
+  (cond (word? p "call")
+          (do
+            (advance! p o)
+            (emit! sb "(call ")
+            (parse-targets! p o sb)
+            (emit! sb ")"))
+        (word? p "enter")
+          (do
+            (advance! p o)
+            (emit! sb "(enter ")
+            (parse-targets! p o sb)
+            (emit! sb ")"))
+        (word? p "mark")
+          (do
+            (advance! p o)
+            (if (= (.kind p) T_STRING)
+                (do
+                  (emit! sb "(mark ")
+                  (emit-quoted! sb (.text p))
+                  (emit! sb ")")
+                  (advance! p o))
+                (fail! p o "expected a mark name in quotes")))
+        (= (.kind p) T_IDENT)
+          (do
+            (emit! sb "(ref ")
+            (emit-quoted! sb (.text p))
+            (emit! sb ")")
+            (advance! p o))
+        :else
+          (fail! p
+                 o
+                 "expected a probe point: `call F`, `enter F`, `mark \"name\"` or a point/span name")))
+
+; ---- destinations ---------------------------------------------------------------
+(defn dest-index! [(o (ptr Out)) (path (slice u8))] (-> i64)
+  (let [n (len (.dests o))
+        (mut i) 0
+        (mut found) -1]
+    (while (and (< (load i) n) (< (load found) 0))
+      (if (str-eq (get (.dests o) (load i)) path) (set! found (load i)) 0)
+      (set! i (+ (load i) 1)))
+    (if (>= (load found) 0)
+        (load found)
+        (do
+          (push! (primitive/field o dests) path)
+          (emit! (primitive/field o cells) "(defn probe-dest-")
+          (sb-push-i64! (primitive/field o cells) n)
+          (emit! (primitive/field o cells)
+                 " [] (-> (ptr probe-rt/Dest)) (primitive/alloc-static probe-rt/Dest))\n")
+          (emit! (primitive/field o init) "(probe-rt/dest-open! (probe-dest-")
+          (sb-push-i64! (primitive/field o init) n)
+          (emit! (primitive/field o init) ") c")
+          (emit-quoted! (primitive/field o init) path)
+          (emit! (primitive/field o init) ")\n")
+          n))))
+
+;;; Optional `to "file"` / `to stderr`. Emits the destination's spec form.
+(defn parse-dest! [(p (ptr P)) (o (ptr Out)) (sb (ptr StrBuf))] (-> i64)
+  (if (word? p "to")
+      (do
+        (advance! p o)
+        (cond (= (.kind p) T_STRING)
+                (let [i (dest-index! o (.text p))]
+                  (emit! sb "\"")
+                  (cell-name! sb o "dest" i)
+                  (emit! sb "\"")
+                  (advance! p o))
+              (word? p "stderr") (do (emit! sb "(stderr)") (advance! p o))
+              :else
+                (fail! p
+                       o
+                       "expected a file path in quotes, or `stderr`, after `to`")))
+      (emit! sb "(stderr)")))
+
+; ---- actions --------------------------------------------------------------------
+(defn parse-by! [(p (ptr P)) (o (ptr Out)) (sb (ptr StrBuf))] (-> i64)
+  ; Returns 1 when the aggregation is keyed.
+  (if (word? p "by")
+      (do
+        (advance! p o)
+        (emit! sb "(by")
+        (let [(mut going) true]
+          (while (and (load going) (= (.failed o) 0))
+            (emit! sb " ")
+            (parse-expr! p o sb)
+            (if (punct? p ",") (advance! p o) (set! going false))))
+        (emit! sb ")")
+        1)
+      (do (emit! sb "(by)") 0)))
+
+(defn agg-kind [(word (slice u8))] (-> i64)
+  (cond (str-eq word "count") 0
+        (str-eq word "time") 1
+        (str-eq word "sum") 2
+        (str-eq word "avg") 3
+        (str-eq word "min") 4
+        (str-eq word "max") 5
+        (str-eq word "hist") 6
+        :else -1))
+
+(defn trimmed-eq? [(s (slice u8)) (want (slice u8))] (-> bool)
+  (let [(mut lo) 0
+        (mut hi) (slice-len s)]
+    (while (and (< (load lo) (load hi))
+                (<= (primitive/cast i64 (char-at s (load lo))) 32))
+      (set! lo (+ (load lo) 1)))
+    (while (and (> (load hi) (load lo))
+                (<= (primitive/cast i64 (char-at s (- (load hi) 1))) 32))
+      (set! hi (- (load hi) 1)))
+    (str-eq (substr s (load lo) (load hi)) want)))
+
+(defn parse-agg! [(p (ptr P))
+                  (o (ptr Out))
+                  (sb (ptr StrBuf))
+                  (kind i64)
+                  (header (slice u8))] (-> i64)
+  (let [action-start (.start p)
+        n (.naggs o)]
+    (set! (.naggs o) (+ n 1))
+    (advance! p o)
+    (emit! sb "(agg ")
+    (sb-push-i64! sb kind)
+    (emit! sb " \"")
+    (cell-name! sb o "agg" n)
+    (emit! sb "\" ")
+    (let [expr-start (.start p)
+          (mut dur) (if (= kind 1) 1 0)]
+      (if (>= kind 2)
+          (do
+            (parse-expr! p o sb)
+            (if (trimmed-eq? (substr (.src p) expr-start (.start p)) "elapsed")
+                (set! dur 1)
+                0)
+            0)
+          (emit! sb "(none)"))
+      (emit! sb " ")
+      (let [keyed (parse-by! p o sb)
+            action-text (substr (.src p) action-start (.start p))]
+        (emit! sb ")")
+        (emit! (primitive/field o cells) "(defn probe-agg-")
+        (sb-push-i64! (primitive/field o cells) n)
+        (emit! (primitive/field o cells)
+               " [] (-> (ptr probe-rt/Agg)) (primitive/alloc-static probe-rt/Agg))\n")
+        (emit! (primitive/field o init) "(probe-rt/agg-register! (probe-agg-")
+        (sb-push-i64! (primitive/field o init) n)
+        (emit! (primitive/field o init) ") ")
+        (sb-push-i64! (primitive/field o init) kind)
+        (emit! (primitive/field o init) " ")
+        (sb-push-i64! (primitive/field o init) (load dur))
+        (emit! (primitive/field o init) " ")
+        (sb-push-i64! (primitive/field o init) keyed)
+        (emit! (primitive/field o init) " ")
+        (let [(mut label) (sb-new (expansion-allocator))]
+          (emit-collapsed! (mut label) header)
+          (emit! (mut label) " · ")
+          (emit-collapsed! (mut label) action-text)
+          (emit-quoted! (primitive/field o init) (sb-str (load label))))
+        (emit! (primitive/field o init) " ")
+        (emit-quoted! (primitive/field o init) (.module o))
+        (emit! (primitive/field o init) ")\n")
+        (expect-punct! p o ";" "expected `;` after the action")))))
+
+;;; `print("… {expr} …")`: the format string is split here, and each hole is
+;;; parsed as an expression by a nested parser over just that text.
+(defn parse-format! [(p (ptr P))
+                     (o (ptr Out))
+                     (sb (ptr StrBuf))
+                     (fmt (slice u8))] (-> i64)
+  (let [(mut i) 0
+        (mut lit) 0
+        n (slice-len fmt)]
+    (while (and (< (load i) n) (= (.failed o) 0))
+      (if (= (primitive/cast i64 (char-at fmt (load i))) 123)
+          (let [(mut j) (+ (load i) 1)]
+            (while (and (< (load j) n)
+                        (!= (primitive/cast i64 (char-at fmt (load j))) 125))
+              (set! j (+ (load j) 1)))
+            (if (>= (load j) n)
+                (fail! p o "unclosed `{` in a print format")
+                (do
+                  (if (> (load i) (load lit))
+                      (do
+                        (emit! sb " (text ")
+                        (emit-quoted! sb (substr fmt (load lit) (load i)))
+                        (emit! sb ")")
+                        0)
+                      0)
+                  (let [(mut inner) (primitive/zeroed P)]
+                    (set! (.src inner) (substr fmt (+ (load i) 1) (load j)))
+                    (advance! (mut inner) o)
+                    (emit! sb " (hole ")
+                    (parse-expr! (mut inner) o sb)
+                    (emit! sb ")")
+                    (if (and (= (.failed o) 0) (!= (.kind inner) T_EOF))
+                        (fail! p o "a print hole holds one expression")
+                        0))
+                  (set! i (+ (load j) 1))
+                  (set! lit (load i))
+                  0)))
+          (set! i (+ (load i) 1))))
+    (if (> n (load lit))
+        (do
+          (emit! sb " (text ")
+          (emit-quoted! sb (substr fmt (load lit) n))
+          (emit! sb ")")
+          0)
+        0)))
+
+(defn parse-print! [(p (ptr P)) (o (ptr Out)) (sb (ptr StrBuf))] (-> i64)
+  (do
+    (advance! p o)
+    (expect-punct! p o "(" "expected `(` after print")
+    (if (= (.kind p) T_STRING)
+        (let [fmt (.text p)
+              (mut parts) (sb-new (expansion-allocator))]
+          (advance! p o)
+          (expect-punct! p o ")" "expected `)` after the print format")
+          (parse-format! p o (mut parts) fmt)
+          (emit! sb "(print ")
+          (parse-dest! p o sb)
+          (emit! sb (sb-str (load parts)))
+          (emit! sb ")")
+          (expect-punct! p o ";" "expected `;` after the action"))
+        (fail! p
+               o
+               "print takes a format string: print(\"{site} took {elapsed}\")"))))
+
+(defn parse-record! [(p (ptr P)) (o (ptr Out)) (sb (ptr StrBuf))] (-> i64)
+  (let [(mut fields) (sb-new (expansion-allocator))
+        (mut going) true]
+    (advance! p o)
+    (expect-punct! p o "{" "expected `{` after record")
+    (while (and (load going) (= (.failed o) 0))
+      (if (= (.kind p) T_IDENT)
+          (let [name (.text p)]
+            (advance! p o)
+            (emit! (mut fields) " (")
+            (if (punct? p ":")
+                (do
+                  (emit-quoted! (mut fields) name)
+                  (emit! (mut fields) " ")
+                  (advance! p o)
+                  (parse-expr! p o (mut fields)))
+                ; `site` alone is `site: site`.
+                (do
+                  (emit-quoted! (mut fields) name)
+                  (emit! (mut fields) " ")
+                  (emit-path! (mut fields) name)))
+            (emit! (mut fields) ")")
+            (if (punct? p ",") (advance! p o) (set! going false)))
+          (do
+            (fail! p o "expected a record field: `name` or `name: expr`")
+            (set! going false))))
+    (expect-punct! p o "}" "expected `}` closing the record")
+    (emit! sb "(record ")
+    (parse-dest! p o sb)
+    (emit! sb (sb-str (load fields)))
+    (emit! sb ")")
+    (expect-punct! p o ";" "expected `;` after the action")))
+
+(defn parse-action! [(p (ptr P))
+                     (o (ptr Out))
+                     (sb (ptr StrBuf))
+                     (header (slice u8))] (-> i64)
+  (do
+    (emit! sb "\n    ")
+    (cond (and (= (.kind p) T_IDENT) (>= (agg-kind (.text p)) 0))
+            (parse-agg! p o sb (agg-kind (.text p)) header)
+          (word? p "print") (parse-print! p o sb)
+          (word? p "record") (parse-record! p o sb)
+          :else
+            (if (and (= (.kind p) T_IDENT) (>= (index-of-byte (.text p) 46) 0))
+                (fail! p
+                       o
+                       "span-scoped variables (`span.name += expr`) are not implemented; to total something per call, probe the call that carries it and `sum` it")
+                (fail! p
+                       o
+                       "expected an action: count, time, sum, avg, min, max, hist, print or record")))))
+
+; ---- top-level items --------------------------------------------------------------
+(defn parse-clause! [(p (ptr P)) (o (ptr Out))] (-> i64)
+  (let [sb (primitive/field o spec)
+        header-start (.start p)
+        (mut point) (sb-new (expansion-allocator))
+        (mut during) (sb-new (expansion-allocator))
+        (mut pred) (sb-new (expansion-allocator))]
+    (parse-point! p o (mut point))
+    (if (word? p "during")
+        (do
+          (advance! p o)
+          (if (= (.kind p) T_IDENT)
+              (do
+                (emit! (mut during) "(during ")
+                (emit-quoted! (mut during) (.text p))
+                (emit! (mut during) ")")
+                (advance! p o))
+              (fail! p o "expected a span name after `during`")))
+        (emit! (mut during) "(always)"))
+    (if (punct? p "/")
+        (do
+          (advance! p o)
+          (parse-expr! p o (mut pred))
+          (expect-punct! p o "/" "expected `/` closing the predicate"))
+        (emit! (mut pred) "(true)"))
+    (let [header (substr (.src p) header-start (.start p))]
+      (expect-punct! p o "{" "expected `{` opening the clause's actions")
+      (set! (.nclauses o) (+ (.nclauses o) 1))
+      (emit! sb "\n  (clause ")
+      (let [(mut label) (sb-new (expansion-allocator))]
+        (emit-collapsed! (mut label) header)
+        (emit-quoted! sb (sb-str (load label))))
+      (emit! sb " ")
+      (emit! sb (sb-str (load point)))
+      (emit! sb " ")
+      (emit! sb (sb-str (load during)))
+      (emit! sb " ")
+      (emit! sb (sb-str (load pred)))
+      (while (and (= (.failed o) 0)
+                  (and (not (punct? p "}")) (!= (.kind p) T_EOF)))
+        (parse-action! p o sb header))
+      (emit! sb ")")
+      (expect-punct! p o "}" "expected `}` closing the clause"))))
+
+(defn parse-point-def! [(p (ptr P)) (o (ptr Out))] (-> i64)
+  (let [sb (primitive/field o defs)]
+    (advance! p o)
+    (if (= (.kind p) T_IDENT)
+        (do
+          (emit! sb "\n  (point ")
+          (emit-quoted! sb (.text p))
+          (emit! sb " ")
+          (advance! p o)
+          (expect-punct! p o "=" "expected `=` after the point name")
+          (parse-point! p o sb)
+          (emit! sb " (fields")
+          (if (punct? p "{")
+              (do
+                (advance! p o)
+                (while (and (= (.failed o) 0) (= (.kind p) T_IDENT))
+                  (emit! sb " (")
+                  (emit-quoted! sb (.text p))
+                  (emit! sb " ")
+                  (advance! p o)
+                  (expect-punct! p o "=" "expected `=` in a point field")
+                  (parse-expr! p o sb)
+                  (emit! sb ")")
+                  (expect-punct! p o ";" "expected `;` after a point field"))
+                (expect-punct! p
+                               o
+                               "}"
+                               "expected `}` closing the point's fields"))
+              (expect-punct! p
+                             o
+                             ";"
+                             "expected `;` or a `{ field = expr; }` block after the point"))
+          (emit! sb "))"))
+        (fail! p o "expected a name after `point`"))))
+
+(defn parse-span-def! [(p (ptr P)) (o (ptr Out))] (-> i64)
+  (let [sb (primitive/field o defs)
+        n (.nspans o)]
+    (advance! p o)
+    (if (= (.kind p) T_IDENT)
+        (do
+          (set! (.nspans o) (+ n 1))
+          (emit! (primitive/field o cells) "(defn probe-span-")
+          (sb-push-i64! (primitive/field o cells) n)
+          (emit! (primitive/field o cells)
+                 " [] (-> (ptr probe-rt/Span)) (primitive/alloc-static probe-rt/Span))\n")
+          (emit! sb "\n  (span ")
+          (emit-quoted! sb (.text p))
+          (emit! sb " \"")
+          (cell-name! sb o "span" n)
+          (emit! sb "\" ")
+          (advance! p o)
+          (expect-punct! p o "=" "expected `=` after the span name")
+          (let [(mut first) (sb-new (expansion-allocator))]
+            (parse-point! p o (mut first))
+            (if (punct? p "..")
+                (do
+                  (advance! p o)
+                  (emit! sb "(range ")
+                  (emit! sb (sb-str (load first)))
+                  (emit! sb " ")
+                  (parse-point! p o sb)
+                  (emit! sb " ")
+                  (if (word? p "by")
+                      (do (advance! p o) (parse-expr! p o sb))
+                      (emit! sb "(nokey)"))
+                  (emit! sb ")"))
+                (emit! sb (sb-str (load first)))))
+          (emit! sb ")")
+          (expect-punct! p o ";" "expected `;` after the span"))
+        (fail! p o "expected a name after `span`"))))
+
+;;; `use http;` names a sibling of this module; `use probes.http;` names it fully.
+(defn resolve-use [(o (ptr Out)) (name (slice u8))] (-> (slice u8))
+  (let [(mut dotted) false
+        (mut i) 0
+        (mut last-dot) -1]
+    (while (< (load i) (slice-len name))
+      (if (= (primitive/cast i64 (char-at name (load i))) 46)
+          (set! dotted true)
+          0)
+      (set! i (+ (load i) 1)))
+    (set! i 0)
+    (while (< (load i) (slice-len (.module o)))
+      (if (= (primitive/cast i64 (char-at (.module o) (load i))) 46)
+          (set! last-dot (load i))
+          0)
+      (set! i (+ (load i) 1)))
+    (if (or (load dotted) (< (load last-dot) 0))
+        name
+        (let [(mut full) (sb-new (expansion-allocator))]
+          (emit! (mut full) (substr (.module o) 0 (+ (load last-dot) 1)))
+          (emit! (mut full) name)
+          (sb-str (load full))))))
+
+(defn parse-use! [(p (ptr P)) (o (ptr Out))] (-> i64)
+  (do
+    (advance! p o)
+    (if (= (.kind p) T_IDENT)
+        (let [target (resolve-use o (.text p))
+              n (.nuses o)]
+          (set! (.nuses o) (+ n 1))
+          (emit! (primitive/field o imports) "(import ")
+          (emit-quoted! (primitive/field o imports) target)
+          (emit! (primitive/field o imports) " :as probe-use-")
+          (sb-push-i64! (primitive/field o imports) n)
+          (emit! (primitive/field o imports) ")\n")
+          ; Builds `(defs-cons (probe-use-0/probe-defs) (defs-cons … (defs-none)))`;
+          ; the closing parens are added where the list is finished.
+          (emit! (primitive/field o uses) "(probe-engine/defs-cons (probe-use-")
+          (sb-push-i64! (primitive/field o uses) n)
+          (emit! (primitive/field o uses) "/probe-defs) ")
+          (advance! p o)
+          (expect-punct! p o ";" "expected `;` after use"))
+        (fail! p o "expected a probe module name after `use`"))))
+
+(defn parse-import! [(p (ptr P)) (o (ptr Out))] (-> i64)
+  (do
+    (advance! p o)
+    (if (= (.kind p) T_IDENT)
+        (do
+          (emit! (primitive/field o imports) "(import ")
+          (emit-quoted! (primitive/field o imports) (.text p))
+          (emit! (primitive/field o imports) " :use [])\n")
+          (advance! p o)
+          (expect-punct! p o ";" "expected `;` after import"))
+        (fail! p o "expected a Coil module name after `import`"))))
+
+;;; `report every 500ms;`  `report every 1s to "stats.txt";`  `report as json;`
+;;; `report every 250ms as json to "stats.json";`
+(defn parse-report! [(p (ptr P)) (o (ptr Out))] (-> i64)
+  (let [(mut interval) 0
+        (mut json) 0
+        (mut dest) -1]
+    (advance! p o)
+    (if (word? p "every")
+        (do
+          (advance! p o)
+          (if (and (= (.kind p) T_NUMBER) (= (.unit p) U_DUR))
+              (if (< (.num p) 1000000)
+                  (fail! p o "a report interval must be at least 1ms")
+                  (do (set! interval (/ (.num p) 1000000)) (advance! p o)))
+              (fail! p o "expected a duration such as `500ms` after `every`")))
+        0)
+    (if (word? p "as")
+        (do
+          (advance! p o)
+          (if (word? p "json")
+              (do (set! json 1) (advance! p o))
+              (fail! p
+                     o
+                     "the only report format is `as json` (text is the default)")))
+        0)
+    ; The destination is resolved before the call below is written: registering a
+    ; new file appends its own `dest-open!` to `init`, which must not land inside it.
+    (if (word? p "to")
+        (do
+          (advance! p o)
+          (if (= (.kind p) T_STRING)
+              (do (set! dest (dest-index! o (.text p))) (advance! p o))
+              (fail! p o "expected a file path in quotes after `to`")))
+        0)
+    (emit! (primitive/field o init) "(probe-rt/report-config! ")
+    (sb-push-i64! (primitive/field o init) (load interval))
+    (if (>= (load dest) 0)
+        (do
+          (emit! (primitive/field o init) " (probe-dest-")
+          (sb-push-i64! (primitive/field o init) (load dest))
+          (emit! (primitive/field o init) ") 1 "))
+        (emit! (primitive/field o init) " (probe-rt/dest-stderr) 0 "))
+    (sb-push-i64! (primitive/field o init) (load json))
+    (emit! (primitive/field o init) ")\n")
+    (expect-punct! p o ";" "expected `;` after report")))
+
+(defn parse-item! [(p (ptr P)) (o (ptr Out))] (-> i64)
+  (cond (word? p "use") (parse-use! p o)
+        (word? p "import") (parse-import! p o)
+        (word? p "report") (parse-report! p o)
+        (word? p "point") (parse-point-def! p o)
+        (word? p "span") (parse-span-def! p o)
+        :else (parse-clause! p o)))
+
+;;; The module name from the file's first line, `# coil-module: NAME`.
+(defn module-name [(src (slice u8))] (-> (slice u8))
+  (let [marker "coil-module:"
+        m (slice-len marker)
+        (mut i) 0
+        (mut found) -1
+        (mut line-end) (slice-len src)]
+    (while (and (< (load i) (slice-len src))
+                (= (load line-end) (slice-len src)))
+      (if (= (primitive/cast i64 (char-at src (load i))) 10)
+          (set! line-end (load i))
+          0)
+      (set! i (+ (load i) 1)))
+    (set! i 0)
+    (while (and (< (load found) 0) (<= (+ (load i) m) (load line-end)))
+      (if (str-eq (substr src (load i) (+ (load i) m)) marker)
+          (set! found (+ (load i) m))
+          0)
+      (set! i (+ (load i) 1)))
+    (if (< (load found) 0)
+        ""
+        (let [(mut lo) (load found)
+              (mut hi) (load line-end)]
+          (while (and (< (load lo) (load hi))
+                      (<= (primitive/cast i64 (char-at src (load lo))) 32))
+            (set! lo (+ (load lo) 1)))
+          (while (and (> (load hi) (load lo))
+                      (<= (primitive/cast i64 (char-at src (- (load hi) 1))) 32))
+            (set! hi (- (load hi) 1)))
+          (substr src (load lo) (load hi))))))
+
+;;; The reader provider. One `.probe` file in, one Coil module out.
+(defn read-probe [(context Code)] (-> Code)
+  (let [a (expansion-allocator)
+        path (primitive/code-str (primitive/code-nth context 1))
+        source (primitive/code-str (primitive/code-nth context 2))
+        (mut p) (primitive/zeroed P)
+        (mut o) (primitive/zeroed Out)]
+    (set! (.src p) source)
+    (set! (.spec o) (sb-new a))
+    (set! (.defs o) (sb-new a))
+    (set! (.cells o) (sb-new a))
+    (set! (.init o) (sb-new a))
+    (set! (.imports o) (sb-new a))
+    (set! (.uses o) (sb-new a))
+    (set! (.err o) (sb-new a))
+    (set! (.dests o) (al-new [(slice u8)] a))
+    (set! (.module o) (module-name source))
+    (if (= (slice-len (.module o)) 0)
+        (primitive/error "probe: the first line of a .probe file must be `# coil-module: NAME`")
+        (do
+          (advance! (mut p) (mut o))
+          (while (and (= (.failed o) 0) (!= (.kind p) T_EOF))
+            (parse-item! (mut p) (mut o)))
+          (if (= (.failed o) 1)
+              (let [(mut msg) (sb-new a)]
+                (emit! (mut msg) "probe: ")
+                (emit! (mut msg) path)
+                (emit! (mut msg) ": ")
+                (emit! (mut msg) (sb-str (.err o)))
+                (primitive/error (sb-str (load msg))))
+              (let [(mut text) (sb-new a)
+                    (mut spec) (sb-new a)
+                    (mut defs) (sb-new a)
+                    active (or (> (.nclauses o) 0) (> (.nspans o) 0))]
+                (emit! (mut defs) "(defs ")
+                (emit-quoted! (mut defs) (.module o))
+                (emit! (mut defs) (sb-str (.defs o)))
+                (emit! (mut defs) ")")
+                (emit! (mut spec) "(spec ")
+                (emit-quoted! (mut spec) (.module o))
+                (emit! (mut spec) (sb-str (.spec o)))
+                (emit! (mut spec) ")")
+                (emit! (mut text) "(do\n")
+                (emit! (mut text) "(import \"coil.primitive\" :as primitive)\n")
+                (emit! (mut text)
+                       "(import \"experiments.probe.engine\" :as probe-engine)\n")
+                (emit! (mut text)
+                       "(import \"experiments.probe.rt\" :as probe-rt)\n")
+                (emit! (mut text) (sb-str (.imports o)))
+                (emit! (mut text) "(defn probe-module-marker [] (-> i64) 0)\n")
+                (emit! (mut text) (sb-str (.cells o)))
+                ; `probe-defs` is called from OTHER modules' transforms (`use`). Only
+                ; functions with Code in their signature are reachable from a
+                ; metaprogram across modules, so it hands back parsed Code.
+                (emit! (mut text)
+                       "(defn probe-defs [] (-> Code) (probe-engine/defs-text ")
+                (emit-quoted! (mut text) (sb-str (load defs)))
+                (emit! (mut text) "))\n")
+                (if active
+                    (do
+                      (emit! (mut text)
+                             "(defn probe-init [] (-> i64) (do (probe-rt/boot!)\n")
+                      (emit! (mut text) (sb-str (.init o)))
+                      (emit! (mut text) "(probe-rt/start-reporter!) 0))\n")
+                      (emit! (mut text)
+                             "(defn probe-transform [(mods Code)] (-> Code)\n  (probe-engine/run mods ")
+                      (emit-quoted! (mut text) (sb-str (load spec)))
+                      ; This module's own definitions go in as a literal: a transform
+                      ; cannot call a function of the module that registers it.
+                      (emit! (mut text) "\n    ")
+                      (emit-quoted! (mut text) (sb-str (load defs)))
+                      (emit! (mut text) "\n    ")
+                      (emit! (mut text) (sb-str (.uses o)))
+                      (emit! (mut text) "(probe-engine/defs-none)")
+                      (let [(mut k) 0]
+                        (while (< (load k) (.nuses o))
+                          (emit! (mut text) ")")
+                          (set! k (+ (load k) 1))))
+                      (emit! (mut text) "))\n")
+                      (emit! (mut text) "(transform probe-transform)\n")
+                      0)
+                    0)
+                (emit! (mut text) ")\n")
+                (primitive/code-read (sb-str (load text)) `(reader-config))))))))

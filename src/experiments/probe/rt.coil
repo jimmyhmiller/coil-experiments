@@ -1,0 +1,1563 @@
+(module experiments.probe.rt)
+
+; The probe runtime: what instrumented call sites talk to while the program runs.
+;
+; It is deliberately self-contained on raw libc. A probe may target ANY function,
+; including stdlib internals (`coil.alloc/raw-alloc`, `coil.os/open`), and the
+; engine rewrites those call sites inside the bundled stdlib too. If this module
+; leaned on stdlib collections, a probe on the allocator would fire from inside
+; the probe's own bookkeeping. So: libc externs, own buffers, own hash table, and
+; a per-thread `busy` flag that makes a probe firing inside a probe a no-op.
+;
+; Results never wait for exit. `print` and `record` write their line the moment
+; they fire; aggregations are re-reported by a background thread every interval
+; (default 1s) whenever they changed, and once more at exit.
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+
+(defstruct Timespec [(sec i64) (nsec i64)])
+
+(extern c-malloc :as "malloc" :cc c [isize] (-> (ptr i8)))
+
+(extern c-realloc :as "realloc" :cc c [(ptr i8) isize] (-> (ptr i8)))
+
+(extern c-free :as "free" :cc c [(ptr i8)] (-> void))
+
+(extern c-memcpy :as "memcpy" :cc c [(ptr i8) (ptr i8) isize] (-> (ptr i8)))
+
+(extern c-memcmp :as "memcmp" :cc c [(ptr i8) (ptr i8) isize] (-> i32))
+
+(extern c-memset :as "memset" :cc c [(ptr i8) i32 isize] (-> (ptr i8)))
+
+(extern c-getenv :as "getenv" :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern c-strlen :as "strlen" :cc c [(ptr i8)] (-> isize))
+
+(extern c-write :as "write" :cc c [i32 (ptr i8) isize] (-> isize))
+
+(extern c-open :as "open" :cc c [(ptr i8) i32 ...] (-> i32))
+
+(extern c-ftruncate :as "ftruncate" :cc c [i32 i64] (-> i32))
+
+(extern c-lseek :as "lseek" :cc c [i32 i64 i32] (-> i64))
+
+(extern c-exit :as "_exit" :cc c [i32] (-> void))
+
+(extern c-atexit :as "atexit" :cc c [(fnptr c [] i64)] (-> i32))
+
+(extern c-clock-gettime :as "clock_gettime" :cc c [i32 (ptr Timespec)] (-> i32))
+
+(extern c-nanosleep
+        :as
+        "nanosleep"
+        :cc
+        c
+        [(ptr Timespec) (ptr Timespec)]
+        (-> i32))
+
+(extern c-key-create
+        :as
+        "pthread_key_create"
+        :cc
+        c
+        [(ptr i64) (ptr i8)]
+        (-> i32))
+
+(extern c-getspecific :as "pthread_getspecific" :cc c [i64] (-> (ptr i8)))
+
+(extern c-setspecific :as "pthread_setspecific" :cc c [i64 (ptr i8)] (-> i32))
+
+(extern c-mutex-init
+        :as
+        "pthread_mutex_init"
+        :cc
+        c
+        [(ptr i8) (ptr i8)]
+        (-> i32))
+
+(extern c-mutex-lock :as "pthread_mutex_lock" :cc c [(ptr i8)] (-> i32))
+
+(extern c-mutex-unlock :as "pthread_mutex_unlock" :cc c [(ptr i8)] (-> i32))
+
+(extern c-thread-create
+        :as
+        "pthread_create"
+        :cc
+        c
+        [(ptr i8) (ptr i8) (fnptr c [(ptr i8)] (ptr i8)) (ptr i8)]
+        (-> i32))
+
+;;; The clock ids differ per OS, so they are chosen for the platform being
+;;; compiled FOR, never probed from the machine running the compiler.
+(defn monotonic-id [] (-> Code)
+  ; Darwin's CLOCK_MONOTONIC ticks in microseconds; CLOCK_UPTIME_RAW (8) is ns.
+  (if (primitive/code-eq (primitive/target-os) `linux) `1 `8))
+
+(defn open-create-flags [] (-> Code)
+  ; O_WRONLY | O_CREAT | O_TRUNC
+  (if (primitive/code-eq (primitive/target-os) `linux) `577 `1537))
+
+; ---- growable byte buffer ---------------------------------------------------
+(defstruct Buf [(data (ptr u8)) (len i64) (cap i64)])
+
+(defn fatal! [(msg (slice u8))] (-> i64)
+  (do
+    (c-write 2 (primitive/cast (ptr i8) (slice-data "probe: fatal: ")) 14)
+    (c-write 2
+             (primitive/cast (ptr i8) (slice-data msg))
+             (primitive/cast isize (slice-len msg)))
+    (c-write 2 (primitive/cast (ptr i8) (slice-data "\n")) 1)
+    (c-exit 2)
+    0))
+
+(defn buf-reserve! [(b (ptr Buf)) (extra i64)] (-> i64)
+  (let [need (+ (.len b) extra)]
+    (if (<= need (.cap b))
+        0
+        (let [(mut cap) (if (= (.cap b) 0) 256 (.cap b))]
+          (while (< (load cap) need) (set! cap (* (load cap) 2)))
+          (let [p
+                  (c-realloc (primitive/cast (ptr i8) (.data b))
+                             (primitive/cast isize (load cap)))]
+            (if (= (primitive/cast i64 p) 0)
+                (fatal! "out of memory growing a probe buffer")
+                (do
+                  (set! (.data b) (primitive/cast (ptr u8) p))
+                  (set! (.cap b) (load cap))
+                  0)))))))
+
+(defn buf-reset! [(b (ptr Buf))] (-> i64)
+  (do (set! (.len b) 0) 0))
+
+(defn buf-byte! [(b (ptr Buf)) (c i64)] (-> i64)
+  (do
+    (buf-reserve! b 1)
+    (primitive/store! (primitive/index (.data b) (.len b))
+                      (primitive/cast u8 c))
+    (set! (.len b) (+ (.len b) 1))
+    0))
+
+(defn buf-bytes! [(b (ptr Buf)) (p (ptr u8)) (n i64)] (-> i64)
+  (if (<= n 0)
+      0
+      (do
+        (buf-reserve! b n)
+        (c-memcpy (primitive/cast (ptr i8) (primitive/index (.data b) (.len b)))
+                  (primitive/cast (ptr i8) p)
+                  (primitive/cast isize n))
+        (set! (.len b) (+ (.len b) n))
+        0)))
+
+(defn buf-str! [(b (ptr Buf)) (s (slice u8))] (-> i64)
+  (buf-bytes! b (slice-data s) (slice-len s)))
+
+(defn buf-spaces! [(b (ptr Buf)) (n i64)] (-> i64)
+  (let [(mut i) 0]
+    (while (< (load i) n)
+      (buf-byte! b 32)
+      (set! i (+ (load i) 1)))
+    0))
+
+(defn buf-uint-digits! [(b (ptr Buf)) (v i64) (sep bool)] (-> i64)
+  ; v >= 0. Digits are produced low-to-high into a small stack array, then emitted
+  ; high-to-low with an optional thousands separator.
+  (let [(mut digits) (primitive/zeroed (array u8 24))
+        (mut n) 0
+        (mut x) v]
+    (if (= (load x) 0)
+        (do
+          (primitive/store! (primitive/index (mut digits) 0)
+                            (primitive/cast u8 48))
+          (set! n 1)
+          0)
+        0)
+    (while (> (load x) 0)
+      (primitive/store! (primitive/index (mut digits) (load n))
+                        (primitive/cast u8 (+ 48 (% (load x) 10))))
+      (set! x (/ (load x) 10))
+      (set! n (+ (load n) 1)))
+    (let [(mut i) (- (load n) 1)]
+      (while (>= (load i) 0)
+        (buf-byte! b
+                   (primitive/cast i64
+                                   (primitive/load (primitive/index (mut digits)
+                                                                    (load i)))))
+        (if (and sep (and (> (load i) 0) (= (% (load i) 3) 0)))
+            (buf-byte! b 44)
+            0)
+        (set! i (- (load i) 1))))
+    0))
+
+(defn buf-int! [(b (ptr Buf)) (v i64)] (-> i64)
+  (if (< v 0)
+      (do (buf-byte! b 45) (buf-uint-digits! b (- 0 v) false))
+      (buf-uint-digits! b v false)))
+
+(defn buf-int-sep! [(b (ptr Buf)) (v i64)] (-> i64)
+  (if (< v 0)
+      (do (buf-byte! b 45) (buf-uint-digits! b (- 0 v) true))
+      (buf-uint-digits! b v true)))
+
+;;; `whole.frac` with FRAC-DIGITS digits after the point, from a value scaled by
+;;; 10^FRAC-DIGITS.
+(defn buf-fixed! [(b (ptr Buf)) (scaled i64) (frac-digits i64)] (-> i64)
+  (let [(mut pow) 1
+        (mut i) 0]
+    (while (< (load i) frac-digits)
+      (set! pow (* (load pow) 10))
+      (set! i (+ (load i) 1)))
+    (buf-uint-digits! b (/ scaled (load pow)) true)
+    (if (> frac-digits 0)
+        (let [frac (% scaled (load pow))
+              (mut lead) (/ (load pow) 10)]
+          (buf-byte! b 46)
+          (while (and (> (load lead) 1) (< frac (load lead)))
+            (buf-byte! b 48)
+            (set! lead (/ (load lead) 10)))
+          (buf-uint-digits! b frac false))
+        0)))
+
+;;; A duration in ns, to three-ish significant figures: 18µs, 3.1ms, 1.24s.
+(defn buf-dur! [(b (ptr Buf)) (ns i64)] (-> i64)
+  (cond (< ns 0) (do (buf-byte! b 45) (buf-dur! b (- 0 ns)))
+        (< ns 1000) (do (buf-uint-digits! b ns false) (buf-str! b "ns"))
+        (< ns 10000) (do (buf-fixed! b (/ ns 100) 1) (buf-str! b "µs"))
+        (< ns 1000000)
+          (do (buf-uint-digits! b (/ ns 1000) false) (buf-str! b "µs"))
+        (< ns 10000000) (do (buf-fixed! b (/ ns 100000) 1) (buf-str! b "ms"))
+        (< ns 1000000000)
+          (do (buf-uint-digits! b (/ ns 1000000) false) (buf-str! b "ms"))
+        :else (do (buf-fixed! b (/ ns 10000000) 2) (buf-str! b "s"))))
+
+(defn buf-f64! [(b (ptr Buf)) (v f64)] (-> i64)
+  ; Fixed six decimals, trailing zeros trimmed. Values beyond i64 range print as
+  ; their sign and "inf"; a probe value that large is not a measurement.
+  (let [neg (< v 0.0)
+        a (if neg (- 0.0 v) v)]
+    (if neg (buf-byte! b 45) 0)
+    (if (> a 9.0e18)
+        (buf-str! b "inf")
+        (let [whole (primitive/cast i64 a)
+              (mut frac)
+                (primitive/cast i64
+                                (+ (* (- a (primitive/cast f64 whole))
+                                      1000000.0)
+                                   0.5))
+              (mut digits) 6]
+          (buf-uint-digits! b whole false)
+          (while (and (> (load digits) 0) (= (% (load frac) 10) 0))
+            (set! frac (/ (load frac) 10))
+            (set! digits (- (load digits) 1)))
+          (if (> (load digits) 0)
+              (do
+                (buf-byte! b 46)
+                (let [(mut lead) 1
+                      (mut i) 1]
+                  (while (< (load i) (load digits))
+                    (set! lead (* (load lead) 10))
+                    (set! i (+ (load i) 1)))
+                  (while (and (> (load lead) 1) (< (load frac) (load lead)))
+                    (buf-byte! b 48)
+                    (set! lead (/ (load lead) 10)))
+                  (buf-uint-digits! b (load frac) false)))
+              0)))))
+
+(defn buf-hex! [(b (ptr Buf)) (v i64)] (-> i64)
+  (let [(mut shift) 60
+        (mut started) false]
+    (buf-str! b "0x")
+    (while (>= (load shift) 0)
+      (let [d (primitive/iand (primitive/ishr v (load shift)) 15)]
+        (if (or (load started) (or (!= d 0) (= (load shift) 0)))
+            (do
+              (set! started true)
+              (buf-byte! b (if (< d 10) (+ 48 d) (+ 87 d))))
+            0))
+      (set! shift (- (load shift) 4)))
+    0))
+
+;;; A JSON string literal. Control bytes are \u-escaped; bytes >= 0x80 pass through,
+;;; so valid UTF-8 stays valid and a binary body stays byte-for-byte recoverable
+;;; only as far as the consumer tolerates it.
+(defn buf-json-str! [(b (ptr Buf)) (p (ptr u8)) (n i64)] (-> i64)
+  (let [(mut i) 0]
+    (buf-byte! b 34)
+    (while (< (load i) n)
+      (let [c (primitive/cast i64 (primitive/load (primitive/index p (load i))))]
+        (cond (= c 34) (buf-str! b "\\\"")
+              (= c 92) (buf-str! b "\\\\")
+              (= c 10) (buf-str! b "\\n")
+              (= c 13) (buf-str! b "\\r")
+              (= c 9) (buf-str! b "\\t")
+              (< c 32)
+                (do
+                  (buf-str! b "\\u00")
+                  (buf-byte! b
+                             (let [h (/ c 16)] (if (< h 10) (+ 48 h) (+ 87 h))))
+                  (buf-byte! b
+                             (let [l (% c 16)] (if (< l 10) (+ 48 l) (+ 87 l)))))
+              :else (buf-byte! b c)))
+      (set! i (+ (load i) 1)))
+    (buf-byte! b 34)))
+
+;;; Terminal columns a UTF-8 run occupies: every byte that is not a continuation.
+(defn display-width [(p (ptr u8)) (n i64)] (-> i64)
+  (let [(mut i) 0
+        (mut w) 0]
+    (while (< (load i) n)
+      (let [c (primitive/cast i64 (primitive/load (primitive/index p (load i))))]
+        (if (!= (primitive/iand c 192) 128) (set! w (+ (load w) 1)) 0))
+      (set! i (+ (load i) 1)))
+    (load w)))
+
+; ---- destinations ------------------------------------------------------------
+;;; Where `print`, `record` and reports go. `fd` 2 with no path is stderr.
+(defstruct Dest [(fd i64) (opened i64)])
+
+(defn dest-stderr [] (-> (ptr Dest))
+  (let [d (primitive/alloc-static Dest)]
+    (if (= (.opened d) 0)
+        (do (set! (.fd d) 2) (set! (.opened d) 1) 0)
+        0)
+    d))
+
+;;; Open a file destination. A destination that cannot be opened is fatal: a
+;;; tracing tool that silently records nothing answers "nothing happened" when
+;;; the truth is "I never looked".
+(defn dest-open! [(d (ptr Dest)) (path (ptr i8))] (-> i64)
+  (if (= (.opened d) 1)
+      0
+      (let [fd (c-open path (primitive/cast i32 (open-create-flags)) 420)]
+        (if (< fd (primitive/cast i32 0))
+            (do
+              (c-write 2
+                       (primitive/cast (ptr i8)
+                                       (slice-data "probe: fatal: cannot open "))
+                       26)
+              (c-write 2 path (c-strlen path))
+              (c-write 2 (primitive/cast (ptr i8) (slice-data "\n")) 1)
+              (c-exit 2)
+              0)
+            (do
+              (set! (.fd d) (primitive/cast i64 fd))
+              (set! (.opened d) 1)
+              0)))))
+
+(defn dest-write! [(d (ptr Dest)) (b (ptr Buf))] (-> i64)
+  (let [(mut off) 0]
+    (while (< (load off) (.len b))
+      (let [n
+              (primitive/cast i64
+                              (c-write (primitive/cast i32 (.fd d))
+                                       (primitive/cast (ptr i8)
+                                                       (primitive/index (.data b)
+                                                                        (load off)))
+                                       (primitive/cast isize
+                                                       (- (.len b) (load off)))))]
+        (if (<= n 0)
+            (set! off (.len b))
+            (set! off (+ (load off) n)))))
+    0))
+
+; ---- aggregations ------------------------------------------------------------
+(const KIND_COUNT 0)
+
+(const KIND_TIME 1)
+
+(const KIND_SUM 2)
+
+(const KIND_AVG 3)
+
+(const KIND_MIN 4)
+
+(const KIND_MAX 5)
+
+(const KIND_HIST 6)
+
+(defstruct Entry
+  [(used i64)
+   (hash i64)
+   (key (ptr u8))
+   (key-len i64)
+   (n i64)
+   (sum i64)
+   (self i64)
+   (lo i64)
+   (hi i64)
+   (shown i64)
+   (hist (array i64 64))])
+
+;;; One aggregation: every site a clause's action was compiled into feeds the same
+;;; Agg, keyed by the rendered `by` values (an unkeyed action has the empty key).
+(defstruct Agg
+  [(registered i64)
+   (kind i64)
+   (dur i64)
+   (keyed i64)
+   (label (slice u8))
+   (owner (slice u8))
+   (entries (ptr Entry))
+   (cap i64)
+   (count i64)
+   (dirty i64)
+   (next (ptr Agg))])
+
+; ---- spans -------------------------------------------------------------------
+(defstruct Open [(used i64) (hash i64) (key (ptr u8)) (key-len i64) (t0 i64)])
+
+;;; A named stretch of time. A call span is tracked per thread (its depth lives in
+;;; the thread's Tls); a range span (`enter A .. call B by K`) is tracked globally,
+;;; one open record per key.
+(defstruct Span
+  [(registered i64)
+   (open-count i64)
+   (opens (ptr Open))
+   (cap i64)
+   (count i64)])
+
+; ---- per-thread state --------------------------------------------------------
+(const STACK_MAX 512)
+
+(const SPAN_MAX 32)
+
+(defstruct Tls
+  [(busy i64)
+   (id i64)
+   (json i64)
+   (first i64)
+   (out Buf)
+   (sp i64)
+   (last-self i64)
+   (child (array i64 512))
+   (nspans i64)
+   (span-keys (array i64 32))
+   (span-depths (array i64 32))])
+
+(defstruct Global
+  [(booted i64)
+   (key i64)
+   (mutex (array u8 64))
+   (aggs (ptr Agg))
+   (interval-ms i64)
+   (report (ptr Dest))
+   (report-file i64)
+   (start-ns i64)
+   (next-thread i64)
+   (reporter-started i64)
+   (exiting i64)
+   (thread-handle i64)
+   (json i64)])
+
+(defn g [] (-> (ptr Global))
+  (primitive/alloc-static Global))
+
+(defn now-ns [] (-> i64)
+  (let [(mut ts) (primitive/zeroed Timespec)]
+    (c-clock-gettime (primitive/cast i32 (monotonic-id)) (mut ts))
+    (primitive/iadd (primitive/imul (.sec ts) 1000000000) (.nsec ts))))
+
+(defn wall-ms [] (-> i64)
+  (let [(mut ts) (primitive/zeroed Timespec)]
+    (c-clock-gettime (primitive/cast i32 0) (mut ts))
+    (+ (* (.sec ts) 1000) (/ (.nsec ts) 1000000))))
+
+;;; This thread's state, created on first use. Uses only primitives and externs:
+;;; it runs outside the `busy` guard, so it must not reach any function a probe
+;;; could be attached to.
+(defn tls [] (-> (ptr Tls))
+  (let [st (g)
+        p (c-getspecific (.key st))]
+    (if (primitive/icmp-ne (primitive/cast i64 p) 0)
+        (primitive/cast (ptr Tls) p)
+        (let [raw (c-malloc (primitive/cast isize (primitive/sizeof Tls)))]
+          (c-memset raw
+                    (primitive/cast i32 0)
+                    (primitive/cast isize (primitive/sizeof Tls)))
+          (c-setspecific (.key st) raw)
+          (let [t (primitive/cast (ptr Tls) raw)]
+            (c-mutex-lock (primitive/cast (ptr i8) (primitive/field st mutex)))
+            (primitive/store! (primitive/field st next-thread)
+                              (primitive/iadd (primitive/load (primitive/field st
+                                                                               next-thread))
+                                              1))
+            (primitive/store! (primitive/field t id)
+                              (primitive/load (primitive/field st next-thread)))
+            (c-mutex-unlock (primitive/cast (ptr i8) (primitive/field st mutex)))
+            t)))))
+
+;;; Enter a probe body. False when the runtime is not up or this thread is already
+;;; inside a probe — which is what keeps a probe on the allocator from firing on
+;;; the allocations its own bookkeeping makes.
+(defn enter! [] (-> bool)
+  (if (primitive/icmp-eq (primitive/load (primitive/field (g) booted)) 0)
+      false
+      (let [t (tls)]
+        (if (primitive/icmp-ne (primitive/load (primitive/field t busy)) 0)
+            false
+            (do (primitive/store! (primitive/field t busy) 1) true)))))
+
+(defn leave! [] (-> i64)
+  (do (primitive/store! (primitive/field (tls) busy) 0) 0))
+
+;;; Start timing a probed call: push a frame that collects the time its probed
+;;; children take, so `time` can report self time as well as inclusive.
+(defn call-begin! [] (-> i64)
+  (if (primitive/icmp-eq (primitive/load (primitive/field (g) booted)) 0)
+      0
+      (let [t (tls)
+            sp (primitive/load (primitive/field t sp))]
+        (if (primitive/icmp-lt sp STACK_MAX)
+            (primitive/store! (primitive/index (primitive/field t child) sp) 0)
+            0)
+        (primitive/store! (primitive/field t sp) (primitive/iadd sp 1))
+        (now-ns))))
+
+;;; Finish timing a probed call. Returns inclusive elapsed ns; the self time is
+;;; left in the thread state for `agg-time!`.
+(defn call-end! [(t0 i64)] (-> i64)
+  (if (primitive/icmp-eq (primitive/load (primitive/field (g) booted)) 0)
+      0
+      (let [t (tls)
+            elapsed (primitive/isub (now-ns) t0)
+            sp (primitive/isub (primitive/load (primitive/field t sp)) 1)]
+        (if (primitive/icmp-lt sp 0)
+            elapsed
+            (do
+              (primitive/store! (primitive/field t sp) sp)
+              (let [kids
+                      (if (primitive/icmp-lt sp STACK_MAX)
+                          (primitive/load (primitive/index (primitive/field t
+                                                                            child)
+                                                           sp))
+                          0)]
+                (primitive/store! (primitive/field t last-self)
+                                  (primitive/isub elapsed kids))
+                (if (if (primitive/icmp-gt sp 0)
+                        (primitive/icmp-le sp STACK_MAX)
+                        false)
+                    (let [parent
+                            (primitive/index (primitive/field t child)
+                                             (primitive/isub sp 1))]
+                      (primitive/store! parent
+                                        (primitive/iadd (primitive/load parent)
+                                                        elapsed)))
+                    0)
+                elapsed))))))
+
+(defn depth [] (-> i64)
+  (.sp (tls)))
+
+(defn thread-id [] (-> i64)
+  (.id (tls)))
+
+;;; The value a probed call produced, handed back through a call so the rewritten
+;;; site is, to the code around it, still a call expression.
+(defn ret :inline (Always) [T] [(x T)] (-> T)
+  x)
+
+; ---- hashing -----------------------------------------------------------------
+(defn hash-bytes [(p (ptr u8)) (n i64)] (-> i64)
+  (let [(mut h) 1469598103934665603
+        (mut i) 0]
+    (while (< (load i) n)
+      (set! h
+            (primitive/ixor (load h)
+                            (primitive/cast i64
+                                            (primitive/load (primitive/index p
+                                                                             (load i))))))
+      (set! h (primitive/imul (load h) 1099511628211))
+      (set! i (+ (load i) 1)))
+    (primitive/iand (load h) 9223372036854775807)))
+
+(defn bytes-eq? [(a (ptr u8)) (an i64) (b (ptr u8)) (bn i64)] (-> bool)
+  (if (!= an bn)
+      false
+      (if (= an 0)
+          true
+          (= (primitive/cast i64
+                             (c-memcmp (primitive/cast (ptr i8) a)
+                                       (primitive/cast (ptr i8) b)
+                                       (primitive/cast isize an)))
+             0))))
+
+(defn copy-bytes [(p (ptr u8)) (n i64)] (-> (ptr u8))
+  (let [raw (c-malloc (primitive/cast isize (if (= n 0) 1 n)))]
+    (if (= (primitive/cast i64 raw) 0)
+        (do
+          (fatal! "out of memory copying a probe key")
+          (primitive/cast (ptr u8) raw))
+        (do
+          (if (> n 0)
+              (c-memcpy raw
+                        (primitive/cast (ptr i8) p)
+                        (primitive/cast isize n))
+              raw)
+          (primitive/cast (ptr u8) raw)))))
+
+(defn entry-at [(a (ptr Agg)) (i i64)] (-> (ptr Entry))
+  (primitive/index (.entries a) i))
+
+(defn agg-alloc-table [(cap i64)] (-> (ptr Entry))
+  (let [bytes (* cap (primitive/sizeof Entry))
+        raw (c-malloc (primitive/cast isize bytes))]
+    (if (= (primitive/cast i64 raw) 0)
+        (do
+          (fatal! "out of memory growing an aggregation")
+          (primitive/cast (ptr Entry) raw))
+        (do
+          (c-memset raw (primitive/cast i32 0) (primitive/cast isize bytes))
+          (primitive/cast (ptr Entry) raw)))))
+
+(defn agg-slot [(entries (ptr Entry)) (cap i64) (h i64) (key (ptr u8)) (n i64)] (-> (ptr Entry))
+  (let [(mut i) (% h cap)
+        (mut found) (primitive/cast (ptr Entry) 0)]
+    (while (= (primitive/cast i64 (load found)) 0)
+      (let [e (primitive/index entries (load i))]
+        (if (= (.used e) 0)
+            (set! found e)
+            (if (and (= (.hash e) h) (bytes-eq? (.key e) (.key-len e) key n))
+                (set! found e)
+                (set! i (% (+ (load i) 1) cap))))))
+    (load found)))
+
+(defn agg-grow! [(a (ptr Agg))] (-> i64)
+  (let [old (.entries a)
+        old-cap (.cap a)
+        cap (if (= old-cap 0) 8 (* old-cap 2))
+        fresh (agg-alloc-table cap)
+        (mut i) 0]
+    (while (< (load i) old-cap)
+      (let [e (primitive/index old (load i))]
+        (if (= (.used e) 1)
+            (let [slot (agg-slot fresh cap (.hash e) (.key e) (.key-len e))]
+              (c-memcpy (primitive/cast (ptr i8) slot)
+                        (primitive/cast (ptr i8) e)
+                        (primitive/cast isize (primitive/sizeof Entry)))
+              0)
+            0))
+      (set! i (+ (load i) 1)))
+    (if (!= (primitive/cast i64 old) 0)
+        (c-free (primitive/cast (ptr i8) old))
+        (c-free (primitive/cast (ptr i8) 0)))
+    (set! (.entries a) fresh)
+    (set! (.cap a) cap)
+    0))
+
+(defn agg-entry! [(a (ptr Agg)) (key (ptr u8)) (n i64)] (-> (ptr Entry))
+  (do
+    (if (>= (* (+ (.count a) 1) 10) (* (.cap a) 7)) (agg-grow! a) 0)
+    (let [h (hash-bytes key n)
+          e (agg-slot (.entries a) (.cap a) h key n)]
+      (if (= (.used e) 0)
+          (do
+            (set! (.used e) 1)
+            (set! (.hash e) h)
+            (set! (.key e) (copy-bytes key n))
+            (set! (.key-len e) n)
+            (set! (.lo e) 9223372036854775807)
+            (set! (.hi e) -9223372036854775807)
+            (set! (.count a) (+ (.count a) 1))
+            0)
+          0)
+      e)))
+
+(defn log2-bucket [(v i64)] (-> i64)
+  (if (<= v 0)
+      0
+      (- 63 (primitive/clz v))))
+
+(defn lock! [] (-> i64)
+  (primitive/cast i64
+                  (c-mutex-lock (primitive/cast (ptr i8)
+                                                (primitive/field (g) mutex)))))
+
+(defn unlock! [] (-> i64)
+  (primitive/cast i64
+                  (c-mutex-unlock (primitive/cast (ptr i8)
+                                                  (primitive/field (g) mutex)))))
+
+;;; Tell the runtime an aggregation exists: what it measures, how to label it, and
+;;; which probe module owns it. Called once per aggregation from the generated
+;;; `probe-init`; the engine never invents one the reader did not declare.
+(defn agg-register! [(a (ptr Agg))
+                     (kind i64)
+                     (dur i64)
+                     (keyed i64)
+                     (label (slice u8))
+                     (owner (slice u8))] (-> i64)
+  (if (= (.registered a) 1)
+      0
+      (let [st (g)]
+        (set! (.registered a) 1)
+        (set! (.kind a) kind)
+        (set! (.dur a) dur)
+        (set! (.keyed a) keyed)
+        (set! (.label a) label)
+        (set! (.owner a) owner)
+        ; Appended, so reports list aggregations in the order the file wrote them.
+        (if (= (primitive/cast i64 (.aggs st)) 0)
+            (set! (.aggs st) a)
+            (let [(mut tail) (.aggs st)]
+              (while (!= (primitive/cast i64 (.next (load tail))) 0)
+                (set! tail (.next (load tail))))
+              (set! (.next (load tail)) a)))
+        0)))
+
+(defn agg-record! [(a (ptr Agg)) (value i64) (self i64)] (-> i64)
+  (let [t (tls)
+        out (primitive/field t out)]
+    (lock!)
+    (let [e (agg-entry! a (.data out) (.len out))]
+      (set! (.n e) (+ (.n e) 1))
+      (set! (.sum e) (+ (.sum e) value))
+      (set! (.self e) (+ (.self e) self))
+      (if (< value (.lo e)) (set! (.lo e) value) 0)
+      (if (> value (.hi e)) (set! (.hi e) value) 0)
+      (let [slot (primitive/index (primitive/field e hist) (log2-bucket value))]
+        (primitive/store! slot (+ (primitive/load slot) 1))))
+    (set! (.dirty a) 1)
+    (unlock!)
+    0))
+
+;;; Feed one value into an aggregation under the key currently in the thread's
+;;; output buffer (see `key-begin!`).
+(defn agg-add! [(a (ptr Agg)) (value i64)] (-> i64)
+  (agg-record! a value 0))
+
+(defn agg-count! [(a (ptr Agg))] (-> i64)
+  (agg-record! a 1 0))
+
+(defn agg-time! [(a (ptr Agg)) (elapsed i64)] (-> i64)
+  (agg-record! a elapsed (.last-self (tls))))
+
+;;; Time for a range span. It is not one call's duration, so it has no self time.
+(defn agg-span-time! [(a (ptr Agg)) (elapsed i64)] (-> i64)
+  (agg-record! a elapsed elapsed))
+
+; ---- the thread output buffer: print lines, record objects, aggregation keys --
+(defn out [] (-> (ptr Buf))
+  (primitive/field (tls) out))
+
+(defn key-begin! [] (-> i64)
+  (let [t (tls)]
+    (set! (.json t) 0)
+    (buf-reset! (primitive/field t out))))
+
+;;; Parts of a `by a, b` key are joined with a unit separator (0x1f), not text, so
+;;; the key is still a list: a table shows it as `a, b`, JSON as `["a","b"]`.
+(const KEY_SEP 31)
+
+(defn key-sep! [] (-> i64)
+  (buf-byte! (out) KEY_SEP))
+
+(defn json? [] (-> bool)
+  (= (.json (g)) 1))
+
+(defn print-begin! [] (-> i64)
+  (key-begin!))
+
+;;; Finish a `print`. In JSON mode the line is an object, so a consumer reading the
+;;; stream can tell a print from a report from a record without guessing.
+(defn print-end! [(d (ptr Dest))] (-> i64)
+  (if (json?)
+      (let [(mut line) (primitive/zeroed Buf)
+            text (out)]
+        (buf-str! (mut line) "{\"type\":\"print\",\"text\":")
+        (buf-json-str! (mut line) (.data text) (.len text))
+        (buf-str! (mut line) "}\n")
+        (dest-write! d (mut line))
+        (c-free (primitive/cast (ptr i8) (.data line)))
+        0)
+      (do
+        (buf-byte! (out) 10)
+        (dest-write! d (out)))))
+
+(defn rec-begin! [] (-> i64)
+  (let [t (tls)]
+    (set! (.json t) 1)
+    (set! (.first t) 1)
+    (buf-reset! (primitive/field t out))
+    (buf-byte! (primitive/field t out) 123)))
+
+(defn rec-key! [(name (slice u8))] (-> i64)
+  (let [t (tls)
+        b (primitive/field t out)]
+    (if (= (.first t) 1) (do (set! (.first t) 0) 0) (buf-byte! b 44))
+    (buf-json-str! b (slice-data name) (slice-len name))
+    (buf-byte! b 58)))
+
+(defn rec-end! [(d (ptr Dest))] (-> i64)
+  (do
+    (buf-str! (out) "}\n")
+    (dest-write! d (out))))
+
+;;; Punctuation the engine writes around a structured value; never quoted.
+(defn out-raw! [(s (slice u8))] (-> i64)
+  (buf-str! (out) s))
+
+(defn out-null! [] (-> i64)
+  (if (= (.json (tls)) 1) (buf-str! (out) "null") (buf-str! (out) "-")))
+
+(defn out-str! [(s (slice u8))] (-> i64)
+  (if (= (.json (tls)) 1)
+      (buf-json-str! (out) (slice-data s) (slice-len s))
+      (buf-str! (out) s)))
+
+;;; Literal text between a format string's `{…}` holes. Always raw.
+(defn out-text! [(s (slice u8))] (-> i64)
+  (buf-str! (out) s))
+
+(defn out-cstr! [(p (ptr i8))] (-> i64)
+  (if (= (primitive/cast i64 p) 0)
+      (out-null!)
+      (out-str! (slice-new [u8]
+                           (primitive/cast (ptr u8) p)
+                           (primitive/cast i64 (c-strlen p))))))
+
+(defn out-int! [(v i64)] (-> i64)
+  (buf-int! (out) v))
+
+(defn out-bool! [(v bool)] (-> i64)
+  (buf-str! (out) (if v "true" "false")))
+
+(defn out-f64! [(v f64)] (-> i64)
+  (buf-f64! (out) v))
+
+(defn out-ptr! [(v i64)] (-> i64)
+  (if (= (.json (tls)) 1)
+      (do (buf-byte! (out) 34) (buf-hex! (out) v) (buf-byte! (out) 34))
+      (buf-hex! (out) v)))
+
+;;; A duration. In a record it is the raw ns count, so consumers can do arithmetic;
+;;; in text it is humanized.
+(defn out-dur! [(ns i64)] (-> i64)
+  (if (= (.json (tls)) 1) (buf-int! (out) ns) (buf-dur! (out) ns)))
+
+;;; A value whose rendering depends on its type. It does nothing: the engine
+;;; replaces every call with the right `out-*` once the type checker has told it
+;;; what `x` is, so reaching this at run time would mean a round was skipped.
+(defn show-marker [T] [(x T)] (-> i64)
+  0)
+
+;;; What a probed `void` call evaluates to.
+(defn nothing [] (-> void)
+  (c-free (primitive/cast (ptr i8) 0)))
+
+(defn out-open! [(s (slice u8))] (-> i64)
+  (buf-str! (out) s))
+
+(defn out-close! [(s (slice u8))] (-> i64)
+  (buf-str! (out) s))
+
+(defn out-sep! [] (-> i64)
+  (buf-str! (out) (if (= (.json (tls)) 1) "," ", ")))
+
+;;; A struct field's name, with the separator before every field but the first.
+(defn out-field! [(name (slice u8)) (index i64)] (-> i64)
+  (do
+    (if (> index 0) (out-sep!) 0)
+    (if (= (.json (tls)) 1)
+        (do
+          (buf-json-str! (out) (slice-data name) (slice-len name))
+          (buf-byte! (out) 58))
+        (do (buf-str! (out) name) (buf-str! (out) ": ")))))
+
+;;; A sum value: `Name` / `Name(a, b)` in text, `"Name"` / `{"Name":[a,b]}` in JSON.
+(defn out-variant-begin! [(name (slice u8)) (nfields i64)] (-> i64)
+  (if (= (.json (tls)) 1)
+      (if (= nfields 0)
+          (buf-json-str! (out) (slice-data name) (slice-len name))
+          (do
+            (buf-byte! (out) 123)
+            (buf-json-str! (out) (slice-data name) (slice-len name))
+            (buf-str! (out) ":[")))
+      (do
+        (buf-str! (out) name)
+        (if (> nfields 0) (buf-byte! (out) 40) 0))))
+
+(defn out-variant-end! [(nfields i64)] (-> i64)
+  (if (= nfields 0)
+      0
+      (if (= (.json (tls)) 1) (buf-str! (out) "]}") (buf-byte! (out) 41))))
+
+;;; At most the first N elements of a slice — `body[..64kb]`.
+(defn clip [T] [(s (slice T)) (n i64)] (-> (slice T))
+  (if (> (slice-len s) n) (subslice s 0 n) s))
+
+; ---- string predicates --------------------------------------------------------
+(defn str-starts-with? [(s (slice u8)) (p (slice u8))] (-> bool)
+  (if (< (slice-len s) (slice-len p))
+      false
+      (bytes-eq? (slice-data s) (slice-len p) (slice-data p) (slice-len p))))
+
+(defn str-ends-with? [(s (slice u8)) (p (slice u8))] (-> bool)
+  (if (< (slice-len s) (slice-len p))
+      false
+      (bytes-eq? (primitive/index (slice-data s)
+                                  (- (slice-len s) (slice-len p)))
+                 (slice-len p)
+                 (slice-data p)
+                 (slice-len p))))
+
+(defn str-contains? [(s (slice u8)) (p (slice u8))] (-> bool)
+  (let [n (slice-len s)
+        m (slice-len p)
+        (mut i) 0
+        (mut hit) false]
+    (while (and (not (load hit)) (<= (+ (load i) m) n))
+      (if (bytes-eq? (primitive/index (slice-data s) (load i))
+                     m
+                     (slice-data p)
+                     m)
+          (set! hit true)
+          (set! i (+ (load i) 1))))
+    (load hit)))
+
+(defn str-equals? [(a (slice u8)) (b (slice u8))] (-> bool)
+  (bytes-eq? (slice-data a) (slice-len a) (slice-data b) (slice-len b)))
+
+; ---- spans --------------------------------------------------------------------
+(defn span-index [(t (ptr Tls)) (s (ptr Span))] (-> i64)
+  (let [key (primitive/cast i64 s)
+        n (primitive/load (primitive/field t nspans))
+        (mut i) 0
+        (mut found) -1]
+    (loop (if (primitive/icmp-ge (primitive/load i) n)
+              (break)
+              (if (primitive/icmp-eq (primitive/load (primitive/index (primitive/field t
+                                                                                       span-keys)
+                                                                      (primitive/load i)))
+                                     key)
+                  (do (primitive/store! found (primitive/load i)) (break))
+                  (primitive/store! i (primitive/iadd (primitive/load i) 1)))))
+    (if (primitive/icmp-ge (primitive/load found) 0)
+        (primitive/load found)
+        (if (primitive/icmp-lt n SPAN_MAX)
+            (do
+              (primitive/store! (primitive/index (primitive/field t span-keys)
+                                                 n)
+                                key)
+              (primitive/store! (primitive/index (primitive/field t span-depths)
+                                                 n)
+                                0)
+              (primitive/store! (primitive/field t nspans) (primitive/iadd n 1))
+              n)
+            -1))))
+
+;;; A call span opens on this thread. Primitives only: it runs outside the guard.
+(defn span-enter! [(s (ptr Span))] (-> i64)
+  (if (primitive/icmp-eq (primitive/load (primitive/field (g) booted)) 0)
+      0
+      (let [t (tls)
+            i (span-index t s)]
+        (if (primitive/icmp-ge i 0)
+            (let [slot (primitive/index (primitive/field t span-depths) i)]
+              (primitive/store! slot (primitive/iadd (primitive/load slot) 1)))
+            0)
+        0)))
+
+(defn span-exit! [(s (ptr Span))] (-> i64)
+  (if (primitive/icmp-eq (primitive/load (primitive/field (g) booted)) 0)
+      0
+      (let [t (tls)
+            i (span-index t s)]
+        (if (primitive/icmp-ge i 0)
+            (let [slot (primitive/index (primitive/field t span-depths) i)]
+              (if (primitive/icmp-gt (primitive/load slot) 0)
+                  (primitive/store! slot
+                                    (primitive/isub (primitive/load slot) 1))
+                  0))
+            0)
+        0)))
+
+;;; Is the span open — on this thread for a call span, anywhere for a range span?
+(defn span-active? [(s (ptr Span))] (-> bool)
+  (if (primitive/icmp-eq (primitive/load (primitive/field (g) booted)) 0)
+      false
+      (if (primitive/icmp-gt (primitive/load (primitive/field s open-count)) 0)
+          true
+          (let [t (tls)
+                i (span-index t s)]
+            (if (primitive/icmp-ge i 0)
+                (primitive/icmp-gt (primitive/load (primitive/index (primitive/field t
+                                                                                     span-depths)
+                                                                    i))
+                                   0)
+                false)))))
+
+(defn open-slot [(opens (ptr Open)) (cap i64) (h i64) (key (ptr u8)) (n i64)] (-> (ptr Open))
+  (let [(mut i) (% h cap)
+        (mut found) (primitive/cast (ptr Open) 0)
+        (mut steps) 0]
+    (while (and (= (primitive/cast i64 (load found)) 0) (< (load steps) cap))
+      (let [o (primitive/index opens (load i))]
+        (if (or (= (.used o) 0)
+                (and (= (.hash o) h) (bytes-eq? (.key o) (.key-len o) key n)))
+            (set! found o)
+            (do
+              (set! i (% (+ (load i) 1) cap))
+              (set! steps (+ (load steps) 1))
+              0))))
+    (load found)))
+
+(defn span-grow! [(s (ptr Span))] (-> i64)
+  (let [old (.opens s)
+        old-cap (.cap s)
+        cap (if (= old-cap 0) 16 (* old-cap 2))
+        bytes (* cap (primitive/sizeof Open))
+        raw (c-malloc (primitive/cast isize bytes))
+        (mut i) 0]
+    (if (= (primitive/cast i64 raw) 0)
+        (fatal! "out of memory growing a span")
+        0)
+    (c-memset raw (primitive/cast i32 0) (primitive/cast isize bytes))
+    (let [fresh (primitive/cast (ptr Open) raw)]
+      (while (< (load i) old-cap)
+        (let [o (primitive/index old (load i))]
+          (if (= (.used o) 1)
+              (let [slot (open-slot fresh cap (.hash o) (.key o) (.key-len o))]
+                (c-memcpy (primitive/cast (ptr i8) slot)
+                          (primitive/cast (ptr i8) o)
+                          (primitive/cast isize (primitive/sizeof Open)))
+                0)
+              0))
+        (set! i (+ (load i) 1)))
+      (c-free (primitive/cast (ptr i8) old))
+      (set! (.opens s) fresh)
+      (set! (.cap s) cap)
+      0)))
+
+;;; A range span opens for the key in the thread's output buffer.
+(defn range-open! [(s (ptr Span))] (-> i64)
+  (let [b (out)
+        h (hash-bytes (.data b) (.len b))]
+    (lock!)
+    (if (>= (* (+ (.count s) 1) 10) (* (.cap s) 5)) (span-grow! s) 0)
+    (let [o (open-slot (.opens s) (.cap s) h (.data b) (.len b))]
+      (if (= (.used o) 0)
+          (do
+            (set! (.used o) 1)
+            (set! (.hash o) h)
+            (set! (.key o) (copy-bytes (.data b) (.len b)))
+            (set! (.key-len o) (.len b))
+            (set! (.count s) (+ (.count s) 1))
+            (set! (.open-count s) (+ (.open-count s) 1))
+            0)
+          0)
+      (set! (.t0 o) (now-ns)))
+    (unlock!)
+    0))
+
+;;; A range span closes for the key in the thread's output buffer. Returns its
+;;; elapsed ns, or -1 when no such span was open (a close with no open is not a
+;;; measurement, so the clause does not fire).
+(defn range-close! [(s (ptr Span))] (-> i64)
+  (let [b (out)
+        h (hash-bytes (.data b) (.len b))
+        (mut elapsed) -1]
+    (lock!)
+    (if (> (.cap s) 0)
+        (let [o (open-slot (.opens s) (.cap s) h (.data b) (.len b))]
+          (if (and (!= (primitive/cast i64 o) 0)
+                   (and (= (.used o) 1) (>= (.t0 o) 0)))
+              (do
+                (set! elapsed (- (now-ns) (.t0 o)))
+                ; The slot stays claimed for its key (open addressing has no
+                ; tombstones here); t0 < 0 marks it closed.
+                (set! (.t0 o) -1)
+                (set! (.open-count s) (- (.open-count s) 1))
+                0)
+              0))
+        0)
+    (unlock!)
+    (load elapsed)))
+
+; ---- reporting ----------------------------------------------------------------
+(defn pad-to! [(b (ptr Buf)) (start i64) (width i64)] (-> i64)
+  (let [w (display-width (primitive/index (.data b) start) (- (.len b) start))]
+    (buf-spaces! b (- width w))))
+
+;;; Append `text` right-aligned in `width` columns.
+(defn buf-right! [(b (ptr Buf)) (text (ptr Buf)) (width i64)] (-> i64)
+  (do
+    (buf-spaces! b (- width (display-width (.data text) (.len text))))
+    (buf-bytes! b (.data text) (.len text))))
+
+(defn buf-value! [(b (ptr Buf)) (dur i64) (v i64)] (-> i64)
+  (if (= dur 1) (buf-dur! b v) (buf-int-sep! b v)))
+
+;;; An approximate quantile from the log₂ histogram: find the bucket holding the
+;;; target rank, then place it within the bucket in proportion to that rank. Clamped
+;;; to the observed range, so a single-valued series reports its exact value.
+(defn quantile [(e (ptr Entry)) (per-mille i64)] (-> i64)
+  (let [target (/ (+ (* (.n e) per-mille) 999) 1000)
+        (mut seen) 0
+        (mut bucket) 0
+        (mut done) false]
+    (while (and (not (load done)) (< (load bucket) 64))
+      (let [here
+              (primitive/load (primitive/index (primitive/field e hist)
+                                               (load bucket)))]
+        (if (>= (+ (load seen) here) target)
+            (set! done true)
+            (do
+              (set! seen (+ (load seen) here))
+              (set! bucket (+ (load bucket) 1))
+              0))))
+    (if (>= (load bucket) 64)
+        (.hi e)
+        (let [here
+                (primitive/load (primitive/index (primitive/field e hist)
+                                                 (load bucket)))
+              lo (if (= (load bucket) 0) 0 (primitive/ishl 1 (load bucket)))
+              width (if (= (load bucket) 0) 2 lo)
+              into (- target (load seen))
+              estimate (+ lo (/ (* width into) (if (= here 0) 1 here)))]
+          (if (< estimate (.lo e))
+              (.lo e)
+              (if (> estimate (.hi e)) (.hi e) estimate))))))
+
+(defn bar [(level i64)] (-> (slice u8))
+  (case level 0
+        " " 1
+        "▁" 2
+        "▂" 3
+        "▃" 4
+        "▄" 5
+        "▅" 6
+        "▆" 7
+        "▇" "█"))
+
+(defn report-hist! [(b (ptr Buf)) (a (ptr Agg)) (e (ptr Entry))] (-> i64)
+  (let [(mut first) 64
+        (mut last) -1
+        (mut peak) 1
+        (mut i) 0]
+    (while (< (load i) 64)
+      (let [c
+              (primitive/load (primitive/index (primitive/field e hist)
+                                               (load i)))]
+        (if (> c 0)
+            (do
+              (if (< (load i) (load first)) (set! first (load i)) 0)
+              (set! last (load i))
+              (if (> c (load peak)) (set! peak c) 0)
+              0)
+            0))
+      (set! i (+ (load i) 1)))
+    (if (< (load last) 0)
+        0
+        (do
+          (buf-str! b "    ")
+          (set! i (load first))
+          (while (<= (load i) (load last))
+            (let [c
+                    (primitive/load (primitive/index (primitive/field e hist)
+                                                     (load i)))
+                  level (+ 1 (/ (* c 7) (load peak)))]
+              (if (> c 0)
+                  (do
+                    (buf-value! b
+                                (.dur a)
+                                (if (= (load i) 0)
+                                    0
+                                    (primitive/ishl 1 (load i))))
+                    (buf-byte! b 32)
+                    (buf-str! b (bar level))
+                    (buf-str! b "  "))
+                  0))
+            (set! i (+ (load i) 1)))
+          (buf-byte! b 10)))))
+
+(defn metric [(a (ptr Agg)) (e (ptr Entry))] (-> i64)
+  (case (.kind a) 0
+        (.n e) 3
+        (if (= (.n e) 0) 0 (/ (.sum e) (.n e))) 4
+        (.lo e) 5
+        (.hi e) 6
+        (.n e) (.sum e)))
+
+(defn report-line! [(b (ptr Buf)) (a (ptr Agg)) (e (ptr Entry))] (-> i64)
+  (let [dur (.dur a)]
+    (case (.kind a) 0
+          (buf-int-sep! b (.n e)) 1
+          (do
+            (buf-int-sep! b (.n e))
+            (buf-str! b (if (= (.n e) 1) " call  total " " calls  total "))
+            (buf-dur! b (.sum e))
+            ; Self time is shown when probed children account for part of the total.
+            (if (and (> (.self e) 0) (< (.self e) (.sum e)))
+                (do (buf-str! b "  self ") (buf-dur! b (.self e)))
+                0)
+            (buf-str! b "  avg ")
+            (buf-dur! b (/ (.sum e) (.n e)))
+            (buf-str! b "  p50 ~")
+            (buf-dur! b (quantile e 500))
+            (buf-str! b "  p99 ~")
+            (buf-dur! b (quantile e 990))
+            (buf-str! b "  max ")
+            (buf-dur! b (.hi e)))
+            2
+          (do
+            (buf-value! b dur (.sum e))
+            (buf-str! b "  (")
+            (buf-int-sep! b (.n e))
+            (buf-str! b (if (= (.n e) 1) " event)" " events)")))
+            3
+          (do
+            (buf-value! b dur (/ (.sum e) (.n e)))
+            (buf-str! b "  (")
+            (buf-int-sep! b (.n e))
+            (buf-str! b (if (= (.n e) 1) " event)" " events)")))
+            4
+          (buf-value! b dur (.lo e)) 5
+          (buf-value! b dur (.hi e))
+            (do
+              (buf-int-sep! b (.n e))
+              (buf-str! b " events  min ")
+              (buf-value! b dur (.lo e))
+              (buf-str! b "  avg ")
+              (buf-value! b dur (/ (.sum e) (.n e)))
+              (buf-str! b "  max ")
+              (buf-value! b dur (.hi e))))))
+
+;;; A key as a table shows it: parts joined with ", ".
+(defn buf-key! [(b (ptr Buf)) (key (ptr u8)) (n i64)] (-> i64)
+  (let [(mut i) 0]
+    (while (< (load i) n)
+      (let [c
+              (primitive/cast i64
+                              (primitive/load (primitive/index key (load i))))]
+        (if (= c KEY_SEP) (buf-str! b ", ") (buf-byte! b c)))
+      (set! i (+ (load i) 1)))
+    0))
+
+(defn key-width [(key (ptr u8)) (n i64)] (-> i64)
+  (let [(mut i) 0
+        (mut seps) 0]
+    (while (< (load i) n)
+      (if (= (primitive/cast i64
+                             (primitive/load (primitive/index key (load i))))
+             KEY_SEP)
+          (set! seps (+ (load seps) 1))
+          0)
+      (set! i (+ (load i) 1)))
+    (+ (display-width key n) (load seps))))
+
+(const REPORT_ROWS 20)
+
+(defn report-agg! [(b (ptr Buf)) (a (ptr Agg))] (-> i64)
+  (do
+    (buf-str! b (.label a))
+    (buf-byte! b 10)
+    (if (= (.count a) 0)
+        (buf-str! b "  (no events yet)\n")
+        (let [(mut width) 0
+              (mut i) 0
+              (mut rows) 0]
+          ; Column width from the keys that will actually be shown.
+          (while (< (load i) (.cap a))
+            (let [e (entry-at a (load i))]
+              (if (= (.used e) 1)
+                  (do
+                    (set! (.shown e) 0)
+                    (let [w (key-width (.key e) (.key-len e))]
+                      (if (> w (load width)) (set! width w) 0))
+                    0)
+                  0))
+            (set! i (+ (load i) 1)))
+          (if (> (load width) 48) (set! width 48) 0)
+          ; Largest first, REPORT_ROWS of them: repeated selection keeps the table
+          ; itself untouched, so reporting never disturbs a concurrent insert order.
+          (while (and (< (load rows) REPORT_ROWS) (< (load rows) (.count a)))
+            (let [(mut best) (primitive/cast (ptr Entry) 0)
+                  (mut j) 0]
+              (while (< (load j) (.cap a))
+                (let [e (entry-at a (load j))]
+                  (if (and (= (.used e) 1) (= (.shown e) 0))
+                      (if (or (= (primitive/cast i64 (load best)) 0)
+                              (> (metric a e) (metric a (load best))))
+                          (set! best e)
+                          0)
+                      0))
+                (set! j (+ (load j) 1)))
+              (let [e (load best)
+                    start (.len b)]
+                (set! (.shown e) 1)
+                (buf-str! b "  ")
+                (if (= (.keyed a) 1)
+                    (do
+                      (buf-key! b (.key e) (.key-len e))
+                      (pad-to! b start (+ (load width) 4))
+                      0)
+                    0)
+                (report-line! b a e)
+                (buf-byte! b 10)
+                (if (or (= (.kind a) 6) (and (= (.kind a) 1) (= (.keyed a) 0)))
+                    (report-hist! b a e)
+                    0)))
+            (set! rows (+ (load rows) 1)))
+          (if (> (.count a) REPORT_ROWS)
+              (do
+                (buf-str! b "  … ")
+                (buf-int-sep! b (- (.count a) REPORT_ROWS))
+                (buf-str! b " more\n"))
+              0)))))
+
+;;; A key as JSON: the list of its parts.
+(defn json-key! [(b (ptr Buf)) (key (ptr u8)) (n i64)] (-> i64)
+  (let [(mut start) 0
+        (mut i) 0]
+    (buf-byte! b 91)
+    (while (<= (load i) n)
+      (if (or (= (load i) n)
+              (= (primitive/cast i64
+                                 (primitive/load (primitive/index key (load i))))
+                 KEY_SEP))
+          (do
+            (if (> (load start) 0) (buf-byte! b 44) 0)
+            (buf-json-str! b
+                           (primitive/index key (load start))
+                           (- (load i) (load start)))
+            (set! start (+ (load i) 1))
+            0)
+          0)
+      (set! i (+ (load i) 1)))
+    (buf-byte! b 93)))
+
+(defn json-field! [(b (ptr Buf)) (name (slice u8)) (v i64)] (-> i64)
+  (do
+    (buf-byte! b 44)
+    (buf-json-str! b (slice-data name) (slice-len name))
+    (buf-byte! b 58)
+    (buf-int! b v)))
+
+(defn kind-name [(kind i64)] (-> (slice u8))
+  (case kind 0
+        "count" 1
+        "time" 2
+        "sum" 3
+        "avg" 4
+        "min" 5
+        "max" "hist"))
+
+;;; One aggregation as JSON. Every row, not the table's top twenty: a consumer can
+;;; sort and cut for itself. Durations are ns; `unit` says when a value is one.
+(defn report-agg-json! [(b (ptr Buf)) (a (ptr Agg))] (-> i64)
+  (let [(mut i) 0
+        (mut first) true]
+    (buf-str! b "{\"label\":")
+    (buf-json-str! b (slice-data (.label a)) (slice-len (.label a)))
+    (buf-str! b ",\"module\":")
+    (buf-json-str! b (slice-data (.owner a)) (slice-len (.owner a)))
+    (buf-str! b ",\"kind\":")
+    (buf-json-str! b
+                   (slice-data (kind-name (.kind a)))
+                   (slice-len (kind-name (.kind a))))
+    (buf-str! b (if (= (.dur a) 1) ",\"unit\":\"ns\"" ",\"unit\":null"))
+    (buf-str! b ",\"rows\":[")
+    (while (< (load i) (.cap a))
+      (let [e (entry-at a (load i))]
+        (if (= (.used e) 1)
+            (do
+              (if (load first)
+                  (set! first false)
+                  (do (buf-byte! b 44) (set! first false)))
+              (buf-str! b "{\"key\":")
+              (json-key! b (.key e) (if (= (.keyed a) 1) (.key-len e) 0))
+              (json-field! b "count" (.n e))
+              (if (!= (.kind a) 0)
+                  (do
+                    (json-field! b "sum" (.sum e))
+                    (json-field! b "min" (.lo e))
+                    (json-field! b "max" (.hi e))
+                    (json-field! b "avg" (/ (.sum e) (.n e)))
+                    0)
+                  0)
+              (if (= (.kind a) 1) (json-field! b "self" (.self e)) 0)
+              (if (or (= (.kind a) 1) (= (.kind a) 6))
+                  (let [(mut k) 0
+                        (mut first-bucket) true]
+                    (json-field! b "p50" (quantile e 500))
+                    (json-field! b "p99" (quantile e 990))
+                    ; [lower bound, count] for every log2 bucket that holds something.
+                    (buf-str! b ",\"hist\":[")
+                    (while (< (load k) 64)
+                      (let [c
+                              (primitive/load (primitive/index (primitive/field e
+                                                                                hist)
+                                                               (load k)))]
+                        (if (> c 0)
+                            (do
+                              (if (load first-bucket) 0 (buf-byte! b 44))
+                              (set! first-bucket false)
+                              (buf-byte! b 91)
+                              (buf-int! b
+                                        (if (= (load k) 0)
+                                            0
+                                            (primitive/ishl 1 (load k))))
+                              (buf-byte! b 44)
+                              (buf-int! b c)
+                              (buf-byte! b 93))
+                            0))
+                      (set! k (+ (load k) 1)))
+                    (buf-byte! b 93))
+                  0)
+              (buf-byte! b 125))
+            0))
+      (set! i (+ (load i) 1)))
+    (buf-str! b "]}")))
+
+;;; Write every aggregation that changed since the last report (all of them when
+;;; `everything`). Returns how many were written.
+(defn report! [(everything bool)] (-> i64)
+  (let [st (g)
+        (mut b) (primitive/zeroed Buf)
+        (mut a) (.aggs st)
+        (mut written) 0]
+    (lock!)
+    (while (!= (primitive/cast i64 (load a)) 0)
+      (let [agg (load a)]
+        (if (or everything (or (= (.dirty agg) 1) (= (.report-file st) 1)))
+            (do
+              (if (= (.json st) 1)
+                  (do
+                    (if (= (load written) 0)
+                        (do
+                          (buf-str! (mut b)
+                                    "{\"type\":\"report\",\"elapsed_ns\":")
+                          (buf-int! (mut b) (- (now-ns) (.start-ns st)))
+                          (buf-str! (mut b)
+                                    (if everything
+                                        ",\"final\":true"
+                                        ",\"final\":false"))
+                          (buf-str! (mut b) ",\"aggregations\":["))
+                        (buf-byte! (mut b) 44))
+                    (report-agg-json! (mut b) agg))
+                  (do
+                    (if (= (load written) 0)
+                        (do
+                          (buf-str! (mut b) "── probe · ")
+                          (buf-dur! (mut b) (- (now-ns) (.start-ns st)))
+                          (buf-str! (mut b)
+                                    (if everything
+                                        " · final ──\n"
+                                        " ──\n"))
+                          0)
+                        0)
+                    (report-agg! (mut b) agg)))
+              (set! (.dirty agg) 0)
+              (set! written (+ (load written) 1))
+              0)
+            0)
+        (set! a (.next agg))))
+    (unlock!)
+    (if (and (> (load written) 0) (= (.json st) 1)) (buf-str! (mut b) "]}\n") 0)
+    (if (> (load written) 0)
+        (do
+          ; A file destination holds the latest snapshot, not a log of snapshots,
+          ; so `watch cat stats.txt` shows a stable table.
+          (if (= (.report-file st) 1)
+              (do
+                (c-lseek (primitive/cast i32 (.fd (.report st)))
+                         0
+                         (primitive/cast i32 0))
+                (c-ftruncate (primitive/cast i32 (.fd (.report st))) 0)
+                0)
+              0)
+          (dest-write! (.report st) (mut b)))
+        0)
+    (c-free (primitive/cast (ptr i8) (.data b)))
+    (load written)))
+
+(defn sleep-ms! [(ms i64)] (-> i64)
+  (let [(mut ts) (primitive/zeroed Timespec)]
+    (set! (.sec ts) (/ ms 1000))
+    (set! (.nsec ts) (* (% ms 1000) 1000000))
+    (primitive/cast i64
+                    (c-nanosleep (mut ts) (primitive/cast (ptr Timespec) 0)))))
+
+(defn any-dirty? [] (-> bool)
+  (let [(mut a) (.aggs (g))
+        (mut dirty) false]
+    (while (and (not (load dirty)) (!= (primitive/cast i64 (load a)) 0))
+      (if (= (.dirty (load a)) 1) (set! dirty true) (set! a (.next (load a)))))
+    (load dirty)))
+
+;;; The reporter: results do not wait for the program to finish. It is a probe
+;;; body for its whole life (`busy` set), so nothing it does can fire a probe.
+(defn reporter-main [(arg (ptr i8))] (-> (ptr i8))
+  (let [st (g)]
+    (primitive/store! (primitive/field (tls) busy) 1)
+    (while (= (.exiting st) 0)
+      (sleep-ms! (.interval-ms st))
+      (if (and (= (.exiting st) 0) (any-dirty?)) (report! false) 0))
+    arg))
+
+(defn at-exit! [] (-> i64)
+  (let [st (g)]
+    (set! (.exiting st) 1)
+    (primitive/store! (primitive/field (tls) busy) 1)
+    (report! true)
+    0))
+
+;;; Bring the runtime up. Called first thing in `main` by every probe module's
+;;; generated `probe-init`; the first call does the work.
+(defn boot! [] (-> i64)
+  (let [st (g)]
+    (if (= (.booted st) 1)
+        0
+        (do
+          (c-mutex-init (primitive/cast (ptr i8) (primitive/field st mutex))
+                        (primitive/cast (ptr i8) 0))
+          (if (!= (primitive/cast i64
+                                  (c-key-create (primitive/field st key)
+                                                (primitive/cast (ptr i8) 0)))
+                  0)
+              (fatal! "pthread_key_create failed")
+              0)
+          (set! (.interval-ms st) 1000)
+          (set! (.report st) (dest-stderr))
+          (set! (.start-ns st) (now-ns))
+          ; `PROBE_JSON=1 ./app` turns any probe's output into JSON without
+          ; rebuilding; `report … as json;` does it from the probe file.
+          (let [flag (c-getenv c"PROBE_JSON")]
+            (if (!= (primitive/cast i64 flag) 0)
+                (if (!= (primitive/cast i64 (primitive/load flag)) 48)
+                    (set! (.json st) 1)
+                    0)
+                0))
+          (set! (.booted st) 1)
+          (c-atexit (primitive/fnptr-of at-exit!))
+          0))))
+
+;;; `report every D [to "file"]`. The shortest interval any probe module asks for
+;;; wins; a file destination makes every report a full snapshot.
+(defn report-config! [(interval-ms i64) (d (ptr Dest)) (to-file i64) (json i64)] (-> i64)
+  (let [st (g)]
+    (if (= json 1) (set! (.json st) 1) 0)
+    (if (and (> interval-ms 0) (< interval-ms (.interval-ms st)))
+        (set! (.interval-ms st) interval-ms)
+        0)
+    (if (= to-file 1)
+        (do (set! (.report st) d) (set! (.report-file st) 1) 0)
+        0)))
+
+;;; Start the reporter thread. Separate from `boot!` so every module's
+;;; `report-config!` has been applied before the first interval is read.
+(defn start-reporter! [] (-> i64)
+  (let [st (g)]
+    (if (= (.reporter-started st) 1)
+        0
+        (do
+          (set! (.reporter-started st) 1)
+          (if (!= (primitive/cast i64
+                                  (c-thread-create (primitive/cast (ptr i8)
+                                                                   (primitive/field st
+                                                                                    thread-handle))
+                                                   (primitive/cast (ptr i8) 0)
+                                                   (primitive/fnptr-of reporter-main)
+                                                   (primitive/cast (ptr i8) 0)))
+                  0)
+              (fatal! "could not start the probe reporter thread")
+              0)))))
