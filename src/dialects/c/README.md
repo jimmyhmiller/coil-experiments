@@ -191,7 +191,7 @@ The Emacs harness retains build logs and measurement JSON in the temporary
 directory it prints. Its RSS metric sums the live compiler process tree at
 100 ms intervals, rather than counting only the parent compiler.
 
-C `__builtin_alloca` uses `primitive/alloc-stack-bytes` directly in the generated
+C `__builtin_alloca` uses `alloc-stack-bytes` (from coil.primitive) directly in the generated
 function. Its storage lasts until that C function returns, including across
 nested calls and loop iterations. This operation currently requires LLVM on
 AArch64 or x86-64; direct backends reject it explicitly. An inline-IR helper that
