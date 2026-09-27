@@ -6,7 +6,7 @@
 (import "coil.str" :as str)
 (import "coil.fs" :as fs)
 (import "coil.result" :use *)
-(import "coil.meta" :use [expansion-allocator])
+(import "coil.meta" :use [expansion-allocator read-context-manifest])
 (import "experiments.c.cc" :as cc)
 
 (reader-provider "experiments.c.reader" read-c-module)
@@ -157,17 +157,63 @@
               :prefixes (load (mut prefixes))
               :module-names (load (mut module-names)))))))
 
+;;; A manifest path relative to the manifest's own directory, as Cargo and
+;;; every other build tool reads one: the same Coil.toml means the same files
+;;; whether its package is built on its own or read from inside a consumer.
+(defn anchor-path [(a (dyn alloc/Allocator)) (base (slice u8)) (path (slice u8))] (-> (slice u8))
+  (if (or (= (slice-len path) 0) (= (primitive/cast i64 (slice-get path 0)) 47))
+      path
+      (let [(mut b) (str/sb-new a)]
+        (str/sb-push-str! (mut b) base)
+        (str/sb-push-str! (mut b) "/")
+        (str/sb-push-str! (mut b) path)
+        (str/sb-str (load (mut b))))))
+
+(defn anchor-paths [(a (dyn alloc/Allocator)) (base (slice u8)) (paths (al/ArrayList (slice u8)))]
+  (-> (al/ArrayList (slice u8)))
+  (let [(mut out) (al/al-new [(slice u8)] a)]
+    (for [i 0 (al/al-len [(slice u8)] paths)]
+      (al/al-push! [(slice u8)] (mut out) (anchor-path a base (al/al-get [(slice u8)] paths i)))
+      0)
+    (load (mut out))))
+
+;;; The directory holding `manifest` ("." for a bare file name).
+(defn manifest-dir [(manifest (slice u8))] (-> (slice u8))
+  (let [(mut cut) -1]
+    (for [i 0 (slice-len manifest)]
+      (when (= (primitive/cast i64 (slice-get manifest i)) 47) (store! cut i) 0)
+      0)
+    (if (< (load cut) 0) "." (subslice manifest 0 (load cut)))))
+
 (defn read-c-module [(context Code)] (-> Code)
   (let [a (expansion-allocator)
         path (primitive/code-str (primitive/code-nth context 1))
-        env (getenv c"COIL_MANIFEST_PATH")]
-    (if (= (primitive/cast i64 env) 0)
+        ;; The manifest of the package that owns this header: a dependency's own
+        ;; Coil.toml even when a consumer imports it from source. Older compilers
+        ;; pass no package; they only ever built this from the package's own
+        ;; directory, where COIL_MANIFEST_PATH named it.
+        owned (read-context-manifest context)
+        env (getenv c"COIL_MANIFEST_PATH")
+        manifest-path (cond (> (slice-len owned) 0) owned
+                            (!= (primitive/cast i64 env) 0) (str/cstr->str env)
+                            :else "")]
+    (if (= (slice-len manifest-path) 0)
         (primitive/error "C reader requires a Coil.toml manifest")
         (let [manifest
-                (match (fs/read-file a (str/cstr->str env))
+                (match (fs/read-file a manifest-path)
                   (Ok [text] text)
                   (Err [_] (primitive/error "C reader cannot read Coil.toml")))
-              config (parse-config a manifest (basename-without-extension path))
+              base (manifest-dir manifest-path)
+              parsed (parse-config a manifest (basename-without-extension path))
+              config (load (CModuleConfig
+                       :sources (anchor-paths a base (.sources parsed))
+                       :includes (anchor-paths a base (.includes parsed))
+                       :defines (.defines parsed)
+                       :header-defines (.header-defines parsed)
+                       :has-header-defines (.has-header-defines parsed)
+                       :generated-modules (.generated-modules parsed)
+                       :prefixes (anchor-paths a base (.prefixes parsed))
+                       :module-names (.module-names parsed)))
               opts
                 (load (cc/Options
                         :inputs (.sources config)
