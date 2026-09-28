@@ -33,6 +33,10 @@ PROJECTS = [
      # Apple's headers redirect the string functions to _FORTIFY_SOURCE builtins
      # this frontend does not implement; cJSON does not need the checked ones.
      ["-D_FORTIFY_SOURCE=0"]),
+    ("header-inline-block-prototype",
+     [ROOT / "tests/c/header-inline-block-prototype/alpha.c",
+      ROOT / "tests/c/header-inline-block-prototype/beta.c"],
+     ["-D_FORTIFY_SOURCE=0"]),
 ]
 
 
